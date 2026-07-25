@@ -16,6 +16,23 @@ pub struct IpcFootprint {
     pub layer: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct IpcPadDefinition {
+    pub number: String,
+    pub pad_type: String,
+    pub shape: String,
+    pub x: f64,
+    pub y: f64,
+    pub rotation: f64,
+    pub size_x: f64,
+    pub size_y: f64,
+    pub drill_x: Option<f64>,
+    pub drill_y: Option<f64>,
+    pub drill_oval: bool,
+    pub layers: Vec<String>,
+    pub roundrect_ratio: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
     pub net_name: String,

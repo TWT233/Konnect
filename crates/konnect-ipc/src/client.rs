@@ -1,6 +1,6 @@
-//! KiCAD 10 IPC API client using NNG + Protocol Buffers.
+//! KiCad 10 IPC API client using NNG + Protocol Buffers.
 //!
-//! KiCAD 10 exposes an IPC API over NNG (nanomsg-next-gen) using protobuf messages.
+//! KiCad 10 exposes an IPC API over NNG (nanomsg-next-gen) using protobuf messages.
 //! The transport is NNG req/rep over IPC (Unix sockets / Windows named pipes).
 //!
 //! Socket path: set by KICAD_API_SOCKET env var when KiCAD launches a plugin,
@@ -13,6 +13,7 @@ use crate::types::*;
 use anyhow::{Context, Result};
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 /// Converts KiCAD nanometers to millimeters.
@@ -60,8 +61,30 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+fn unpack_required<M: Message + Default>(
+    response: Option<prost_types::Any>,
+    command_name: &str,
+) -> Result<M> {
+    let response =
+        response.with_context(|| format!("KiCad returned no {command_name} response payload"))?;
+    unpack_any(&response)
+}
+
+fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
+    let status = kiapi::common::types::ItemRequestStatus::try_from(status)
+        .unwrap_or(kiapi::common::types::ItemRequestStatus::IrsUnknown);
+    if status != kiapi::common::types::ItemRequestStatus::IrsOk {
+        anyhow::bail!(
+            "KiCad {operation} request failed with {}",
+            status.as_str_name()
+        );
+    }
+    Ok(())
+}
+
 pub struct KiCadIpcClient {
     socket_path: String,
+    kicad_token: String,
     client_name: String,
 }
 
@@ -77,8 +100,20 @@ impl KiCadIpcClient {
         };
         KiCadIpcClient {
             socket_path: effective_path,
+            kicad_token: std::env::var("KICAD_API_TOKEN").unwrap_or_default(),
             client_name: format!("konnect-{}", std::process::id()),
         }
+    }
+
+    /// Create a client with an explicit API token.
+    ///
+    /// KiCad supplies this token to executable plugins through
+    /// `KICAD_API_TOKEN`. This constructor is useful for clients that obtain
+    /// the connection details through another discovery mechanism.
+    pub fn new_with_token(socket_path: impl Into<String>, token: impl Into<String>) -> Self {
+        let mut client = Self::new(socket_path);
+        client.kicad_token = token.into();
+        client
     }
 
     /// Send a protobuf command and return the response Any.
@@ -97,13 +132,13 @@ impl KiCadIpcClient {
                  (3) restart the AI client so the server rereads settings. \
                  Alternatively set ipc_socket_path in konnect-settings.json or launch \
                  via KiCAD (which sets KICAD_API_SOCKET). \
-                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
+                 Full guide: https://github.com/perara/Konnect/blob/main/docs/TROUBLESHOOTING.md"
             );
         }
 
         let request = kiapi::common::ApiRequest {
             header: Some(kiapi::common::ApiRequestHeader {
-                kicad_token: String::new(), // Empty = accept any instance
+                kicad_token: self.kicad_token.clone(),
                 client_name: self.client_name.clone(),
             }),
             message: Some(pack_any(command, type_name)),
@@ -159,18 +194,20 @@ impl KiCadIpcClient {
         let response = kiapi::common::ApiResponse::decode(reply.as_slice())
             .context("Failed to decode ApiResponse")?;
 
-        // Check status
-        if let Some(ref status) = response.status {
-            let code = status.status();
-            if code != kiapi::common::ApiStatusCode::AsOk {
-                let msg = if status.error_message.is_empty() {
-                    format!("{:?}", code)
-                } else {
-                    status.error_message.clone()
-                };
-                debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
-                anyhow::bail!("KiCAD IPC error: {} ({})", msg, code.as_str_name());
-            }
+        // A response without an envelope status is malformed, not success.
+        let status = response
+            .status
+            .as_ref()
+            .context("KiCad IPC response is missing its status")?;
+        let code = status.status();
+        if code != kiapi::common::ApiStatusCode::AsOk {
+            let msg = if status.error_message.is_empty() {
+                format!("{:?}", code)
+            } else {
+                status.error_message.clone()
+            };
+            debug!("[BETA] IPC ← error: {} ({})", msg, code.as_str_name());
+            anyhow::bail!("KiCad IPC error: {} ({})", msg, code.as_str_name());
         }
 
         debug!("[BETA] IPC ← OK");
@@ -211,6 +248,25 @@ impl KiCadIpcClient {
         docs.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("No PCB document is open in KiCAD. Open a board file first.")
         })
+    }
+
+    /// Fail closed unless the first board targeted by IPC is the requested file.
+    ///
+    /// KiCad may have several boards open, while the item APIs operate on a
+    /// `DocumentSpecifier`. Konnect currently targets the first open PCB, so a
+    /// path-bearing MCP request must verify that choice before mutating it.
+    pub fn ensure_board_is_active(&self, requested: &Path) -> Result<()> {
+        let document = self.get_board_document()?;
+        let active = board_document_path(&document)
+            .context("KiCad returned an open PCB without a board filename")?;
+        if paths_refer_to_same_board(requested, &active) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "requested board '{}' is not the active IPC board '{}'",
+            requested.display(),
+            active.display()
+        )
     }
 
     fn make_header(&self) -> Result<kiapi::common::types::ItemHeader> {
@@ -312,30 +368,95 @@ impl KiCadIpcClient {
 
     /// Create items on the board.
     pub fn create_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let expected_count = items.len();
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::CreateItems {
             header: Some(header),
             items,
             container: None,
         };
-        self.send_command(&cmd, "kiapi.common.commands.CreateItems")?;
+        let response = unpack_required::<kiapi::common::commands::CreateItemsResponse>(
+            self.send_command(&cmd, "kiapi.common.commands.CreateItems")?,
+            "CreateItems",
+        )?;
+        ensure_item_request_ok(response.status, "item creation")?;
+        if response.created_items.len() != expected_count {
+            anyhow::bail!(
+                "KiCad returned {} creation results for {} requested items",
+                response.created_items.len(),
+                expected_count
+            );
+        }
+        for result in response.created_items {
+            let status = result
+                .status
+                .context("KiCad returned a creation result without item status")?;
+            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
+                anyhow::bail!(
+                    "KiCad item creation failed: {} ({})",
+                    status.error_message,
+                    status.code().as_str_name()
+                );
+            }
+        }
         Ok(())
     }
 
     /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;
     /// each `Any` must be a fully-formed board item with an existing `id` populated.
     pub fn update_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let expected_count = items.len();
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::UpdateItems {
             header: Some(header),
             items,
         };
-        self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+        let response = unpack_required::<kiapi::common::commands::UpdateItemsResponse>(
+            self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?,
+            "UpdateItems",
+        )?;
+        ensure_item_request_ok(response.status, "item update")?;
+        if response.updated_items.len() != expected_count {
+            anyhow::bail!(
+                "KiCad returned {} update results for {} requested items",
+                response.updated_items.len(),
+                expected_count
+            );
+        }
+        for result in response.updated_items {
+            let Some(status) = result.status else {
+                anyhow::bail!("KiCad returned an update result without item status");
+            };
+            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
+                anyhow::bail!(
+                    "KiCad item update failed: {} ({})",
+                    status.error_message,
+                    status.code().as_str_name()
+                );
+            }
+        }
         Ok(())
     }
 
     /// Delete items by KIID.
     pub fn delete_items(&self, ids: Vec<String>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let expected_count = ids.len();
+        let mut expected_ids = ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if expected_ids.len() != expected_count {
+            anyhow::bail!("delete request contains duplicate item identifiers");
+        }
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::DeleteItems {
             header: Some(header),
@@ -344,7 +465,35 @@ impl KiCadIpcClient {
                 .map(|id| kiapi::common::types::Kiid { value: id.clone() })
                 .collect(),
         };
-        self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?;
+        let response = unpack_required::<kiapi::common::commands::DeleteItemsResponse>(
+            self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?,
+            "DeleteItems",
+        )?;
+        ensure_item_request_ok(response.status, "item deletion")?;
+        if response.deleted_items.len() != expected_count {
+            anyhow::bail!(
+                "KiCad returned {} deletion results for {} requested items",
+                response.deleted_items.len(),
+                expected_count
+            );
+        }
+        for result in response.deleted_items {
+            let status = result.status();
+            let id = result
+                .id
+                .context("KiCad returned a deletion result without an item identifier")?
+                .value;
+            if !expected_ids.remove(&id) {
+                anyhow::bail!("KiCad returned a deletion result for unexpected item '{id}'");
+            }
+            if status != kiapi::common::commands::ItemDeletionStatus::IdsOk {
+                anyhow::bail!(
+                    "KiCad failed to delete item '{}': {}",
+                    id,
+                    status.as_str_name()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -373,12 +522,16 @@ impl KiCadIpcClient {
     pub fn begin_commit(&self) -> Result<String> {
         let cmd = kiapi::common::commands::BeginCommit {};
         let response_any = self.send_command(&cmd, "kiapi.common.commands.BeginCommit")?;
-        if let Some(any) = response_any {
-            let resp: kiapi::common::commands::BeginCommitResponse = unpack_any(&any)?;
-            Ok(resp.id.map(|id| id.value).unwrap_or_default())
-        } else {
-            Ok(String::new())
+        let response: kiapi::common::commands::BeginCommitResponse =
+            unpack_required(response_any, "BeginCommit")?;
+        let id = response
+            .id
+            .context("KiCad returned BeginCommit without a commit identifier")?
+            .value;
+        if id.is_empty() {
+            anyhow::bail!("KiCad returned an empty commit identifier");
         }
+        Ok(id)
     }
 
     /// End a commit (push or drop).
@@ -395,7 +548,10 @@ impl KiCadIpcClient {
             action: action as i32,
             message: message.to_string(),
         };
-        self.send_command(&cmd, "kiapi.common.commands.EndCommit")?;
+        let _: kiapi::common::commands::EndCommitResponse = unpack_required(
+            self.send_command(&cmd, "kiapi.common.commands.EndCommit")?,
+            "EndCommit",
+        )?;
         Ok(())
     }
 
@@ -415,6 +571,49 @@ impl KiCadIpcClient {
             kiapi::common::commands::CommitAction::CmaDrop,
             "",
         )
+    }
+
+    /// Run a multi-step mutation as one KiCad undo transaction.
+    ///
+    /// Any operation error, or a failure to publish the commit, triggers a
+    /// best-effort drop so callers never knowingly leave a partial batch.
+    pub fn run_commit<T>(
+        &self,
+        description: &str,
+        operation: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        let commit_id = self.begin_commit()?;
+        let operation_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        match operation_result {
+            Err(panic) => {
+                if let Err(rollback_error) = self.drop_commit(&commit_id) {
+                    anyhow::bail!("KiCad batch panicked and rollback failed ({rollback_error})");
+                }
+                std::panic::resume_unwind(panic)
+            }
+            Ok(Ok(value)) => {
+                if let Err(commit_error) = self.push_commit(&commit_id, description) {
+                    let rollback_error = self.drop_commit(&commit_id).err();
+                    if let Some(rollback_error) = rollback_error {
+                        anyhow::bail!(
+                            "failed to publish KiCad commit ({commit_error}); rollback also failed ({rollback_error})"
+                        );
+                    }
+                    return Err(commit_error)
+                        .context("failed to publish KiCad commit; changes dropped");
+                }
+                Ok(value)
+            }
+            Ok(Err(operation_error)) => {
+                if let Err(rollback_error) = self.drop_commit(&commit_id) {
+                    anyhow::bail!(
+                        "KiCad batch failed ({operation_error}); rollback also failed ({rollback_error})"
+                    );
+                }
+                Err(operation_error).context("KiCad batch failed; changes dropped")
+            }
+        }
     }
 
     // ─── PCB Item Operations (real protobuf implementations) ───────────
@@ -583,13 +782,7 @@ impl KiCadIpcClient {
                         },
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
-
-                    let header = self.make_header()?;
-                    let cmd = kiapi::common::commands::UpdateItems {
-                        header: Some(header),
-                        items: vec![any],
-                    };
-                    self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+                    self.update_items(vec![any])?;
                     return Ok(());
                 }
             }
@@ -633,17 +826,57 @@ impl KiCadIpcClient {
                         },
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
-                    let header = self.make_header()?;
-                    let cmd = kiapi::common::commands::UpdateItems {
-                        header: Some(header),
-                        items: vec![any],
-                    };
-                    self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+                    self.update_items(vec![any])?;
                     return Ok(());
                 }
             }
         }
         anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
+    /// Update the visible value field of an existing footprint.
+    pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in items {
+            if let Ok(mut footprint) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            {
+                let current_reference = footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|board_text| board_text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    .unwrap_or("");
+                if current_reference != reference {
+                    continue;
+                }
+                if let Some(text) = footprint
+                    .value_field
+                    .as_mut()
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|board_text| board_text.text.as_mut())
+                {
+                    text.text = value.to_string();
+                } else {
+                    anyhow::bail!("Footprint '{reference}' has no editable value field");
+                }
+                if let Some(text) = footprint
+                    .definition
+                    .as_mut()
+                    .and_then(|definition| definition.value_field.as_mut())
+                    .and_then(|field| field.text.as_mut())
+                    .and_then(|board_text| board_text.text.as_mut())
+                {
+                    text.text = value.to_string();
+                }
+                let any =
+                    crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+                self.update_items(vec![any])?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("Footprint '{reference}' not found")
     }
 
     /// Delete a footprint by reference.
@@ -652,46 +885,215 @@ impl KiCadIpcClient {
         self.delete_items(vec![kiid])
     }
 
-    /// Place a footprint — currently requires KiCAD's ParseAndCreateItemsFromString.
+    /// Build a typed footprint item suitable for [`Self::create_items`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_footprint_item(
+        &self,
+        lib_id: &str,
+        reference: &str,
+        value: &str,
+        pads: &[IpcPadDefinition],
+        x: f64,
+        y: f64,
+        rotation: f64,
+        layer: &str,
+    ) -> Result<prost_types::Any> {
+        let (library_nickname, entry_name) = lib_id
+            .split_once(':')
+            .context("footprint identifier must use Library:Footprint syntax")?;
+        let text_field =
+            |name: &str, text: &str, field_y: f64, visible: bool| kiapi::board::types::Field {
+                id: None,
+                name: name.to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    id: None,
+                    text: Some(kiapi::common::types::Text {
+                        position: Some(crate::builders::vec2(x, field_y)),
+                        attributes: Some(kiapi::common::types::TextAttributes {
+                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            angle: Some(kiapi::common::types::Angle {
+                                value_degrees: rotation,
+                            }),
+                            ..Default::default()
+                        }),
+                        text: text.to_string(),
+                        hyperlink: String::new(),
+                    }),
+                    layer: crate::builders::layer_from_name(if layer == "B.Cu" {
+                        "B.SilkS"
+                    } else {
+                        "F.SilkS"
+                    }) as i32,
+                    knockout: false,
+                    locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                }),
+                visible,
+            };
+        let reference_field = text_field("Reference", reference, y - 1.0, true);
+        let value_field = text_field("Value", value, y + 1.0, false);
+        let radians = rotation.to_radians();
+        let child_items = pads
+            .iter()
+            .map(|pad| {
+                let local_x = pad.x;
+                let local_y = pad.y;
+                let board_x = x + local_x * radians.cos() + local_y * radians.sin();
+                let board_y = y - local_x * radians.sin() + local_y * radians.cos();
+                let mut layers = Vec::new();
+                for name in &pad.layers {
+                    match name.as_str() {
+                        "*.Cu" => layers.extend(3..=34),
+                        "*.Mask" => layers.extend([
+                            kiapi::board::types::BoardLayer::BlFMask as i32,
+                            kiapi::board::types::BoardLayer::BlBMask as i32,
+                        ]),
+                        "*.Paste" => layers.extend([
+                            kiapi::board::types::BoardLayer::BlFPaste as i32,
+                            kiapi::board::types::BoardLayer::BlBPaste as i32,
+                        ]),
+                        name => layers.push(crate::builders::layer_from_name(name) as i32),
+                    }
+                }
+                layers
+                    .retain(|layer| *layer != kiapi::board::types::BoardLayer::BlUndefined as i32);
+                layers.sort_unstable();
+                layers.dedup();
+
+                let shape = match pad.shape.as_str() {
+                    "circle" => kiapi::board::types::PadStackShape::PssCircle,
+                    "rect" => kiapi::board::types::PadStackShape::PssRectangle,
+                    "oval" => kiapi::board::types::PadStackShape::PssOval,
+                    "trapezoid" => kiapi::board::types::PadStackShape::PssTrapezoid,
+                    "roundrect" => kiapi::board::types::PadStackShape::PssRoundrect,
+                    "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
+                    _ => kiapi::board::types::PadStackShape::PssRectangle,
+                };
+                let copper_layer =
+                    if layers.contains(&(kiapi::board::types::BoardLayer::BlFCu as i32)) {
+                        kiapi::board::types::BoardLayer::BlFCu
+                    } else {
+                        kiapi::board::types::BoardLayer::BlBCu
+                    };
+                let copper = kiapi::board::types::PadStackLayer {
+                    layer: copper_layer as i32,
+                    shape: shape as i32,
+                    size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
+                    corner_rounding_ratio: pad.roundrect_ratio,
+                    custom_anchor_shape: shape as i32,
+                    offset: Some(crate::builders::vec2(0.0, 0.0)),
+                    ..Default::default()
+                };
+                let drill = pad
+                    .drill_x
+                    .map(|drill_x| kiapi::board::types::DrillProperties {
+                        start_layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                        end_layer: kiapi::board::types::BoardLayer::BlBCu as i32,
+                        diameter: Some(crate::builders::vec2(
+                            drill_x,
+                            pad.drill_y.unwrap_or(drill_x),
+                        )),
+                        shape: if pad.drill_oval {
+                            kiapi::board::types::DrillShape::DsOblong as i32
+                        } else {
+                            kiapi::board::types::DrillShape::DsCircle as i32
+                        },
+                        ..Default::default()
+                    });
+                let stack = kiapi::board::types::PadStack {
+                    r#type: kiapi::board::types::PadStackType::PstNormal as i32,
+                    layers,
+                    drill,
+                    unconnected_layer_removal: kiapi::board::types::UnconnectedLayerRemoval::UlrKeep
+                        as i32,
+                    copper_layers: vec![copper],
+                    angle: Some(kiapi::common::types::Angle {
+                        value_degrees: rotation + pad.rotation,
+                    }),
+                    ..Default::default()
+                };
+                let pad_type = match pad.pad_type.as_str() {
+                    "thru_hole" => kiapi::board::types::PadType::PtPth,
+                    "np_thru_hole" => kiapi::board::types::PadType::PtNpth,
+                    "connect" => kiapi::board::types::PadType::PtEdgeConnector,
+                    _ => kiapi::board::types::PadType::PtSmd,
+                };
+                let item = kiapi::board::types::Pad {
+                    number: pad.number.clone(),
+                    r#type: pad_type as i32,
+                    pad_stack: Some(stack),
+                    position: Some(crate::builders::vec2(board_x, board_y)),
+                    locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+                    ..Default::default()
+                };
+                crate::builders::pack_any(&item, "kiapi.board.types.Pad")
+            })
+            .collect();
+        let definition = kiapi::board::types::Footprint {
+            id: Some(kiapi::common::types::LibraryIdentifier {
+                library_nickname: library_nickname.to_string(),
+                entry_name: entry_name.to_string(),
+            }),
+            reference_field: Some(reference_field.clone()),
+            value_field: Some(value_field.clone()),
+            items: child_items,
+            ..Default::default()
+        };
+        let footprint = kiapi::board::types::FootprintInstance {
+            position: Some(crate::builders::vec2(x, y)),
+            orientation: Some(kiapi::common::types::Angle {
+                value_degrees: rotation,
+            }),
+            layer: crate::builders::layer_from_name(layer) as i32,
+            locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+            definition: Some(definition),
+            reference_field: Some(reference_field),
+            value_field: Some(value_field),
+            ..Default::default()
+        };
+        Ok(crate::builders::pack_any(
+            &footprint,
+            "kiapi.board.types.FootprintInstance",
+        ))
+    }
+
+    /// Place and verify a footprint instance through the typed KiCad API.
+    #[allow(clippy::too_many_arguments)]
     pub fn place_footprint(
         &self,
         lib_id: &str,
+        reference: &str,
+        value: &str,
+        pads: &[IpcPadDefinition],
         x: f64,
         y: f64,
         rotation: f64,
         layer: &str,
     ) -> Result<IpcFootprint> {
-        // KiCAD 10 IPC doesn't have a direct "place footprint from library" command.
-        // The CreateItems command requires a fully formed FootprintInstance protobuf,
-        // which needs the complete footprint definition (pads, shapes, etc.) from the library.
-        // For now, use ParseAndCreateItemsFromString with S-expression format.
-        let sexp = format!(
-            r#"(footprint "{lib_id}"
-  (layer "{layer}")
-  (at {x} {y} {rotation})
-)"#,
-            lib_id = lib_id,
-            layer = layer,
-            x = crate::builders::mm_to_nm(x) as f64 / 1_000_000.0,
-            y = crate::builders::mm_to_nm(y) as f64 / 1_000_000.0,
-            rotation = rotation,
-        );
-
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-
-        Ok(IpcFootprint {
-            reference: String::new(),
-            value: String::new(),
-            footprint: lib_id.to_string(),
-            position: IpcVector2 { x, y },
-            rotation,
-            layer: layer.to_string(),
-        })
+        if self
+            .list_footprints()?
+            .iter()
+            .any(|footprint| footprint.reference == reference)
+        {
+            anyhow::bail!("footprint reference '{reference}' already exists on the board");
+        }
+        let item =
+            self.build_footprint_item(lib_id, reference, value, pads, x, y, rotation, layer)?;
+        self.create_items(vec![item])?;
+        let footprints = self.list_footprints()?;
+        footprints
+            .iter()
+            .find(|footprint| footprint.reference == reference)
+            .cloned()
+            .with_context(|| {
+                let references = footprints
+                    .iter()
+                    .map(|footprint| footprint.reference.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "KiCad created the footprint but reference '{reference}' was not found (board references: {references})"
+                )
+            })
     }
 
     /// Get board extents (bounding box of all items).
@@ -775,5 +1177,75 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
+    }
+}
+
+fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Option<PathBuf> {
+    use kiapi::common::types::document_specifier::Identifier;
+
+    let Identifier::BoardFilename(filename) = document.identifier.as_ref()? else {
+        return None;
+    };
+    let path = PathBuf::from(filename);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    document
+        .project
+        .as_ref()
+        .filter(|project| !project.path.is_empty())
+        .map(|project| PathBuf::from(&project.path).join(&path))
+        .or(Some(path))
+}
+
+fn paths_refer_to_same_board(requested: &Path, active: &Path) -> bool {
+    match (requested.canonicalize(), active.canonicalize()) {
+        (Ok(requested), Ok(active)) => requested == active,
+        _ if active.components().count() == 1 => {
+            requested.components().count() == 1 && requested.file_name() == active.file_name()
+        }
+        _ => requested == active,
+    }
+}
+
+#[cfg(test)]
+mod document_path_tests {
+    use super::*;
+
+    #[test]
+    fn relative_board_filename_is_resolved_against_project_path() {
+        let document = kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "controller.kicad_pcb".to_string(),
+                ),
+            ),
+            project: Some(kiapi::common::types::ProjectSpecifier {
+                name: "controller".to_string(),
+                path: "/work/controller".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            board_document_path(&document).unwrap(),
+            PathBuf::from("/work/controller/controller.kicad_pcb")
+        );
+    }
+
+    #[test]
+    fn bare_kicad_filename_is_not_enough_to_authorize_an_absolute_request() {
+        assert!(!paths_refer_to_same_board(
+            Path::new("/work/controller/controller.kicad_pcb"),
+            Path::new("controller.kicad_pcb")
+        ));
+        assert!(paths_refer_to_same_board(
+            Path::new("controller.kicad_pcb"),
+            Path::new("controller.kicad_pcb")
+        ));
+        assert!(!paths_refer_to_same_board(
+            Path::new("/work/controller/other.kicad_pcb"),
+            Path::new("controller.kicad_pcb")
+        ));
     }
 }

@@ -20,3 +20,6 @@ prost-types.workspace = true
 
 [build-dependencies]
 prost-build = "0.13"
+
+[dev-dependencies]
+konnect-sexp = { path = "../konnect-sexp" }

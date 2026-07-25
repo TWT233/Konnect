@@ -916,6 +916,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "dirs",
  "konnect-ipc",
  "konnect-schematic-editor",
  "konnect-sexp",
@@ -937,6 +938,7 @@ name = "konnect-ipc"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "konnect-sexp",
  "nng",
  "prost",
  "prost-build",

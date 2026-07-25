@@ -5,10 +5,12 @@
 //! exercise the full encode → transport → decode → error-mapping path that
 //! previously only ran against a live KiCAD session.
 
+use konnect_ipc::builders;
 use konnect_ipc::gen::kiapi;
 use konnect_ipc::KiCadIpcClient;
 use nng::options::Options;
 use prost::Message;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A rep0 server answering each request via `respond`.
@@ -30,12 +32,14 @@ where
     let url = format!("tcp://127.0.0.1:{port}");
 
     let listen_url = url.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
         socket
             .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
             .unwrap();
         socket.listen(&listen_url).expect("mock listen");
+        ready_tx.send(()).expect("signal mock readiness");
         while let Ok(msg) = socket.recv() {
             let request = match kiapi::common::ApiRequest::decode(msg.as_slice()) {
                 Ok(r) => r,
@@ -58,6 +62,9 @@ where
             }
         }
     });
+    ready_rx
+        .recv()
+        .expect("mock server failed before listening");
 
     MockKicad {
         url,
@@ -74,6 +81,31 @@ fn ok_response() -> kiapi::common::ApiResponse {
         header: None,
         message: None,
     }
+}
+
+fn reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
+    kiapi::common::ApiResponse {
+        message: Some(inner),
+        ..ok_response()
+    }
+}
+
+fn open_board_response() -> kiapi::common::ApiResponse {
+    let response = kiapi::common::commands::GetOpenDocumentsResponse {
+        documents: vec![kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "test.kicad_pcb".to_string(),
+                ),
+            ),
+        }],
+    };
+    reply_with(builders::pack_any(
+        &response,
+        "kiapi.common.commands.GetOpenDocumentsResponse",
+    ))
 }
 
 #[test]
@@ -93,6 +125,18 @@ fn ping_roundtrips_through_mock() {
     });
 
     let client = KiCadIpcClient::new(&mock.url);
+    assert!(client.ping().unwrap());
+}
+
+#[test]
+fn explicit_kicad_token_is_sent_in_request_header() {
+    let mock = spawn_mock(|req| {
+        let header = req.header.expect("request header");
+        assert_eq!(header.kicad_token, "linux-instance-token");
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new_with_token(&mock.url, "linux-instance-token");
     assert!(client.ping().unwrap());
 }
 
@@ -150,6 +194,131 @@ fn empty_socket_path_is_configuration_error() {
     assert!(
         err.contains("TROUBLESHOOTING"),
         "error should link the troubleshooting guide: {err}"
+    );
+}
+
+#[test]
+fn create_items_requires_a_typed_response_payload() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else {
+            assert!(message.type_url.ends_with("CreateItems"));
+            Some(ok_response())
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let item = builders::pack_any(&kiapi::common::commands::Ping {}, "test.Item");
+
+    let error = client.create_items(vec![item]).unwrap_err().to_string();
+
+    assert!(error.contains("no CreateItems response payload"), "{error}");
+}
+
+#[test]
+fn update_items_rejects_missing_per_item_results() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else {
+            assert!(message.type_url.ends_with("UpdateItems"));
+            let response = kiapi::common::commands::UpdateItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                updated_items: vec![],
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.UpdateItemsResponse",
+            )))
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let item = builders::pack_any(&kiapi::common::commands::Ping {}, "test.Item");
+
+    let error = client.update_items(vec![item]).unwrap_err().to_string();
+
+    assert!(
+        error.contains("0 update results for 1 requested"),
+        "{error}"
+    );
+}
+
+#[test]
+fn delete_items_surfaces_per_item_failure() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else {
+            assert!(message.type_url.ends_with("DeleteItems"));
+            let response = kiapi::common::commands::DeleteItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                deleted_items: vec![kiapi::common::commands::ItemDeletionResult {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "missing-id".to_string(),
+                    }),
+                    status: kiapi::common::commands::ItemDeletionStatus::IdsNonexistent as i32,
+                }],
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.DeleteItemsResponse",
+            )))
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let error = client
+        .delete_items(vec!["missing-id".to_string()])
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("IDS_NONEXISTENT"), "{error}");
+    assert!(error.contains("missing-id"), "{error}");
+}
+
+#[test]
+fn failed_multi_step_commit_is_dropped() {
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let captured_actions = actions.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("BeginCommit") {
+            let response = kiapi::common::commands::BeginCommitResponse {
+                id: Some(kiapi::common::types::Kiid {
+                    value: "commit-1".to_string(),
+                }),
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.BeginCommitResponse",
+            )))
+        } else {
+            assert!(message.type_url.ends_with("EndCommit"));
+            let command =
+                kiapi::common::commands::EndCommit::decode(message.value.as_slice()).unwrap();
+            captured_actions.lock().unwrap().push(command.action());
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )))
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let error = client
+        .run_commit::<()>("test transaction", |_| anyhow::bail!("second step failed"))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("changes dropped"), "{error}");
+    assert_eq!(
+        *actions.lock().unwrap(),
+        vec![kiapi::common::commands::CommitAction::CmaDrop]
     );
 }
 
