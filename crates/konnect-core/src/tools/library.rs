@@ -1970,6 +1970,95 @@ mod tests {
         format!("({kind}\r\n\t(version 7)\r\n{body})\r\n")
     }
 
+    #[tokio::test]
+    async fn list_footprint_libraries_reads_a_table_kicad_wrote() {
+        // End-to-end regression for the user-visible symptom: on a stock KiCad
+        // 10 install every library listing returned {"count": 0}, which left
+        // place_component unable to resolve any Library:Footprint id. Drive the
+        // real handler with a table in the exact shape KiCad writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyParts.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let table = kicad_style_table(
+            "fp_lib_table",
+            &[("MyParts", "KiCad", &pretty.to_string_lossy())],
+        );
+        assert!(
+            !table.contains("\n  (lib "),
+            "fixture must be in KiCad's tab format, not the old needle's"
+        );
+        std::fs::write(tmp.path().join("fp-lib-table"), table).unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["count"], 1, "library not found: {out}");
+        assert_eq!(out["libraries"][0]["nickname"], "MyParts");
+        assert_eq!(
+            out["libraries"][0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "the resolved directory should be reported alongside the raw uri"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_footprint_libraries_expands_a_nested_table_of_env_var_uris() {
+        // The two things that kept KiCad's ~155 bundled libraries invisible even
+        // once the table parsed: a `(type "Table")` indirection, and entries
+        // addressed as ${KICAD10_FOOTPRINT_DIR}/Foo.pretty.
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped = tmp.path().join("share");
+        let pretty = shipped.join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::env::set_var("KICAD10_FOOTPRINT_DIR", &shipped);
+
+        let nested = tmp.path().join("template-fp-lib-table");
+        std::fs::write(
+            &nested,
+            kicad_style_table(
+                "fp_lib_table",
+                &[(
+                    "Resistor_SMD",
+                    "KiCad",
+                    "${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty",
+                )],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("fp-lib-table"),
+            kicad_style_table(
+                "fp_lib_table",
+                &[("KiCad", "Table", &nested.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(out["count"], 1, "nested table not expanded: {out}");
+        assert_eq!(out["libraries"][0]["nickname"], "Resistor_SMD");
+        assert_eq!(
+            out["libraries"][0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "env-var URI should resolve to a real directory"
+        );
+    }
+
     #[test]
     fn parse_lib_table_reads_kicad10_crlf_tab_format() {
         // Regression: parse_lib_table hard-coded the needle `\n  (lib ` (LF +
