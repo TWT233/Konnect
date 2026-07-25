@@ -2,6 +2,9 @@
 
 Internal reference for developing and maintaining the Rust port.
 
+Repository-wide naming, public API, branch, and pull-request rules live in
+[docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md).
+
 ## Quick Start
 
 ```bash
