@@ -67,6 +67,31 @@ fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String
         .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
 }
 
+/// Structured rejection for any back-side (`B.*`) placement layer.
+///
+/// Placing on the back is not a layer rename: KiCAD's flip mirrors the
+/// footprint's geometry (pad X positions negate, every front layer swaps with
+/// its back counterpart per item). Until Konnect implements that mirror,
+/// pretending to support `B.Cu` silently produces wrong copper, so the layer
+/// is refused up front — before anything is resolved, sent, or written.
+fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
+    if !layer.starts_with("B.") {
+        return None;
+    }
+    Some(CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: "layer".to_string(),
+            reason: format!("back-side placement on '{layer}' is not yet supported"),
+        },
+        format!(
+            "Cannot place on '{layer}': back-side placement is not yet supported, \
+             because a correct flip must mirror the footprint geometry rather than \
+             just rename its layers. Place the footprint on F.Cu and flip it to the \
+             back in KiCAD (select it and press F)."
+        ),
+    ))
+}
+
 fn escape_sexp_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -107,20 +132,21 @@ fn prepare_footprint_source(
     rotation: f64,
     layer: &str,
 ) -> anyhow::Result<String> {
-    if !matches!(layer, "F.Cu" | "B.Cu") {
-        anyhow::bail!("footprints can only be placed on F.Cu or B.Cu, got '{layer}'");
+    // No back-side placement: a correct F.Cu→B.Cu flip mirrors the geometry
+    // (pad X positions negate, layers swap per item) the way KiCAD's own flip
+    // does. A textual layer swap produces wrong copper, so it is refused
+    // outright — see back_side_layer_error.
+    if layer != "F.Cu" {
+        anyhow::bail!(
+            "footprints can only be placed on F.Cu (back-side placement is not yet \
+             supported because a correct flip must mirror the geometry), got '{layer}'"
+        );
     }
     let mut prepared = source.to_string();
     replace_quoted_after(&mut prepared, "(footprint \"", lib_id)?;
     replace_quoted_after(&mut prepared, "(property \"Reference\" \"", reference)?;
     if let Some(value) = value {
         replace_quoted_after(&mut prepared, "(property \"Value\" \"", value)?;
-    }
-
-    if layer == "B.Cu" {
-        prepared = prepared.replace("\"F.", "\"__KONNECT_FRONT__.");
-        prepared = prepared.replace("\"B.", "\"F.");
-        prepared = prepared.replace("\"__KONNECT_FRONT__.", "\"B.");
     }
     replace_quoted_after(&mut prepared, "(layer \"", layer)?;
     let layer_start = prepared
@@ -439,6 +465,9 @@ async fn handle_place_component(
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    if let Some(rejection) = back_side_layer_error(&layer) {
+        return Ok(rejection);
+    }
     let source = match resolve_footprint_source(&footprint, &board) {
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
@@ -905,6 +934,9 @@ async fn handle_duplicate_component(
         c.get_footprint(&ref_ipc)?
             .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", ref_ipc))
     });
+    if let Some(rejection) = back_side_layer_error(&src.layer) {
+        return Ok(rejection);
+    }
     let source = match resolve_footprint_source(&src.footprint, &board) {
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
@@ -1020,8 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn flips_all_copper_side_layers_for_back_placement() {
-        let prepared = prepare_footprint_source(
+    fn back_side_placement_is_rejected_not_string_swapped() {
+        // The old implementation did a blind "F. → "B. text swap over the whole
+        // footprint, which corrupted property values starting with "F." and
+        // left pad X positions unmirrored — wrong geometry presented as
+        // success. Until a real mirror flip exists, B.Cu must be refused.
+        let error = prepare_footprint_source(
             FOOTPRINT,
             "Resistor_SMD:R_0402",
             "R18",
@@ -1031,13 +1067,8 @@ mod tests {
             0.0,
             "B.Cu",
         )
-        .unwrap();
-        assert!(prepared.contains("(layer \"B.Cu\")"));
-        assert!(prepared.contains("(layer \"B.SilkS\")"));
-        assert!(prepared.contains("(layer \"B.Fab\")"));
-        assert!(prepared.contains("(layers \"B.Cu\" \"B.Paste\" \"B.Mask\")"));
-        assert!(prepared.contains("(property \"Value\" \"10k\""));
-        assert!(!prepared.contains("__KONNECT_FRONT__"));
+        .unwrap_err();
+        assert!(error.to_string().contains("not yet supported"), "{error}");
     }
 
     #[test]
@@ -1053,6 +1084,72 @@ mod tests {
             "In1.Cu",
         )
         .unwrap_err();
-        assert!(error.to_string().contains("F.Cu or B.Cu"));
+        assert!(error.to_string().contains("F.Cu"));
+    }
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                // No IPC address: any handler that reaches the IPC layer fails
+                // with the socket-path configuration error, so a different
+                // error proves the handler rejected before trying IPC.
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn result_text(res: &CallToolResult) -> String {
+        match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn place_component_rejects_back_copper_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("b.kicad_pcb");
+        let board_content = "(kicad_pcb\n\t(version 20240108)\n\t(generator \"pcbnew\")\n)\n";
+        std::fs::write(&board, board_content).unwrap();
+
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Resistor_SMD:R_0402",
+            "reference": "R1",
+            "x": 10.0, "y": 20.0,
+            "layer": "B.Cu",
+        });
+        let res = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "B.Cu placement must be refused");
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&res).as_deref(),
+            Some("invalid_argument"),
+            "rejection should be a structured invalid_argument error"
+        );
+        let text = result_text(&res);
+        assert!(
+            text.contains("back-side placement is not yet supported"),
+            "must say why: {text}"
+        );
+        assert!(
+            text.contains("F.Cu") && text.contains("flip"),
+            "must suggest the workaround: {text}"
+        );
+        // Rejection happens before any resolution, IPC round-trip, or file
+        // write — the board is untouched and no IPC error ever surfaced.
+        assert!(
+            !text.contains("socket path not configured"),
+            "the handler must not have reached the IPC layer: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            board_content,
+            "board file must be left untouched"
+        );
     }
 }
