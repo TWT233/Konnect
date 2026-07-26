@@ -96,24 +96,65 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 ///
 /// The scratch file is a sibling so the rename stays within one filesystem,
 /// where it is atomic; a temp directory elsewhere would silently degrade to a
-/// copy. It is removed if any step fails, so a failed write leaves nothing
-/// behind in the user's project directory.
+/// copy. A failed write attempts to remove it — best effort, since the removal
+/// can itself fail on a locked or read-only directory, and a write already
+/// failing is the wrong moment to start reporting a second error.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
-    let tmp_path = scratch_path_for(path);
+    let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
     let mut cleanup = ScratchGuard(Some(tmp_path.clone()));
 
-    {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?; // fsync — mandatory
-    }
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?; // fsync — mandatory
+    drop(file);
 
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     Ok(())
+}
+
+/// Open `path` for writing, failing if anything is already there.
+///
+/// The whole point is what it does *not* do: `File::create` truncates whatever
+/// it finds and follows a symlink to write wherever it points.
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// How many scratch names to try before giving up.
+///
+/// Reaching the end means something is generating files faster than this can
+/// pick names, or is planting them deliberately. Either way, looping forever
+/// would be worse than failing.
+const SCRATCH_ATTEMPTS: u32 = 16;
+
+/// Create a fresh scratch file, never opening one that already exists.
+///
+/// `File::create` truncates whatever it finds, and follows a symlink to write
+/// wherever it points. In a directory the user does not solely control that is
+/// the classic insecure-temp-file shape — a planted symlink turns this write
+/// into a write somewhere else entirely. `create_new` refuses instead, and a
+/// name that is somehow taken is simply exchanged for another.
+fn create_scratch_file(path: &Path) -> Result<(PathBuf, std::fs::File), SexpError> {
+    let mut last = None;
+    for _ in 0..SCRATCH_ATTEMPTS {
+        let candidate = scratch_path_for(path);
+        match open_exclusive(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no scratch name free")
+        })
+        .into())
 }
 
 /// A scratch path in `path`'s directory, unique to this file and this write.
@@ -164,7 +205,10 @@ impl ScratchGuard {
 impl Drop for ScratchGuard {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
-            // Already failing; a failure to clean up is not worth masking it.
+            // Best effort by necessity: this runs while a write is already
+            // failing, and a removal that fails too — a locked file, a
+            // read-only directory — has no better outcome to report than the
+            // error already on its way to the caller.
             let _ = std::fs::remove_file(path);
         }
     }
@@ -584,6 +628,41 @@ mod atomic_write_tests {
                 .extension()
                 .is_some_and(|x| x == "kicad_tmp")
         })
+    }
+
+    #[test]
+    fn opening_a_scratch_file_refuses_an_existing_path() {
+        // The property `create_new` buys, tested where it can actually be
+        // observed. Squatting the name write_atomic would pick next proves
+        // nothing — the counter has already moved past it by the time the
+        // write runs — so the opener is exercised directly.
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("board.kicad_pcb.1.0.kicad_tmp");
+        std::fs::write(&occupied, "not mine").unwrap();
+
+        let err = open_exclusive(&occupied).expect_err("must not open an existing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&occupied).unwrap(),
+            "not mine",
+            "the existing file was truncated"
+        );
+    }
+
+    #[test]
+    fn a_taken_scratch_name_is_exchanged_for_another() {
+        // create_scratch_file draws a new name on AlreadyExists rather than
+        // failing the write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+
+        let (first, _held) = create_scratch_file(&path).unwrap();
+        // `first` is still on disk and still open; the next call must not
+        // return it again.
+        let (second, _g) = create_scratch_file(&path).unwrap();
+
+        assert_ne!(first, second, "the same scratch file was handed out twice");
+        assert!(first.exists() && second.exists());
     }
 
     /// The bug itself: concurrent writers must never mix their content.
