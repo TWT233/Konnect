@@ -869,7 +869,9 @@ fn expand_lib_uri(uri: &str) -> Option<PathBuf> {
     let var = &rest[..close];
     let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
 
-    if let Ok(base) = std::env::var(var) {
+    // var_os, not var: `var` treats a non-Unicode value as absent, which would
+    // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
+    if let Some(base) = std::env::var_os(var) {
         let p = PathBuf::from(base).join(tail);
         if p.exists() {
             return Some(p);
@@ -974,15 +976,39 @@ fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
     }
 }
 
+/// Whether a footprint reference is KiCad's `Library:Footprint` form rather
+/// than a filesystem path.
+///
+/// "Contains a colon" is not enough, because Windows paths contain one too.
+/// `C:\libs\R.kicad_mod` is caught by the separator test, but the
+/// drive-*relative* form `C:R.kicad_mod` — meaning `R.kicad_mod` in the current
+/// directory of drive C — carries no separator and is otherwise shaped exactly
+/// like a lib id.
+///
+/// A one-letter prefix is therefore read as a drive letter rather than a
+/// nickname. Nothing distinguishes the two, so this is a choice: a drive letter
+/// is much the likelier reading, and guessing the other way means silently
+/// hunting for a library named "C". The cost is that a single-letter nickname
+/// cannot be written in this form — it is still reachable by path — and the
+/// rule is applied on every platform so the behaviour does not change under
+/// the caller's feet.
+pub(crate) fn is_lib_id(reference: &str) -> bool {
+    let Some((nick, _)) = reference.split_once(':') else {
+        return false;
+    };
+    if reference.contains('/') || reference.contains('\\') {
+        return false;
+    }
+    !(nick.len() == 1 && nick.as_bytes()[0].is_ascii_alphabetic())
+}
+
 /// Resolve a footprint reference to an on-disk `.kicad_mod` path.
 ///
 /// Accepts either a direct filesystem path or KiCad's `Library:Footprint`
 /// form, which is looked up in the global fp-lib-table. Returns a
 /// human-readable message on failure so callers can surface it verbatim.
 pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String> {
-    let looks_like_lib_id =
-        reference.contains(':') && !reference.contains('/') && !reference.contains('\\');
-    if !looks_like_lib_id {
+    if !is_lib_id(reference) {
         // Check here rather than leaving it to the caller's read: an unchecked
         // path reaches the reader as a bare io::Error, which surfaces as
         // "The system cannot find the file specified. (os error 2)" with no
@@ -2245,6 +2271,30 @@ mod tests {
 
         let content = std::fs::read_to_string(&table).unwrap();
         assert!(flatten_lib_table(&content, 0).is_empty());
+    }
+
+    #[test]
+    fn is_lib_id_separates_library_ids_from_paths() {
+        assert!(is_lib_id("Resistor_SMD:R_0402"));
+        assert!(is_lib_id("MyParts:Weird:Name")); // only the first colon splits
+
+        // Paths, by separator.
+        assert!(!is_lib_id(r"C:\KiCad\R.kicad_mod"));
+        assert!(!is_lib_id("/usr/share/kicad/R.kicad_mod"));
+        assert!(!is_lib_id("Resistor_SMD.pretty/R.kicad_mod"));
+        // No colon at all.
+        assert!(!is_lib_id("R_0402.kicad_mod"));
+    }
+
+    #[test]
+    fn a_windows_drive_relative_path_is_not_a_library_id() {
+        // `C:R.kicad_mod` means R.kicad_mod in drive C's current directory. It
+        // has a colon and no separator, so it is shaped exactly like a lib id;
+        // the one-letter prefix is what gives it away.
+        assert!(!is_lib_id("C:R_0402.kicad_mod"));
+        assert!(!is_lib_id("d:board.kicad_mod"));
+        // Two letters is a nickname again — no drive is named "Ab".
+        assert!(is_lib_id("Ab:R_0402"));
     }
 
     #[test]

@@ -742,7 +742,12 @@ pub(crate) fn find_kicad_library_dirs(kind: &str) -> Vec<std::path::PathBuf> {
 
     if let Some(suffix) = kicad_env_suffix(kind) {
         for major in ["10", "9", "8"] {
-            if let Ok(dir) = std::env::var(format!("KICAD{major}_{suffix}")) {
+            // var_os, not var: a directory whose name is not valid Unicode is
+            // still a directory KiCad may have pointed us at, and `var` reports
+            // those as absent — silently falling back to the install roots, or
+            // to nothing, on exactly the machines where the variable was the
+            // only correct answer.
+            if let Some(dir) = std::env::var_os(format!("KICAD{major}_{suffix}")) {
                 push(std::path::PathBuf::from(dir));
             }
         }
