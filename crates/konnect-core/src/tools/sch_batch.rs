@@ -16,9 +16,13 @@ use konnect_sexp::{
         extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
         format_net_label, format_wire, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
+        new_uuid, write_atomic, SexpEdit,
+    },
 };
 use serde_json::json;
+use std::collections::HashSet;
 
 // Re-use the crate-internal net-graph primitives from sch_analysis.
 use super::sch_analysis::build_net_graph;
@@ -363,6 +367,7 @@ async fn handle_batch_delete(
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut delete_ranges: HashSet<(usize, usize)> = HashSet::new();
 
     // Delete by UUID — walk back from uuid node to enclosing top-level block
     if let Some(uuids) = args["uuids"].as_array() {
@@ -374,14 +379,23 @@ async fn handle_batch_delete(
             let pattern = format!(r#"(uuid "{}")"#, uuid);
             match content.find(&pattern) {
                 Some(uuid_pos) => {
-                    let before = &content[..uuid_pos];
-                    // Top-level schematic items are at 2-space indent: "\n  ("
-                    match before.rfind("\n  (").map(|p| p + 1) {
-                        Some(block_start) => {
+                    match find_enclosing_direct_child_block(&content, "kicad_sch", uuid_pos) {
+                        Some((block_start, block_end)) => {
+                            let item = &content[block_start..block_end];
+                            if !is_deletable_schematic_item(item) {
+                                errors.push(format!(
+                                    "UUID '{}' belongs to protected schematic structure '{}'",
+                                    uuid,
+                                    sexp_tag(item)
+                                ));
+                                continue;
+                            }
                             match find_block_with_leading_whitespace(&content, block_start) {
                                 Some((del_start, del_end)) => {
-                                    edits.push(SexpEdit::delete(del_start, del_end));
-                                    deleted.push(uuid.to_string());
+                                    if delete_ranges.insert((del_start, del_end)) {
+                                        edits.push(SexpEdit::delete(del_start, del_end));
+                                        deleted.push(uuid.to_string());
+                                    }
                                 }
                                 None => {
                                     errors.push(format!("Cannot parse block for UUID '{}'", uuid))
@@ -405,8 +419,10 @@ async fn handle_batch_delete(
             };
             match find_symbol_block(&content, reference) {
                 Some((del_start, del_end)) => {
-                    edits.push(SexpEdit::delete(del_start, del_end));
-                    deleted.push(reference.to_string());
+                    if delete_ranges.insert((del_start, del_end)) {
+                        edits.push(SexpEdit::delete(del_start, del_end));
+                        deleted.push(reference.to_string());
+                    }
                 }
                 None => errors.push(format!("Component '{}' not found", reference)),
             }
@@ -421,6 +437,35 @@ async fn handle_batch_delete(
         "deleted": deleted,
         "errors": errors
     })))
+}
+
+fn sexp_tag(block: &str) -> &str {
+    let Some(after_open) = block.strip_prefix('(') else {
+        return "";
+    };
+    let end = after_open
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .unwrap_or(after_open.len());
+    &after_open[..end]
+}
+
+// Blocklist of structural forms, not an allowlist of item kinds: deleting a
+// drawing item (text, bus, sheet, image, polyline, …) by UUID has always
+// worked and must keep working — only the schematic's skeleton is protected.
+fn is_deletable_schematic_item(block: &str) -> bool {
+    !matches!(
+        sexp_tag(block),
+        "version"
+            | "generator"
+            | "generator_version"
+            | "uuid"
+            | "paper"
+            | "title_block"
+            | "lib_symbols"
+            | "sheet_instances"
+            | "symbol_instances"
+            | "embedded_fonts"
+    )
 }
 
 async fn handle_bulk_move(
@@ -975,4 +1020,57 @@ async fn handle_validate_component_connections(
         "unconnected_count": unconnected.len(),
         "unconnected_pins": unconnected
     })))
+}
+
+#[cfg(test)]
+mod batch_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_delete_uuid_is_tab_indentation_safe_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch-delete.kicad_sch");
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(uuid \"{uuid}\")\n\t)\n\t(text \"keep me\" (at 5 5 0) (uuid \"text\"))\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [uuid, "root", uuid]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(uuid));
+        assert!(after.contains("(uuid \"root\")"));
+        assert!(after.contains("keep me"));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
 }

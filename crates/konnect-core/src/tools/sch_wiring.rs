@@ -18,7 +18,7 @@ use konnect_sexp::{
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        write_atomic, SexpEdit,
+        find_direct_child_blocks, find_enclosing_block, write_atomic, SexpEdit,
     },
 };
 use serde_json::json;
@@ -65,13 +65,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_wire",
-            "Delete a wire segment by its UUID or by matching its start/end coordinates.",
+            "Delete a wire segment by its UUID, or by matching BOTH endpoints \
+             (all four of x1/y1/x2/y2, either direction). Fails without deleting \
+             anything when no wire matches.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "uuid": { "type": "string", "description": "Wire UUID (preferred)" },
-                    "x1": { "type": "number" }, "y1": { "type": "number" },
+                    "x1": { "type": "number", "description": "Endpoint 1 X in mm (required with y1/x2/y2 when no uuid)" },
+                    "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" }
                 },
                 "required": ["schematic"]
@@ -373,18 +376,11 @@ fn insert_before_close(content: &str, new_sexp: &str) -> String {
 /// Top-level instances have `(lib_id` as a child, while lib_symbols definitions don't.
 /// Returns the position where wires/labels should be inserted BEFORE.
 fn find_first_symbol_instance(content: &str) -> Option<usize> {
-    // Pattern: a symbol instance always contains (lib_id "...") shortly after (symbol
-    // lib_symbols definitions contain sub-symbols but NOT (lib_id
-    let mut pos = 0;
-    while let Some(found) = content[pos..].find("\n  (symbol") {
-        let abs = pos + found;
-        // Check if this symbol block contains (lib_id within the next ~200 chars
-        let lookahead = &content[abs..content.len().min(abs + 200)];
-        if lookahead.contains("(lib_id ") {
-            // This is a top-level symbol instance, not a lib_symbols definition
-            return Some(abs + 1); // +1 to skip the \n
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let block = &content[start..end];
+        if block.starts_with("(symbol") && block.contains("(lib_id ") {
+            return Some(start);
         }
-        pos = abs + 1;
     }
     None
 }
@@ -529,25 +525,45 @@ async fn handle_delete_wire(
     let sch_path = get_path(args, "schematic")?;
     let content = std::fs::read_to_string(&sch_path)?;
 
-    let search_str = if let Some(uuid) = opt_str(args, "uuid") {
-        format!(r#"(uuid "{uuid}")"#)
+    let delete_range = if let Some(uuid) = opt_str(args, "uuid") {
+        let search = format!(r#"(uuid "{uuid}")"#);
+        let Some(wire_offset) = content.find(&search) else {
+            return Ok(CallToolResult::error(format!(
+                "Wire UUID '{uuid}' not found"
+            )));
+        };
+        wire_block_with_leading_whitespace(&content, wire_offset)
     } else {
-        let x1 = opt_f64(args, "x1").unwrap_or(0.0);
-        let y1 = opt_f64(args, "y1").unwrap_or(0.0);
-        format!("(start {x1} {y1})")
+        let Some(x1) = opt_f64(args, "x1") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(y1) = opt_f64(args, "y1") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(x2) = opt_f64(args, "x2") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(y2) = opt_f64(args, "y2") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        find_wire_block_by_endpoints(&content, x1, y1, x2, y2)
     };
 
-    let wire_offset = match content.find(&search_str) {
-        Some(o) => o,
-        None => return Ok(CallToolResult::error("Wire not found")),
-    };
-
-    // Walk back to the (wire ...) block start
-    let before = &content[..wire_offset];
-    let wire_start = before.rfind("\n  (wire").map(|p| p + 1).unwrap_or(0);
-    let (del_start, del_end) = match find_block_with_leading_whitespace(&content, wire_start) {
+    let (del_start, del_end) = match delete_range {
         Some(r) => r,
-        None => return Ok(CallToolResult::error("Cannot parse wire block")),
+        None => {
+            return Ok(CallToolResult::error(
+                "Cannot locate a wire block matching the requested identity",
+            ))
+        }
     };
 
     let edits = vec![SexpEdit::delete(del_start, del_end)];
@@ -568,31 +584,86 @@ async fn handle_batch_delete_wire(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
-    let mut deleted = 0usize;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut errors = Vec::new();
 
     // Collect all delete ranges first, then apply in reverse order
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for uuid in &uuids {
         let search = format!(r#"(uuid "{uuid}")"#);
-        if let Some(offset) = content.find(&search) {
-            let before = &content[..offset];
-            if let Some(wire_start) = before.rfind("\n  (wire").map(|p| p + 1) {
-                if let Some(range) = find_block_with_leading_whitespace(&content, wire_start) {
-                    ranges.push(range);
-                    deleted += 1;
-                }
-            }
+        match content.find(&search) {
+            Some(offset) => match wire_block_with_leading_whitespace(&content, offset) {
+                Some(range) => ranges.push(range),
+                None => errors.push(format!(
+                    "UUID '{uuid}' exists but is not inside a parseable wire block"
+                )),
+            },
+            None => errors.push(format!("Wire UUID '{uuid}' not found")),
         }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let deleted = ranges.len();
+
+    if deleted == 0 && !uuids.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No wires deleted: {}",
+            errors.join("; ")
+        )));
     }
 
     let edits: Vec<SexpEdit> = ranges
         .into_iter()
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
-    content = apply_edits(content, edits);
+    let content = apply_edits(content, edits);
     write_atomic(&sch_path, &content)?;
-    Ok(CallToolResult::json(&json!({ "deleted": deleted })))
+    Ok(CallToolResult::json(&json!({
+        "deleted": deleted,
+        "errors": errors
+    })))
+}
+
+fn wire_block_with_leading_whitespace(
+    content: &str,
+    contained_offset: usize,
+) -> Option<(usize, usize)> {
+    let (wire_start, _) = find_enclosing_block(content, "wire", contained_offset)?;
+    find_block_with_leading_whitespace(content, wire_start)
+}
+
+fn find_wire_block_by_endpoints(
+    content: &str,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Option<(usize, usize)> {
+    const TOLERANCE: f64 = 1e-6;
+    let same = |a: f64, b: f64| (a - b).abs() <= TOLERANCE;
+
+    for start in find_block_starts(content, "wire") {
+        let Some((block_start, block_end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        // `extract_wires` expects wires to be direct children of the parsed
+        // document root, so wrap this standalone block in a minimal root.
+        let wrapped = format!("(kicad_sch {})", &content[block_start..block_end]);
+        let Ok(node) = parse_sexp(&wrapped) else {
+            continue;
+        };
+        let matches = extract_wires(&node).into_iter().any(|wire| {
+            (same(wire.x1, x1) && same(wire.y1, y1) && same(wire.x2, x2) && same(wire.y2, y2))
+                || (same(wire.x1, x2)
+                    && same(wire.y1, y2)
+                    && same(wire.x2, x1)
+                    && same(wire.y2, y1))
+        });
+        if matches {
+            return find_block_with_leading_whitespace(content, block_start);
+        }
+    }
+    None
 }
 
 async fn handle_split_wire_at_point(
@@ -632,17 +703,25 @@ async fn handle_split_wire_at_point(
     let del_args = if let Some(uuid) = &w.uuid {
         json!({ "schematic": sch_path.display().to_string(), "uuid": uuid })
     } else {
-        json!({ "schematic": sch_path.display().to_string(), "x1": w.x1, "y1": w.y1 })
+        json!({
+            "schematic": sch_path.display().to_string(),
+            "x1": w.x1,
+            "y1": w.y1,
+            "x2": w.x2,
+            "y2": w.y2
+        })
     };
-    handle_delete_wire(&del_args, ctx).await?;
+    let delete_result = handle_delete_wire(&del_args, ctx).await?;
+    if delete_result.is_error {
+        return Ok(delete_result);
+    }
 
     let content = std::fs::read_to_string(&sch_path)?;
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
     let junc = format_junction(px, py);
-    let close = content.rfind(')').unwrap_or(content.len());
-    let edits = vec![SexpEdit::insert(close, format!("{}{}{}", w1, w2, junc))];
-    let new_content = apply_edits(content, edits);
+    let insert = format!("{w1}{w2}{junc}");
+    let new_content = insert_before_close(&content, &insert);
     write_atomic(&sch_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
@@ -1661,5 +1740,151 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
         assert!(result.is_error, "must not rotate the nearest label instead");
+    }
+}
+
+#[cfg(test)]
+mod wire_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const WIRE_1: &str = "11111111-1111-1111-1111-111111111111";
+    const WIRE_2: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn tab_indented_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-delete.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(generator_version \"10.0\")\n\t(uuid \"00000000-0000-0000-0000-000000000001\")\n\t(paper \"A4\")\n\t(wire\n\t\t(pts\n\t\t\t(xy 50.8 50.8) (xy 60.96 50.8)\n\t\t)\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"{WIRE_1}\")\n\t)\n\t(wire\n\t\t(pts\n\t\t\t(xy 50.8 60.96) (xy 60.96 60.96)\n\t\t)\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"{WIRE_2}\")\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn delete_wire_preserves_tab_indented_schematic_and_neighbors() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_delete_wire(
+            &json!({ "schematic": path.display().to_string(), "uuid": WIRE_1 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(after.contains(WIRE_2));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_wire_matches_reversed_endpoint_coordinates() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 60.96,
+                "y1": 50.8,
+                "x2": 50.8,
+                "y2": 50.8
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(after.contains(WIRE_2));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_wire_handles_tabs_and_duplicate_requests() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_batch_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [WIRE_1, WIRE_1, WIRE_2]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(!after.contains(WIRE_2));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_wire_fails_closed_when_nothing_matches() {
+        let (_dir, path) = tab_indented_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_batch_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn split_wire_without_uuid_deletes_by_complete_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-split.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(stroke (width 0) (type default))\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_split_wire_at_point(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x": 5.0,
+                "y": 0.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let parsed = konnect_sexp::parse_sexp(&after).unwrap();
+        let wires = extract_wires(&parsed);
+        assert_eq!(wires.len(), 2);
+        assert!(after.contains("(junction"));
+        assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
     }
 }
