@@ -678,11 +678,18 @@ fn kicad_share_roots() -> Vec<std::path::PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
+        // Keep these majors in step with the ones find_kicad_library_dirs
+        // reads environment variables for. A major listed there but missing
+        // here is invisible on any machine where KiCad did not export its
+        // variable — which is every machine where Konnect was not launched
+        // by KiCad.
         for c in [
             r"C:\KiCad\10.0\share\kicad",
             r"C:\Program Files\KiCad\10.0\share\kicad",
             r"C:\KiCad\9.0\share\kicad",
             r"C:\Program Files\KiCad\9.0\share\kicad",
+            r"C:\KiCad\8.0\share\kicad",
+            r"C:\Program Files\KiCad\8.0\share\kicad",
         ] {
             roots.push(std::path::PathBuf::from(c));
         }

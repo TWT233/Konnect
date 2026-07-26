@@ -1743,8 +1743,10 @@ async fn handle_search_symbols(
     }
 
     let mut results = Vec::new();
-    'outer: for (nickname, uri) in entries {
-        let lib_path = PathBuf::from(&uri);
+    // `entries` holds resolved filesystem paths, not the raw uris they came
+    // from — read_flat_lib_table does that expansion now.
+    'outer: for (nickname, resolved) in entries {
+        let lib_path = PathBuf::from(&resolved);
         if !lib_path.exists() {
             continue;
         }
