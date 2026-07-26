@@ -715,9 +715,16 @@ fn kicad_share_roots() -> Vec<std::path::PathBuf> {
 /// Find directories holding a bundled KiCAD library kind — `"symbols"`,
 /// `"footprints"` or `"3dmodels"`.
 ///
-/// The matching `KICAD<major>_<KIND>_DIR` environment variable wins when KiCad
-/// has exported it (it does so for plugins); otherwise the well-known install
-/// locations are searched, newest KiCad first.
+/// The matching environment variable wins when KiCad has exported it (it does
+/// so for plugins); otherwise the well-known install locations are searched,
+/// newest KiCad first. The names are not a plain uppercasing of `kind` — they
+/// are singular, and the 3D one is not a word:
+///
+/// | `kind`        | variable                |
+/// |---------------|-------------------------|
+/// | `symbols`     | `KICAD<major>_SYMBOL_DIR`    |
+/// | `footprints`  | `KICAD<major>_FOOTPRINT_DIR` |
+/// | `3dmodels`    | `KICAD<major>_3DMODEL_DIR`   |
 pub(crate) fn find_kicad_library_dirs(kind: &str) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut push = |p: std::path::PathBuf| {

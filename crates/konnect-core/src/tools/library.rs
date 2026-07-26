@@ -942,12 +942,35 @@ fn flatten_lib_table(content: &str, depth: usize) -> Vec<serde_json::Value> {
     out
 }
 
-/// Read a lib-table file from disk and flatten it. Returns an empty list when
-/// the file is absent or unreadable.
-fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
+/// Read a lib-table file from disk and flatten it, reporting a table that is
+/// present but unreadable.
+///
+/// An absent table is normal and yields an empty list: a project without its
+/// own fp-lib-table simply has none, and every caller checks both the global
+/// and project tables. Anything else — a permissions problem, a truncated
+/// file — is not normal, and must not be folded into the same empty list. The
+/// symptom that produces is a bare `{"count": 0}`, which is precisely what the
+/// bug this module fixes looked like, so silence here would make a real
+/// failure indistinguishable from a regression.
+fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Value>, String> {
     match std::fs::read_to_string(path) {
-        Ok(content) => flatten_lib_table(&content, 0),
-        Err(_) => Vec::new(),
+        Ok(content) => Ok(flatten_lib_table(&content, 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Cannot read lib-table {}: {}", path.display(), e)),
+    }
+}
+
+/// As [`read_lib_table_checked`], for callers with nowhere to put an error.
+///
+/// The failure is logged rather than dropped in silence. Handlers that can
+/// surface it to the user should call `read_lib_table_checked` directly.
+fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
+    match read_lib_table_checked(path) {
+        Ok(libs) => libs,
+        Err(msg) => {
+            tracing::warn!("{msg}");
+            Vec::new()
+        }
     }
 }
 
@@ -1078,8 +1101,14 @@ async fn handle_list_footprint_libraries(
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
+    // A table that exists but cannot be read is reported rather than counted
+    // as zero libraries — "0" is the symptom of the bug this PR fixes, so the
+    // two must not look alike.
     if scope == "global" || scope == "all" {
-        let mut libs = read_flat_lib_table(&global_fp_lib_table());
+        let mut libs = match read_lib_table_checked(&global_fp_lib_table()) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
         for lib in &mut libs {
             lib["scope"] = json!("global");
         }
@@ -1089,7 +1118,10 @@ async fn handle_list_footprint_libraries(
     if (scope == "project" || scope == "all") && args["project"].is_string() {
         let proj = PathBuf::from(args["project"].as_str().unwrap());
         let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
-        let mut libs = read_flat_lib_table(&table);
+        let mut libs = match read_lib_table_checked(&table) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
         for lib in &mut libs {
             lib["scope"] = json!("project");
         }
@@ -1152,8 +1184,13 @@ async fn handle_list_symbol_libraries(
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
+    // Same as the footprint listing: an unreadable table is an error, not a
+    // zero count.
     if scope == "global" || scope == "all" {
-        let mut libs = read_flat_lib_table(&global_sym_lib_table());
+        let mut libs = match read_lib_table_checked(&global_sym_lib_table()) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
         for lib in &mut libs {
             lib["scope"] = json!("global");
         }
@@ -1166,7 +1203,10 @@ async fn handle_list_symbol_libraries(
             .parent()
             .unwrap_or(Path::new("."))
             .join("sym-lib-table");
-        let mut libs = read_flat_lib_table(&table);
+        let mut libs = match read_lib_table_checked(&table) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
         for lib in &mut libs {
             lib["scope"] = json!("project");
         }
@@ -2203,6 +2243,51 @@ mod tests {
 
         let content = std::fs::read_to_string(&table).unwrap();
         assert!(flatten_lib_table(&content, 0).is_empty());
+    }
+
+    #[test]
+    fn an_absent_lib_table_is_not_an_error() {
+        // Every caller checks both the global and project tables, and a project
+        // without its own is the normal case.
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("fp-lib-table");
+        assert_eq!(read_lib_table_checked(&absent), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_unreadable_lib_table_is_an_error_not_an_empty_list() {
+        // Reading a directory as a file fails with something other than
+        // NotFound on every platform, which is the case that must not be
+        // folded into "0 libraries" — that is the symptom of the very bug this
+        // module fixes.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_as_table = tmp.path().join("fp-lib-table");
+        std::fs::create_dir(&dir_as_table).unwrap();
+
+        let err = read_lib_table_checked(&dir_as_table)
+            .expect_err("a table that exists but cannot be read must be reported");
+        assert!(err.contains("fp-lib-table"), "must name the table: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_footprint_libraries_reports_an_unreadable_table() {
+        // The handler-level half: this used to surface a read error via `?`
+        // before the table read was centralised, and must still.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("fp-lib-table")).unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(
+            res.is_error,
+            "an unreadable table must not report zero libraries: {:?}",
+            res.content
+        );
     }
 
     #[test]
