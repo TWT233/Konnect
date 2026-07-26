@@ -1547,9 +1547,14 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
 ///
 /// Checks the **global** sym-lib-table first, then the **project** table at
 /// `project_dir/sym-lib-table` (if a project dir is supplied). Returns the first
-/// entry whose nickname matches and whose URI resolves to an existing path.
-/// Both tables are read with `read_flat_lib_table`, so nested `(type "Table")`
+/// entry whose nickname matches and whose URI resolved to a path at all. Both
+/// tables are read with `read_flat_lib_table`, so nested `(type "Table")`
 /// references are followed and `${KICAD*_DIR}` URIs are expanded.
+///
+/// The returned path is *not* guaranteed to exist: `expand_lib_uri` checks
+/// existence only for `${KICAD*_DIR}` expansions, and takes a plain URI as
+/// written. A stale global entry therefore still shadows a working project one
+/// with the same nickname, and the caller's read is what discovers it.
 async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
     let mut tables = vec![global_sym_lib_table()];
     if let Some(pd) = project_dir {
