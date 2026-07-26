@@ -1025,9 +1025,24 @@ pub(crate) fn is_lib_id(reference: &str) -> bool {
 /// Resolve a footprint reference to an on-disk `.kicad_mod` path.
 ///
 /// Accepts either a direct filesystem path or KiCad's `Library:Footprint`
-/// form, which is looked up in the global fp-lib-table. Returns a
-/// human-readable message on failure so callers can surface it verbatim.
-pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String> {
+/// form. Returns a human-readable message on failure so callers can surface it
+/// verbatim.
+///
+/// A lib id is looked up in `project_dir`'s fp-lib-table first, then the
+/// global one, and finally the conventional `<nickname>.pretty` layout under
+/// the bundled library directories. Project-first matches KiCad, where a
+/// project entry shadows a global one of the same nickname, and it is the only
+/// order that makes `register_footprint_library` useful — it writes to the
+/// project table by default, so a global-only lookup cannot see anything it
+/// registers. The `.pretty` fallback covers a stock install whose global
+/// table is missing or unreadable.
+///
+/// (`resolve_symbol_lib_path` still searches global-first for symbols; that
+/// asymmetry is pre-existing and noted on that function.)
+pub(crate) fn resolve_footprint_path(
+    reference: &str,
+    project_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
     if !is_lib_id(reference) {
         // Check here rather than leaving it to the caller's read: an unchecked
         // path reaches the reader as a bare io::Error, which surfaces as
@@ -1045,51 +1060,75 @@ pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String>
     }
 
     let (nick, fp_name) = reference.split_once(':').expect("checked above");
-    let table = global_fp_lib_table();
-    if !table.exists() {
-        return Err(format!(
-            "Global fp-lib-table not found at {}",
-            table.display()
-        ));
+    let filename = format!("{fp_name}.kicad_mod");
+
+    // Project table first: its entries shadow same-nickname global ones.
+    let mut libs = Vec::new();
+    if let Some(project) = project_dir.map(|d| d.join("fp-lib-table")) {
+        libs.extend(read_flat_lib_table(&project));
+    }
+    libs.extend(read_flat_lib_table(&global_fp_lib_table()));
+
+    if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
+        let Some(dir) = lib["path"].as_str() else {
+            return Err(format!(
+                "Library '{}' has an unresolvable URI '{}'",
+                nick,
+                lib["uri"].as_str().unwrap_or("")
+            ));
+        };
+        let path = PathBuf::from(dir).join(&filename);
+        if !path.is_file() {
+            return Err(format!(
+                "Footprint '{}' not found in library '{}' (looked for {})",
+                fp_name,
+                nick,
+                path.display()
+            ));
+        }
+        return Ok(path);
     }
 
-    let libs = read_flat_lib_table(&table);
-    let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) else {
-        let known: Vec<&str> = libs
-            .iter()
-            .filter_map(|l| l["nickname"].as_str())
-            .take(12)
-            .collect();
-        return Err(format!(
-            "Library '{}' not found in fp-lib-table ({} libraries known{})",
-            nick,
-            libs.len(),
-            if known.is_empty() {
-                String::new()
-            } else {
-                format!(", e.g. {}", known.join(", "))
-            }
-        ));
-    };
-
-    let Some(dir) = lib["path"].as_str() else {
-        return Err(format!(
-            "Library '{}' has an unresolvable URI '{}'",
-            nick,
-            lib["uri"].as_str().unwrap_or("")
-        ));
-    };
-
-    let path = PathBuf::from(dir).join(format!("{}.kicad_mod", fp_name));
-    if !path.exists() {
-        return Err(format!(
-            "Footprint '{}' not found in library '{}' (looked for {})",
-            fp_name,
-            nick,
-            path.display()
-        ));
+    // Not in any table — fall back to the conventional `<nickname>.pretty`
+    // layout under the discovered KiCad library directories.
+    let attempted: Vec<PathBuf> = super::find_kicad_library_dirs("footprints")
+        .into_iter()
+        .map(|base| base.join(format!("{nick}.pretty")).join(&filename))
+        .collect();
+    if let Some(path) = attempted.iter().find(|p| p.is_file()) {
+        return Ok(path.clone());
     }
-    Ok(path)
+
+    let known: Vec<&str> = libs
+        .iter()
+        .filter_map(|l| l["nickname"].as_str())
+        .take(12)
+        .collect();
+    let attempted_list = if attempted.is_empty() {
+        "no KiCad library directories were found — set KICAD10_FOOTPRINT_DIR for a \
+         non-standard install"
+        .to_string()
+    } else {
+        format!(
+            "also looked for {}",
+            attempted
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(format!(
+        "Library '{}' not found in the project or global fp-lib-table ({} libraries known{}); {}",
+        nick,
+        libs.len(),
+        if known.is_empty() {
+            String::new()
+        } else {
+            format!(", e.g. {}", known.join(", "))
+        },
+        attempted_list
+    ))
 }
 
 /// Extract a quoted string value from `(key "value")` within a block.
@@ -1879,8 +1918,13 @@ async fn handle_get_footprint_info(
     let fp_path_str =
         require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    // Resolve "Library:Footprint" form via global fp-lib-table
-    let path = match resolve_footprint_path(fp_path_str) {
+    // Resolve "Library:Footprint" against the project's fp-lib-table as well
+    // as the global one, when the caller says which project they mean.
+    let project_dir = args["project"]
+        .as_str()
+        .map(PathBuf::from)
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let path = match resolve_footprint_path(fp_path_str, project_dir.as_deref()) {
         Ok(p) => p,
         Err(msg) => return Ok(CallToolResult::error(msg)),
     };
@@ -2388,7 +2432,7 @@ mod tests {
         // point of the test.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope.kicad_mod");
-        let err = resolve_footprint_path(&missing.to_string_lossy())
+        let err = resolve_footprint_path(&missing.to_string_lossy(), None)
             .expect_err("a nonexistent path must not resolve");
         assert!(err.contains("nope.kicad_mod"), "must name the file: {err}");
         assert!(
@@ -2402,7 +2446,7 @@ mod tests {
         // is_file, not exists — a .pretty directory would otherwise resolve and
         // fail confusingly at read time.
         let tmp = tempfile::tempdir().unwrap();
-        assert!(resolve_footprint_path(&tmp.path().to_string_lossy()).is_err());
+        assert!(resolve_footprint_path(&tmp.path().to_string_lossy(), None).is_err());
     }
 
     #[test]
@@ -2411,8 +2455,67 @@ mod tests {
         let file = tmp.path().join("R_0805.kicad_mod");
         std::fs::write(&file, "(footprint \"R_0805\")").unwrap();
         assert_eq!(
-            resolve_footprint_path(&file.to_string_lossy()).unwrap(),
+            resolve_footprint_path(&file.to_string_lossy(), None).unwrap(),
             file
+        );
+    }
+
+    #[test]
+    fn a_project_registered_library_resolves() {
+        // register_footprint_library writes to the project fp-lib-table by
+        // default, so a global-only lookup could not see anything it
+        // registered — the default workflow resolved to "library not found".
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyProjLib.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("Foo.kicad_mod"), "(footprint \"Foo\")").unwrap();
+        std::fs::write(
+            tmp.path().join("fp-lib-table"),
+            kicad_style_table(
+                "fp_lib_table",
+                &[("MyProjLib", "KiCad", &pretty.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_footprint_path("MyProjLib:Foo", Some(tmp.path())).unwrap(),
+            pretty.join("Foo.kicad_mod")
+        );
+        // Without the project dir it is invisible, which is the bug.
+        assert!(resolve_footprint_path("MyProjLib:Foo", None).is_err());
+    }
+
+    #[test]
+    fn an_unregistered_nickname_falls_back_to_the_conventional_pretty_dir() {
+        // A stock install whose global table is missing or unreadable can
+        // still serve Resistor_SMD:R_0402 from <libdir>/Resistor_SMD.pretty.
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("Fallback_Lib.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("R_1.kicad_mod"), "(footprint \"R_1\")").unwrap();
+        let _env = footprint_dir_env(tmp.path());
+
+        assert_eq!(
+            resolve_footprint_path("Fallback_Lib:R_1", None).unwrap(),
+            pretty.join("R_1.kicad_mod")
+        );
+    }
+
+    #[test]
+    fn a_missing_library_error_names_the_nickname_and_attempted_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = footprint_dir_env(tmp.path());
+        let err = resolve_footprint_path("NoSuchLib:R_1", Some(tmp.path()))
+            .expect_err("an unknown nickname must not resolve");
+        assert!(err.contains("NoSuchLib"), "must name the library: {err}");
+        assert!(
+            err.contains("libraries known"),
+            "should count the known libraries: {err}"
+        );
+        assert!(
+            err.contains("NoSuchLib.pretty"),
+            "should list the attempted fallback location: {err}"
         );
     }
 

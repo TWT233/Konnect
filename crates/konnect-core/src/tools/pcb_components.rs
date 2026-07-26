@@ -11,7 +11,7 @@ use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
@@ -50,104 +50,10 @@ macro_rules! ipc {
 
 // ─── Footprint-library resolution ───────────────────────────────────────────
 
-fn footprint_library_dirs() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for variable in ["KICAD10_FOOTPRINT_DIR", "KICAD9_FOOTPRINT_DIR"] {
-        if let Some(path) = std::env::var_os(variable).map(PathBuf::from) {
-            if path.is_dir() && !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-
-    let candidates: &[&str] = if cfg!(target_os = "windows") {
-        &[
-            r"C:\Program Files\KiCad\10.0\share\kicad\footprints",
-            r"C:\KiCad\10.0\share\kicad\footprints",
-            r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
-            r"C:\KiCad\9.0\share\kicad\footprints",
-        ]
-    } else if cfg!(target_os = "macos") {
-        &[
-            "/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints",
-            "/usr/local/share/kicad/footprints",
-        ]
-    } else {
-        &[
-            "/usr/share/kicad/footprints",
-            "/usr/local/share/kicad/footprints",
-            "/snap/kicad/current/usr/share/kicad/footprints",
-            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad/footprints",
-        ]
-    };
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_dir() && !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    if cfg!(not(any(target_os = "windows", target_os = "macos"))) {
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(
-                ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad/footprints",
-            );
-            if path.is_dir() && !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-    paths
-}
-
-fn expand_library_uri(uri: &str, project_dir: &Path) -> Option<PathBuf> {
-    let mut expanded = uri.strip_prefix("file://").unwrap_or(uri).to_string();
-    expanded = expanded.replace("${KIPRJMOD}", &project_dir.to_string_lossy());
-    expanded = expanded.replace("$(KIPRJMOD)", &project_dir.to_string_lossy());
-
-    for delimiters in [("${", "}"), ("$(", ")")] {
-        while let Some(start) = expanded.find(delimiters.0) {
-            let name_start = start + delimiters.0.len();
-            let end = expanded[name_start..].find(delimiters.1)? + name_start;
-            let name = &expanded[name_start..end];
-            let value = std::env::var(name).ok()?;
-            expanded.replace_range(start..end + delimiters.1.len(), &value);
-        }
-    }
-    Some(PathBuf::from(expanded))
-}
-
-fn footprint_from_table(
-    table: &Path,
-    nickname: &str,
-    entry: &str,
-    project_dir: &Path,
-) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(table).ok()?;
-    let parsed = konnect_sexp::parse_sexp(&content).ok()?;
-    let library = parsed
-        .find_all("lib")
-        .into_iter()
-        .find(|library| library.find_str("name") == Some(nickname))?;
-    let uri = library.find_str("uri")?;
-
-    // KiCad defines this variable internally rather than exporting it to the
-    // process environment. Resolve the standard-library form against every
-    // discovered platform installation directory.
-    for prefix in ["${KICAD10_FOOTPRINT_DIR}", "$(KICAD10_FOOTPRINT_DIR)"] {
-        if let Some(suffix) = uri.strip_prefix(prefix) {
-            let suffix = suffix.trim_start_matches(['/', '\\']);
-            return footprint_library_dirs()
-                .into_iter()
-                .map(|base| base.join(suffix).join(format!("{entry}.kicad_mod")))
-                .find(|path| path.is_file());
-        }
-    }
-
-    let library_dir = expand_library_uri(uri, project_dir)?;
-    let path = library_dir.join(format!("{entry}.kicad_mod"));
-    path.is_file().then_some(path)
-}
-
+/// Read the library source of `lib_id` (`Library:Footprint`), resolving it
+/// through the project's fp-lib-table (the board's directory), then the global
+/// table, then the conventional KiCad library directories — the lookup that
+/// `library::resolve_footprint_path` owns.
 fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String> {
     let (nickname, entry) = lib_id.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("footprint must use Library:Footprint syntax, got '{lib_id}'")
@@ -155,30 +61,10 @@ fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String
     if nickname.is_empty() || entry.is_empty() {
         anyhow::bail!("footprint must use a non-empty Library:Footprint identifier");
     }
-    let project_dir = board.parent().unwrap_or_else(|| Path::new("."));
-    let project_table = project_dir.join("fp-lib-table");
-    let global_table = super::kicad_config_dir().join("fp-lib-table");
-    for table in [&project_table, &global_table] {
-        if let Some(path) = footprint_from_table(table, nickname, entry, project_dir) {
-            return std::fs::read_to_string(&path)
-                .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()));
-        }
-    }
-
-    let filename = format!("{entry}.kicad_mod");
-    let attempted: Vec<PathBuf> = footprint_library_dirs()
-        .into_iter()
-        .map(|base| base.join(format!("{nickname}.pretty")).join(&filename))
-        .collect();
-    for path in &attempted {
-        if path.is_file() {
-            return std::fs::read_to_string(path)
-                .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()));
-        }
-    }
-    anyhow::bail!(
-        "footprint '{lib_id}' was not found in the project/global fp-lib-table or KiCad library directories (set KICAD10_FOOTPRINT_DIR for a non-standard install)"
-    )
+    let path = super::library::resolve_footprint_path(lib_id, board.parent())
+        .map_err(|message| anyhow::anyhow!(message))?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
 }
 
 fn escape_sexp_string(value: &str) -> String {

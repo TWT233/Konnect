@@ -916,7 +916,6 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
- "dirs",
  "konnect-ipc",
  "konnect-schematic-editor",
  "konnect-sexp",
