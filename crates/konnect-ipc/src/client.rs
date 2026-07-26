@@ -367,6 +367,16 @@ impl KiCadIpcClient {
     }
 
     /// Create items on the board.
+    ///
+    /// `created_items` is documented as the status of each item *to be*
+    /// created: a rejected item still occupies a result slot (with e.g.
+    /// `ISC_INVALID_DATA` and no item attached), so counting the vector's
+    /// length would report phantom successes. Only results whose status is
+    /// `ISC_OK` — or whose status was left at the protobuf default while an
+    /// item came back, since proto3 cannot distinguish "unset" from an
+    /// explicit `ISC_UNKNOWN` — count as created; anything else fails with
+    /// KiCad's own per-item reasons. (Outcome semantics follow emolitor's
+    /// PR #66.)
     pub fn create_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -383,24 +393,51 @@ impl KiCadIpcClient {
             "CreateItems",
         )?;
         ensure_item_request_ok(response.status, "item creation")?;
-        if response.created_items.len() != expected_count {
+        if response.created_items.is_empty() {
+            // KiCad 10.0's observed behaviour for a request it ignores: an
+            // IRS_OK response carrying no per-item results at all.
             anyhow::bail!(
-                "KiCad returned {} creation results for {} requested items",
-                response.created_items.len(),
-                expected_count
+                "KiCad created no items: the CreateItems response carried no items at all \
+                 ({expected_count} requested)"
             );
         }
-        for result in response.created_items {
-            let status = result
+        let mut created = 0usize;
+        let mut rejections = Vec::new();
+        for (index, result) in response.created_items.iter().enumerate() {
+            use kiapi::common::commands::ItemStatusCode;
+            let code = result
                 .status
-                .context("KiCad returned a creation result without item status")?;
-            if status.code() != kiapi::common::commands::ItemStatusCode::IscOk {
-                anyhow::bail!(
-                    "KiCad item creation failed: {} ({})",
-                    status.error_message,
-                    status.code().as_str_name()
-                );
+                .as_ref()
+                .map(|status| status.code())
+                .unwrap_or(ItemStatusCode::IscUnknown);
+            let is_created = match code {
+                ItemStatusCode::IscOk => true,
+                // A defaulted status is only evidence of success when the
+                // created item itself came back alongside it.
+                ItemStatusCode::IscUnknown => result.item.is_some(),
+                _ => false,
+            };
+            if is_created {
+                created += 1;
+            } else {
+                let message = result
+                    .status
+                    .as_ref()
+                    .map(|status| status.error_message.as_str())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("no error message");
+                rejections.push(format!(
+                    "item {index}: {} ({message})",
+                    code.as_str_name()
+                ));
             }
+        }
+        if created != expected_count {
+            anyhow::bail!(
+                "KiCad created {created} of {expected_count} requested items{}{}",
+                if rejections.is_empty() { "" } else { ": " },
+                rejections.join("; ")
+            );
         }
         Ok(())
     }

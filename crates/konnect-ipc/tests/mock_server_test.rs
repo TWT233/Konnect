@@ -196,6 +196,150 @@ fn empty_socket_path_is_configuration_error() {
     );
 }
 
+// ─── CreateItems outcome handling ─────────────────────────────────────────────
+//
+// Ported from emolitor's PR #66 (which exercised these against the
+// ParseAndCreateItemsFromString path) and adapted to the typed create_items
+// API: the per-item accounting bugs they guard are identical.
+
+/// A mock KiCAD with one board open that answers every CreateItems with
+/// `results`.
+fn spawn_mock_creating(results: Vec<kiapi::common::commands::ItemCreationResult>) -> MockKicad {
+    spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else {
+            assert!(message.type_url.ends_with("CreateItems"));
+            let response = kiapi::common::commands::CreateItemsResponse {
+                header: None,
+                // IRS_OK even though nothing may have been created — the
+                // response shape the proto explicitly warns about.
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                created_items: results.clone(),
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.CreateItemsResponse",
+            )))
+        }
+    })
+}
+
+fn creation_result(
+    code: kiapi::common::commands::ItemStatusCode,
+    message: &str,
+) -> kiapi::common::commands::ItemCreationResult {
+    kiapi::common::commands::ItemCreationResult {
+        status: Some(kiapi::common::commands::ItemStatus {
+            code: code as i32,
+            error_message: message.to_string(),
+        }),
+        item: None,
+    }
+}
+
+fn any_item() -> prost_types::Any {
+    builders::pack_any(&kiapi::common::commands::Ping {}, "test.Item")
+}
+
+#[test]
+fn a_rejected_item_is_not_counted_as_created() {
+    // The regression this guards: created_items is documented as "status of
+    // each item TO BE created", so a rejection still occupies a slot. Counting
+    // the vector's length would call this a success and put the phantom back.
+    let mock = spawn_mock_creating(vec![creation_result(
+        kiapi::common::commands::ItemStatusCode::IscInvalidData,
+        "footprint has no pads",
+    )]);
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let err = client.create_items(vec![any_item()]).unwrap_err().to_string();
+
+    assert!(
+        err.contains("created 0 of 1"),
+        "must report failure: {err}"
+    );
+    // The per-item reason is what makes this diagnosable.
+    assert!(
+        err.contains("ISC_INVALID_DATA") && err.contains("footprint has no pads"),
+        "must surface KiCAD's own reason: {err}"
+    );
+}
+
+#[test]
+fn an_empty_result_list_still_reports_failure() {
+    // KiCAD 10.0's actual behaviour: an empty CreateItemsResponse with IRS_OK.
+    let mock = spawn_mock_creating(vec![]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let err = client.create_items(vec![any_item()]).unwrap_err().to_string();
+    assert!(err.contains("created no items"), "unexpected: {err}");
+    assert!(err.contains("no items at all"), "unexpected: {err}");
+}
+
+#[test]
+fn a_created_item_counts() {
+    let mock = spawn_mock_creating(vec![creation_result(
+        kiapi::common::commands::ItemStatusCode::IscOk,
+        "",
+    )]);
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .create_items(vec![any_item()])
+        .expect("an ISC_OK result is a created item");
+}
+
+#[test]
+fn a_defaulted_status_counts_only_when_an_item_came_back() {
+    // Protobuf cannot distinguish "unset" from "explicitly zero", so an
+    // ISC_UNKNOWN status is only evidence of success if an item is attached.
+    let with_item = kiapi::common::commands::ItemCreationResult {
+        status: None,
+        item: Some(prost_types::Any::default()),
+    };
+    let mock = spawn_mock_creating(vec![with_item]);
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .create_items(vec![any_item()])
+        .expect("an item with a defaulted status was still created");
+
+    // The same defaulted status with nothing attached created nothing.
+    let without_item = kiapi::common::commands::ItemCreationResult {
+        status: Some(kiapi::common::commands::ItemStatus {
+            code: kiapi::common::commands::ItemStatusCode::IscUnknown as i32,
+            error_message: String::new(),
+        }),
+        item: None,
+    };
+    let mock = spawn_mock_creating(vec![without_item]);
+    let client = KiCadIpcClient::new(&mock.url);
+    assert!(
+        client.create_items(vec![any_item()]).is_err(),
+        "a bare ISC_UNKNOWN with no item must not count as created"
+    );
+}
+
+#[test]
+fn a_mixed_response_counts_only_the_successes() {
+    let mock = spawn_mock_creating(vec![
+        creation_result(kiapi::common::commands::ItemStatusCode::IscOk, ""),
+        creation_result(
+            kiapi::common::commands::ItemStatusCode::IscInvalidData,
+            "bad",
+        ),
+    ]);
+    let client = KiCadIpcClient::new(&mock.url);
+    let err = client
+        .create_items(vec![any_item(), any_item()])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("created 1 of 2"), "unexpected: {err}");
+    assert!(
+        err.contains("item 1") && err.contains("ISC_INVALID_DATA") && err.contains("bad"),
+        "the rejected slot must be identified: {err}"
+    );
+}
+
 #[test]
 fn create_items_requires_a_typed_response_payload() {
     let mock = spawn_mock(|request| {
