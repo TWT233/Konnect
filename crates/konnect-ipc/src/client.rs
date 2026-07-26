@@ -132,7 +132,7 @@ impl KiCadIpcClient {
                  (3) restart the AI client so the server rereads settings. \
                  Alternatively set ipc_socket_path in konnect-settings.json or launch \
                  via KiCAD (which sets KICAD_API_SOCKET). \
-                 Full guide: https://github.com/perara/Konnect/blob/main/docs/TROUBLESHOOTING.md"
+                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
             );
         }
 

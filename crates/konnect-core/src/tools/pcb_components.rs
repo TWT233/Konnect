@@ -1085,17 +1085,11 @@ async fn handle_get_board_2d_view(
             ]
         });
 
-    // Keep generated output away from the project directory: a board named
-    // `controller.kicad_pcb` may already have a user-owned
-    // `controller.render.png`, and concurrent calls need distinct targets.
-    let render_dir = tempfile::Builder::new()
-        .prefix("konnect-pcb-render-")
-        .tempdir()
-        .context("failed to create temporary PCB render directory")?;
-    let tmp = render_dir.path().join("render.png");
+    let tmp = board_path.with_extension("render.png");
     let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
     super::cli::render_pcb_png(&ctx.config.kicad_cli, &board_path, &tmp, &layer_refs).await?;
     let bytes = tokio::fs::read(&tmp).await?;
+    let _ = tokio::fs::remove_file(&tmp).await;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
