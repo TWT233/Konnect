@@ -21,7 +21,7 @@
 
 use crate::SexpError;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── Edit Types ───────────────────────────────────────────────────────────────
 
@@ -89,22 +89,129 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 
 /// Write `content` to `path` atomically with fsync.
 ///
-/// Writes to a `.tmp` sibling file first, then renames. This prevents
+/// Writes to a scratch sibling file first, then renames. This prevents
 /// corrupted writes if the process is killed mid-write. The KiCAD MCP
 /// protocol requires that reads immediately after writes see the new data,
 /// so fsync is mandatory.
+///
+/// The scratch file is a sibling so the rename stays within one filesystem,
+/// where it is atomic; a temp directory elsewhere would silently degrade to a
+/// copy. A failed write attempts to remove it — best effort, since the removal
+/// can itself fail on a locked or read-only directory, and a write already
+/// failing is the wrong moment to start reporting a second error.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
-    let tmp_path = path.with_extension("kicad_tmp");
+    let (tmp_path, mut file) = create_scratch_file(path)?;
 
-    {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?; // fsync — mandatory
-    }
+    // Remove the scratch file unless the rename below succeeds.
+    let mut cleanup = ScratchGuard(Some(tmp_path.clone()));
+
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?; // fsync — mandatory
+    drop(file);
 
     std::fs::rename(&tmp_path, path)?;
+    cleanup.disarm();
     Ok(())
+}
+
+/// Open `path` for writing, failing if anything is already there.
+///
+/// The whole point is what it does *not* do: `File::create` truncates whatever
+/// it finds and follows a symlink to write wherever it points.
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// How many scratch names to try before giving up.
+///
+/// Reaching the end means something is generating files faster than this can
+/// pick names, or is planting them deliberately. Either way, looping forever
+/// would be worse than failing.
+const SCRATCH_ATTEMPTS: u32 = 16;
+
+/// Create a fresh scratch file, never opening one that already exists.
+///
+/// `File::create` truncates whatever it finds, and follows a symlink to write
+/// wherever it points. In a directory the user does not solely control that is
+/// the classic insecure-temp-file shape — a planted symlink turns this write
+/// into a write somewhere else entirely. `create_new` refuses instead, and a
+/// name that is somehow taken is simply exchanged for another.
+fn create_scratch_file(path: &Path) -> Result<(PathBuf, std::fs::File), SexpError> {
+    let mut last = None;
+    for _ in 0..SCRATCH_ATTEMPTS {
+        let candidate = scratch_path_for(path);
+        match open_exclusive(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no scratch name free")
+        })
+        .into())
+}
+
+/// A scratch path in `path`'s directory, unique to this file and this write.
+///
+/// Uniqueness has to cover more than it looks. `with_extension("kicad_tmp")`
+/// *replaces* the extension, so every file in a project collapsed to one
+/// scratch path — `board.kicad_pcb`, `board.kicad_sch` and `board.kicad_pro`
+/// all became `board.kicad_tmp`. Two overlapping writes then shared a scratch
+/// file and could rename each other's half-written bytes over a user's board.
+///
+/// So the name is built from the full file name, and carries a process id and
+/// a per-process counter: the file name separates a project's files, the pid
+/// separates concurrent Konnect processes, and the counter separates
+/// concurrent writes within one process.
+fn scratch_path_for(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    // Built as an OsString rather than through to_string_lossy: a file name is
+    // arbitrary bytes on Unix and arbitrary UTF-16 on Windows, neither of which
+    // is guaranteed to be valid Unicode, and lossy conversion would rewrite the
+    // invalid parts to U+FFFD. Uniqueness does not depend on this — the pid and
+    // counter carry that on their own, so two names that differ only in bytes
+    // lossy conversion would flatten still get separate scratch files either
+    // way — but a scratch file left by a killed process should be traceable to
+    // the file it belonged to.
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| OsString::from("unnamed"));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".{}.{n}.kicad_tmp", std::process::id()));
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(name)
+}
+
+/// Removes the scratch file on drop unless disarmed.
+struct ScratchGuard(Option<PathBuf>);
+
+impl ScratchGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            // Best effort by necessity: this runs while a write is already
+            // failing, and a removal that fails too — a locked file, a
+            // read-only directory — has no better outcome to report than the
+            // error already on its way to the caller.
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 // ─── Balanced-Paren Block Finder ─────────────────────────────────────────────
@@ -463,5 +570,270 @@ mod block_start_tests {
         let (start, end) = find_enclosing_direct_child_block(content, "kicad_sch", pos).unwrap();
         assert!(content[start..end].starts_with("(wire"));
         assert!(!content[start..end].contains("sheet_instances"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    /// The precondition for the collision, stated without threads.
+    ///
+    /// This is what `with_extension` did, and why every file in a project
+    /// shared one scratch file.
+    #[test]
+    fn a_projects_files_do_not_share_a_scratch_path() {
+        let pcb = scratch_path_for(Path::new("proj/board.kicad_pcb"));
+        let sch = scratch_path_for(Path::new("proj/board.kicad_sch"));
+        let pro = scratch_path_for(Path::new("proj/board.kicad_pro"));
+
+        assert_ne!(pcb, sch);
+        assert_ne!(sch, pro);
+        assert_ne!(pcb, pro);
+
+        // Demonstrates the old derivation collapsing them, so the test says
+        // what it is guarding against.
+        assert_eq!(
+            Path::new("proj/board.kicad_pcb").with_extension("kicad_tmp"),
+            Path::new("proj/board.kicad_sch").with_extension("kicad_tmp"),
+        );
+    }
+
+    #[test]
+    fn repeated_writes_to_one_file_get_distinct_scratch_paths() {
+        let p = Path::new("proj/board.kicad_pcb");
+        assert_ne!(scratch_path_for(p), scratch_path_for(p));
+    }
+
+    /// Uniqueness comes from the pid and counter, not from the file name.
+    ///
+    /// Worth stating outright: names that are *identical*, let alone names that
+    /// merely look alike after some lossy transform, cannot collide. Anything
+    /// the name contributes is for legibility.
+    #[test]
+    fn identical_names_in_one_directory_still_get_distinct_scratch_paths() {
+        let p = Path::new("proj/board.kicad_pcb");
+        let paths: Vec<_> = (0..64).map(|_| scratch_path_for(p)).collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "scratch paths repeated");
+    }
+
+    /// The file name reaches the scratch name byte-for-byte.
+    ///
+    /// A name is arbitrary bytes on Unix and arbitrary UTF-16 on Windows;
+    /// neither is guaranteed to be valid Unicode. Going through a lossy string
+    /// conversion would rewrite the invalid parts to U+FFFD, leaving a scratch
+    /// file that cannot be traced back to the file it belonged to.
+    #[test]
+    fn a_non_unicode_file_name_survives_intact() {
+        let name = non_unicode_name();
+        let path = Path::new("proj").join(&name);
+
+        // Sanity: the fixture has to be genuinely non-Unicode, or this test
+        // proves nothing. A lossy round-trip must change it.
+        let lossy = std::ffi::OsString::from(name.to_string_lossy().into_owned());
+        assert_ne!(
+            os_bytes(&name),
+            os_bytes(&lossy),
+            "fixture is valid Unicode, so it cannot demonstrate anything"
+        );
+
+        let scratch = scratch_path_for(&path);
+        let scratch_name = scratch.file_name().unwrap().to_os_string();
+        let bytes = os_bytes(&scratch_name);
+
+        assert!(
+            bytes.starts_with(&os_bytes(&name)),
+            "the original name was not preserved: {scratch_name:?}"
+        );
+        assert!(
+            !bytes.starts_with(&os_bytes(&lossy)),
+            "the name went through a lossy conversion: {scratch_name:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_name() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        // 0xFF is never valid UTF-8.
+        std::ffi::OsString::from_vec(b"board\xFF.kicad_pcb".to_vec())
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_name() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired high surrogate is never valid UTF-16.
+        let mut units: Vec<u16> = "board".encode_utf16().collect();
+        units.push(0xD800);
+        units.extend(".kicad_pcb".encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    }
+
+    #[cfg(unix)]
+    fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+
+    #[cfg(windows)]
+    fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt;
+        s.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn the_scratch_file_is_a_sibling_of_its_destination() {
+        // A rename across filesystems is not atomic, so the scratch file has
+        // to live beside the destination rather than in a temp dir.
+        let p = Path::new("proj/nested/board.kicad_pcb");
+        assert_eq!(scratch_path_for(p).parent(), p.parent());
+    }
+
+    #[test]
+    fn a_bare_filename_lands_in_the_current_directory() {
+        assert_eq!(
+            scratch_path_for(Path::new("board.kicad_pcb")).parent(),
+            Some(Path::new(""))
+        );
+    }
+
+    #[test]
+    fn a_successful_write_leaves_no_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        write_atomic(&path, "(kicad_pcb)").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "(kicad_pcb)");
+        assert!(
+            !leftover_scratch_files(dir.path()),
+            "scratch file left behind after a successful write"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_scratch_file() {
+        // Renaming onto an existing directory fails on every platform, which
+        // exercises the path where the scratch file is already written.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("board.kicad_pcb");
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(write_atomic(&blocked, "(kicad_pcb)").is_err());
+        assert!(
+            !leftover_scratch_files(dir.path()),
+            "a failed write must not litter the project directory"
+        );
+    }
+
+    fn leftover_scratch_files(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|e| {
+            e.unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "kicad_tmp")
+        })
+    }
+
+    #[test]
+    fn opening_a_scratch_file_refuses_an_existing_path() {
+        // The property `create_new` buys, tested where it can actually be
+        // observed. Squatting the name write_atomic would pick next proves
+        // nothing — the counter has already moved past it by the time the
+        // write runs — so the opener is exercised directly.
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("board.kicad_pcb.1.0.kicad_tmp");
+        std::fs::write(&occupied, "not mine").unwrap();
+
+        let err = open_exclusive(&occupied).expect_err("must not open an existing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&occupied).unwrap(),
+            "not mine",
+            "the existing file was truncated"
+        );
+    }
+
+    #[test]
+    fn a_taken_scratch_name_is_exchanged_for_another() {
+        // create_scratch_file draws a new name on AlreadyExists rather than
+        // failing the write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+
+        let (first, _held) = create_scratch_file(&path).unwrap();
+        // `first` is still on disk and still open; the next call must not
+        // return it again.
+        let (second, _g) = create_scratch_file(&path).unwrap();
+
+        assert_ne!(first, second, "the same scratch file was handed out twice");
+        assert!(first.exists() && second.exists());
+    }
+
+    /// The bug itself: concurrent writers must never mix their content.
+    ///
+    /// Every writer sends a distinct byte repeated far past a page, so any
+    /// interleaving is visible as a file that is not uniformly one byte. With
+    /// a shared scratch path this fails; with one per writer it cannot, since
+    /// each rename publishes a file no other writer ever touched.
+    #[test]
+    fn concurrent_writers_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, "seed").unwrap();
+
+        let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+        std::thread::scope(|s| {
+            for b in bytes {
+                let path = path.clone();
+                s.spawn(move || {
+                    let content = String::from_utf8(vec![b; 400_000]).unwrap();
+                    for _ in 0..10 {
+                        write_atomic(&path, &content).unwrap();
+                    }
+                });
+            }
+        });
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out.len(), 400_000, "file is not one writer's full content");
+        let first = out.as_bytes()[0];
+        assert!(
+            out.bytes().all(|b| b == first),
+            "content from two writers was mixed into one file"
+        );
+        assert!(!leftover_scratch_files(dir.path()));
+    }
+
+    /// The project-layout case from the issue: a schematic and a board written
+    /// at the same time must not land on each other.
+    #[test]
+    fn a_schematic_and_a_board_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let pcb = dir.path().join("board.kicad_pcb");
+        let sch = dir.path().join("board.kicad_sch");
+
+        let pcb_content = "(kicad_pcb)".repeat(30_000);
+        let sch_content = "(kicad_sch)".repeat(30_000);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let (p, c) = (pcb.clone(), pcb_content.clone());
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        write_atomic(&p, &c).unwrap();
+                    }
+                });
+                let (p, c) = (sch.clone(), sch_content.clone());
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        write_atomic(&p, &c).unwrap();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(std::fs::read_to_string(&pcb).unwrap(), pcb_content);
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), sch_content);
+        assert!(!leftover_scratch_files(dir.path()));
     }
 }
