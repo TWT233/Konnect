@@ -65,13 +65,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_wire",
-            "Delete a wire segment by its UUID or by matching its start/end coordinates.",
+            "Delete a wire segment by its UUID, or by matching BOTH endpoints \
+             (all four of x1/y1/x2/y2, either direction). Fails without deleting \
+             anything when no wire matches.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "uuid": { "type": "string", "description": "Wire UUID (preferred)" },
-                    "x1": { "type": "number" }, "y1": { "type": "number" },
+                    "x1": { "type": "number", "description": "Endpoint 1 X in mm (required with y1/x2/y2 when no uuid)" },
+                    "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" }
                 },
                 "required": ["schematic"]

@@ -449,16 +449,22 @@ fn sexp_tag(block: &str) -> &str {
     &after_open[..end]
 }
 
+// Blocklist of structural forms, not an allowlist of item kinds: deleting a
+// drawing item (text, bus, sheet, image, polyline, …) by UUID has always
+// worked and must keep working — only the schematic's skeleton is protected.
 fn is_deletable_schematic_item(block: &str) -> bool {
-    matches!(
+    !matches!(
         sexp_tag(block),
-        "wire"
-            | "label"
-            | "global_label"
-            | "hierarchical_label"
-            | "junction"
-            | "no_connect"
-            | "symbol"
+        "version"
+            | "generator"
+            | "generator_version"
+            | "uuid"
+            | "paper"
+            | "title_block"
+            | "lib_symbols"
+            | "sheet_instances"
+            | "symbol_instances"
+            | "embedded_fonts"
     )
 }
 
