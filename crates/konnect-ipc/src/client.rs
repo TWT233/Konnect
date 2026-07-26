@@ -82,6 +82,70 @@ fn ensure_item_request_ok(status: i32, operation: &str) -> Result<()> {
     Ok(())
 }
 
+/// Marker error carried (via anyhow's error chain) by every failure where no
+/// request completed a round-trip with a live KiCad: no socket path
+/// configured, or the NNG dial/send failed.
+///
+/// Callers must classify with [`IpcFailure::from_error`], never by matching
+/// error text.
+#[derive(Debug)]
+pub struct TransportUnreachable;
+
+impl std::fmt::Display for TransportUnreachable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "KiCad IPC transport unreachable")
+    }
+}
+
+impl std::error::Error for TransportUnreachable {}
+
+/// Why an IPC operation failed, for callers deciding whether a file-based
+/// fallback is safe.
+///
+/// `Unreachable` means the transport never delivered the request — IPC is
+/// unconfigured (empty socket path) or the dial/send failed — so no live
+/// KiCad can be holding the board, and editing the board file directly
+/// cannot race an editor.
+///
+/// `Rejected` is everything else, including any error after a request was
+/// delivered (a receive timeout may mean KiCad is still processing it).
+/// KiCad is — or may be — alive on the other end, so a file edit could be
+/// silently overwritten on its next save. Fail closed.
+#[derive(Debug)]
+pub enum IpcFailure {
+    Unreachable(String),
+    Rejected(String),
+}
+
+impl IpcFailure {
+    /// Classify an error from any [`KiCadIpcClient`] operation by walking its
+    /// chain for the [`TransportUnreachable`] marker — never by matching
+    /// message text.
+    pub fn from_error(error: anyhow::Error) -> Self {
+        let message = format!("{error:#}");
+        if error
+            .chain()
+            .any(|cause| cause.is::<TransportUnreachable>())
+        {
+            IpcFailure::Unreachable(message)
+        } else {
+            IpcFailure::Rejected(message)
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            IpcFailure::Unreachable(message) | IpcFailure::Rejected(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for IpcFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message())
+    }
+}
+
 pub struct KiCadIpcClient {
     socket_path: String,
     kicad_token: String,
@@ -123,7 +187,7 @@ impl KiCadIpcClient {
         type_name: &str,
     ) -> Result<Option<prost_types::Any>> {
         if self.socket_path.is_empty() {
-            anyhow::bail!(
+            return Err(anyhow::Error::new(TransportUnreachable).context(
                 "KiCAD IPC socket path not configured. To fix: \
                  (1) in KiCAD, enable Edit > Preferences > Plugins > 'Enable KiCad API' \
                  and copy the listed ipc:// address; \
@@ -132,8 +196,8 @@ impl KiCadIpcClient {
                  (3) restart the AI client so the server rereads settings. \
                  Alternatively set ipc_socket_path in konnect-settings.json or launch \
                  via KiCAD (which sets KICAD_API_SOCKET). \
-                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md"
-            );
+                 Full guide: https://github.com/mixelpixx/Konnect/blob/main/docs/TROUBLESHOOTING.md",
+            ));
         }
 
         let request = kiapi::common::ApiRequest {
@@ -176,15 +240,16 @@ impl KiCadIpcClient {
                 format!("ipc://{}", self.socket_path)
             };
 
-        socket
-            .dial(&dial_url)
-            .with_context(|| format!("Cannot connect to KiCAD IPC at {}", dial_url))?;
+        socket.dial(&dial_url).map_err(|error| {
+            anyhow::Error::new(TransportUnreachable)
+                .context(format!("Cannot connect to KiCAD IPC at {dial_url}: {error}"))
+        })?;
 
         // Send request
         let msg = nng::Message::from(request_bytes.as_slice());
-        socket
-            .send(msg)
-            .map_err(|(_, e)| anyhow::anyhow!("NNG send failed: {}", e))?;
+        socket.send(msg).map_err(|(_, error)| {
+            anyhow::Error::new(TransportUnreachable).context(format!("NNG send failed: {error}"))
+        })?;
 
         // Receive response
         let reply = socket

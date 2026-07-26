@@ -604,6 +604,58 @@ fn failed_multi_step_commit_is_dropped() {
     );
 }
 
+// ─── IpcFailure classification ────────────────────────────────────────────────
+//
+// The file-editing fallback in konnect-core is gated on this classification:
+// only a transport that never delivered the request may fall back, and the
+// decision must come from the typed marker, never from matching error text
+// (Copilot flagged substring matching three times on PR #66).
+
+#[test]
+fn an_unconfigured_socket_classifies_as_unreachable() {
+    if std::env::var("KICAD_API_SOCKET").is_ok() {
+        eprintln!("SKIP: KICAD_API_SOCKET set in environment");
+        return;
+    }
+    let client = KiCadIpcClient::new("");
+    let failure = konnect_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::Unreachable(_)),
+        "unexpected classification: {failure:?}"
+    );
+}
+
+#[test]
+fn a_dead_endpoint_classifies_as_unreachable() {
+    let client = KiCadIpcClient::new("tcp://127.0.0.1:1");
+    let failure = konnect_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::Unreachable(_)),
+        "unexpected classification: {failure:?}"
+    );
+}
+
+#[test]
+fn a_live_kicad_that_says_no_classifies_as_rejected() {
+    let mock = spawn_mock(|_req| {
+        Some(kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                error_message: "no board open".to_string(),
+            }),
+            header: None,
+            message: None,
+        })
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+    let failure = konnect_ipc::IpcFailure::from_error(client.get_open_documents().unwrap_err());
+    assert!(
+        matches!(failure, konnect_ipc::IpcFailure::Rejected(_)),
+        "a completed round-trip must never classify as unreachable: {failure:?}"
+    );
+    assert!(failure.message().contains("no board open"), "{failure:?}");
+}
+
 /// The regression the recv timeout exists for: a server that accepts the
 /// request and never replies. The predecessor project hung >600 s here; the
 /// client must give up at its recv timeout instead.
