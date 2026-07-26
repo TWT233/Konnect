@@ -238,6 +238,203 @@ fn extract_pad_definitions(source: &str) -> anyhow::Result<Vec<konnect_ipc::IpcP
         .collect()
 }
 
+// ─── Footprint graphics extraction ───────────────────────────────────────────
+
+/// `(start x y)`-style point child of a graphic node.
+fn graphic_point(
+    node: &konnect_sexp::SexpNode,
+    tag: &str,
+    kind: &str,
+) -> anyhow::Result<(f64, f64)> {
+    let point = node
+        .find(tag)
+        .ok_or_else(|| anyhow::anyhow!("footprint {kind} is missing its ({tag} …)"))?;
+    Ok((
+        point
+            .get_f64(1)
+            .ok_or_else(|| anyhow::anyhow!("footprint {kind} has an invalid {tag} X"))?,
+        point
+            .get_f64(2)
+            .ok_or_else(|| anyhow::anyhow!("footprint {kind} has an invalid {tag} Y"))?,
+    ))
+}
+
+fn graphic_layer(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<String> {
+    node.find_str("layer")
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("footprint {kind} is missing its layer"))
+}
+
+/// Stroke width in mm: modern `(stroke (width w) …)`, legacy bare `(width w)`.
+/// KiCad's default silkscreen line width stands in when neither is present.
+fn graphic_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
+    node.find("stroke")
+        .and_then(|stroke| stroke.find_f64("width"))
+        .or_else(|| node.find_f64("width"))
+        .unwrap_or(0.12)
+}
+
+/// `(fill yes)` (KiCad 8+) or legacy `(fill solid)`.
+fn graphic_filled(node: &konnect_sexp::SexpNode) -> bool {
+    matches!(node.find_str("fill"), Some("yes") | Some("solid"))
+}
+
+/// `(hide yes)` (modern) or a bare `hide` atom (legacy).
+fn text_hidden(node: &konnect_sexp::SexpNode) -> bool {
+    node.find_str("hide") == Some("yes")
+        || node
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .any(|child| child.as_str() == Some("hide"))
+}
+
+/// `(effects (font (size h w)))` glyph size, defaulting to KiCad's 1 mm.
+fn text_size(node: &konnect_sexp::SexpNode) -> f64 {
+    node.find("effects")
+        .and_then(|effects| effects.find("font"))
+        .and_then(|font| font.find("size"))
+        .and_then(|size| size.get_f64(1))
+        .unwrap_or(1.0)
+}
+
+/// Text position and angle from `(at x y [rot])`.
+fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f64), f64)> {
+    let at = node
+        .find("at")
+        .ok_or_else(|| anyhow::anyhow!("footprint {kind} is missing its position"))?;
+    Ok((
+        (
+            at.get_f64(1)
+                .ok_or_else(|| anyhow::anyhow!("footprint {kind} has an invalid X position"))?,
+            at.get_f64(2)
+                .ok_or_else(|| anyhow::anyhow!("footprint {kind} has an invalid Y position"))?,
+        ),
+        at.get_f64(3).unwrap_or(0.0),
+    ))
+}
+
+/// Parse a footprint's drawable children — `fp_line`, `fp_rect`, `fp_circle`,
+/// `fp_arc`, `fp_poly` and visible `fp_text`/`property` texts — into
+/// footprint-local [`konnect_ipc::IpcGraphicDefinition`]s.
+///
+/// The typed placement path previously shipped pads only, so a placed part had
+/// no courtyard, silkscreen, or fab drawing: courtyard DRC had nothing to
+/// check and KiCad's `lib_footprint_mismatch` flagged every placement.
+///
+/// `Reference` and `Value` properties are excluded — `build_footprint_item`
+/// already carries those as first-class fields.
+fn extract_graphic_definitions(
+    source: &str,
+) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
+    use konnect_ipc::IpcGraphicDefinition as Graphic;
+    let footprint = konnect_sexp::parse_sexp(source)?;
+    let mut graphics = Vec::new();
+
+    for line in footprint.find_all("fp_line") {
+        graphics.push(Graphic::Line {
+            start: graphic_point(line, "start", "fp_line")?,
+            end: graphic_point(line, "end", "fp_line")?,
+            layer: graphic_layer(line, "fp_line")?,
+            width: graphic_stroke_width(line),
+        });
+    }
+    for rect in footprint.find_all("fp_rect") {
+        graphics.push(Graphic::Rect {
+            start: graphic_point(rect, "start", "fp_rect")?,
+            end: graphic_point(rect, "end", "fp_rect")?,
+            layer: graphic_layer(rect, "fp_rect")?,
+            width: graphic_stroke_width(rect),
+            filled: graphic_filled(rect),
+        });
+    }
+    for circle in footprint.find_all("fp_circle") {
+        graphics.push(Graphic::Circle {
+            center: graphic_point(circle, "center", "fp_circle")?,
+            end: graphic_point(circle, "end", "fp_circle")?,
+            layer: graphic_layer(circle, "fp_circle")?,
+            width: graphic_stroke_width(circle),
+            filled: graphic_filled(circle),
+        });
+    }
+    for arc in footprint.find_all("fp_arc") {
+        graphics.push(Graphic::Arc {
+            start: graphic_point(arc, "start", "fp_arc")?,
+            mid: graphic_point(arc, "mid", "fp_arc")?,
+            end: graphic_point(arc, "end", "fp_arc")?,
+            layer: graphic_layer(arc, "fp_arc")?,
+            width: graphic_stroke_width(arc),
+        });
+    }
+    for poly in footprint.find_all("fp_poly") {
+        let pts = poly
+            .find("pts")
+            .ok_or_else(|| anyhow::anyhow!("footprint fp_poly is missing its (pts …)"))?;
+        let points = pts
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .filter(|node| node.head() == Some("xy"))
+            .map(|node| {
+                Ok((
+                    node.get_f64(1)
+                        .ok_or_else(|| anyhow::anyhow!("footprint fp_poly has an invalid X"))?,
+                    node.get_f64(2)
+                        .ok_or_else(|| anyhow::anyhow!("footprint fp_poly has an invalid Y"))?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        graphics.push(Graphic::Poly {
+            points,
+            layer: graphic_layer(poly, "fp_poly")?,
+            width: graphic_stroke_width(poly),
+            filled: graphic_filled(poly),
+        });
+    }
+    for text in footprint.find_all("fp_text") {
+        if text_hidden(text) {
+            continue;
+        }
+        let content = text
+            .get(2)
+            .and_then(konnect_sexp::SexpNode::as_str)
+            .ok_or_else(|| anyhow::anyhow!("footprint fp_text is missing its text"))?;
+        let (position, rotation) = text_at(text, "fp_text")?;
+        graphics.push(Graphic::Text {
+            text: content.to_string(),
+            position,
+            rotation,
+            layer: graphic_layer(text, "fp_text")?,
+            size: text_size(text),
+        });
+    }
+    for property in footprint.find_all("property") {
+        let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str);
+        // Reference and Value travel as first-class fields; hidden built-ins
+        // (Footprint, Datasheet, …) are not drawn.
+        if matches!(name, Some("Reference") | Some("Value")) || text_hidden(property) {
+            continue;
+        }
+        let Some(content) = property.get(2).and_then(konnect_sexp::SexpNode::as_str) else {
+            continue;
+        };
+        let Ok((position, rotation)) = text_at(property, "property") else {
+            continue;
+        };
+        let Ok(layer) = graphic_layer(property, "property") else {
+            continue;
+        };
+        graphics.push(Graphic::Text {
+            text: content.to_string(),
+            position,
+            rotation,
+            layer,
+            size: text_size(property),
+        });
+    }
+    Ok(graphics)
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -482,6 +679,10 @@ async fn handle_place_component(
         Ok(pads) => pads,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let graphics = match extract_graphic_definitions(&prepared) {
+        Ok(graphics) => graphics,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
 
     let value = footprint
         .split_once(':')
@@ -489,7 +690,7 @@ async fn handle_place_component(
         .unwrap_or(&footprint)
         .to_string();
     let fp = ipc!(ctx, args, |c| c.place_footprint(
-        &footprint, &reference, &value, &pads, x, y, rotation, &layer
+        &footprint, &reference, &value, &pads, &graphics, x, y, rotation, &layer
     ));
     Ok(CallToolResult::json(&json!({
         "placed": fp.reference,
@@ -760,6 +961,12 @@ async fn handle_place_array(
         Ok(source) => source,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    // Graphics are footprint-local and identical for every array instance, so
+    // one extraction serves the whole batch.
+    let graphics = match extract_graphic_definitions(&source) {
+        Ok(graphics) => graphics,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
 
     let value = footprint
         .split_once(':')
@@ -810,8 +1017,18 @@ async fn handle_place_array(
         let items = planned
             .iter()
             .map(|(reference, pads, x, y)| {
-                c.build_footprint_item(&footprint_id, reference, &value, pads, *x, *y, 0.0, "F.Cu")
-                    .with_context(|| format!("failed to prepare {reference}"))
+                c.build_footprint_item(
+                    &footprint_id,
+                    reference,
+                    &value,
+                    pads,
+                    &graphics,
+                    *x,
+                    *y,
+                    0.0,
+                    "F.Cu",
+                )
+                .with_context(|| format!("failed to prepare {reference}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         c.run_commit("Place footprint array", |c| c.create_items(items))?;
@@ -963,11 +1180,16 @@ async fn handle_duplicate_component(
         Ok(pads) => pads,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let graphics = match extract_graphic_definitions(&prepared) {
+        Ok(graphics) => graphics,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
     let fp = ipc!(ctx, args, |c| c.place_footprint(
         &fp_id,
         &ipc_reference,
         &fp_value,
         &pads,
+        &graphics,
         x,
         y,
         fp_rotation,
@@ -1085,6 +1307,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("F.Cu"));
+    }
+
+    /// A footprint with the graphics KiCad's own libraries ship: courtyard
+    /// rect, silkscreen lines, a fab outline and text, plus hidden built-in
+    /// properties that must not be drawn.
+    const GRAPHIC_FOOTPRINT: &str = r#"(footprint "R_0402"
+  (version 20240108)
+  (generator pcbnew)
+  (layer "F.Cu")
+  (property "Reference" "REF**" (at 0 -1 0) (layer "F.SilkS"))
+  (property "Value" "R_0402" (at 0 1 0) (layer "F.Fab"))
+  (property "Datasheet" "" (at 0 0 0) (layer "F.Fab") (hide yes))
+  (fp_line (start -0.6 -0.5) (end 0.6 -0.5) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+  (fp_line (start -0.6 0.5) (end 0.6 0.5) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+  (fp_rect (start -0.8 -0.7) (end 0.8 0.7) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd"))
+  (fp_circle (center 0 0) (end 0.25 0) (stroke (width 0.1) (type solid)) (fill yes) (layer "F.Fab"))
+  (fp_arc (start -0.3 0) (mid 0 -0.3) (end 0.3 0) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
+  (fp_poly (pts (xy -0.2 -0.2) (xy 0.2 -0.2) (xy 0.2 0.2)) (stroke (width 0.1) (type solid)) (fill yes) (layer "F.Fab"))
+  (fp_text user "${REFERENCE}" (at 0 1.17 0) (layer "F.Fab") (effects (font (size 0.26 0.26) (thickness 0.04))))
+  (fp_text user "secret" (at 0 0 0) (layer "F.Fab") (hide yes) (effects (font (size 0.26 0.26))))
+  (pad "1" smd roundrect (at -0.5 0) (size 0.5 0.5)
+    (layers "F.Cu" "F.Paste" "F.Mask")))"#;
+
+    #[test]
+    fn extracts_all_drawable_graphics_with_layers_and_widths() {
+        use konnect_ipc::IpcGraphicDefinition as Graphic;
+        let graphics = extract_graphic_definitions(GRAPHIC_FOOTPRINT).unwrap();
+
+        let lines: Vec<_> = graphics
+            .iter()
+            .filter(|g| matches!(g, Graphic::Line { .. }))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(matches!(
+            lines[0],
+            Graphic::Line { layer, width, start, .. }
+                if layer == "F.SilkS" && *width == 0.12 && *start == (-0.6, -0.5)
+        ));
+
+        let rect = graphics
+            .iter()
+            .find(|g| matches!(g, Graphic::Rect { .. }))
+            .unwrap();
+        assert!(matches!(
+            rect,
+            Graphic::Rect { layer, width, filled, start, end }
+                if layer == "F.CrtYd" && *width == 0.05 && !*filled
+                    && *start == (-0.8, -0.7) && *end == (0.8, 0.7)
+        ));
+
+        let circle = graphics
+            .iter()
+            .find(|g| matches!(g, Graphic::Circle { .. }))
+            .unwrap();
+        assert!(matches!(
+            circle,
+            Graphic::Circle { layer, filled, end, .. }
+                if layer == "F.Fab" && *filled && *end == (0.25, 0.0)
+        ));
+
+        assert!(graphics
+            .iter()
+            .any(|g| matches!(g, Graphic::Arc { layer, mid, .. }
+                if layer == "F.SilkS" && *mid == (0.0, -0.3))));
+
+        let poly = graphics
+            .iter()
+            .find(|g| matches!(g, Graphic::Poly { .. }))
+            .unwrap();
+        assert!(matches!(
+            poly,
+            Graphic::Poly { points, filled, .. } if points.len() == 3 && *filled
+        ));
+
+        // Exactly one visible text: the fab ${REFERENCE}. The hidden fp_text,
+        // the hidden Datasheet property, and the Reference/Value properties
+        // (carried as first-class fields) are all excluded.
+        let texts: Vec<_> = graphics
+            .iter()
+            .filter(|g| matches!(g, Graphic::Text { .. }))
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(matches!(
+            texts[0],
+            Graphic::Text { text, layer, size, position, .. }
+                if text == "${REFERENCE}" && layer == "F.Fab" && *size == 0.26
+                    && *position == (0.0, 1.17)
+        ));
+    }
+
+    #[test]
+    fn a_bare_pads_only_footprint_extracts_no_graphics() {
+        assert!(extract_graphic_definitions(FOOTPRINT).unwrap().is_empty());
     }
 
     fn test_ctx() -> ToolContext {

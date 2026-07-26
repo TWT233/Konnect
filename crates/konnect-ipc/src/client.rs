@@ -923,6 +923,11 @@ impl KiCadIpcClient {
     }
 
     /// Build a typed footprint item suitable for [`Self::create_items`].
+    ///
+    /// Children (pads and graphics) are emitted in ABSOLUTE board
+    /// coordinates: KiCAD serializes `FootprintInstance` children that way
+    /// and re-creates them verbatim (issue #23 — see the `transform` module
+    /// docs), so every footprint-local point is rotated and translated here.
     #[allow(clippy::too_many_arguments)]
     pub fn build_footprint_item(
         &self,
@@ -930,6 +935,7 @@ impl KiCadIpcClient {
         reference: &str,
         value: &str,
         pads: &[IpcPadDefinition],
+        graphics: &[IpcGraphicDefinition],
         x: f64,
         y: f64,
         rotation: f64,
@@ -968,7 +974,7 @@ impl KiCadIpcClient {
             };
         let reference_field = text_field("Reference", reference, y - 1.0, true);
         let value_field = text_field("Value", value, y + 1.0, false);
-        let child_items = pads
+        let mut child_items: Vec<prost_types::Any> = pads
             .iter()
             .map(|pad| {
                 // Canonical KiCAD footprint-local → board transform; see
@@ -1065,6 +1071,11 @@ impl KiCadIpcClient {
                 crate::builders::pack_any(&item, "kiapi.board.types.Pad")
             })
             .collect();
+        child_items.extend(
+            graphics
+                .iter()
+                .map(|graphic| build_graphic_child(graphic, x, y, rotation)),
+        );
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
                 library_nickname: library_nickname.to_string(),
@@ -1101,6 +1112,7 @@ impl KiCadIpcClient {
         reference: &str,
         value: &str,
         pads: &[IpcPadDefinition],
+        graphics: &[IpcGraphicDefinition],
         x: f64,
         y: f64,
         rotation: f64,
@@ -1113,8 +1125,8 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item =
-            self.build_footprint_item(lib_id, reference, value, pads, x, y, rotation, layer)?;
+        let item = self
+            .build_footprint_item(lib_id, reference, value, pads, graphics, x, y, rotation, layer)?;
         self.create_items(vec![item])?;
         let footprints = self.list_footprints()?;
         footprints
@@ -1217,6 +1229,143 @@ impl KiCadIpcClient {
     }
 }
 
+/// True when `rotation` keeps axis-aligned shapes axis-aligned.
+fn is_cardinal_rotation(rotation_deg: f64) -> bool {
+    let r = rotation_deg.rem_euclid(90.0);
+    r.abs() < 1e-9 || (90.0 - r).abs() < 1e-9
+}
+
+/// Normalize a text angle the way KiCAD keeps labels readable: fold into
+/// [0, 360), then flip anything that would read upside down by 180°.
+fn readable_text_angle(deg: f64) -> f64 {
+    let mut angle = deg.rem_euclid(360.0);
+    if angle > 90.0 && angle <= 270.0 {
+        angle -= 180.0;
+    }
+    angle
+}
+
+/// Transform one footprint-local graphic into an absolute-board-space child
+/// item for a `FootprintInstance` (see [`KiCadIpcClient::build_footprint_item`]).
+fn build_graphic_child(
+    graphic: &IpcGraphicDefinition,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> prost_types::Any {
+    use crate::builders;
+    const SHAPE: &str = "kiapi.board.types.BoardGraphicShape";
+    let xf = |(px, py): (f64, f64)| konnect_sexp::geometry::transform_pad(px, py, x, y, rotation);
+    match graphic {
+        IpcGraphicDefinition::Line {
+            start,
+            end,
+            layer,
+            width,
+        } => {
+            let (x1, y1) = xf(*start);
+            let (x2, y2) = xf(*end);
+            builders::pack_any(&builders::board_segment(layer, *width, x1, y1, x2, y2), SHAPE)
+        }
+        IpcGraphicDefinition::Rect {
+            start,
+            end,
+            layer,
+            width,
+            filled,
+        } => {
+            if is_cardinal_rotation(rotation) {
+                // A 90°-multiple keeps the rectangle axis-aligned; rotate the
+                // corners and re-normalize which one is top-left.
+                let (x1, y1) = xf(*start);
+                let (x2, y2) = xf(*end);
+                builders::pack_any(
+                    &builders::board_rectangle(
+                        layer,
+                        *width,
+                        x1.min(x2),
+                        y1.min(y2),
+                        x1.max(x2),
+                        y1.max(y2),
+                        *filled,
+                    ),
+                    SHAPE,
+                )
+            } else {
+                // The Rectangle message is axis-aligned by construction, so a
+                // non-cardinal rotation emits the four rotated corners as a
+                // polygon — the same degradation EDA_SHAPE::Rotate applies.
+                let corners = vec![xf(*start), xf((end.0, start.1)), xf(*end), xf((start.0, end.1))];
+                builders::pack_any(&builders::board_polygon(layer, *width, *filled, &[corners]), SHAPE)
+            }
+        }
+        IpcGraphicDefinition::Circle {
+            center,
+            end,
+            layer,
+            width,
+            filled,
+        } => {
+            let (cx, cy) = xf(*center);
+            // The radius is rotation-invariant; keep KiCAD's center +
+            // circumference-point encoding by re-deriving it from the length.
+            let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
+            builders::pack_any(
+                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+                SHAPE,
+            )
+        }
+        IpcGraphicDefinition::Arc {
+            start,
+            mid,
+            end,
+            layer,
+            width,
+        } => {
+            let (sx, sy) = xf(*start);
+            let (mx, my) = xf(*mid);
+            let (ex, ey) = xf(*end);
+            builders::pack_any(
+                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+                SHAPE,
+            )
+        }
+        IpcGraphicDefinition::Poly {
+            points,
+            layer,
+            width,
+            filled,
+        } => {
+            let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
+            builders::pack_any(
+                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+                SHAPE,
+            )
+        }
+        IpcGraphicDefinition::Text {
+            text,
+            position,
+            rotation: text_rotation,
+            layer,
+            size,
+        } => {
+            let (tx, ty) = xf(*position);
+            builders::pack_any(
+                &builders::board_text(
+                    layer,
+                    text,
+                    tx,
+                    ty,
+                    *size,
+                    readable_text_angle(text_rotation + rotation),
+                    false,
+                ),
+                "kiapi.board.types.BoardText",
+            )
+        }
+    }
+}
+
 fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Option<PathBuf> {
     use kiapi::common::types::document_specifier::Identifier;
 
@@ -1284,5 +1433,208 @@ mod document_path_tests {
             Path::new("/work/controller/other.kicad_pcb"),
             Path::new("controller.kicad_pcb")
         ));
+    }
+}
+
+#[cfg(test)]
+mod footprint_graphics_tests {
+    use super::*;
+    use prost::Message;
+
+    fn build(
+        graphics: &[IpcGraphicDefinition],
+        x: f64,
+        y: f64,
+        rotation: f64,
+    ) -> kiapi::board::types::FootprintInstance {
+        // build_footprint_item is pure — no IPC round-trip — so the socket
+        // path is never dialed.
+        let client = KiCadIpcClient::new("tcp://never-dialed");
+        let any = client
+            .build_footprint_item("Lib:Fp", "R1", "R", &[], graphics, x, y, rotation, "F.Cu")
+            .unwrap();
+        kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap()
+    }
+
+    fn shapes(
+        fp: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<kiapi::board::types::BoardGraphicShape> {
+        fp.definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|any| any.type_url.ends_with("BoardGraphicShape"))
+            .map(|any| {
+                kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice()).unwrap()
+            })
+            .collect()
+    }
+
+    fn texts(fp: &kiapi::board::types::FootprintInstance) -> Vec<kiapi::board::types::BoardText> {
+        fp.definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|any| any.type_url.ends_with("BoardText"))
+            .map(|any| kiapi::board::types::BoardText::decode(any.value.as_slice()).unwrap())
+            .collect()
+    }
+
+    /// Courtyard rect + silk line + fab text at rotation 90 must come out on
+    /// their own layers, at absolute board coordinates rotated with the part.
+    ///
+    /// transform_pad at 90°: (lx, ly) → (x + ly, y − lx).
+    #[test]
+    fn rotation_90_pretransforms_graphics_to_absolute_board_space() {
+        let graphics = vec![
+            IpcGraphicDefinition::Rect {
+                start: (-1.0, -2.0),
+                end: (1.0, 2.0),
+                layer: "F.CrtYd".to_string(),
+                width: 0.05,
+                filled: false,
+            },
+            IpcGraphicDefinition::Line {
+                start: (-1.0, 0.0),
+                end: (1.0, 0.0),
+                layer: "F.SilkS".to_string(),
+                width: 0.12,
+            },
+            IpcGraphicDefinition::Text {
+                text: "hello".to_string(),
+                position: (0.0, 2.0),
+                rotation: 0.0,
+                layer: "F.Fab".to_string(),
+                size: 0.5,
+            },
+        ];
+        let fp = build(&graphics, 100.0, 50.0, 90.0);
+
+        let shapes = shapes(&fp);
+        assert_eq!(shapes.len(), 2);
+
+        // The rectangle stays axis-aligned at a cardinal rotation: corners
+        // (-1,-2) → (98, 51) and (1,2) → (102, 49), re-normalized so the
+        // top-left really is top-left.
+        let rect = &shapes[0];
+        assert_eq!(rect.layer, kiapi::board::types::BoardLayer::BlFCrtYd as i32);
+        let geometry = rect.shape.as_ref().unwrap().geometry.as_ref().unwrap();
+        let kiapi::common::types::graphic_shape::Geometry::Rectangle(r) = geometry else {
+            panic!("expected Rectangle geometry, got {geometry:?}");
+        };
+        assert_eq!(r.top_left.unwrap().x_nm, 98_000_000);
+        assert_eq!(r.top_left.unwrap().y_nm, 49_000_000);
+        assert_eq!(r.bottom_right.unwrap().x_nm, 102_000_000);
+        assert_eq!(r.bottom_right.unwrap().y_nm, 51_000_000);
+
+        // Silk line (-1,0)→(1,0) rotates to (100,51)→(100,49).
+        let line = &shapes[1];
+        assert_eq!(line.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
+        let geometry = line.shape.as_ref().unwrap().geometry.as_ref().unwrap();
+        let kiapi::common::types::graphic_shape::Geometry::Segment(s) = geometry else {
+            panic!("expected Segment geometry, got {geometry:?}");
+        };
+        assert_eq!(s.start.unwrap().x_nm, 100_000_000);
+        assert_eq!(s.start.unwrap().y_nm, 51_000_000);
+        assert_eq!(s.end.unwrap().x_nm, 100_000_000);
+        assert_eq!(s.end.unwrap().y_nm, 49_000_000);
+
+        // Fab text at local (0,2) lands at (102, 50) with its angle rotated.
+        let texts = texts(&fp);
+        assert_eq!(texts.len(), 1);
+        let text = texts[0].text.as_ref().unwrap();
+        assert_eq!(texts[0].layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        assert_eq!(text.position.unwrap().x_nm, 102_000_000);
+        assert_eq!(text.position.unwrap().y_nm, 50_000_000);
+        assert_eq!(
+            text.attributes.as_ref().unwrap().angle.unwrap().value_degrees,
+            90.0
+        );
+    }
+
+    /// At 180° the text would read upside down; KiCAD keeps labels readable by
+    /// flipping such angles 180°, and so does the emitted child.
+    #[test]
+    fn text_angles_are_kept_readable() {
+        let graphics = vec![IpcGraphicDefinition::Text {
+            text: "hello".to_string(),
+            position: (0.0, 0.0),
+            rotation: 0.0,
+            layer: "F.Fab".to_string(),
+            size: 0.5,
+        }];
+        let fp = build(&graphics, 0.0, 0.0, 180.0);
+        let texts = texts(&fp);
+        assert_eq!(
+            texts[0]
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .angle
+                .unwrap()
+                .value_degrees,
+            0.0
+        );
+    }
+
+    /// The Rectangle protobuf message is axis-aligned by construction, so a
+    /// non-cardinal rotation must degrade the rect to its four rotated corners
+    /// as a polygon — mirroring EDA_SHAPE::Rotate.
+    #[test]
+    fn non_cardinal_rotation_emits_rect_as_polygon() {
+        let graphics = vec![IpcGraphicDefinition::Rect {
+            start: (-1.0, -1.0),
+            end: (1.0, 1.0),
+            layer: "F.CrtYd".to_string(),
+            width: 0.05,
+            filled: false,
+        }];
+        let fp = build(&graphics, 0.0, 0.0, 45.0);
+        let shapes = shapes(&fp);
+        assert_eq!(shapes.len(), 1);
+        let geometry = shapes[0].shape.as_ref().unwrap().geometry.as_ref().unwrap();
+        let kiapi::common::types::graphic_shape::Geometry::Polygon(poly) = geometry else {
+            panic!("expected Polygon geometry for a 45-degree rect, got {geometry:?}");
+        };
+        let outline = poly.polygons[0].outline.as_ref().unwrap();
+        assert!(outline.closed);
+        assert_eq!(outline.nodes.len(), 4);
+        // Corner (-1,-1) at 45°: bx = -cos45 - sin45 = -√2, by = sin45 - cos45 = 0.
+        let first = match outline.nodes[0].geometry.as_ref().unwrap() {
+            kiapi::common::types::poly_line_node::Geometry::Point(p) => p,
+            other => panic!("expected Point node, got {other:?}"),
+        };
+        let sqrt2_nm = (std::f64::consts::SQRT_2 * 1_000_000.0) as i64;
+        assert!((first.x_nm + sqrt2_nm).abs() < 10, "x={}", first.x_nm);
+        assert!(first.y_nm.abs() < 10, "y={}", first.y_nm);
+    }
+
+    /// A circle's radius survives rotation via the circumference-point
+    /// encoding.
+    #[test]
+    fn circle_center_rotates_and_radius_is_preserved() {
+        let graphics = vec![IpcGraphicDefinition::Circle {
+            center: (1.0, 0.0),
+            end: (1.5, 0.0),
+            layer: "F.Fab".to_string(),
+            width: 0.1,
+            filled: true,
+        }];
+        let fp = build(&graphics, 10.0, 10.0, 90.0);
+        let shapes = shapes(&fp);
+        let geometry = shapes[0].shape.as_ref().unwrap().geometry.as_ref().unwrap();
+        let kiapi::common::types::graphic_shape::Geometry::Circle(c) = geometry else {
+            panic!("expected Circle geometry, got {geometry:?}");
+        };
+        // Center (1,0) at 90° around (10,10): (10, 9).
+        assert_eq!(c.center.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.center.unwrap().y_nm, 9_000_000);
+        // Radius 0.5 mm regardless of rotation.
+        assert_eq!(c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm, 500_000);
     }
 }

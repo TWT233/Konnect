@@ -33,6 +33,65 @@ pub struct IpcPadDefinition {
     pub roundrect_ratio: f64,
 }
 
+/// A footprint graphic item in footprint-local coordinates (mm), parsed from
+/// the library `.kicad_mod` source.
+///
+/// Points are pre-transform: `build_footprint_item` rotates and translates
+/// them into absolute board coordinates before emission, because KiCAD
+/// serializes `FootprintInstance` children in absolute board space (see the
+/// `transform` module docs / issue #23).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IpcGraphicDefinition {
+    /// `fp_line` — straight segment.
+    Line {
+        start: (f64, f64),
+        end: (f64, f64),
+        layer: String,
+        width: f64,
+    },
+    /// `fp_rect` — axis-aligned rectangle between two opposite corners.
+    Rect {
+        start: (f64, f64),
+        end: (f64, f64),
+        layer: String,
+        width: f64,
+        filled: bool,
+    },
+    /// `fp_circle` — center plus a point on the circumference.
+    Circle {
+        center: (f64, f64),
+        end: (f64, f64),
+        layer: String,
+        width: f64,
+        filled: bool,
+    },
+    /// `fp_arc` — start / mid / end points.
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+        layer: String,
+        width: f64,
+    },
+    /// `fp_poly` — closed outline.
+    Poly {
+        points: Vec<(f64, f64)>,
+        layer: String,
+        width: f64,
+        filled: bool,
+    },
+    /// Visible `fp_text` / `property` text.
+    Text {
+        text: String,
+        position: (f64, f64),
+        /// Text angle in degrees, footprint-local.
+        rotation: f64,
+        layer: String,
+        /// Glyph size (width and height) in mm.
+        size: f64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
     pub net_name: String,

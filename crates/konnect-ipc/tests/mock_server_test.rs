@@ -340,6 +340,145 @@ fn a_mixed_response_counts_only_the_successes() {
     );
 }
 
+/// End-to-end placement through the mock: the FootprintInstance sent over the
+/// wire must carry the footprint's graphics (courtyard/silk/fab) as children
+/// alongside its pads — a pads-only instance trips lib_footprint_mismatch and
+/// makes courtyard DRC meaningless.
+#[test]
+fn place_footprint_sends_graphics_children() {
+    use konnect_ipc::{IpcGraphicDefinition, IpcPadDefinition};
+
+    let captured: Arc<Mutex<Option<kiapi::common::commands::CreateItems>>> =
+        Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else if message.type_url.ends_with("GetItems") {
+            // Before creation the board is empty; afterwards it holds exactly
+            // what CreateItems carried, so the client's verification pass sees
+            // its own footprint.
+            let items = captured_in_mock
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|create| create.items.clone())
+                .unwrap_or_default();
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items,
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        } else {
+            assert!(message.type_url.ends_with("CreateItems"));
+            let create =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            let created_items = create
+                .items
+                .iter()
+                .cloned()
+                .map(|item| kiapi::common::commands::ItemCreationResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                })
+                .collect();
+            *captured_in_mock.lock().unwrap() = Some(create);
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::CreateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    created_items,
+                },
+                "kiapi.common.commands.CreateItemsResponse",
+            )))
+        }
+    });
+
+    let pads = vec![IpcPadDefinition {
+        number: "1".to_string(),
+        pad_type: "smd".to_string(),
+        shape: "roundrect".to_string(),
+        x: -0.5,
+        y: 0.0,
+        rotation: 0.0,
+        size_x: 0.5,
+        size_y: 0.5,
+        drill_x: None,
+        drill_y: None,
+        drill_oval: false,
+        layers: vec!["F.Cu".to_string()],
+        roundrect_ratio: 0.25,
+    }];
+    let graphics = vec![
+        IpcGraphicDefinition::Rect {
+            start: (-0.8, -0.7),
+            end: (0.8, 0.7),
+            layer: "F.CrtYd".to_string(),
+            width: 0.05,
+            filled: false,
+        },
+        IpcGraphicDefinition::Line {
+            start: (-0.6, -0.5),
+            end: (0.6, -0.5),
+            layer: "F.SilkS".to_string(),
+            width: 0.12,
+        },
+        IpcGraphicDefinition::Text {
+            text: "R_0402".to_string(),
+            position: (0.0, 1.17),
+            rotation: 0.0,
+            layer: "F.Fab".to_string(),
+            size: 0.26,
+        },
+    ];
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let placed = client
+        .place_footprint(
+            "Resistor_SMD:R_0402",
+            "R1",
+            "R_0402",
+            &pads,
+            &graphics,
+            10.0,
+            20.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect("placement through the mock should succeed");
+    assert_eq!(placed.reference, "R1");
+
+    let create = captured.lock().unwrap().take().expect("CreateItems sent");
+    assert_eq!(create.items.len(), 1);
+    let footprint = kiapi::board::types::FootprintInstance::decode(
+        create.items[0].value.as_slice(),
+    )
+    .expect("sent item must be a FootprintInstance");
+    let children = footprint.definition.expect("definition").items;
+    let pads_sent = children
+        .iter()
+        .filter(|any| any.type_url.ends_with("kiapi.board.types.Pad"))
+        .count();
+    let shapes_sent = children
+        .iter()
+        .filter(|any| any.type_url.ends_with("BoardGraphicShape"))
+        .count();
+    let texts_sent = children
+        .iter()
+        .filter(|any| any.type_url.ends_with("BoardText"))
+        .count();
+    assert_eq!(pads_sent, 1, "pad child missing");
+    assert_eq!(shapes_sent, 2, "courtyard rect + silk line must be sent");
+    assert_eq!(texts_sent, 1, "fab text must be sent");
+}
+
 #[test]
 fn create_items_requires_a_typed_response_payload() {
     let mock = spawn_mock(|request| {
