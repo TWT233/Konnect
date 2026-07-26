@@ -7,7 +7,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_sexp::parser::{parse_sexp, SexpNode};
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -826,29 +826,18 @@ fn global_sym_lib_table() -> PathBuf {
 }
 
 /// Parse a lib-table S-expression and return list of (nickname, uri, type) tuples.
+///
+/// Indentation-agnostic: KiCad's own writers emit tab-indented, CRLF-terminated
+/// tables while this crate's writer uses two spaces, so a fixed literal such as
+/// `"\n  (lib "` silently matches nothing in a real `fp-lib-table`.
 fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
     let mut libs = Vec::new();
     // Each entry: (lib (name "NICK") (type "...") (uri "...") (options "") (descr "..."))
-    let mut pos = 0;
-    while let Some(lib_start) = content[pos..].find("\n  (lib ").map(|i| pos + i) {
-        // Find the end of this lib block
-        let inner_start = lib_start + 2; // skip "\n  "
-        let mut depth = 0i32;
-        let mut end = inner_start;
-        for (i, ch) in content[inner_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = inner_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let block = &content[inner_start..end];
+    for start in find_block_starts(content, "lib") {
+        let Some((block_start, block_end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        let block = &content[block_start..block_end];
 
         let nickname = extract_sexp_string(block, "name").unwrap_or_default();
         let uri = extract_sexp_string(block, "uri").unwrap_or_default();
@@ -861,9 +850,246 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
             "type": lib_type,
             "description": descr
         }));
-        pos = end;
     }
     libs
+}
+
+/// Resolve a lib-table URI to a concrete path, expanding a leading
+/// `${KICAD*_DIR}` reference.
+///
+/// KiCad's shipped tables address bundled libraries as
+/// `${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty`. An exported environment
+/// variable wins; otherwise the variable's kind is inferred from its name and
+/// the known install locations are searched.
+fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
+    let Some(rest) = uri.strip_prefix("${") else {
+        return (!uri.is_empty()).then(|| PathBuf::from(uri));
+    };
+    let close = rest.find('}')?;
+    let var = &rest[..close];
+    let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
+
+    // ${KIPRJMOD} is the project directory — resolved from the table's own
+    // location, not the environment: KiCad sets it per open project at
+    // runtime, so an exported value (if any) may belong to a different
+    // project than the table being read. Project-scoped registrations are
+    // the default for register_footprint_library, so this is the common
+    // case for user-registered libraries, not an edge.
+    if var == "KIPRJMOD" {
+        let p = kiprjmod?.join(tail);
+        return p.exists().then_some(p);
+    }
+
+    // var_os, not var: `var` treats a non-Unicode value as absent, which would
+    // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
+    if let Some(base) = std::env::var_os(var) {
+        let p = PathBuf::from(base).join(tail);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // e.g. KICAD10_FOOTPRINT_DIR -> "footprints"
+    let kind = if var.ends_with("_FOOTPRINT_DIR") {
+        "footprints"
+    } else if var.ends_with("_SYMBOL_DIR") {
+        "symbols"
+    } else if var.ends_with("_3DMODEL_DIR") {
+        "3dmodels"
+    } else {
+        return None;
+    };
+
+    super::find_kicad_library_dirs(kind)
+        .into_iter()
+        .map(|base| base.join(tail))
+        .find(|p| p.exists())
+}
+
+/// Maximum depth when following nested `(type "Table")` lib-table references.
+const MAX_LIB_TABLE_DEPTH: usize = 4;
+
+/// Parse a lib-table and return concrete libraries, following nested tables.
+///
+/// KiCad 10 no longer copies its ~155 bundled libraries into the user's table.
+/// The default global table instead holds a single indirection entry —
+/// `(lib (name "KiCad") (type "Table") (uri ".../template/fp-lib-table"))` —
+/// pointing at the shipped template table. Treating that entry as a library
+/// makes every bundled library invisible, so it is followed here.
+///
+/// Each returned entry carries the original `uri` plus a resolved `path`
+/// whenever [`expand_lib_uri`] yields one: a `${KICAD*_DIR}` URI resolves only
+/// if the expansion exists on disk, while a plain URI is passed through as
+/// written. The target may be a directory (`.pretty`) or a file
+/// (`.kicad_sym`), so the presence of `path` is not a promise that the library
+/// is readable — only that the URI was understood.
+fn flatten_lib_table(
+    content: &str,
+    depth: usize,
+    kiprjmod: Option<&Path>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for mut entry in parse_lib_table(content) {
+        let uri = entry["uri"].as_str().unwrap_or("").to_string();
+        let is_nested = entry["type"].as_str() == Some("Table");
+
+        if is_nested {
+            if depth >= MAX_LIB_TABLE_DEPTH {
+                tracing::warn!(
+                    "lib-table nesting deeper than {} levels at '{}' — not followed",
+                    MAX_LIB_TABLE_DEPTH,
+                    uri
+                );
+                continue;
+            }
+            match expand_lib_uri(&uri, kiprjmod).map(std::fs::read_to_string) {
+                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1, kiprjmod)),
+                _ => tracing::warn!("nested lib-table '{}' could not be read", uri),
+            }
+            continue;
+        }
+
+        if let Some(path) = expand_lib_uri(&uri, kiprjmod) {
+            entry["path"] = json!(path.to_string_lossy());
+        }
+        out.push(entry);
+    }
+
+    out
+}
+
+/// Read a lib-table file from disk and flatten it, reporting a table that is
+/// present but unreadable.
+///
+/// An absent table is normal and yields an empty list: a project without its
+/// own fp-lib-table simply has none, and every caller checks both the global
+/// and project tables. Anything else — a permissions problem, a truncated
+/// file — is not normal, and must not be folded into the same empty list. The
+/// symptom that produces is a bare `{"count": 0}`, which is precisely what the
+/// bug this module fixes looked like, so silence here would make a real
+/// failure indistinguishable from a regression.
+fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    match std::fs::read_to_string(path) {
+        // ${KIPRJMOD} is the directory the project's lib-table lives in, so
+        // the table's own parent IS the correct expansion base for a project
+        // table. For the global table the parent is KiCad's config dir, where
+        // a ${KIPRJMOD} entry would be authoring error to begin with — the
+        // expansion then simply fails its exists() check.
+        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Cannot read lib-table {}: {}", path.display(), e)),
+    }
+}
+
+/// As [`read_lib_table_checked`], for callers with nowhere to put an error.
+///
+/// The failure is logged rather than dropped in silence. Handlers that can
+/// surface it to the user should call `read_lib_table_checked` directly.
+fn read_flat_lib_table(path: &Path) -> Vec<serde_json::Value> {
+    match read_lib_table_checked(path) {
+        Ok(libs) => libs,
+        Err(msg) => {
+            tracing::warn!("{msg}");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether a footprint reference is KiCad's `Library:Footprint` form rather
+/// than a filesystem path.
+///
+/// "Contains a colon" is not enough, because Windows paths contain one too.
+/// `C:\libs\R.kicad_mod` is caught by the separator test, but the
+/// drive-*relative* form `C:R.kicad_mod` — meaning `R.kicad_mod` in the current
+/// directory of drive C — carries no separator and is otherwise shaped exactly
+/// like a lib id.
+///
+/// A one-letter prefix is therefore read as a drive letter rather than a
+/// nickname. Nothing distinguishes the two, so this is a choice: a drive letter
+/// is much the likelier reading, and guessing the other way means silently
+/// hunting for a library named "C". The cost is that a single-letter nickname
+/// cannot be written in this form — it is still reachable by path — and the
+/// rule is applied on every platform so the behaviour does not change under
+/// the caller's feet.
+pub(crate) fn is_lib_id(reference: &str) -> bool {
+    let Some((nick, _)) = reference.split_once(':') else {
+        return false;
+    };
+    if reference.contains('/') || reference.contains('\\') {
+        return false;
+    }
+    !(nick.len() == 1 && nick.as_bytes()[0].is_ascii_alphabetic())
+}
+
+/// Resolve a footprint reference to an on-disk `.kicad_mod` path.
+///
+/// Accepts either a direct filesystem path or KiCad's `Library:Footprint`
+/// form, which is looked up in the global fp-lib-table. Returns a
+/// human-readable message on failure so callers can surface it verbatim.
+pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String> {
+    if !is_lib_id(reference) {
+        // Check here rather than leaving it to the caller's read: an unchecked
+        // path reaches the reader as a bare io::Error, which surfaces as
+        // "The system cannot find the file specified. (os error 2)" with no
+        // mention of what was being looked for.
+        let path = PathBuf::from(reference);
+        if !path.is_file() {
+            return Err(format!(
+                "Footprint file not found: {}. Pass either a path to a .kicad_mod \
+                 file or a Library:Footprint id (e.g. 'Resistor_SMD:R_0402').",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+
+    let (nick, fp_name) = reference.split_once(':').expect("checked above");
+    let table = global_fp_lib_table();
+    if !table.exists() {
+        return Err(format!(
+            "Global fp-lib-table not found at {}",
+            table.display()
+        ));
+    }
+
+    let libs = read_flat_lib_table(&table);
+    let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) else {
+        let known: Vec<&str> = libs
+            .iter()
+            .filter_map(|l| l["nickname"].as_str())
+            .take(12)
+            .collect();
+        return Err(format!(
+            "Library '{}' not found in fp-lib-table ({} libraries known{})",
+            nick,
+            libs.len(),
+            if known.is_empty() {
+                String::new()
+            } else {
+                format!(", e.g. {}", known.join(", "))
+            }
+        ));
+    };
+
+    let Some(dir) = lib["path"].as_str() else {
+        return Err(format!(
+            "Library '{}' has an unresolvable URI '{}'",
+            nick,
+            lib["uri"].as_str().unwrap_or("")
+        ));
+    };
+
+    let path = PathBuf::from(dir).join(format!("{}.kicad_mod", fp_name));
+    if !path.exists() {
+        return Err(format!(
+            "Footprint '{}' not found in library '{}' (looked for {})",
+            fp_name,
+            nick,
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// Extract a quoted string value from `(key "value")` within a block.
@@ -921,29 +1147,31 @@ async fn handle_list_footprint_libraries(
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
+    // A table that exists but cannot be read is reported rather than counted
+    // as zero libraries — "0" is the symptom of the bug this PR fixes, so the
+    // two must not look alike.
     if scope == "global" || scope == "all" {
-        let table = global_fp_lib_table();
-        if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("global");
-            }
-            all_libs.extend(libs);
+        let mut libs = match read_lib_table_checked(&global_fp_lib_table()) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
+        for lib in &mut libs {
+            lib["scope"] = json!("global");
         }
+        all_libs.extend(libs);
     }
 
     if (scope == "project" || scope == "all") && args["project"].is_string() {
         let proj = PathBuf::from(args["project"].as_str().unwrap());
         let table = proj.parent().unwrap_or(Path::new(".")).join("fp-lib-table");
-        if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("project");
-            }
-            all_libs.extend(libs);
+        let mut libs = match read_lib_table_checked(&table) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
+        for lib in &mut libs {
+            lib["scope"] = json!("project");
         }
+        all_libs.extend(libs);
     }
 
     Ok(CallToolResult::text(
@@ -1002,16 +1230,17 @@ async fn handle_list_symbol_libraries(
     let scope = args["scope"].as_str().unwrap_or("all");
     let mut all_libs = Vec::new();
 
+    // Same as the footprint listing: an unreadable table is an error, not a
+    // zero count.
     if scope == "global" || scope == "all" {
-        let table = global_sym_lib_table();
-        if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("global");
-            }
-            all_libs.extend(libs);
+        let mut libs = match read_lib_table_checked(&global_sym_lib_table()) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
+        for lib in &mut libs {
+            lib["scope"] = json!("global");
         }
+        all_libs.extend(libs);
     }
 
     if (scope == "project" || scope == "all") && args["project"].is_string() {
@@ -1020,14 +1249,14 @@ async fn handle_list_symbol_libraries(
             .parent()
             .unwrap_or(Path::new("."))
             .join("sym-lib-table");
-        if table.exists() {
-            let content = tokio::fs::read_to_string(&table).await?;
-            let mut libs = parse_lib_table(&content);
-            for lib in &mut libs {
-                lib["scope"] = json!("project");
-            }
-            all_libs.extend(libs);
+        let mut libs = match read_lib_table_checked(&table) {
+            Ok(libs) => libs,
+            Err(msg) => return Ok(CallToolResult::error(msg)),
+        };
+        for lib in &mut libs {
+            lib["scope"] = json!("project");
         }
+        all_libs.extend(libs);
     }
 
     Ok(CallToolResult::text(
@@ -1037,6 +1266,22 @@ async fn handle_list_symbol_libraries(
         }))
         .unwrap(),
     ))
+}
+
+/// Root S-expression element for a lib-table file, decided by its filename:
+/// `sym-lib-table` uses `sym_lib_table`, everything else (`fp-lib-table`)
+/// uses `fp_lib_table`. Credit: first diagnosed in PR #54 (presire) — the
+/// hardcoded `fp_lib_table` scaffold produced symbol tables KiCad rejects.
+fn table_root_element(table_path: &Path) -> &'static str {
+    let is_sym = table_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("sym"));
+    if is_sym {
+        "sym_lib_table"
+    } else {
+        "fp_lib_table"
+    }
 }
 
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
@@ -1050,7 +1295,10 @@ async fn register_in_lib_table(
     let content = if table_path.exists() {
         tokio::fs::read_to_string(table_path).await?
     } else {
-        "(fp_lib_table\n  (version 7)\n)\n".to_string()
+        // The scaffold's root element must match the table kind: a
+        // sym-lib-table created with an (fp_lib_table root is rejected by
+        // KiCad. Decide from the filename, which is fixed by convention.
+        format!("({}\n  (version 7)\n)\n", table_root_element(table_path))
     };
 
     // Check if nickname already registered
@@ -1404,21 +1652,24 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
 ///
 /// Checks the **global** sym-lib-table first, then the **project** table at
 /// `project_dir/sym-lib-table` (if a project dir is supplied). Returns the first
-/// entry whose nickname matches and whose `uri` does not use an unresolved KiCad
-/// env var (`${…}`). Both tables are read with `parse_lib_table`.
+/// entry whose nickname matches and whose URI resolved to a path at all. Both
+/// tables are read with `read_flat_lib_table`, so nested `(type "Table")`
+/// references are followed and `${KICAD*_DIR}` URIs are expanded.
+///
+/// The returned path is *not* guaranteed to exist: `expand_lib_uri` checks
+/// existence only for `${KICAD*_DIR}` expansions, and takes a plain URI as
+/// written. A stale global entry therefore still shadows a working project one
+/// with the same nickname, and the caller's read is what discovers it.
 async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
     let mut tables = vec![global_sym_lib_table()];
     if let Some(pd) = project_dir {
         tables.push(pd.join("sym-lib-table"));
     }
     for table in tables {
-        let Ok(content) = tokio::fs::read_to_string(&table).await else {
-            continue;
-        };
-        for lib in parse_lib_table(&content) {
+        for lib in read_flat_lib_table(&table) {
             if lib["nickname"].as_str() == Some(nick) {
-                if let Some(uri) = lib["uri"].as_str().filter(|u| !u.starts_with("${")) {
-                    return Some(PathBuf::from(uri));
+                if let Some(path) = lib["path"].as_str() {
+                    return Some(PathBuf::from(path));
                 }
             }
         }
@@ -1538,35 +1789,29 @@ async fn handle_search_symbols(
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    // Gather (nickname, uri) entries from the global sym-lib-table and, when a
+    // Gather (nickname, path) entries from the global sym-lib-table and, when a
     // project dir is supplied, the project's own sym-lib-table too — this is
-    // what makes project-attached libraries searchable.
+    // what makes project-attached libraries searchable. Nested `(type "Table")`
+    // references are followed and `${KICAD*_DIR}` URIs expanded, so the
+    // libraries KiCad ships are included.
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut tables = vec![global_sym_lib_table()];
     if let Some(pd) = &project_dir {
         tables.push(pd.join("sym-lib-table"));
     }
     for table in &tables {
-        if !table.exists() {
-            continue;
-        }
-        let Ok(content) = tokio::fs::read_to_string(table).await else {
-            continue;
-        };
-        for lib in parse_lib_table(&content) {
-            if let (Some(nick), Some(uri)) = (lib["nickname"].as_str(), lib["uri"].as_str()) {
-                entries.push((nick.to_string(), uri.to_string()));
+        for lib in read_flat_lib_table(table) {
+            if let (Some(nick), Some(path)) = (lib["nickname"].as_str(), lib["path"].as_str()) {
+                entries.push((nick.to_string(), path.to_string()));
             }
         }
     }
 
     let mut results = Vec::new();
-    'outer: for (nickname, uri) in entries {
-        // Skip KiCad env-var URIs (${KICAD*_SYMBOL_DIR}) — unresolvable here.
-        if uri.starts_with("${") {
-            continue;
-        }
-        let lib_path = PathBuf::from(&uri);
+    // `entries` holds resolved filesystem paths, not the raw uris they came
+    // from — read_flat_lib_table does that expansion now.
+    'outer: for (nickname, resolved) in entries {
+        let lib_path = PathBuf::from(&resolved);
         if !lib_path.exists() {
             continue;
         }
@@ -1635,29 +1880,10 @@ async fn handle_get_footprint_info(
         require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
     // Resolve "Library:Footprint" form via global fp-lib-table
-    let path =
-        if fp_path_str.contains(':') && !fp_path_str.contains('/') && !fp_path_str.contains('\\') {
-            let parts: Vec<&str> = fp_path_str.splitn(2, ':').collect();
-            let (nick, fp_name) = (parts[0], parts[1]);
-            let table = global_fp_lib_table();
-            if table.exists() {
-                let tc = tokio::fs::read_to_string(&table).await?;
-                let libs = parse_lib_table(&tc);
-                if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
-                    let uri = lib["uri"].as_str().unwrap_or("");
-                    PathBuf::from(uri).join(format!("{}.kicad_mod", fp_name))
-                } else {
-                    return Ok(CallToolResult::error(format!(
-                        "Library '{}' not found in fp-lib-table",
-                        nick
-                    )));
-                }
-            } else {
-                return Ok(CallToolResult::error("Global fp-lib-table not found"));
-            }
-        } else {
-            PathBuf::from(fp_path_str)
-        };
+    let path = match resolve_footprint_path(fp_path_str) {
+        Ok(p) => p,
+        Err(msg) => return Ok(CallToolResult::error(msg)),
+    };
 
     let content = tokio::fs::read_to_string(&path).await?;
 
@@ -1704,58 +1930,30 @@ async fn handle_search_footprints(
 
     let mut results = Vec::new();
 
-    if fp_lib_table_path.exists() {
-        let tc = tokio::fs::read_to_string(&fp_lib_table_path).await?;
-
-        // Parse lib entries
-        let mut search = tc.as_str();
-        'outer: while let Some(lib_pos) = search.find("\n  (lib ") {
-            let block_start = lib_pos + 3;
-            let mut depth = 0i32;
-            let mut block_end = block_start;
-            for (i, ch) in search[block_start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            block_end = block_start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
+    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
+        let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
+        let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            let Some(fp_name) = fname_str.strip_suffix(".kicad_mod") else {
+                continue;
+            };
+            if fp_name.to_lowercase().contains(&query) {
+                results.push(json!({
+                    "library": nickname,
+                    "name": fp_name,
+                    "id": format!("{}:{}", nickname, fp_name)
+                }));
+                if results.len() >= limit {
+                    break 'outer;
                 }
             }
-            let block = &search[block_start..block_end];
-            let nickname = extract_sexp_string(block, "name").unwrap_or_default();
-            let uri = extract_sexp_string(block, "uri").unwrap_or_default();
-
-            if !uri.starts_with("${") {
-                let dir = PathBuf::from(uri);
-                if dir.is_dir() {
-                    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
-                        while let Ok(Some(entry)) = rd.next_entry().await {
-                            let fname = entry.file_name();
-                            let fname_str = fname.to_string_lossy();
-                            if fname_str.ends_with(".kicad_mod") {
-                                let fp_name = fname_str.trim_end_matches(".kicad_mod");
-                                if fp_name.to_lowercase().contains(&query) {
-                                    results.push(json!({
-                                        "library": nickname,
-                                        "name": fp_name,
-                                        "id": format!("{}:{}", nickname, fp_name)
-                                    }));
-                                    if results.len() >= limit {
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            search = &search[lib_pos + 1..];
         }
     }
 
@@ -1884,6 +2082,418 @@ mod tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    /// A lib-table in the exact shape KiCad writes it: CRLF-terminated and
+    /// TAB-indented.
+    fn kicad_style_table(kind: &str, entries: &[(&str, &str, &str)]) -> String {
+        let body: String = entries
+            .iter()
+            .map(|(nick, ty, uri)| {
+                format!(
+                    "\t(lib (name \"{nick}\") (type \"{ty}\") (uri \"{uri}\") (options \"\") (descr \"\"))\r\n"
+                )
+            })
+            .collect();
+        format!("({kind}\r\n\t(version 7)\r\n{body})\r\n")
+    }
+
+    /// Serializes tests that set KICAD10_FOOTPRINT_DIR (process-wide env), the
+    /// way `sch_components`' `SYMBOL_DIR_ENV` does for the symbol equivalent.
+    static FOOTPRINT_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `KICAD10_FOOTPRINT_DIR` at `dir` for as long as the returned guard
+    /// lives.
+    ///
+    /// Rust runs tests in threads of one process, so two tests setting this to
+    /// their own tempdir would race. Holding the lock serializes them, and
+    /// restoring the previous value keeps a developer's real KiCad environment
+    /// intact for whatever runs next.
+    fn footprint_dir_env(dir: &Path) -> FootprintDirEnv {
+        let guard = FOOTPRINT_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // var_os, not var: a value this process cannot decode as UTF-8 is still
+        // one the developer set, and `var` would report it as absent, leaving
+        // the restore to silently delete it.
+        let previous = std::env::var_os("KICAD10_FOOTPRINT_DIR");
+        std::env::set_var("KICAD10_FOOTPRINT_DIR", dir);
+        FootprintDirEnv {
+            _guard: guard,
+            previous,
+        }
+    }
+
+    struct FootprintDirEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for FootprintDirEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KICAD10_FOOTPRINT_DIR", v),
+                None => std::env::remove_var("KICAD10_FOOTPRINT_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_footprint_libraries_reads_a_table_kicad_wrote() {
+        // End-to-end regression for the user-visible symptom: on a stock KiCad
+        // 10 install every library listing returned {"count": 0}, which left
+        // place_component unable to resolve any Library:Footprint id. Drive the
+        // real handler with a table in the exact shape KiCad writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyParts.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let table = kicad_style_table(
+            "fp_lib_table",
+            &[("MyParts", "KiCad", &pretty.to_string_lossy())],
+        );
+        assert!(
+            !table.contains("\n  (lib "),
+            "fixture must be in KiCad's tab format, not the old needle's"
+        );
+        std::fs::write(tmp.path().join("fp-lib-table"), table).unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["count"], 1, "library not found: {out}");
+        assert_eq!(out["libraries"][0]["nickname"], "MyParts");
+        assert_eq!(
+            out["libraries"][0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "the resolved directory should be reported alongside the raw uri"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_footprint_libraries_expands_a_nested_table_of_env_var_uris() {
+        // The two things that kept KiCad's ~155 bundled libraries invisible even
+        // once the table parsed: a `(type "Table")` indirection, and entries
+        // addressed as ${KICAD10_FOOTPRINT_DIR}/Foo.pretty.
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped = tmp.path().join("share");
+        let pretty = shipped.join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let _env = footprint_dir_env(&shipped);
+
+        let nested = tmp.path().join("template-fp-lib-table");
+        std::fs::write(
+            &nested,
+            kicad_style_table(
+                "fp_lib_table",
+                &[(
+                    "Resistor_SMD",
+                    "KiCad",
+                    "${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty",
+                )],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("fp-lib-table"),
+            kicad_style_table(
+                "fp_lib_table",
+                &[("KiCad", "Table", &nested.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(out["count"], 1, "nested table not expanded: {out}");
+        assert_eq!(out["libraries"][0]["nickname"], "Resistor_SMD");
+        assert_eq!(
+            out["libraries"][0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "env-var URI should resolve to a real directory"
+        );
+    }
+
+    #[test]
+    fn parse_lib_table_reads_kicad10_crlf_tab_format() {
+        // Regression: parse_lib_table hard-coded the needle `\n  (lib ` (LF +
+        // exactly 2 spaces). KiCad writes these tables CRLF-terminated and
+        // TAB-indented, so the needle never matched and every library listing
+        // came back empty — which in turn made footprint placement unable to
+        // resolve any `Library:Footprint` id.
+        let content = kicad_style_table(
+            "fp_lib_table",
+            &[
+                ("OpenDongle", "KiCad", "/tmp/OpenDongle"),
+                ("wch-antenna", "KiCad", "/tmp/wch.pretty"),
+            ],
+        );
+        assert!(
+            !content.contains("\n  (lib "),
+            "fixture must not contain the old LF/2-space needle"
+        );
+
+        let libs = parse_lib_table(&content);
+        assert_eq!(libs.len(), 2, "parsed: {libs:?}");
+        assert_eq!(libs[0]["nickname"], "OpenDongle");
+        assert_eq!(libs[1]["uri"], "/tmp/wch.pretty");
+    }
+
+    #[test]
+    fn parse_lib_table_still_reads_two_space_indentation() {
+        // konnect's own writer emits two-space indentation; both must work.
+        let content = "(fp_lib_table\n  (version 7)\n  (lib (name \"Local\") (type \"KiCad\") (uri \"/tmp/local.pretty\") (options \"\") (descr \"\"))\n)\n";
+        let libs = parse_lib_table(content);
+        assert_eq!(libs.len(), 1);
+        assert_eq!(libs[0]["nickname"], "Local");
+    }
+
+    #[test]
+    fn flatten_lib_table_follows_nested_table_entries() {
+        // KiCad 10's default global table does not copy the ~155 bundled
+        // libraries; it holds one `(type "Table")` entry pointing at the
+        // template table that KiCad ships. Treating that as a library makes
+        // every bundled library invisible.
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf_dir = tmp.path().join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&leaf_dir).unwrap();
+
+        let nested = tmp.path().join("template-fp-lib-table");
+        std::fs::write(
+            &nested,
+            kicad_style_table(
+                "fp_lib_table",
+                &[("Resistor_SMD", "KiCad", &leaf_dir.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let root = kicad_style_table(
+            "fp_lib_table",
+            &[("KiCad", "Table", &nested.to_string_lossy())],
+        );
+
+        let libs = flatten_lib_table(&root, 0, None);
+        assert_eq!(libs.len(), 1, "nested table not followed: {libs:?}");
+        assert_eq!(libs[0]["nickname"], "Resistor_SMD");
+        assert_eq!(
+            libs[0]["path"].as_str().map(PathBuf::from),
+            Some(leaf_dir),
+            "resolved path missing"
+        );
+    }
+
+    #[test]
+    fn flatten_lib_table_stops_at_a_self_referencing_table() {
+        // A table that points at itself must not recurse forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        std::fs::write(
+            &table,
+            kicad_style_table(
+                "fp_lib_table",
+                &[("Loop", "Table", &table.to_string_lossy())],
+            ),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(flatten_lib_table(&content, 0, None).is_empty());
+    }
+
+    #[test]
+    fn is_lib_id_separates_library_ids_from_paths() {
+        assert!(is_lib_id("Resistor_SMD:R_0402"));
+        assert!(is_lib_id("MyParts:Weird:Name")); // only the first colon splits
+
+        // Paths, by separator.
+        assert!(!is_lib_id(r"C:\KiCad\R.kicad_mod"));
+        assert!(!is_lib_id("/usr/share/kicad/R.kicad_mod"));
+        assert!(!is_lib_id("Resistor_SMD.pretty/R.kicad_mod"));
+        // No colon at all.
+        assert!(!is_lib_id("R_0402.kicad_mod"));
+    }
+
+    #[test]
+    fn a_windows_drive_relative_path_is_not_a_library_id() {
+        // `C:R.kicad_mod` means R.kicad_mod in drive C's current directory. It
+        // has a colon and no separator, so it is shaped exactly like a lib id;
+        // the one-letter prefix is what gives it away.
+        assert!(!is_lib_id("C:R_0402.kicad_mod"));
+        assert!(!is_lib_id("d:board.kicad_mod"));
+        // Two letters is a nickname again — no drive is named "Ab".
+        assert!(is_lib_id("Ab:R_0402"));
+    }
+
+    #[test]
+    fn an_absent_lib_table_is_not_an_error() {
+        // Every caller checks both the global and project tables, and a project
+        // without its own is the normal case.
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("fp-lib-table");
+        assert_eq!(read_lib_table_checked(&absent), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn an_unreadable_lib_table_is_an_error_not_an_empty_list() {
+        // Reading a directory as a file fails with something other than
+        // NotFound on every platform, which is the case that must not be
+        // folded into "0 libraries" — that is the symptom of the very bug this
+        // module fixes.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_as_table = tmp.path().join("fp-lib-table");
+        std::fs::create_dir(&dir_as_table).unwrap();
+
+        let err = read_lib_table_checked(&dir_as_table)
+            .expect_err("a table that exists but cannot be read must be reported");
+        assert!(err.contains("fp-lib-table"), "must name the table: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_footprint_libraries_reports_an_unreadable_table() {
+        // The handler-level half: this used to surface a read error via `?`
+        // before the table read was centralised, and must still.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("fp-lib-table")).unwrap();
+
+        let args = json!({
+            "project": tmp.path().join("board.kicad_pro").to_string_lossy(),
+            "scope": "project",
+        });
+        let res = handle_list_footprint_libraries(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(
+            res.is_error,
+            "an unreadable table must not report zero libraries: {:?}",
+            res.content
+        );
+    }
+
+    #[test]
+    fn a_missing_footprint_path_names_itself() {
+        // Without the existence check the caller's read fails with a bare
+        // "os error 2" that never mentions the file, so the message is the
+        // point of the test.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.kicad_mod");
+        let err = resolve_footprint_path(&missing.to_string_lossy())
+            .expect_err("a nonexistent path must not resolve");
+        assert!(err.contains("nope.kicad_mod"), "must name the file: {err}");
+        assert!(
+            err.contains("Library:Footprint"),
+            "should say what the alternative is: {err}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_a_footprint() {
+        // is_file, not exists — a .pretty directory would otherwise resolve and
+        // fail confusingly at read time.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_footprint_path(&tmp.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn an_existing_footprint_path_resolves_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("R_0805.kicad_mod");
+        std::fs::write(&file, "(footprint \"R_0805\")").unwrap();
+        assert_eq!(
+            resolve_footprint_path(&file.to_string_lossy()).unwrap(),
+            file
+        );
+    }
+
+    #[test]
+    fn expand_lib_uri_expands_a_kicad_env_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("Resistor_SMD.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let _env = footprint_dir_env(tmp.path());
+
+        assert_eq!(
+            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None),
+            Some(pretty)
+        );
+        assert_eq!(
+            expand_lib_uri("/plain/path", None),
+            Some(PathBuf::from("/plain/path")),
+            "a non-variable URI must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn kiprjmod_resolves_against_the_tables_own_directory() {
+        // The default register_footprint_library scope is "project", which
+        // writes ${KIPRJMOD}/… entries — the common case, not an edge (#61
+        // repro case 1 was exactly this).
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyParts.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        std::fs::write(
+            &table,
+            "(fp_lib_table\n\t(version 7)\n\t(lib (name \"MyParts\") (type \"KiCad\") (uri \"${KIPRJMOD}/MyParts.pretty\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let libs = read_lib_table_checked(&table).unwrap();
+        assert_eq!(libs.len(), 1);
+        assert_eq!(
+            libs[0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "a project-scoped ${{KIPRJMOD}} URI must resolve via the table's directory"
+        );
+
+        // Without a project context (direct call, no table), it must not
+        // resolve rather than guess.
+        assert_eq!(expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None), None);
+    }
+
+    #[test]
+    fn table_root_element_matches_the_table_kind() {
+        // Credit: PR #54 — the scaffold was hardcoded to fp_lib_table, so
+        // registering a symbol library on a machine with no global
+        // sym-lib-table wrote a file KiCad rejects.
+        assert_eq!(
+            table_root_element(Path::new("sym-lib-table")),
+            "sym_lib_table"
+        );
+        assert_eq!(
+            table_root_element(Path::new("C:/proj/sym-lib-table")),
+            "sym_lib_table"
+        );
+        assert_eq!(
+            table_root_element(Path::new("fp-lib-table")),
+            "fp_lib_table"
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_a_symbol_library_scaffolds_a_sym_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            content.starts_with("(sym_lib_table"),
+            "scaffold root must match the table kind, got: {content}"
+        );
+        assert!(content.contains("\"MySyms\""));
     }
 
     fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {
