@@ -931,14 +931,14 @@ impl KiCadIpcClient {
             };
         let reference_field = text_field("Reference", reference, y - 1.0, true);
         let value_field = text_field("Value", value, y + 1.0, false);
-        let radians = rotation.to_radians();
         let child_items = pads
             .iter()
             .map(|pad| {
-                let local_x = pad.x;
-                let local_y = pad.y;
-                let board_x = x + local_x * radians.cos() + local_y * radians.sin();
-                let board_y = y - local_x * radians.sin() + local_y * radians.cos();
+                // Canonical KiCAD footprint-local → board transform; see
+                // konnect_sexp::geometry::transform_pad for why the sin terms
+                // are not the textbook rotation matrix (Y axis points down).
+                let (board_x, board_y) =
+                    konnect_sexp::geometry::transform_pad(pad.x, pad.y, x, y, rotation);
                 let mut layers = Vec::new();
                 for name in &pad.layers {
                     match name.as_str() {

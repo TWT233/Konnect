@@ -11,6 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+konnect-sexp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -21,6 +22,3 @@ prost-types.workspace = true
 
 [build-dependencies]
 prost-build = "0.13"
-
-[dev-dependencies]
-konnect-sexp = { path = "../konnect-sexp" }
