@@ -246,6 +246,78 @@ pub fn find_enclosing_block(content: &str, tag: &str, pos: usize) -> Option<(usi
         .find_map(|start| find_balanced_block(content, start).filter(|&(_, end)| end > pos))
 }
 
+/// Byte ranges of the direct child S-expression blocks of the first
+/// `(parent_tag …)` block in `content`.
+///
+/// This is indentation-agnostic and string-aware. It is intended for KiCAD
+/// root files where callers need to distinguish top-level schematic/board
+/// items from nested library definitions or properties.
+pub fn find_direct_child_blocks(content: &str, parent_tag: &str) -> Vec<(usize, usize)> {
+    let Some(parent_start) = find_block_starts(content, parent_tag).into_iter().next() else {
+        return Vec::new();
+    };
+    let Some((_, parent_end)) = find_balanced_block(content, parent_start) else {
+        return Vec::new();
+    };
+
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut i = parent_start;
+
+    while i < parent_end {
+        let b = bytes[i];
+        if escape_next {
+            escape_next = false;
+        } else if in_string {
+            if b == b'\\' {
+                escape_next = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'(' if depth == 1 => {
+                    let Some(range) = find_balanced_block(content, i) else {
+                        break;
+                    };
+                    out.push(range);
+                    i = range.1;
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte range of the direct child of `(parent_tag …)` that encloses `pos`.
+///
+/// Unlike walking backward to a fixed indentation pattern, this cannot fall
+/// back to the root of a tab-indented file and accidentally select the entire
+/// document for deletion.
+pub fn find_enclosing_direct_child_block(
+    content: &str,
+    parent_tag: &str,
+    pos: usize,
+) -> Option<(usize, usize)> {
+    find_direct_child_blocks(content, parent_tag)
+        .into_iter()
+        .find(|&(start, end)| start <= pos && end > pos)
+}
+
 // ─── UUID Generation ─────────────────────────────────────────────────────────
 
 /// Generate a new KiCAD-compatible UUID string.
@@ -359,5 +431,37 @@ mod block_start_tests {
         // Tag that isn't present at all.
         let pos = TABS.find("\"R1\"").unwrap();
         assert!(find_enclosing_block(TABS, "wire", pos).is_none());
+    }
+
+    #[test]
+    fn direct_children_ignore_indentation_and_nested_blocks() {
+        for (label, indent, child_indent) in [("tabs", "\t", "\t\t"), ("spaces", "  ", "    ")] {
+            let content = format!(
+                "(kicad_sch\n{indent}(uuid \"root\")\n{indent}(lib_symbols\n{child_indent}(symbol \"Nested\" (uuid \"nested\"))\n{indent})\n{indent}(wire\n{child_indent}(pts (xy 0 0) (xy 1 0))\n{child_indent}(uuid \"wire\")\n{indent})\n)"
+            );
+            let blocks = find_direct_child_blocks(&content, "kicad_sch");
+            assert_eq!(blocks.len(), 3, "{label}");
+            assert!(
+                blocks
+                    .iter()
+                    .any(|&(start, end)| content[start..end].starts_with("(wire")),
+                "{label}"
+            );
+            assert!(
+                !blocks
+                    .iter()
+                    .any(|&(start, end)| content[start..end].starts_with("(symbol")),
+                "{label}: nested symbol must not be returned as a root child"
+            );
+        }
+    }
+
+    #[test]
+    fn enclosing_direct_child_selects_wire_not_root_or_neighbor() {
+        let content = "(kicad_sch\n\t(uuid \"root\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 1 0))\n\t\t(uuid \"target\")\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)";
+        let pos = content.find("\"target\"").unwrap();
+        let (start, end) = find_enclosing_direct_child_block(content, "kicad_sch", pos).unwrap();
+        assert!(content[start..end].starts_with("(wire"));
+        assert!(!content[start..end].contains("sheet_instances"));
     }
 }
