@@ -9,6 +9,11 @@ name: E2E (real KiCAD)
 # Runs weekly, on release tags, and on demand. Not per-PR: installing KiCAD
 # costs several minutes and the per-PR suite already covers everything that
 # doesn't need a real KiCAD.
+#
+# NOTE: at tag time this runs IN PARALLEL with release.yml and does not gate
+# it — a red E2E next to a published release is advisory signal, not a
+# contradiction (it happened at v0.2.0). Fold into release.yml as a `needs:`
+# if release gating is ever wanted.
 
 on:
   schedule:
@@ -39,8 +44,11 @@ jobs:
         with:
           key: e2e-kicad
 
+      # Pinned: an unpinned install would silently switch what E2E tests the
+      # day KiCAD 11 ships, while metadata.json still declares kicad_version
+      # 10.x. Bump deliberately alongside the supported-version claim.
       - name: Install KiCAD
-        run: choco install kicad --no-progress --yes
+        run: choco install kicad --version=10.0.5 --no-progress --yes
 
       - name: Locate kicad-cli and demos
         id: kicad
@@ -67,11 +75,15 @@ jobs:
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Assemble + schema-validate PCM package
         shell: pwsh
         run: |
-          pip install jsonschema
-          cargo build --release -p konnect
+          python -m pip install jsonschema
+          cargo build --release --locked -p konnect
           ./packaging/build-pcm.ps1 -Version 0.0.0 -BinaryPath target/release/konnect.exe -Platform windows -OutDir dist
           python packaging/validate-pcm.py --zip dist/konnect-pcm-v0.0.0-windows.zip
 
