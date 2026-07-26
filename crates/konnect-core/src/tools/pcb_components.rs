@@ -1917,7 +1917,11 @@ mod tests {
     fn fallback_fixture(dir: &Path) -> std::path::PathBuf {
         let pretty = dir.join("Resistor_SMD.pretty");
         std::fs::create_dir_all(&pretty).unwrap();
-        std::fs::write(pretty.join("R_0805_2012Metric.kicad_mod"), library_footprint()).unwrap();
+        std::fs::write(
+            pretty.join("R_0805_2012Metric.kicad_mod"),
+            library_footprint(),
+        )
+        .unwrap();
         std::fs::write(
             dir.join("fp-lib-table"),
             format!(
@@ -1984,14 +1988,24 @@ mod tests {
             written.contains("(footprint \"Resistor_SMD:R_0805_2012Metric\""),
             "board should carry the Library:Footprint id:\n{written}"
         );
-        assert!(written.contains("(at 50 60 0)"), "placement missing:\n{written}");
-        assert!(written.contains("(property \"Reference\" \"R7\""), "{written}");
+        assert!(
+            written.contains("(at 50 60 0)"),
+            "placement missing:\n{written}"
+        );
+        assert!(
+            written.contains("(property \"Reference\" \"R7\""),
+            "{written}"
+        );
         assert!(
             written.contains("(pad \"1\" smd roundrect"),
             "the full definition must be carried:\n{written}"
         );
         assert!(written.contains("(uuid \""), "board items need a uuid");
-        assert_eq!(count_parens(&written), 0, "board is no longer balanced:\n{written}");
+        assert_eq!(
+            count_parens(&written),
+            0,
+            "board is no longer balanced:\n{written}"
+        );
     }
 
     #[tokio::test]
@@ -2011,7 +2025,10 @@ mod tests {
         let out = std::fs::read_to_string(&board).unwrap();
         assert!(out.contains("(at 10 20 -90)"), "footprint angle:\n{out}");
         assert!(out.contains("(at -0.9125 0 270)"), "pad angle:\n{out}");
-        assert!(out.contains("(at 0 -1.65 90)"), "readable text angle:\n{out}");
+        assert!(
+            out.contains("(at 0 -1.65 90)"),
+            "readable text angle:\n{out}"
+        );
     }
 
     #[tokio::test]
@@ -2070,7 +2087,10 @@ mod tests {
         assert!(!res.is_error, "handler errored: {:?}", res.content);
 
         let out = std::fs::read_to_string(&board).unwrap();
-        assert!(out.contains("(pad \"1\" smd roundrect"), "footprint missing");
+        assert!(
+            out.contains("(pad \"1\" smd roundrect"),
+            "footprint missing"
+        );
         let bare_lf = out
             .match_indices('\n')
             .filter(|(i, _)| *i == 0 || out.as_bytes()[i - 1] != b'\r')
@@ -2098,7 +2118,10 @@ mod tests {
         assert!(!res.is_error, "handler errored: {:?}", res.content);
 
         let out = std::fs::read_to_string(&board).unwrap();
-        assert!(out.contains("(pad \"1\" smd roundrect"), "footprint missing");
+        assert!(
+            out.contains("(pad \"1\" smd roundrect"),
+            "footprint missing"
+        );
         assert!(
             !out.contains('\r'),
             "a CRLF library footprint dragged \\r into an LF board:\n{out:?}"
@@ -2125,8 +2148,7 @@ mod tests {
             while socket.recv().is_ok() {
                 let response = konnect_ipc::gen::kiapi::common::ApiResponse {
                     status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
-                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsBadRequest
-                            as i32,
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsBadRequest as i32,
                         error_message: "mock rejects everything".to_string(),
                     }),
                     header: None,
@@ -2222,7 +2244,10 @@ mod tests {
             "R_0805"
         );
         // An empty declared name is no better than a path.
-        assert_eq!(id_for("/nonexistent/scratch/R_0805.kicad_mod", ""), "R_0805");
+        assert_eq!(
+            id_for("/nonexistent/scratch/R_0805.kicad_mod", ""),
+            "R_0805"
+        );
     }
 
     #[test]
@@ -2265,7 +2290,10 @@ mod tests {
         let out = apply_rotation_to_children(&library_footprint(), -90.0);
         assert!(out.contains("(at -0.9125 0 270)"), "{out}");
         // Position is unchanged; only the angle was added.
-        assert!(!out.contains("(at 0 -0.9125"), "pad position must not rotate");
+        assert!(
+            !out.contains("(at 0 -0.9125"),
+            "pad position must not rotate"
+        );
     }
 
     #[test]

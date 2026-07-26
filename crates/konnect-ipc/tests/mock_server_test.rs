@@ -254,12 +254,12 @@ fn a_rejected_item_is_not_counted_as_created() {
     )]);
 
     let client = KiCadIpcClient::new(&mock.url);
-    let err = client.create_items(vec![any_item()]).unwrap_err().to_string();
+    let err = client
+        .create_items(vec![any_item()])
+        .unwrap_err()
+        .to_string();
 
-    assert!(
-        err.contains("created 0 of 1"),
-        "must report failure: {err}"
-    );
+    assert!(err.contains("created 0 of 1"), "must report failure: {err}");
     // The per-item reason is what makes this diagnosable.
     assert!(
         err.contains("ISC_INVALID_DATA") && err.contains("footprint has no pads"),
@@ -272,7 +272,10 @@ fn an_empty_result_list_still_reports_failure() {
     // KiCAD 10.0's actual behaviour: an empty CreateItemsResponse with IRS_OK.
     let mock = spawn_mock_creating(vec![]);
     let client = KiCadIpcClient::new(&mock.url);
-    let err = client.create_items(vec![any_item()]).unwrap_err().to_string();
+    let err = client
+        .create_items(vec![any_item()])
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("created no items"), "unexpected: {err}");
     assert!(err.contains("no items at all"), "unexpected: {err}");
 }
@@ -457,10 +460,9 @@ fn place_footprint_sends_graphics_children() {
 
     let create = captured.lock().unwrap().take().expect("CreateItems sent");
     assert_eq!(create.items.len(), 1);
-    let footprint = kiapi::board::types::FootprintInstance::decode(
-        create.items[0].value.as_slice(),
-    )
-    .expect("sent item must be a FootprintInstance");
+    let footprint =
+        kiapi::board::types::FootprintInstance::decode(create.items[0].value.as_slice())
+            .expect("sent item must be a FootprintInstance");
     let children = footprint.definition.expect("definition").items;
     let pads_sent = children
         .iter()

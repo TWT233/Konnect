@@ -241,8 +241,9 @@ impl KiCadIpcClient {
             };
 
         socket.dial(&dial_url).map_err(|error| {
-            anyhow::Error::new(TransportUnreachable)
-                .context(format!("Cannot connect to KiCAD IPC at {dial_url}: {error}"))
+            anyhow::Error::new(TransportUnreachable).context(format!(
+                "Cannot connect to KiCAD IPC at {dial_url}: {error}"
+            ))
         })?;
 
         // Send request
@@ -491,10 +492,7 @@ impl KiCadIpcClient {
                     .map(|status| status.error_message.as_str())
                     .filter(|message| !message.is_empty())
                     .unwrap_or("no error message");
-                rejections.push(format!(
-                    "item {index}: {} ({message})",
-                    code.as_str_name()
-                ));
+                rejections.push(format!("item {index}: {} ({message})", code.as_str_name()));
             }
         }
         if created != expected_count {
@@ -1190,8 +1188,9 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = self
-            .build_footprint_item(lib_id, reference, value, pads, graphics, x, y, rotation, layer)?;
+        let item = self.build_footprint_item(
+            lib_id, reference, value, pads, graphics, x, y, rotation, layer,
+        )?;
         self.create_items(vec![item])?;
         let footprints = self.list_footprints()?;
         footprints
@@ -1330,7 +1329,10 @@ fn build_graphic_child(
         } => {
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
-            builders::pack_any(&builders::board_segment(layer, *width, x1, y1, x2, y2), SHAPE)
+            builders::pack_any(
+                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+                SHAPE,
+            )
         }
         IpcGraphicDefinition::Rect {
             start,
@@ -1360,8 +1362,16 @@ fn build_graphic_child(
                 // The Rectangle message is axis-aligned by construction, so a
                 // non-cardinal rotation emits the four rotated corners as a
                 // polygon — the same degradation EDA_SHAPE::Rotate applies.
-                let corners = vec![xf(*start), xf((end.0, start.1)), xf(*end), xf((start.0, end.1))];
-                builders::pack_any(&builders::board_polygon(layer, *width, *filled, &[corners]), SHAPE)
+                let corners = vec![
+                    xf(*start),
+                    xf((end.0, start.1)),
+                    xf(*end),
+                    xf((start.0, end.1)),
+                ];
+                builders::pack_any(
+                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                    SHAPE,
+                )
             }
         }
         IpcGraphicDefinition::Circle {
@@ -1610,11 +1620,19 @@ mod footprint_graphics_tests {
         let texts = texts(&fp);
         assert_eq!(texts.len(), 1);
         let text = texts[0].text.as_ref().unwrap();
-        assert_eq!(texts[0].layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+        assert_eq!(
+            texts[0].layer,
+            kiapi::board::types::BoardLayer::BlFFab as i32
+        );
         assert_eq!(text.position.unwrap().x_nm, 102_000_000);
         assert_eq!(text.position.unwrap().y_nm, 50_000_000);
         assert_eq!(
-            text.attributes.as_ref().unwrap().angle.unwrap().value_degrees,
+            text.attributes
+                .as_ref()
+                .unwrap()
+                .angle
+                .unwrap()
+                .value_degrees,
             90.0
         );
     }
@@ -1700,6 +1718,9 @@ mod footprint_graphics_tests {
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
         // Radius 0.5 mm regardless of rotation.
-        assert_eq!(c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm, 500_000);
+        assert_eq!(
+            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
+            500_000
+        );
     }
 }

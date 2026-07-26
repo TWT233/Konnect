@@ -1132,7 +1132,7 @@ pub(crate) fn resolve_footprint_path(
     let attempted_list = if attempted.is_empty() {
         "no KiCad library directories were found — set KICAD10_FOOTPRINT_DIR for a \
          non-standard install"
-        .to_string()
+            .to_string()
     } else {
         format!(
             "also looked for {}",
