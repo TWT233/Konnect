@@ -861,13 +861,24 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
 /// `${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty`. An exported environment
 /// variable wins; otherwise the variable's kind is inferred from its name and
 /// the known install locations are searched.
-fn expand_lib_uri(uri: &str) -> Option<PathBuf> {
+fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
     };
     let close = rest.find('}')?;
     let var = &rest[..close];
     let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
+
+    // ${KIPRJMOD} is the project directory — resolved from the table's own
+    // location, not the environment: KiCad sets it per open project at
+    // runtime, so an exported value (if any) may belong to a different
+    // project than the table being read. Project-scoped registrations are
+    // the default for register_footprint_library, so this is the common
+    // case for user-registered libraries, not an edge.
+    if var == "KIPRJMOD" {
+        let p = kiprjmod?.join(tail);
+        return p.exists().then_some(p);
+    }
 
     // var_os, not var: `var` treats a non-Unicode value as absent, which would
     // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
@@ -912,7 +923,11 @@ const MAX_LIB_TABLE_DEPTH: usize = 4;
 /// written. The target may be a directory (`.pretty`) or a file
 /// (`.kicad_sym`), so the presence of `path` is not a promise that the library
 /// is readable — only that the URI was understood.
-fn flatten_lib_table(content: &str, depth: usize) -> Vec<serde_json::Value> {
+fn flatten_lib_table(
+    content: &str,
+    depth: usize,
+    kiprjmod: Option<&Path>,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
     for mut entry in parse_lib_table(content) {
@@ -928,14 +943,14 @@ fn flatten_lib_table(content: &str, depth: usize) -> Vec<serde_json::Value> {
                 );
                 continue;
             }
-            match expand_lib_uri(&uri).map(std::fs::read_to_string) {
-                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1)),
+            match expand_lib_uri(&uri, kiprjmod).map(std::fs::read_to_string) {
+                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1, kiprjmod)),
                 _ => tracing::warn!("nested lib-table '{}' could not be read", uri),
             }
             continue;
         }
 
-        if let Some(path) = expand_lib_uri(&uri) {
+        if let Some(path) = expand_lib_uri(&uri, kiprjmod) {
             entry["path"] = json!(path.to_string_lossy());
         }
         out.push(entry);
@@ -956,7 +971,12 @@ fn flatten_lib_table(content: &str, depth: usize) -> Vec<serde_json::Value> {
 /// failure indistinguishable from a regression.
 fn read_lib_table_checked(path: &Path) -> Result<Vec<serde_json::Value>, String> {
     match std::fs::read_to_string(path) {
-        Ok(content) => Ok(flatten_lib_table(&content, 0)),
+        // ${KIPRJMOD} is the directory the project's lib-table lives in, so
+        // the table's own parent IS the correct expansion base for a project
+        // table. For the global table the parent is KiCad's config dir, where
+        // a ${KIPRJMOD} entry would be authoring error to begin with — the
+        // expansion then simply fails its exists() check.
+        Ok(content) => Ok(flatten_lib_table(&content, 0, path.parent())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("Cannot read lib-table {}: {}", path.display(), e)),
     }
@@ -1248,6 +1268,22 @@ async fn handle_list_symbol_libraries(
     ))
 }
 
+/// Root S-expression element for a lib-table file, decided by its filename:
+/// `sym-lib-table` uses `sym_lib_table`, everything else (`fp-lib-table`)
+/// uses `fp_lib_table`. Credit: first diagnosed in PR #54 (presire) — the
+/// hardcoded `fp_lib_table` scaffold produced symbol tables KiCad rejects.
+fn table_root_element(table_path: &Path) -> &'static str {
+    let is_sym = table_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("sym"));
+    if is_sym {
+        "sym_lib_table"
+    } else {
+        "fp_lib_table"
+    }
+}
+
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
 /// Creates the file with minimal scaffolding if it doesn't exist.
 async fn register_in_lib_table(
@@ -1259,7 +1295,10 @@ async fn register_in_lib_table(
     let content = if table_path.exists() {
         tokio::fs::read_to_string(table_path).await?
     } else {
-        "(fp_lib_table\n  (version 7)\n)\n".to_string()
+        // The scaffold's root element must match the table kind: a
+        // sym-lib-table created with an (fp_lib_table root is rejected by
+        // KiCad. Decide from the filename, which is fixed by convention.
+        format!("({}\n  (version 7)\n)\n", table_root_element(table_path))
     };
 
     // Check if nickname already registered
@@ -2245,7 +2284,7 @@ mod tests {
             &[("KiCad", "Table", &nested.to_string_lossy())],
         );
 
-        let libs = flatten_lib_table(&root, 0);
+        let libs = flatten_lib_table(&root, 0, None);
         assert_eq!(libs.len(), 1, "nested table not followed: {libs:?}");
         assert_eq!(libs[0]["nickname"], "Resistor_SMD");
         assert_eq!(
@@ -2270,7 +2309,7 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(&table).unwrap();
-        assert!(flatten_lib_table(&content, 0).is_empty());
+        assert!(flatten_lib_table(&content, 0, None).is_empty());
     }
 
     #[test]
@@ -2385,14 +2424,76 @@ mod tests {
         let _env = footprint_dir_env(tmp.path());
 
         assert_eq!(
-            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty"),
+            expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty", None),
             Some(pretty)
         );
         assert_eq!(
-            expand_lib_uri("/plain/path"),
+            expand_lib_uri("/plain/path", None),
             Some(PathBuf::from("/plain/path")),
             "a non-variable URI must pass through untouched"
         );
+    }
+
+    #[test]
+    fn kiprjmod_resolves_against_the_tables_own_directory() {
+        // The default register_footprint_library scope is "project", which
+        // writes ${KIPRJMOD}/… entries — the common case, not an edge (#61
+        // repro case 1 was exactly this).
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("MyParts.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        std::fs::write(
+            &table,
+            "(fp_lib_table\n\t(version 7)\n\t(lib (name \"MyParts\") (type \"KiCad\") (uri \"${KIPRJMOD}/MyParts.pretty\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let libs = read_lib_table_checked(&table).unwrap();
+        assert_eq!(libs.len(), 1);
+        assert_eq!(
+            libs[0]["path"].as_str().map(PathBuf::from),
+            Some(pretty),
+            "a project-scoped ${{KIPRJMOD}} URI must resolve via the table's directory"
+        );
+
+        // Without a project context (direct call, no table), it must not
+        // resolve rather than guess.
+        assert_eq!(expand_lib_uri("${KIPRJMOD}/MyParts.pretty", None), None);
+    }
+
+    #[test]
+    fn table_root_element_matches_the_table_kind() {
+        // Credit: PR #54 — the scaffold was hardcoded to fp_lib_table, so
+        // registering a symbol library on a machine with no global
+        // sym-lib-table wrote a file KiCad rejects.
+        assert_eq!(
+            table_root_element(Path::new("sym-lib-table")),
+            "sym_lib_table"
+        );
+        assert_eq!(
+            table_root_element(Path::new("C:/proj/sym-lib-table")),
+            "sym_lib_table"
+        );
+        assert_eq!(
+            table_root_element(Path::new("fp-lib-table")),
+            "fp_lib_table"
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_a_symbol_library_scaffolds_a_sym_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            content.starts_with("(sym_lib_table"),
+            "scaffold root must match the table kind, got: {content}"
+        );
+        assert!(content.contains("\"MySyms\""));
     }
 
     fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {

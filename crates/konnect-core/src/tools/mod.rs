@@ -701,6 +701,8 @@ fn kicad_share_roots() -> Vec<std::path::PathBuf> {
             "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
         ));
         roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
+        // Homebrew (Apple Silicon prefix)
+        roots.push(std::path::PathBuf::from("/opt/homebrew/share/kicad"));
         if let Ok(home) = std::env::var("HOME") {
             // Per-user install (KiCad.app dragged into ~/Applications)
             roots.push(
@@ -713,6 +715,22 @@ fn kicad_share_roots() -> Vec<std::path::PathBuf> {
     {
         roots.push(std::path::PathBuf::from("/usr/share/kicad"));
         roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
+        roots.push(std::path::PathBuf::from("/opt/kicad/share/kicad"));
+        // Flatpak: system-wide and per-user installs
+        roots.push(std::path::PathBuf::from(
+            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+        ));
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(
+                std::path::PathBuf::from(&home).join(
+                    ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+                ),
+            );
+        }
+        // Snap
+        roots.push(std::path::PathBuf::from(
+            "/snap/kicad/current/usr/share/kicad",
+        ));
     }
 
     roots.retain(|p| p.is_dir());
