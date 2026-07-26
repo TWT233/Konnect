@@ -350,6 +350,39 @@ fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f
 ///
 /// `Reference` and `Value` properties are excluded — `build_footprint_item`
 /// already carries those as first-class fields.
+/// Footprint-local Reference/Value text anchors from the library source, so
+/// placed parts keep the library's text layout (a synthesized offset put the
+/// Reference on the part's own silkscreen — silk_overlap in live DRC).
+fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
+    let mut placement = konnect_ipc::IpcFieldPlacement::default();
+    let Ok(footprint) = konnect_sexp::parse_sexp(source) else {
+        return placement;
+    };
+    for prop in footprint.find_all("property") {
+        let Some(name) = prop.get(1).and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(at) = prop.find("at") else {
+            continue;
+        };
+        let num = |i: usize| {
+            at.get(i)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        };
+        let (x, y) = (num(1), num(2));
+        let rot = num(3).unwrap_or(0.0);
+        if let (Some(x), Some(y)) = (x, y) {
+            match name {
+                "Reference" => placement.reference_at = Some((x, y, rot)),
+                "Value" => placement.value_at = Some((x, y, rot)),
+                _ => {}
+            }
+        }
+    }
+    placement
+}
+
 fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
@@ -1072,6 +1105,7 @@ async fn handle_place_component(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let fields = extract_field_placement(&prepared);
 
     let value = footprint
         .split_once(':')
@@ -1090,13 +1124,14 @@ async fn handle_place_component(
     let reference_ipc = reference.clone();
     let layer_ipc = layer.clone();
     let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested_board)?;
         c.place_footprint(
+            &requested_board,
             &footprint_ipc,
             &reference_ipc,
             &value,
             &pads,
             &graphics,
+            &fields,
             x,
             y,
             rotation,
@@ -1414,6 +1449,7 @@ async fn handle_place_array(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let fields = extract_field_placement(&source);
 
     let value = footprint
         .split_once(':')
@@ -1470,6 +1506,7 @@ async fn handle_place_array(
                     &value,
                     pads,
                     &graphics,
+                    &fields,
                     *x,
                     *y,
                     0.0,
@@ -1631,12 +1668,16 @@ async fn handle_duplicate_component(
         Ok(graphics) => graphics,
         Err(error) => return Ok(CallToolResult::error(error.to_string())),
     };
+    let fields = extract_field_placement(&prepared);
+    let dup_board = board.clone();
     let fp = ipc!(ctx, args, |c| c.place_footprint(
+        &dup_board,
         &fp_id,
         &ipc_reference,
         &fp_value,
         &pads,
         &graphics,
+        &fields,
         x,
         y,
         fp_rotation,
@@ -2396,5 +2437,35 @@ mod tests {
             board_content,
             "board file must be left untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod field_placement_tests {
+    use super::*;
+
+    #[test]
+    fn field_anchors_come_from_the_library_footprint() {
+        // R_0603-style: Reference above the silk at -1.43, Value below at 1.43.
+        let source = "(footprint \"R_0603\"
+	(property \"Reference\" \"REF**\"
+		(at 0 -1.43 0)
+		(layer \"F.SilkS\")
+	)
+	(property \"Value\" \"R_0603\"
+		(at 0 1.43 0)
+		(layer \"F.Fab\")
+	)
+)";
+        let placement = extract_field_placement(source);
+        assert_eq!(placement.reference_at, Some((0.0, -1.43, 0.0)));
+        assert_eq!(placement.value_at, Some((0.0, 1.43, 0.0)));
+    }
+
+    #[test]
+    fn missing_fields_leave_defaults() {
+        let placement = extract_field_placement("(footprint \"bare\")");
+        assert_eq!(placement.reference_at, None);
+        assert_eq!(placement.value_at, None);
     }
 }

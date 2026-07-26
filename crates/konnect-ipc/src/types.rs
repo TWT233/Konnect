@@ -119,3 +119,15 @@ pub struct IpcBoardExtents {
     pub min: IpcVector2,
     pub max: IpcVector2,
 }
+
+/// Footprint-local placement of the Reference and Value text fields, read
+/// from the library footprint so placed parts keep the library's text
+/// positions. A hardcoded offset put the Reference on top of the part's own
+/// silkscreen (silk_overlap DRC warnings in live verification).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IpcFieldPlacement {
+    /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
+    pub reference_at: Option<(f64, f64, f64)>,
+    /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
+    pub value_at: Option<(f64, f64, f64)>,
+}

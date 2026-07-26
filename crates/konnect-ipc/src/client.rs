@@ -316,31 +316,43 @@ impl KiCadIpcClient {
         })
     }
 
-    /// Fail closed unless the first board targeted by IPC is the requested file.
-    ///
-    /// KiCad may have several boards open, while the item APIs operate on a
-    /// `DocumentSpecifier`. Konnect currently targets the first open PCB, so a
-    /// path-bearing MCP request must verify that choice before mutating it.
-    pub fn ensure_board_is_active(&self, requested: &Path) -> Result<()> {
-        let document = self.get_board_document()?;
-        let active = board_document_path(&document)
-            .context("KiCad returned an open PCB without a board filename")?;
-        if paths_refer_to_same_board(requested, &active) {
-            return Ok(());
+    /// Find the open document matching `requested`, so a path-bearing MCP
+    /// request operates on the board it names — not whichever board happens
+    /// to be first in KiCad's open-document list. Live verification caught
+    /// exactly this: with the user's own project focused and the target
+    /// board open behind it, first-document targeting either fails or, worse,
+    /// would mutate the wrong board.
+    pub fn find_open_board(
+        &self,
+        requested: &Path,
+    ) -> Result<kiapi::common::types::DocumentSpecifier> {
+        let docs = self.get_open_documents()?;
+        if docs.is_empty() {
+            anyhow::bail!("No PCB document is open in KiCAD. Open a board file first.");
+        }
+        let mut open_names = Vec::new();
+        for doc in docs {
+            if let Some(path) = board_document_path(&doc) {
+                if paths_refer_to_same_board(requested, &path) {
+                    return Ok(doc);
+                }
+                open_names.push(path.display().to_string());
+            }
         }
         anyhow::bail!(
-            "requested board '{}' is not the active IPC board '{}'",
+            "requested board '{}' is not open in KiCAD (open boards: {})",
             requested.display(),
-            active.display()
+            open_names.join(", ")
         )
     }
 
+    /// Fail closed unless the requested board is open in the IPC session.
+    pub fn ensure_board_is_active(&self, requested: &Path) -> Result<()> {
+        self.find_open_board(requested).map(|_| ())
+    }
+
     fn make_header(&self) -> Result<kiapi::common::types::ItemHeader> {
-        Ok(kiapi::common::types::ItemHeader {
-            document: Some(self.get_board_document()?),
-            container: None,
-            field_mask: None,
-        })
+        Ok(header_for(self.get_board_document()?))
     }
 
     /// Get all nets on the board.
@@ -371,7 +383,16 @@ impl KiCadIpcClient {
         &self,
         item_type: kiapi::common::types::KiCadObjectType,
     ) -> Result<Vec<prost_types::Any>> {
-        let header = self.make_header()?;
+        self.get_items_in(self.get_board_document()?, item_type)
+    }
+
+    /// As [`Self::get_items`], targeting a specific open document.
+    pub fn get_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_type: kiapi::common::types::KiCadObjectType,
+    ) -> Result<Vec<prost_types::Any>> {
+        let header = header_for(document);
         let cmd = kiapi::common::commands::GetItems {
             header: Some(header),
             types: vec![item_type as i32],
@@ -387,7 +408,18 @@ impl KiCadIpcClient {
 
     /// List all footprints on the board.
     pub fn list_footprints(&self) -> Result<Vec<IpcFootprint>> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        self.list_footprints_in(self.get_board_document()?)
+    }
+
+    /// As [`Self::list_footprints`], targeting a specific open document.
+    pub fn list_footprints_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcFootprint>> {
+        let items = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
         let mut footprints = Vec::new();
         for item in &items {
             if let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
@@ -444,11 +476,20 @@ impl KiCadIpcClient {
     /// KiCad's own per-item reasons. (Outcome semantics follow emolitor's
     /// PR #66.)
     pub fn create_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        self.create_items_in(self.get_board_document()?, items)
+    }
+
+    /// As [`Self::create_items`], targeting a specific open document.
+    pub fn create_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        items: Vec<prost_types::Any>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         let expected_count = items.len();
-        let header = self.make_header()?;
+        let header = header_for(document);
         let cmd = kiapi::common::commands::CreateItems {
             header: Some(header),
             items,
@@ -999,6 +1040,7 @@ impl KiCadIpcClient {
         value: &str,
         pads: &[IpcPadDefinition],
         graphics: &[IpcGraphicDefinition],
+        fields: &IpcFieldPlacement,
         x: f64,
         y: f64,
         rotation: f64,
@@ -1007,18 +1049,24 @@ impl KiCadIpcClient {
         let (library_nickname, entry_name) = lib_id
             .split_once(':')
             .context("footprint identifier must use Library:Footprint syntax")?;
-        let text_field =
-            |name: &str, text: &str, field_y: f64, visible: bool| kiapi::board::types::Field {
+        let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
+            // Field text positions come footprint-local from the library and
+            // are transformed exactly like pads, so the placed part keeps the
+            // library's text layout instead of a synthesized offset that can
+            // sit on the part's own silkscreen.
+            let (fx, fy, frot) = local;
+            let (bx, by) = konnect_sexp::geometry::transform_pad(fx, fy, x, y, rotation);
+            kiapi::board::types::Field {
                 id: None,
                 name: name.to_string(),
                 text: Some(kiapi::board::types::BoardText {
                     id: None,
                     text: Some(kiapi::common::types::Text {
-                        position: Some(crate::builders::vec2(x, field_y)),
+                        position: Some(crate::builders::vec2(bx, by)),
                         attributes: Some(kiapi::common::types::TextAttributes {
                             size: Some(crate::builders::vec2(1.0, 1.0)),
                             angle: Some(kiapi::common::types::Angle {
-                                value_degrees: rotation,
+                                value_degrees: readable_text_angle(rotation + frot),
                             }),
                             ..Default::default()
                         }),
@@ -1034,9 +1082,20 @@ impl KiCadIpcClient {
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                 }),
                 visible,
-            };
-        let reference_field = text_field("Reference", reference, y - 1.0, true);
-        let value_field = text_field("Value", value, y + 1.0, false);
+            }
+        };
+        let reference_field = text_field(
+            "Reference",
+            reference,
+            fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
+            true,
+        );
+        let value_field = text_field(
+            "Value",
+            value,
+            fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
+            false,
+        );
         let mut child_items: Vec<prost_types::Any> = pads
             .iter()
             .map(|pad| {
@@ -1171,28 +1230,34 @@ impl KiCadIpcClient {
     #[allow(clippy::too_many_arguments)]
     pub fn place_footprint(
         &self,
+        board: &Path,
         lib_id: &str,
         reference: &str,
         value: &str,
         pads: &[IpcPadDefinition],
         graphics: &[IpcGraphicDefinition],
+        fields: &IpcFieldPlacement,
         x: f64,
         y: f64,
         rotation: f64,
         layer: &str,
     ) -> Result<IpcFootprint> {
+        // Target the document matching `board`, not whichever board is first
+        // in KiCad's open list — with several boards open, first-document
+        // targeting mutates the wrong one (caught in live verification).
+        let document = self.find_open_board(board)?;
         if self
-            .list_footprints()?
+            .list_footprints_in(document.clone())?
             .iter()
             .any(|footprint| footprint.reference == reference)
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
         let item = self.build_footprint_item(
-            lib_id, reference, value, pads, graphics, x, y, rotation, layer,
+            lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
-        self.create_items(vec![item])?;
-        let footprints = self.list_footprints()?;
+        self.create_items_in(document.clone(), vec![item])?;
+        let footprints = self.list_footprints_in(document)?;
         footprints
             .iter()
             .find(|footprint| footprint.reference == reference)
@@ -1441,6 +1506,16 @@ fn build_graphic_child(
     }
 }
 
+fn header_for(
+    document: kiapi::common::types::DocumentSpecifier,
+) -> kiapi::common::types::ItemHeader {
+    kiapi::common::types::ItemHeader {
+        document: Some(document),
+        container: None,
+        field_mask: None,
+    }
+}
+
 fn board_document_path(document: &kiapi::common::types::DocumentSpecifier) -> Option<PathBuf> {
     use kiapi::common::types::document_specifier::Identifier;
 
@@ -1526,7 +1601,18 @@ mod footprint_graphics_tests {
         // path is never dialed.
         let client = KiCadIpcClient::new("tcp://never-dialed");
         let any = client
-            .build_footprint_item("Lib:Fp", "R1", "R", &[], graphics, x, y, rotation, "F.Cu")
+            .build_footprint_item(
+                "Lib:Fp",
+                "R1",
+                "R",
+                &[],
+                graphics,
+                &crate::types::IpcFieldPlacement::default(),
+                x,
+                y,
+                rotation,
+                "F.Cu",
+            )
             .unwrap();
         kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap()
     }

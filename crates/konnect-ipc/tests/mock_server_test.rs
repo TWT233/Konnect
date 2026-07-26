@@ -445,11 +445,13 @@ fn place_footprint_sends_graphics_children() {
     let client = KiCadIpcClient::new(&mock.url);
     let placed = client
         .place_footprint(
+            std::path::Path::new("test.kicad_pcb"),
             "Resistor_SMD:R_0402",
             "R1",
             "R_0402",
             &pads,
             &graphics,
+            &konnect_ipc::IpcFieldPlacement::default(),
             10.0,
             20.0,
             0.0,
@@ -678,4 +680,117 @@ fn wedged_server_times_out_instead_of_hanging() {
         elapsed >= Duration::from_secs(25) && elapsed < Duration::from_secs(60),
         "expected ~30s recv timeout, got {elapsed:?}"
     );
+}
+
+// ─── Multi-board document targeting ──────────────────────────────────────────
+//
+// Live verification caught this: with the user's own project focused and the
+// target board open behind it, first-document targeting either fails or
+// mutates the wrong board. place_footprint must address the document whose
+// path matches the request.
+
+#[test]
+fn placement_targets_the_named_board_among_several_open() {
+    use std::sync::{Arc, Mutex};
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            let response = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![
+                    doc_for("other-project.kicad_pcb"),
+                    doc_for("target.kicad_pcb"),
+                ],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )));
+        }
+        if message.type_url.ends_with("GetItems") {
+            let request =
+                kiapi::common::commands::GetItems::decode(message.value.as_slice()).unwrap();
+            record_doc(&captured_in_mock, &request.header);
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("CreateItems") {
+            let request =
+                kiapi::common::commands::CreateItems::decode(message.value.as_slice()).unwrap();
+            record_doc(&captured_in_mock, &request.header);
+            // Fail fast after capturing the header; the assertion below is
+            // about WHICH board the create addressed, not the outcome.
+            return Some(kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                    error_message: "stop here".to_string(),
+                }),
+                header: None,
+                message: None,
+            });
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let _ = client.place_footprint(
+        std::path::Path::new("target.kicad_pcb"),
+        "Resistor_SMD:R_0402",
+        "R1",
+        "R_0402",
+        &[],
+        &[],
+        &konnect_ipc::IpcFieldPlacement::default(),
+        10.0,
+        20.0,
+        0.0,
+        "F.Cu",
+    );
+
+    let addressed = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a command carried a document");
+    assert_eq!(
+        addressed, "target.kicad_pcb",
+        "commands must address the requested board, not the first open one"
+    );
+}
+
+fn doc_for(filename: &str) -> kiapi::common::types::DocumentSpecifier {
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        project: None,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                filename.to_string(),
+            ),
+        ),
+    }
+}
+
+fn record_doc(
+    slot: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    header: &Option<kiapi::common::types::ItemHeader>,
+) {
+    if let Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(name)) = header
+        .as_ref()
+        .and_then(|h| h.document.as_ref())
+        .and_then(|d| d.identifier.as_ref())
+    {
+        let mut slot = slot.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(name.clone());
+        }
+    }
 }
