@@ -904,8 +904,12 @@ const MAX_LIB_TABLE_DEPTH: usize = 4;
 /// pointing at the shipped template table. Treating that entry as a library
 /// makes every bundled library invisible, so it is followed here.
 ///
-/// Each returned entry carries the original `uri` plus a resolved `path` when
-/// the URI could be turned into an existing directory.
+/// Each returned entry carries the original `uri` plus a resolved `path`
+/// whenever [`expand_lib_uri`] yields one: a `${KICAD*_DIR}` URI resolves only
+/// if the expansion exists on disk, while a plain URI is passed through as
+/// written. The target may be a directory (`.pretty`) or a file
+/// (`.kicad_sym`), so the presence of `path` is not a promise that the library
+/// is readable — only that the URI was understood.
 fn flatten_lib_table(content: &str, depth: usize) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
@@ -1970,6 +1974,44 @@ mod tests {
         format!("({kind}\r\n\t(version 7)\r\n{body})\r\n")
     }
 
+    /// Serializes tests that set KICAD10_FOOTPRINT_DIR (process-wide env), the
+    /// way `sch_components`' `SYMBOL_DIR_ENV` does for the symbol equivalent.
+    static FOOTPRINT_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point `KICAD10_FOOTPRINT_DIR` at `dir` for as long as the returned guard
+    /// lives.
+    ///
+    /// Rust runs tests in threads of one process, so two tests setting this to
+    /// their own tempdir would race. Holding the lock serializes them, and
+    /// restoring the previous value keeps a developer's real KiCad environment
+    /// intact for whatever runs next.
+    fn footprint_dir_env(dir: &Path) -> FootprintDirEnv {
+        let guard = FOOTPRINT_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // var_os, not var: a value this process cannot decode as UTF-8 is still
+        // one the developer set, and `var` would report it as absent, leaving
+        // the restore to silently delete it.
+        let previous = std::env::var_os("KICAD10_FOOTPRINT_DIR");
+        std::env::set_var("KICAD10_FOOTPRINT_DIR", dir);
+        FootprintDirEnv {
+            _guard: guard,
+            previous,
+        }
+    }
+
+    struct FootprintDirEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for FootprintDirEnv {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KICAD10_FOOTPRINT_DIR", v),
+                None => std::env::remove_var("KICAD10_FOOTPRINT_DIR"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn list_footprint_libraries_reads_a_table_kicad_wrote() {
         // End-to-end regression for the user-visible symptom: on a stock KiCad
@@ -2017,7 +2059,7 @@ mod tests {
         let shipped = tmp.path().join("share");
         let pretty = shipped.join("Resistor_SMD.pretty");
         std::fs::create_dir_all(&pretty).unwrap();
-        std::env::set_var("KICAD10_FOOTPRINT_DIR", &shipped);
+        let _env = footprint_dir_env(&shipped);
 
         let nested = tmp.path().join("template-fp-lib-table");
         std::fs::write(
@@ -2151,7 +2193,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pretty = tmp.path().join("Resistor_SMD.pretty");
         std::fs::create_dir_all(&pretty).unwrap();
-        std::env::set_var("KICAD10_FOOTPRINT_DIR", tmp.path());
+        let _env = footprint_dir_env(tmp.path());
 
         assert_eq!(
             expand_lib_uri("${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty"),
