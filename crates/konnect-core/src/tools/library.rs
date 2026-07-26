@@ -960,7 +960,19 @@ pub(crate) fn resolve_footprint_path(reference: &str) -> Result<PathBuf, String>
     let looks_like_lib_id =
         reference.contains(':') && !reference.contains('/') && !reference.contains('\\');
     if !looks_like_lib_id {
-        return Ok(PathBuf::from(reference));
+        // Check here rather than leaving it to the caller's read: an unchecked
+        // path reaches the reader as a bare io::Error, which surfaces as
+        // "The system cannot find the file specified. (os error 2)" with no
+        // mention of what was being looked for.
+        let path = PathBuf::from(reference);
+        if !path.is_file() {
+            return Err(format!(
+                "Footprint file not found: {}. Pass either a path to a .kicad_mod \
+                 file or a Library:Footprint id (e.g. 'Resistor_SMD:R_0402').",
+                path.display()
+            ));
+        }
+        return Ok(path);
     }
 
     let (nick, fp_name) = reference.split_once(':').expect("checked above");
@@ -2186,6 +2198,41 @@ mod tests {
 
         let content = std::fs::read_to_string(&table).unwrap();
         assert!(flatten_lib_table(&content, 0).is_empty());
+    }
+
+    #[test]
+    fn a_missing_footprint_path_names_itself() {
+        // Without the existence check the caller's read fails with a bare
+        // "os error 2" that never mentions the file, so the message is the
+        // point of the test.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.kicad_mod");
+        let err = resolve_footprint_path(&missing.to_string_lossy())
+            .expect_err("a nonexistent path must not resolve");
+        assert!(err.contains("nope.kicad_mod"), "must name the file: {err}");
+        assert!(
+            err.contains("Library:Footprint"),
+            "should say what the alternative is: {err}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_a_footprint() {
+        // is_file, not exists — a .pretty directory would otherwise resolve and
+        // fail confusingly at read time.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_footprint_path(&tmp.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn an_existing_footprint_path_resolves_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("R_0805.kicad_mod");
+        std::fs::write(&file, "(footprint \"R_0805\")").unwrap();
+        assert_eq!(
+            resolve_footprint_path(&file.to_string_lossy()).unwrap(),
+            file
+        );
     }
 
     #[test]
