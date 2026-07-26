@@ -21,7 +21,7 @@
 
 use crate::SexpError;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── Edit Types ───────────────────────────────────────────────────────────────
 
@@ -89,12 +89,20 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 
 /// Write `content` to `path` atomically with fsync.
 ///
-/// Writes to a `.tmp` sibling file first, then renames. This prevents
+/// Writes to a scratch sibling file first, then renames. This prevents
 /// corrupted writes if the process is killed mid-write. The KiCAD MCP
 /// protocol requires that reads immediately after writes see the new data,
 /// so fsync is mandatory.
+///
+/// The scratch file is a sibling so the rename stays within one filesystem,
+/// where it is atomic; a temp directory elsewhere would silently degrade to a
+/// copy. It is removed if any step fails, so a failed write leaves nothing
+/// behind in the user's project directory.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
-    let tmp_path = path.with_extension("kicad_tmp");
+    let tmp_path = scratch_path_for(path);
+
+    // Remove the scratch file unless the rename below succeeds.
+    let mut cleanup = ScratchGuard(Some(tmp_path.clone()));
 
     {
         let mut f = std::fs::File::create(&tmp_path)?;
@@ -104,7 +112,52 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     }
 
     std::fs::rename(&tmp_path, path)?;
+    cleanup.disarm();
     Ok(())
+}
+
+/// A scratch path in `path`'s directory, unique to this file and this write.
+///
+/// Uniqueness has to cover more than it looks. `with_extension("kicad_tmp")`
+/// *replaces* the extension, so every file in a project collapsed to one
+/// scratch path — `board.kicad_pcb`, `board.kicad_sch` and `board.kicad_pro`
+/// all became `board.kicad_tmp`. Two overlapping writes then shared a scratch
+/// file and could rename each other's half-written bytes over a user's board.
+///
+/// So the name is built from the full file name, and carries a process id and
+/// a per-process counter: the file name separates a project's files, the pid
+/// separates concurrent Konnect processes, and the counter separates
+/// concurrent writes within one process.
+fn scratch_path_for(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".to_string());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{name}.{}.{n}.kicad_tmp", std::process::id()))
+}
+
+/// Removes the scratch file on drop unless disarmed.
+struct ScratchGuard(Option<PathBuf>);
+
+impl ScratchGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            // Already failing; a failure to clean up is not worth masking it.
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 // ─── Balanced-Paren Block Finder ─────────────────────────────────────────────
@@ -359,5 +412,159 @@ mod block_start_tests {
         // Tag that isn't present at all.
         let pos = TABS.find("\"R1\"").unwrap();
         assert!(find_enclosing_block(TABS, "wire", pos).is_none());
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    /// The precondition for the collision, stated without threads.
+    ///
+    /// This is what `with_extension` did, and why every file in a project
+    /// shared one scratch file.
+    #[test]
+    fn a_projects_files_do_not_share_a_scratch_path() {
+        let pcb = scratch_path_for(Path::new("proj/board.kicad_pcb"));
+        let sch = scratch_path_for(Path::new("proj/board.kicad_sch"));
+        let pro = scratch_path_for(Path::new("proj/board.kicad_pro"));
+
+        assert_ne!(pcb, sch);
+        assert_ne!(sch, pro);
+        assert_ne!(pcb, pro);
+
+        // Demonstrates the old derivation collapsing them, so the test says
+        // what it is guarding against.
+        assert_eq!(
+            Path::new("proj/board.kicad_pcb").with_extension("kicad_tmp"),
+            Path::new("proj/board.kicad_sch").with_extension("kicad_tmp"),
+        );
+    }
+
+    #[test]
+    fn repeated_writes_to_one_file_get_distinct_scratch_paths() {
+        let p = Path::new("proj/board.kicad_pcb");
+        assert_ne!(scratch_path_for(p), scratch_path_for(p));
+    }
+
+    #[test]
+    fn the_scratch_file_is_a_sibling_of_its_destination() {
+        // A rename across filesystems is not atomic, so the scratch file has
+        // to live beside the destination rather than in a temp dir.
+        let p = Path::new("proj/nested/board.kicad_pcb");
+        assert_eq!(scratch_path_for(p).parent(), p.parent());
+    }
+
+    #[test]
+    fn a_bare_filename_lands_in_the_current_directory() {
+        assert_eq!(
+            scratch_path_for(Path::new("board.kicad_pcb")).parent(),
+            Some(Path::new(""))
+        );
+    }
+
+    #[test]
+    fn a_successful_write_leaves_no_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        write_atomic(&path, "(kicad_pcb)").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "(kicad_pcb)");
+        assert!(
+            !leftover_scratch_files(dir.path()),
+            "scratch file left behind after a successful write"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_scratch_file() {
+        // Renaming onto an existing directory fails on every platform, which
+        // exercises the path where the scratch file is already written.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("board.kicad_pcb");
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(write_atomic(&blocked, "(kicad_pcb)").is_err());
+        assert!(
+            !leftover_scratch_files(dir.path()),
+            "a failed write must not litter the project directory"
+        );
+    }
+
+    fn leftover_scratch_files(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|e| {
+            e.unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "kicad_tmp")
+        })
+    }
+
+    /// The bug itself: concurrent writers must never mix their content.
+    ///
+    /// Every writer sends a distinct byte repeated far past a page, so any
+    /// interleaving is visible as a file that is not uniformly one byte. With
+    /// a shared scratch path this fails; with one per writer it cannot, since
+    /// each rename publishes a file no other writer ever touched.
+    #[test]
+    fn concurrent_writers_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, "seed").unwrap();
+
+        let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+        std::thread::scope(|s| {
+            for b in bytes {
+                let path = path.clone();
+                s.spawn(move || {
+                    let content = String::from_utf8(vec![b; 400_000]).unwrap();
+                    for _ in 0..10 {
+                        write_atomic(&path, &content).unwrap();
+                    }
+                });
+            }
+        });
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out.len(), 400_000, "file is not one writer's full content");
+        let first = out.as_bytes()[0];
+        assert!(
+            out.bytes().all(|b| b == first),
+            "content from two writers was mixed into one file"
+        );
+        assert!(!leftover_scratch_files(dir.path()));
+    }
+
+    /// The project-layout case from the issue: a schematic and a board written
+    /// at the same time must not land on each other.
+    #[test]
+    fn a_schematic_and_a_board_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let pcb = dir.path().join("board.kicad_pcb");
+        let sch = dir.path().join("board.kicad_sch");
+
+        let pcb_content = "(kicad_pcb)".repeat(30_000);
+        let sch_content = "(kicad_sch)".repeat(30_000);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let (p, c) = (pcb.clone(), pcb_content.clone());
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        write_atomic(&p, &c).unwrap();
+                    }
+                });
+                let (p, c) = (sch.clone(), sch_content.clone());
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        write_atomic(&p, &c).unwrap();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(std::fs::read_to_string(&pcb).unwrap(), pcb_content);
+        assert_eq!(std::fs::read_to_string(&sch).unwrap(), sch_content);
+        assert!(!leftover_scratch_files(dir.path()));
     }
 }
