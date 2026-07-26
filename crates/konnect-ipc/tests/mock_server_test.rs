@@ -29,13 +29,17 @@ where
     };
     let url = format!("tcp://127.0.0.1:{port}");
 
-    let listen_url = url.clone();
+    // Listen BEFORE returning (and before the receive thread spawns): the
+    // client dials the moment spawn_mock returns, and NNG's dial fails
+    // immediately with Connection refused if nothing is bound yet. Doing the
+    // listen inside the thread raced the caller — flaky on slow CI runners.
+    let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+    socket
+        .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
+        .unwrap();
+    socket.listen(&url).expect("mock listen");
+
     let thread = std::thread::spawn(move || {
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
-            .unwrap();
-        socket.listen(&listen_url).expect("mock listen");
         while let Ok(msg) = socket.recv() {
             let request = match kiapi::common::ApiRequest::decode(msg.as_slice()) {
                 Ok(r) => r,
