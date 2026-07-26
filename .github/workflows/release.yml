@@ -194,7 +194,7 @@ jobs:
 
       # Gate: the package must declare the platform it carries, and the bundled
       # binary must actually be that platform's executable format.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 

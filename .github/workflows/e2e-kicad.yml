@@ -75,7 +75,7 @@ jobs:
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
