@@ -175,8 +175,27 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
         } else if msg.type_url.ends_with("UpdateItems") {
             let update =
                 kiapi::common::commands::UpdateItems::decode(msg.value.as_slice()).unwrap();
+            let updated_items = update
+                .items
+                .iter()
+                .cloned()
+                .map(|item| kiapi::common::commands::ItemUpdateResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: Some(item),
+                })
+                .collect();
             *captured_in_mock.lock().unwrap() = Some(update);
-            Some(ok_response())
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::UpdateItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    updated_items,
+                },
+                "kiapi.common.commands.UpdateItemsResponse",
+            )))
         } else {
             Some(ok_response())
         }
