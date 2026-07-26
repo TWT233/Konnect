@@ -129,17 +129,27 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 /// separates concurrent Konnect processes, and the counter separates
 /// concurrent writes within one process.
 fn scratch_path_for(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let name = path
+    // Built as an OsString rather than through to_string_lossy: a file name is
+    // arbitrary bytes on Unix and arbitrary UTF-16 on Windows, neither of which
+    // is guaranteed to be valid Unicode, and lossy conversion would rewrite the
+    // invalid parts to U+FFFD. Uniqueness does not depend on this — the pid and
+    // counter carry that on their own, so two names that differ only in bytes
+    // lossy conversion would flatten still get separate scratch files either
+    // way — but a scratch file left by a killed process should be traceable to
+    // the file it belonged to.
+    let mut name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unnamed".to_string());
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| OsString::from("unnamed"));
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".{}.{n}.kicad_tmp", std::process::id()));
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!("{name}.{}.{n}.kicad_tmp", std::process::id()))
+    dir.join(name)
 }
 
 /// Removes the scratch file on drop unless disarmed.
@@ -445,6 +455,82 @@ mod atomic_write_tests {
     fn repeated_writes_to_one_file_get_distinct_scratch_paths() {
         let p = Path::new("proj/board.kicad_pcb");
         assert_ne!(scratch_path_for(p), scratch_path_for(p));
+    }
+
+    /// Uniqueness comes from the pid and counter, not from the file name.
+    ///
+    /// Worth stating outright: names that are *identical*, let alone names that
+    /// merely look alike after some lossy transform, cannot collide. Anything
+    /// the name contributes is for legibility.
+    #[test]
+    fn identical_names_in_one_directory_still_get_distinct_scratch_paths() {
+        let p = Path::new("proj/board.kicad_pcb");
+        let paths: Vec<_> = (0..64).map(|_| scratch_path_for(p)).collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "scratch paths repeated");
+    }
+
+    /// The file name reaches the scratch name byte-for-byte.
+    ///
+    /// A name is arbitrary bytes on Unix and arbitrary UTF-16 on Windows;
+    /// neither is guaranteed to be valid Unicode. Going through a lossy string
+    /// conversion would rewrite the invalid parts to U+FFFD, leaving a scratch
+    /// file that cannot be traced back to the file it belonged to.
+    #[test]
+    fn a_non_unicode_file_name_survives_intact() {
+        let name = non_unicode_name();
+        let path = Path::new("proj").join(&name);
+
+        // Sanity: the fixture has to be genuinely non-Unicode, or this test
+        // proves nothing. A lossy round-trip must change it.
+        let lossy = std::ffi::OsString::from(name.to_string_lossy().into_owned());
+        assert_ne!(
+            os_bytes(&name),
+            os_bytes(&lossy),
+            "fixture is valid Unicode, so it cannot demonstrate anything"
+        );
+
+        let scratch = scratch_path_for(&path);
+        let scratch_name = scratch.file_name().unwrap().to_os_string();
+        let bytes = os_bytes(&scratch_name);
+
+        assert!(
+            bytes.starts_with(&os_bytes(&name)),
+            "the original name was not preserved: {scratch_name:?}"
+        );
+        assert!(
+            !bytes.starts_with(&os_bytes(&lossy)),
+            "the name went through a lossy conversion: {scratch_name:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_name() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        // 0xFF is never valid UTF-8.
+        std::ffi::OsString::from_vec(b"board\xFF.kicad_pcb".to_vec())
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_name() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired high surrogate is never valid UTF-16.
+        let mut units: Vec<u16> = "board".encode_utf16().collect();
+        units.push(0xD800);
+        units.extend(".kicad_pcb".encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    }
+
+    #[cfg(unix)]
+    fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+
+    #[cfg(windows)]
+    fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt;
+        s.encode_wide().flat_map(u16::to_le_bytes).collect()
     }
 
     #[test]
