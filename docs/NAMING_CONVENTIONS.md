@@ -12,7 +12,7 @@ Use the official spelling in prose, comments, errors, and UI text:
 | Use | Do not introduce | Notes |
 |---|---|---|
 | `Konnect` | `konnect` as a product name | Lowercase remains correct for binaries, crates, commands, and paths. |
-| `KiCad` | `KiCAD`, `Kicad` | Preserve legacy spellings only in external identifiers or historical repository names. |
+| `KiCad` | `KiCAD`, `Kicad` | Applies to NEW prose only — the existing codebase uses `KiCAD` widely (~400 occurrences) and is not to be mass-renamed; match surrounding style when editing existing text. |
 | `MCP` | `Mcp` in prose | Rust type names use `Mcp`, for example `McpHandler`. |
 | `IPC` | `Ipc` in prose | Rust type names use `Ipc`, for example `KiCadIpcClient`. |
 | `PCB`, `ERC`, `DRC`, `BOM` | mixed-case variants in prose | Rust identifiers treat each acronym as a word. |

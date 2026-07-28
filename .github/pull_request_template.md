@@ -21,9 +21,10 @@ Write "No public compatibility impact" when applicable.
 <!-- Paste the exact commands and results. Note environment-dependent checks not run and why. -->
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo test --locked --workspace --all-targets`
-- [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings`
-- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps`
+- [ ] `cargo test --workspace --locked --lib --tests` (what CI runs)
+- [ ] `cargo test --workspace --locked --doc`
+- [ ] `cargo clippy --workspace --locked -- -D warnings`
+- [ ] `cargo fmt --all -- --check`
 - [ ] Relevant viewer, plugin, packaging, and real-KiCad checks
 
 ## Review checklist
@@ -33,4 +34,4 @@ Write "No public compatibility impact" when applicable.
 - [ ] New behavior and failure paths have regression coverage.
 - [ ] File mutations are atomic and preserve unrelated content.
 - [ ] IPC mutations verify the requested board and do not leave partial batches.
-- [ ] Tool counts, `tool-directory.md`, user docs, and examples are updated where applicable.
+- [ ] If tools were added/removed: counts and docs updated per CONTRIBUTING.md (registry `tool_count`, `tool-directory.md`, DEV.md stats, README count).
