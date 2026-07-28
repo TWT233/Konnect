@@ -21,6 +21,21 @@ struct HttpServer {
 
 impl HttpServer {
     fn spawn() -> Self {
+        // The probed port can be taken between the probe and the child's own
+        // bind (TOCTOU) — same race that made the konnect-ipc mocks flaky on
+        // CI. The child needs a real TCP port (separate process, no inproc
+        // option), so handle the race by retrying on a fresh port instead.
+        let mut last_err = String::new();
+        for _ in 0..5 {
+            match Self::try_spawn() {
+                Ok(server) => return server,
+                Err(e) => last_err = e,
+            }
+        }
+        panic!("server never became ready: {last_err}");
+    }
+
+    fn try_spawn() -> Result<Self, String> {
         // Pick a free port by binding then dropping a listener.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -41,26 +56,28 @@ impl HttpServer {
             .spawn()
             .expect("failed to spawn konnect binary");
 
-        let server = HttpServer {
+        let mut server = HttpServer {
             child,
             addr,
             _config: config,
         };
-        server.wait_ready();
-        server
-    }
-
-    fn wait_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
-            if let Ok((status, _, body)) = self.raw_request("GET", "/health", &[], None) {
+            if let Ok((status, _, body)) = server.raw_request("GET", "/health", &[], None) {
                 if status == 200 && body == "ok" {
-                    return;
+                    return Ok(server);
                 }
+            }
+            // Child already gone: its bind lost the port race (or it crashed).
+            if let Ok(Some(status)) = server.child.try_wait() {
+                return Err(format!(
+                    "server exited ({status}) before becoming ready on {}",
+                    server.addr
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("server did not become ready on {}", self.addr);
+        Err(format!("server did not become ready on {}", server.addr))
     }
 
     /// Minimal HTTP/1.1 request. Returns (status, headers, body).
