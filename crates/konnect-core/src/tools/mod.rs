@@ -625,8 +625,13 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
         return true;
     }
 
-    // Resolve the symbol from KiCAD libraries
-    let sym_def = match resolve_lib_symbol(lib_id) {
+    // Resolve the symbol from KiCAD libraries. Prefer the flattened resolver:
+    // derived symbols ((extends "Parent")) must be embedded with the parent's
+    // units copied in, not as a stub kicad-cli can't netlist (#35). Fall back
+    // to the local raw resolver for parity with the pre-flattening behavior.
+    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
+        .or_else(|| resolve_lib_symbol(lib_id))
+    {
         Some(s) => s,
         None => return false,
     };

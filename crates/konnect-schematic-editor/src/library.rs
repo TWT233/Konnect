@@ -97,10 +97,146 @@ pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
     parser::parse(&raw).ok()
 }
 
+/// Resolve a lib_id to a parsed tree with any `(extends "Parent")` chain
+/// FLATTENED, the way eeschema itself saves derived symbols (#35):
+///
+/// - the parent chain's unit sub-symbols are deep-copied into the child,
+///   renamed `Parent_N_M` → `Derived_N_M`;
+/// - parent properties and attribute nodes (pin_numbers, pin_names, in_bom,
+///   …) are inherited unless the child overrides them;
+/// - the `(extends …)` marker is dropped.
+///
+/// An extends STUB embed (child + separately embedded parent) is a shape
+/// kicad-cli cannot resolve — the netlist gets a pinless libpart — and one
+/// eeschema never writes. A missing/broken parent stops the walk gracefully,
+/// returning the partially flattened child.
+pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
+    let mut node = resolve_lib_symbol_node(lib_id)?;
+    let child_base = lib_id.split_once(':')?.1.to_string();
+
+    let mut parent_id = node.get_value("extends").map(str::to_string);
+    if parent_id.is_none() {
+        return Some(node); // not derived: nothing to flatten
+    }
+    if let SexpNode::List(children) = &mut node {
+        children.retain(|c| c.tag() != Some("extends"));
+    }
+
+    let mut visited: std::collections::HashSet<String> =
+        std::collections::HashSet::from([lib_id.to_string()]);
+    while let Some(pid) = parent_id {
+        if !visited.insert(pid.clone()) {
+            break; // cyclic extends: stop, keep what we have
+        }
+        let Some(parent) = resolve_lib_symbol_node(&pid) else {
+            break; // broken library (dangling parent): keep what we have
+        };
+        let parent_base = pid
+            .split_once(':')
+            .map_or(pid.as_str(), |x| x.1)
+            .to_string();
+        merge_parent_into_child(&mut node, &parent, &parent_base, &child_base);
+        parent_id = parent.get_value("extends").map(str::to_string);
+    }
+    Some(node)
+}
+
+/// Serialized form of [`resolve_lib_symbol_flattened_node`], for callers that
+/// splice raw text into a schematic's `lib_symbols` section.
+pub fn resolve_lib_symbol_flattened(lib_id: &str) -> Option<String> {
+    resolve_lib_symbol_flattened_node(lib_id).map(|n| crate::sexp::writer::write(&n))
+}
+
+/// Copy one parent level into a derived symbol: unit sub-symbols renamed to
+/// the child's base name, plus properties / attribute nodes the child does
+/// not define itself (most-derived wins, matching eeschema's inheritance).
+fn merge_parent_into_child(
+    child: &mut SexpNode,
+    parent: &SexpNode,
+    parent_base: &str,
+    child_base: &str,
+) {
+    let child_subs: std::collections::HashSet<String> = child
+        .find_all("symbol")
+        .iter()
+        .filter_map(|s| s.value())
+        .map(String::from)
+        .collect();
+    let child_props: std::collections::HashSet<String> = child
+        .find_all("property")
+        .iter()
+        .filter_map(|p| p.value())
+        .map(String::from)
+        .collect();
+
+    let mut inherited: Vec<SexpNode> = Vec::new();
+    for item in parent.args() {
+        match item.tag() {
+            Some("symbol") => {
+                let Some(name) = item.value() else { continue };
+                let Some(suffix) = unit_suffix_of(name, parent_base) else {
+                    continue;
+                };
+                let new_name = format!("{child_base}{suffix}");
+                if child_subs.contains(&new_name) {
+                    continue; // child overrides this unit's drawing
+                }
+                let mut cloned = item.clone();
+                if let SexpNode::List(c) = &mut cloned {
+                    if c.len() >= 2 {
+                        c[1] = SexpNode::Str(new_name);
+                    }
+                }
+                inherited.push(cloned);
+            }
+            Some("property") => {
+                let Some(key) = item.value() else { continue };
+                if !child_props.contains(key) {
+                    inherited.push(item.clone());
+                }
+            }
+            // extends handled by the caller's chain walk.
+            Some("extends") | None => {}
+            // Attribute-style nodes (pin_numbers, pin_names, in_bom,
+            // on_board, exclude_from_sim, …): inherit unless overridden.
+            Some(tag) => {
+                if child.find(tag).is_none() {
+                    inherited.push(item.clone());
+                }
+            }
+        }
+    }
+    if let SexpNode::List(c) = child {
+        c.extend(inherited);
+    }
+}
+
+/// The `_N_M` unit suffix of `name` given its base (e.g. `LM2904_1_1` with
+/// base `LM2904` → `_1_1`). `None` unless the remainder is exactly two
+/// `_`-separated integers.
+fn unit_suffix_of<'a>(name: &'a str, base: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(base)?;
+    let mut it = rest.rsplitn(3, '_');
+    let style = it.next()?;
+    let unit = it.next()?;
+    let lead = it.next()?;
+    (lead.is_empty()
+        && !style.is_empty()
+        && !unit.is_empty()
+        && style.bytes().all(|b| b.is_ascii_digit())
+        && unit.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(rest)
+}
+
 /// Ensure a library symbol definition is present in the schematic's lib_symbols section.
 /// If the symbol is already present (by name), does nothing.
 /// If the lib_symbols node doesn't exist in raw_other, creates one.
-/// Handles `(extends "ParentName")` — automatically embeds the parent symbol too.
+///
+/// Derived symbols (`(extends "Parent")`) are embedded FLATTENED — parent
+/// units deep-copied and renamed, no extends stub — the way eeschema saves
+/// them. The stub-plus-parent shape this used to write is unresolvable by
+/// kicad-cli: its netlist showed a pinless libpart for every derived symbol
+/// (#35).
 ///
 /// Returns `false` when `lib_id` cannot be resolved from the installed
 /// libraries — callers MUST surface that as an error: a symbol instance
@@ -122,30 +258,8 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
         return true;
     }
 
-    // Resolve the symbol's raw text to check for (extends "ParentName")
-    let sym_raw = match resolve_lib_symbol(lib_id) {
-        Some(r) => r,
-        None => return false,
-    };
-
-    // Check for (extends "ParentName") and resolve the parent too.
-    // Note: sym_raw already has prefixed names (e.g. extends "MCU_Microchip_ATmega:ATmega48PV-10A")
-    // so we use the prefixed parent name directly as the lib_id for the recursive call.
-    if let Some(extends_pos) = sym_raw.find("(extends \"") {
-        let after = &sym_raw[extends_pos + 10..];
-        if let Some(end) = after.find('"') {
-            let parent_lib_id = &after[..end]; // Already has library prefix
-            if parent_lib_id.contains(':') {
-                // The child resolved, so its parent lives in the same library
-                // file; a failure here would be a broken library, not a bad
-                // lib_id from the caller.
-                let _ = ensure_lib_symbol(schematic, parent_lib_id);
-            }
-        }
-    }
-
-    // Now resolve and embed the symbol itself
-    let sym_node = match resolve_lib_symbol_node(lib_id) {
+    // Resolve and embed the symbol, flattening any extends chain.
+    let sym_node = match resolve_lib_symbol_flattened_node(lib_id) {
         Some(n) => n,
         None => return false,
     };
@@ -471,6 +585,68 @@ mod suggestion_tests {
         assert_eq!(ranked.len().min(2), ranked.len(), "limit respected");
         assert_eq!(ranked[0], "R_Potentiometer_Trim");
         assert!(!ranked.contains(&"Fuse".to_string()));
+    }
+
+    #[test]
+    fn ensure_lib_symbol_flattens_extends_chain() {
+        // NE5532-style derived symbol: (extends "LM2904"), no drawing of its
+        // own. The embed must copy the parent's unit sub-symbols renamed to
+        // the derived name and drop the extends marker — the old stub+parent
+        // shape produced a pinless libpart in kicad-cli's netlist (#35).
+        let libdir = tempfile::tempdir().unwrap();
+        let symdir = libdir.path().join("Amp.kicad_symdir");
+        std::fs::create_dir_all(&symdir).unwrap();
+        std::fs::write(
+            symdir.join("LM2904.kicad_sym"),
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"LM2904\"\n\t\t(pin_names (offset 0.127))\n\t\t(in_bom yes)\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"LM2904\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"lm2904.pdf\" (at 0 0 0))\n\t\t(symbol \"LM2904_1_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t\t(symbol \"LM2904_2_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"7\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            symdir.join("NE5532.kicad_sym"),
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"NE5532\"\n\t\t(extends \"LM2904\")\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"NE5532\" (at 0 0 0))\n\t)\n)\n",
+        )
+        .unwrap();
+        std::env::set_var("KICAD10_SYMBOL_DIR", libdir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flat.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"test\")\n\t(lib_symbols\n\t)\n)\n",
+        )
+        .unwrap();
+        let mut sch = Schematic::load(&path).unwrap();
+        assert!(ensure_lib_symbol(&mut sch, "Amp:NE5532"));
+        sch.overwrite().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            out.contains("(symbol \"Amp:NE5532\""),
+            "derived symbol embedded:\n{out}"
+        );
+        assert!(
+            out.contains("(symbol \"NE5532_1_1\"") && out.contains("(symbol \"NE5532_2_1\""),
+            "parent units must be copied in, renamed to the derived base:\n{out}"
+        );
+        assert!(
+            !out.contains("(extends"),
+            "no extends stub may remain:\n{out}"
+        );
+        assert!(
+            !out.contains("(symbol \"Amp:LM2904\""),
+            "the parent must not be embedded separately:\n{out}"
+        );
+        assert!(
+            out.contains("\"NE5532\""),
+            "the child's own Value wins:\n{out}"
+        );
+        assert!(
+            out.contains("lm2904.pdf"),
+            "properties the child lacks are inherited:\n{out}"
+        );
+        // Pins from both units present exactly once.
+        assert_eq!(out.matches("(number \"1\"").count(), 1);
+        assert_eq!(out.matches("(number \"7\"").count(), 1);
     }
 
     #[test]
