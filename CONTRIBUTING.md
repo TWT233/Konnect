@@ -8,6 +8,10 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
   out of scope).
 - For anything non-trivial, open an issue first so we can agree on the approach before
   you invest time.
+- Keep each pull request focused on one reviewable outcome. Split unrelated platform,
+  protocol, feature, and documentation changes into a short PR series.
+- Read [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md) before adding public
+  tools, schema fields, CLI options, environment variables, or user-facing terms.
 
 ## Development setup
 
@@ -23,11 +27,29 @@ cargo build --release -p konnect
 See [DEV.md](DEV.md) for the architecture guide, tool conventions, and how to add a
 new tool.
 
+## Pull request shape
+
+Use an imperative title such as `fix(schematic): preserve tab-indented wire blocks`.
+The description should state:
+
+1. the user-visible problem and scope;
+2. the root cause and chosen design;
+3. compatibility or migration effects;
+4. tests run, including intentionally skipped environment-dependent checks;
+5. risk and rollback notes for file formats, IPC, packaging, or release changes.
+
+Treat MCP tools, schema fields, CLI flags, environment variables, config keys, and
+documented paths as public API. Preserve compatibility or provide an explicit
+migration. Keep generated artifacts, personal settings, downloaded catalogs, build
+output, and unrelated cleanup out of the diff.
+
 ## Pull request checklist
 
 - `cargo test --workspace --lib --tests` passes
 - `cargo clippy --workspace -- -D warnings` is clean
 - `cargo fmt --all` applied
+- New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
+  changes include compatibility handling and migration notes
 - If you added or removed tools: update `tool_count` in `router/registry.rs` and
   regenerate the matching section of `tool-directory.md`
 

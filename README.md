@@ -20,7 +20,8 @@ that teach Claude KiCAD conventions out of the box.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
-> see [CONTRIBUTING.md](CONTRIBUTING.md).
+> see [CONTRIBUTING.md](CONTRIBUTING.md) and the
+> [naming conventions](docs/NAMING_CONVENTIONS.md).
 
 ## Why Konnect exists
 
