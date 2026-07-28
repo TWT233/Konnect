@@ -170,6 +170,15 @@ fn default_stroke_fill() -> Vec<SexpNode> {
     ]
 }
 
+fn property_at(x: f64, y: f64) -> SexpNode {
+    SexpNode::List(vec![
+        atom("at"),
+        atom(fmt_f64(x)),
+        atom(fmt_f64(y)),
+        atom("0"),
+    ])
+}
+
 impl Sheet {
     pub fn new(
         name: impl Into<String>,
@@ -179,16 +188,22 @@ impl Sheet {
         width: f64,
         height: f64,
     ) -> Self {
+        // Property (at …) is absolute sheet coords. Bare Property::new writes
+        // no (at); KiCad then defaults to (0,0) and Sheetname/Sheetfile pile
+        // up in the top-left. Offsets match what eeschema writes for a new
+        // hierarchical sheet (name just above the box, file just below).
+        let mut sheetname = Property::new("Sheetname", name);
+        sheetname.sub_nodes.push(property_at(x, y - 0.8));
+        let mut sheetfile = Property::new("Sheetfile", file);
+        sheetfile.sub_nodes.push(property_at(x, y + height + 0.4));
+
         Sheet {
             at: At::new(x, y),
             width,
             height,
             uuid: uuid::Uuid::new_v4().to_string(),
             fields_autoplaced: true,
-            properties: vec![
-                Property::new("Sheetname", name),
-                Property::new("Sheetfile", file),
-            ],
+            properties: vec![sheetname, sheetfile],
             pins: vec![],
             instances: vec![],
             raw_sub_nodes: default_stroke_fill(),
@@ -500,6 +515,23 @@ mod tests {
         assert!(sheet.pins.is_empty());
         assert!(sheet.instances.is_empty());
         assert!(!sheet.uuid.is_empty());
+    }
+
+    #[test]
+    fn new_sheet_places_name_and_file_near_the_box() {
+        // Bare properties with no (at) default to sheet origin in KiCad — the
+        // same class of bug as power-symbol #PWR stacking in the top-left.
+        let sheet = Sheet::new("Storage", "storage.kicad_sch", 100.0, 50.0, 40.0, 30.0);
+        let name = crate::sexp::writer::write(&sheet.properties[0].to_sexp());
+        let file = crate::sexp::writer::write(&sheet.properties[1].to_sexp());
+        assert!(
+            name.contains("(at 100") && name.contains("49.2"),
+            "Sheetname must sit just above the box, got: {name}"
+        );
+        assert!(
+            file.contains("(at 100") && file.contains("80.4"),
+            "Sheetfile must sit just below the box, got: {file}"
+        );
     }
 
     #[test]
