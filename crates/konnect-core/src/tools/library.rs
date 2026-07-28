@@ -138,7 +138,11 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "number": { "type": "string" },
                                 "name": { "type": "string" },
-                                "type": { "type": "string", "description": "'input', 'output', 'bidirectional', 'power_in', 'power_out', 'passive'" },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
+                                    "description": "Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected')."
+                                },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
                                 "angle": { "type": "number", "default": 0 },
@@ -163,7 +167,11 @@ pub fn tools() -> Vec<ToolDef> {
                                         "properties": {
                                             "number": { "type": "string" },
                                             "name": { "type": "string" },
-                                            "type": { "type": "string", "description": "'input', 'output', 'bidirectional', 'power_in', 'power_out', 'passive'" },
+                                            "type": {
+                                                "type": "string",
+                                                "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
+                                                "description": "Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected')."
+                                            },
                                             "x": { "type": "number" },
                                             "y": { "type": "number" },
                                             "angle": { "type": "number", "default": 0 },
@@ -184,7 +192,11 @@ pub fn tools() -> Vec<ToolDef> {
                             "properties": {
                                 "number": { "type": "string" },
                                 "name": { "type": "string" },
-                                "type": { "type": "string" },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
+                                    "description": "Pin electrical type — exactly one of KiCAD's 12 values (power pins are usually 'power_in'). Note: NC pins are 'no_connect' (not 'not_connected')."
+                                },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
                                 "angle": { "type": "number", "default": 0 },
@@ -1482,16 +1494,56 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
     Some((min_x, min_y, max_x, max_y))
 }
 
+/// KiCAD's 12 valid pin electrical types — the first token of a
+/// `(pin TYPE line …)` S-expression. Anything else makes eeschema refuse to
+/// load the library ("Failed to load schematic"-class parse error), so the
+/// value is validated instead of interpolated verbatim (#55).
+const ALLOWED_PIN_ELECTRICAL_TYPES: [&str; 12] = [
+    "input",
+    "output",
+    "bidirectional",
+    "tri_state",
+    "passive",
+    "free",
+    "unspecified",
+    "power_in",
+    "power_out",
+    "open_collector",
+    "open_emitter",
+    "no_connect",
+];
+
 /// Build one unit's inner S-expression — an optional body rectangle (when
 /// `with_body`) followed by its pins — and return it with the body rect (used
 /// for reference/value placement). Shared by the single- and multi-unit paths.
-fn build_symbol_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String, SymbolRect) {
+///
+/// Errors when a pin's electrical type is not one of KiCAD's 12 valid values
+/// (#55) — the caller must not write anything to disk in that case.
+fn build_symbol_unit(
+    pins_val: &[serde_json::Value],
+    with_body: bool,
+) -> anyhow::Result<(String, SymbolRect)> {
     let mut pins_sexp = String::new();
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
     for pin in pins_val {
         let number = pin["number"].as_str().unwrap_or("1");
         let pin_name = pin["name"].as_str().unwrap_or("~");
         let pin_type = pin["type"].as_str().unwrap_or("passive");
+        if !ALLOWED_PIN_ELECTRICAL_TYPES.contains(&pin_type) {
+            // The one mistake seen in the wild (#55) gets a targeted hint.
+            let hint = if pin_type == "not_connected" {
+                " (did you mean \"no_connect\"?)"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "invalid pin electrical type \"{}\" on pin \"{}\"{} — KiCAD accepts exactly one of: {}",
+                pin_type,
+                number,
+                hint,
+                ALLOWED_PIN_ELECTRICAL_TYPES.join(", ")
+            );
+        }
         let x = pin["x"].as_f64().unwrap_or(0.0);
         let y = pin["y"].as_f64().unwrap_or(0.0);
         let angle = pin["angle"].as_f64().unwrap_or(0.0);
@@ -1520,7 +1572,7 @@ fn build_symbol_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String
         ),
         None => String::new(),
     };
-    (format!("{}{}", body_sexp, pins_sexp), body)
+    Ok((format!("{}{}", body_sexp, pins_sexp), body))
 }
 
 type SymbolRect = Option<(f64, f64, f64, f64)>;
@@ -1555,7 +1607,10 @@ async fn handle_create_symbol(
     if units.is_empty() {
         // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
         let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
-        let (inner, body) = build_symbol_unit(&pins_val, true);
+        let (inner, body) = match build_symbol_unit(&pins_val, true) {
+            Ok(v) => v,
+            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+        };
         units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
         unit_count = 1;
         ref_body = body;
@@ -1568,7 +1623,10 @@ async fn handle_create_symbol(
         // unit, where each duplicate would otherwise need wiring to pass ERC.
         let mut first_body: SymbolRect = None;
         for (i, unit_pins) in units.iter().enumerate() {
-            let (inner, body) = build_symbol_unit(unit_pins, true);
+            let (inner, body) = match build_symbol_unit(unit_pins, true) {
+                Ok(v) => v,
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            };
             if i == 0 {
                 first_body = body;
             }
@@ -1581,7 +1639,10 @@ async fn handle_create_symbol(
         }
         let mut total = units.len();
         if !power_pins.is_empty() {
-            let (inner, _) = build_symbol_unit(&power_pins, true);
+            let (inner, _) = match build_symbol_unit(&power_pins, true) {
+                Ok(v) => v,
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            };
             total += 1;
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
@@ -3200,6 +3261,134 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with("_0_1")),
             "sub-units leaked: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_accepts_all_12_kicad_pin_types() {
+        // One pin per valid electrical type; the generated library must carry
+        // each type verbatim and still parse (#55).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("types.kicad_sym");
+        let pins: Vec<serde_json::Value> = ALLOWED_PIN_ELECTRICAL_TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                json!({
+                    "number": (i + 1).to_string(),
+                    "name": format!("P{}", i + 1),
+                    "type": t,
+                    "x": -7.62, "y": (i as f64) * 2.54, "angle": 0, "length": 2.54
+                })
+            })
+            .collect();
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "ALL_TYPES",
+            "reference_prefix": "U",
+            "pins": pins
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(
+            !res.is_error,
+            "all valid types must pass: {:?}",
+            res.content
+        );
+        let c = std::fs::read_to_string(&lib).unwrap();
+        for t in ALLOWED_PIN_ELECTRICAL_TYPES {
+            assert!(
+                c.contains(&format!("(pin {} line", t)),
+                "missing pin type {t}:\n{c}"
+            );
+        }
+        assert!(
+            konnect_sexp::parser::parse_sexp(&c).is_ok(),
+            "generated symbol doesn't parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_rejects_not_connected_with_suggestion() {
+        // KiCAD's enum is `no_connect`; `not_connected` used to be interpolated
+        // verbatim, producing a library eeschema refuses to load (#55).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("nc.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "BAD_NC",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"NC","type":"not_connected","x":-5.08,"y":0.0}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "not_connected must be rejected");
+        let text = result_text(&res);
+        assert!(
+            text.contains("not_connected"),
+            "error must name the invalid token: {text}"
+        );
+        assert!(
+            text.contains("no_connect"),
+            "error must suggest the valid spelling: {text}"
+        );
+        assert!(
+            !lib.exists(),
+            "nothing may be written when validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_rejects_dual_electrical_type() {
+        // "output bidirectional" is two types in one string — KiCAD expects
+        // exactly one (#55, bug 2).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("dual_type.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "BAD_DUAL",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"IO","type":"output bidirectional","x":-5.08,"y":0.0}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "dual electrical type must be rejected");
+        let text = result_text(&res);
+        assert!(
+            text.contains("output bidirectional"),
+            "error must name the invalid token: {text}"
+        );
+        assert!(!lib.exists(), "nothing may be written on failure");
+    }
+
+    #[tokio::test]
+    async fn create_symbol_invalid_type_in_multi_unit_writes_nothing() {
+        // The multi-unit and power-pin paths validate too, and an existing
+        // library file must be left untouched on failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("existing.kicad_sym");
+        let before = "(kicad_symbol_lib\n  (version 20240108)\n  (generator \"konnect\")\n)\n";
+        std::fs::write(&lib, before).unwrap();
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "BAD_MULTI",
+            "reference_prefix": "U",
+            "units": [
+                { "pins": [{"number":"1","name":"A","type":"input","x":-5.08,"y":0.0}] },
+                { "pins": [{"number":"2","name":"B","type":"totem_pole","x":-5.08,"y":0.0}] }
+            ],
+            "power_pins": [
+                {"number":"3","name":"VCC","type":"power_in","x":0.0,"y":5.08,"angle":270}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(res.is_error, "invalid type in unit 2 must be rejected");
+        assert!(result_text(&res).contains("totem_pole"));
+        assert_eq!(
+            std::fs::read_to_string(&lib).unwrap(),
+            before,
+            "existing library must be untouched on failure"
         );
     }
 
