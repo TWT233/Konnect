@@ -271,6 +271,47 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     out
 }
 
+/// Unit-aware variant of [`extract_lib_pins`] for multi-unit symbols (#35).
+///
+/// KiCAD names unit sub-symbols `Name_N_M` where `N` is the unit number
+/// (`0` = drawn on every unit) and `M` is the body style. The unit-agnostic
+/// [`extract_lib_pins`] superimposes every unit's pins onto one placement —
+/// for an LM2904 that reports both op-amps' pins at the same instance. This
+/// variant keeps only pins from sub-symbols where `N == 0` or `N == unit`
+/// (pins directly on the symbol node, or in sub-symbols without the `_N_M`
+/// suffix, are always kept).
+pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> {
+    let mut out = Vec::new();
+    for pin in sym_node.find_all("pin") {
+        if let Some(lib_pin) = parse_lib_pin(pin) {
+            out.push(lib_pin);
+        }
+    }
+    for sub in sym_node.find_all("symbol") {
+        let sub_unit = sub
+            .get(1)
+            .and_then(|n| n.as_str())
+            .and_then(parse_unit_from_subsymbol_name);
+        match sub_unit {
+            Some(n) if n != 0 && n != unit => {} // another unit's pins: skip
+            // n == 0 (common), n == unit, or an un-suffixed name: keep all.
+            _ => collect_pins_recursive(sub, &mut out),
+        }
+    }
+    out
+}
+
+/// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
+/// `None` when the name doesn't end in two `_`-separated integers (base names
+/// may themselves contain underscores and digits, e.g. `R_Small_1_1` → 1).
+fn parse_unit_from_subsymbol_name(name: &str) -> Option<u32> {
+    let mut it = name.rsplitn(3, '_');
+    let _style: u32 = it.next()?.parse().ok()?;
+    let unit: u32 = it.next()?.parse().ok()?;
+    it.next()?; // a base name must exist before the suffix
+    Some(unit)
+}
+
 fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
     for pin in node.find_all("pin") {
         if let Some(lib_pin) = parse_lib_pin(pin) {
@@ -395,6 +436,86 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     (uuid "{uuid}")
   )"#
     )
+}
+
+#[cfg(test)]
+mod unit_pin_tests {
+    use super::*;
+
+    /// A 2-unit op-amp shaped like LM2904: unit 1 has pins 1-3, unit 2 has
+    /// pins 5-7, and the power pins 4/8 live in a `_0_1` sub-symbol common to
+    /// all units.
+    fn two_unit_symbol() -> SexpNode {
+        let pin = |num: &str, y: f64| {
+            format!(
+                "(pin passive line (at -7.62 {y} 0) (length 2.54)\n  (name \"~\" (effects (font (size 1.27 1.27))))\n  (number \"{num}\" (effects (font (size 1.27 1.27))))\n)"
+            )
+        };
+        let sch = format!(
+            "(kicad_symbol_lib\n  (symbol \"OP_DUAL\"\n    (symbol \"OP_DUAL_0_1\"\n      {}{}\n    )\n    (symbol \"OP_DUAL_1_1\"\n      {}{}{}\n    )\n    (symbol \"OP_DUAL_2_1\"\n      {}{}{}\n    )\n  )\n)",
+            pin("4", -10.16),
+            pin("8", 10.16),
+            pin("1", 0.0),
+            pin("2", 2.54),
+            pin("3", 5.08),
+            pin("5", 0.0),
+            pin("6", 2.54),
+            pin("7", 5.08),
+        );
+        parse_sexp(&sch).unwrap()
+    }
+
+    fn numbers(pins: &[LibPin]) -> Vec<String> {
+        let mut n: Vec<String> = pins.iter().map(|p| p.number.clone()).collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn for_unit_keeps_own_and_common_pins_only() {
+        let root = two_unit_symbol();
+        let sym = root.find("symbol").unwrap();
+
+        let u1 = extract_lib_pins_for_unit(sym, 1);
+        assert_eq!(
+            numbers(&u1),
+            vec!["1", "2", "3", "4", "8"],
+            "unit 1 = its own pins + the _0_1 commons"
+        );
+
+        let u2 = extract_lib_pins_for_unit(sym, 2);
+        assert_eq!(
+            numbers(&u2),
+            vec!["4", "5", "6", "7", "8"],
+            "unit 2 = its own pins + the _0_1 commons"
+        );
+
+        // The signal pin sets are disjoint — before this function, both units
+        // reported all 8 pins superimposed (#35).
+        assert!(!numbers(&u1).contains(&"5".to_string()));
+        assert!(!numbers(&u2).contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn unit_agnostic_extraction_still_returns_everything() {
+        let root = two_unit_symbol();
+        let sym = root.find("symbol").unwrap();
+        assert_eq!(
+            numbers(&extract_lib_pins(sym)),
+            vec!["1", "2", "3", "4", "5", "6", "7", "8"]
+        );
+    }
+
+    #[test]
+    fn underscored_base_names_parse_their_unit_suffix() {
+        assert_eq!(parse_unit_from_subsymbol_name("R_Small_1_1"), Some(1));
+        assert_eq!(parse_unit_from_subsymbol_name("OP_DUAL_2_1"), Some(2));
+        assert_eq!(parse_unit_from_subsymbol_name("X_0_1"), Some(0));
+        // No trailing _N_M suffix → None (pins are then always kept).
+        assert_eq!(parse_unit_from_subsymbol_name("R"), None);
+        assert_eq!(parse_unit_from_subsymbol_name("R_1"), None);
+        assert_eq!(parse_unit_from_subsymbol_name("Name_A_1"), None);
+    }
 }
 
 #[cfg(test)]
