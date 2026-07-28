@@ -13,8 +13,8 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_lib_pins, extract_symbol_instances, extract_wires, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
+        parse_at, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -1444,11 +1444,20 @@ fn resolve_pin_endpoint(
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
 
-    let pins = extract_lib_pins(lib_sym);
+    // Unit-aware (#35): only this instance's unit owns the pin — asking unit 1
+    // of an LM2904 for pin 7 must fail, not wire to a superimposed phantom.
+    let pins = konnect_sexp::schematic::extract_lib_pins_for_unit(lib_sym, inst.unit);
     let lib_pin = pins
         .iter()
         .find(|p| p.number == pin_number)
-        .ok_or_else(|| anyhow::anyhow!("Pin '{}' not found on '{}'", pin_number, reference))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pin '{}' not found on '{}' (unit {})",
+                pin_number,
+                reference,
+                inst.unit
+            )
+        })?;
 
     Ok(pin_endpoint(lib_pin, inst.pin_transform()))
 }
@@ -1492,6 +1501,107 @@ async fn handle_add_schematic_connection(
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod unit_aware_wiring_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A schematic with an embedded LM2904-style dual op-amp (unit 1 = pins
+    /// 1-3, unit 2 = pins 5-7) placed twice: U1 as unit 1, U2 as unit 2.
+    fn dual_opamp_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin = |num: &str, x: f64, y: f64, angle: u32| {
+            format!(
+                "\t\t\t(pin passive line (at {x} {y} {angle}) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"{num}\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n"
+            )
+        };
+        let lib_sym = format!(
+            "\t\t(symbol \"Test:OP2\"\n\t\t\t(symbol \"OP2_1_1\"\n{}{}{}\t\t\t)\n\t\t\t(symbol \"OP2_2_1\"\n{}{}{}\t\t\t)\n\t\t)\n",
+            pin("1", -7.62, 2.54, 0),
+            pin("2", -7.62, -2.54, 0),
+            pin("3", 7.62, 0.0, 180),
+            pin("5", -7.62, 2.54, 0),
+            pin("6", -7.62, -2.54, 0),
+            pin("7", 7.62, 0.0, 180),
+        );
+        let inst = |reference: &str, unit: u32, x: f64, uuid: &str| {
+            format!(
+                "\t(symbol\n\t\t(lib_id \"Test:OP2\")\n\t\t(at {x} 80 0)\n\t\t(unit {unit})\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} 75 0)\n\t\t)\n\t)\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{})\n",
+                lib_sym,
+                inst("U1", 1, 100.0, "aaaaaaaa-1111-1111-1111-111111111111"),
+                inst("U2", 2, 150.0, "bbbbbbbb-2222-2222-2222-222222222222"),
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn connect_pins_uses_the_instance_unit() {
+        let (_d, path) = dual_opamp_schematic();
+
+        // U1 is unit 1: its pins are 1-3. U2 is unit 2: pins 5-7.
+        let ok = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "1",
+                "ref2": "U2", "pin2": "5"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok.is_error,
+            "unit-owned pins must connect: {:?}",
+            ok.content
+        );
+
+        // Pin 5 belongs to unit 2 — asking for it on the unit-1 instance must
+        // fail instead of wiring to a superimposed phantom position (#35).
+        let err = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "5",
+                "ref2": "U2", "pin2": "6"
+            }),
+            &test_ctx(),
+        )
+        .await;
+        let msg = format!("{:?}", err);
+        assert!(
+            err.is_err() || err.as_ref().is_ok_and(|r| r.is_error),
+            "pin 5 on a unit-1 instance must not resolve: {msg}"
+        );
+        assert!(
+            msg.contains("unit 1"),
+            "error should name the instance unit: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]

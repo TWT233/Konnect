@@ -13,7 +13,9 @@ use crate::tools::{
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
-    schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
+    schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
+    },
     writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
 };
 use serde_json::json;
@@ -258,7 +260,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "reference": { "type": "string", "description": "Component reference designator (e.g. 'U1')" },
-                    "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" }
+                    "new_lib_id": { "type": "string", "description": "New Library:Symbol identifier (e.g. 'Device:C')" },
+                    "unit": { "type": "integer", "description": "Optional unit number for multi-unit symbols; validated against the new symbol's unit count. When omitted the existing unit is kept." }
                 },
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
@@ -338,6 +341,17 @@ async fn handle_add_schematic_component(
     // Embed the library symbol definition
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    }
+
+    // Validate the unit against the resolved symbol BEFORE writing anything:
+    // eeschema silently renders an out-of-range unit as unit 1 and the
+    // netlister mis-assigns its pins (#35).
+    let unit_count = cse::library::symbol_unit_count(&lib_id).unwrap_or(1);
+    if unit < 1 || unit > unit_count {
+        return Ok(CallToolResult::error(format!(
+            "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
+            unit, lib_id, unit_count, unit_count
+        )));
     }
 
     // Build the Symbol struct
@@ -783,7 +797,26 @@ async fn handle_get_schematic_pin_locations(
             reference, inst.lib_id
         )));
     };
-    let lib_pins = extract_lib_pins(sym);
+    // Unit-aware: only this instance's unit (plus _0_1 commons), not every
+    // unit's pins superimposed (#35).
+    let lib_pins = extract_lib_pins_for_unit(sym, inst.unit);
+    // A definition that resolves but has ZERO pins is almost always an
+    // `(extends "Parent")` stub — kicad-cli can't resolve those either (the
+    // netlist shows a pinless part), so silent pins:[] hides real breakage.
+    // The #34 guard above only catches MISSING definitions.
+    if lib_pins.is_empty() {
+        if let Some(parent) = sym.find_str("extends") {
+            return Ok(CallToolResult::error(format!(
+                "Component '{}': the embedded definition for '{}' is an \
+                 (extends \"{}\") stub with no pins of its own. kicad-cli \
+                 cannot resolve extends stubs (the netlist gets a pinless \
+                 part). Re-add the component (delete_schematic_component + \
+                 add_schematic_component) so the definition is embedded in \
+                 full, or place the parent symbol '{}' directly.",
+                reference, inst.lib_id, parent, parent
+            )));
+        }
+    }
     let t = inst.pin_transform();
     let pins: Vec<serde_json::Value> = lib_pins
         .iter()
@@ -849,8 +882,24 @@ async fn handle_batch_get_pin_locations(
                     )
                 });
             };
+            let lib_pins = extract_lib_pins_for_unit(sym, inst.unit);
+            // Zero pins from a resolving definition = extends stub (#35);
+            // mirror the single-component handler's structured error.
+            if lib_pins.is_empty() {
+                if let Some(parent) = sym.find_str("extends") {
+                    return json!({
+                        "reference": reference,
+                        "error": format!(
+                            "embedded definition for '{}' is an (extends \"{}\") \
+                             stub with no pins — re-add the component so it is \
+                             embedded in full",
+                            inst.lib_id, parent
+                        )
+                    });
+                }
+            }
             let t = inst.pin_transform();
-            let pins: Vec<serde_json::Value> = extract_lib_pins(sym)
+            let pins: Vec<serde_json::Value> = lib_pins
                 .iter()
                 .map(|p| {
                     let (sx, sy) = pin_endpoint(p, t);
@@ -1009,6 +1058,7 @@ async fn handle_replace_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    let new_unit = opt_f64(args, "unit").map(|u| u as u32);
 
     let mut content = std::fs::read_to_string(&sch_path)?;
 
@@ -1053,6 +1103,39 @@ async fn handle_replace_component(
     );
     content = new_content;
 
+    // Optional unit change, validated against the NEW symbol's unit count
+    // (#35). Applied before the embed so all edits land in one write.
+    if let Some(unit) = new_unit {
+        let unit_count = cse::library::symbol_unit_count(&new_lib_id).unwrap_or(1);
+        if unit < 1 || unit > unit_count {
+            return Ok(CallToolResult::error(format!(
+                "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
+                unit, new_lib_id, unit_count, unit_count
+            )));
+        }
+        // Re-find the block (offsets moved with the lib_id edit), then update
+        // every `(unit N)` inside it — the symbol's own and the one in its
+        // (instances …) entry.
+        if let Some((s, e)) = find_symbol_instance_block(&content, &reference) {
+            let block = &content[s..e];
+            let mut edits = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = block[from..].find("(unit ") {
+                let num_start = from + rel + "(unit ".len();
+                let Some(close) = block[num_start..].find(')') else {
+                    break;
+                };
+                edits.push(SexpEdit::replace(
+                    s + num_start,
+                    s + num_start + close,
+                    unit.to_string(),
+                ));
+                from = num_start + close;
+            }
+            content = apply_edits(content, edits);
+        }
+    }
+
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
     // a replace that can't embed its definition would leave the component
     // netlist-invisible (#34).
@@ -1064,7 +1147,8 @@ async fn handle_replace_component(
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "old_lib_id": old_lib_id,
-        "new_lib_id": new_lib_id
+        "new_lib_id": new_lib_id,
+        "unit": new_unit
     })))
 }
 
@@ -1108,6 +1192,32 @@ mod tests {
         };
         std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
         std::fs::write(symdir.join("C_Polarized.kicad_sym"), symbol("C_Polarized")).unwrap();
+        // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
+        // unit 3 = power pins 4/8 (#35 repro shape).
+        let pin = |num: &str, x: f64, y: f64, angle: u32| {
+            format!(
+                "\t\t\t(pin passive line (at {x} {y} {angle}) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"{num}\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n"
+            )
+        };
+        let opamp = format!(
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"OPAMP_DUAL\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"OPAMP_DUAL\" (at 0 0 0))\n\t\t(symbol \"OPAMP_DUAL_1_1\"\n{}{}{}\t\t)\n\t\t(symbol \"OPAMP_DUAL_2_1\"\n{}{}{}\t\t)\n\t\t(symbol \"OPAMP_DUAL_3_1\"\n{}{}\t\t)\n\t)\n)\n",
+            pin("1", -7.62, 2.54, 0),
+            pin("2", -7.62, -2.54, 0),
+            pin("3", 7.62, 0.0, 180),
+            pin("5", -7.62, 2.54, 0),
+            pin("6", -7.62, -2.54, 0),
+            pin("7", 7.62, 0.0, 180),
+            pin("4", 0.0, -7.62, 90),
+            pin("8", 0.0, 7.62, 270),
+        );
+        std::fs::write(symdir.join("OPAMP_DUAL.kicad_sym"), opamp).unwrap();
+        // Derived symbol: an extends stub with no drawing of its own, like
+        // Amplifier_Operational:NE5532 → LM2904.
+        std::fs::write(
+            symdir.join("OPAMP_DERIVED.kicad_sym"),
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"OPAMP_DERIVED\"\n\t\t(extends \"OPAMP_DUAL\")\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"OPAMP_DERIVED\" (at 0 0 0))\n\t)\n)\n",
+        )
+        .unwrap();
         std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
         (dir, guard)
     }
@@ -1177,7 +1287,7 @@ mod tests {
         let result = handle_add_schematic_component(
             &json!({
                 "schematic": path.display().to_string(),
-                "lib_id": "Device:R",
+                "lib_id": "Device:OPAMP_DUAL",
                 "x": 100.0, "y": 80.0,
                 "reference": "U1",
                 "unit": 3
@@ -1186,7 +1296,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!result.is_error);
+        assert!(!result.is_error, "unit 3 of a 3-unit part must be accepted");
 
         let sch = cse::Schematic::load(&path).unwrap();
         let sym = sch.symbols.by_reference("U1").unwrap();
@@ -1196,6 +1306,269 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains(&format!("/{}", root_uuid)));
         assert!(raw.contains("(unit 3)"), "instance unit must be 3");
+    }
+
+    fn content_text(res: &CallToolResult) -> String {
+        match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_component_rejects_out_of_range_unit() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("units.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for bad_unit in [0, 99] {
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:OPAMP_DUAL",
+                    "x": 100.0, "y": 80.0,
+                    "reference": "U1",
+                    "unit": bad_unit
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error, "unit {bad_unit} must be rejected");
+            let text = content_text(&result);
+            assert!(
+                text.contains("3 unit"),
+                "error must state the unit count: {text}"
+            );
+        }
+        // A single-unit symbol only accepts unit 1.
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 100.0, "y": 80.0,
+                "reference": "R1",
+                "unit": 2
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_error,
+            "unit 2 of a 1-unit symbol must be rejected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "rejected placements must not modify the schematic"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_locations_are_unit_aware() {
+        // The #35 repro: an LM2904-style dual op-amp placed as unit 1 and as
+        // unit 2 must report DISJOINT pin sets, not all units superimposed.
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        for (reference, unit, x) in [("U1", 1, 100.0), ("U2", 2, 150.0)] {
+            let res = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": "Device:OPAMP_DUAL",
+                    "x": x, "y": 80.0,
+                    "reference": reference,
+                    "unit": unit
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!res.is_error, "placing {reference}: {:?}", res.content);
+        }
+
+        let pin_numbers = |res: &CallToolResult| -> Vec<String> {
+            let out: serde_json::Value = serde_json::from_str(&content_text(res)).unwrap();
+            let mut nums: Vec<String> = out["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["number"].as_str().unwrap().to_string())
+                .collect();
+            nums.sort();
+            nums
+        };
+
+        let u1 = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "U1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!u1.is_error);
+        assert_eq!(pin_numbers(&u1), vec!["1", "2", "3"], "unit 1 pins only");
+
+        let u2 = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "U2" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!u2.is_error);
+        assert_eq!(pin_numbers(&u2), vec!["5", "6", "7"], "unit 2 pins only");
+
+        // Batch variant agrees.
+        let batch = handle_batch_get_pin_locations(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["U1", "U2"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&content_text(&batch)).unwrap();
+        let comps = out["components"].as_array().unwrap();
+        let nums = |i: usize| -> Vec<String> {
+            let mut v: Vec<String> = comps[i]["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["number"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(nums(0), vec!["1", "2", "3"]);
+        assert_eq!(nums(1), vec!["5", "6", "7"]);
+    }
+
+    #[tokio::test]
+    async fn pin_locations_error_on_extends_stub_with_zero_pins() {
+        // A pre-flattening schematic: the embedded definition for the derived
+        // symbol is an (extends "Parent") stub with no pins. The #34 guard
+        // only catches MISSING definitions; a resolving-but-pinless stub must
+        // be a structured error too, not pins:[] (#35).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stub.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t\t(symbol \"Device:OPAMP_DERIVED\"\n\t\t\t(extends \"Device:OPAMP_DUAL\")\n\t\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:OPAMP_DERIVED\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let res = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "U1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(res.is_error, "extends stub with zero pins must be an error");
+        let text = content_text(&res);
+        assert!(
+            text.contains("Device:OPAMP_DERIVED"),
+            "error must name the lib_id: {text}"
+        );
+        assert!(
+            text.contains("Device:OPAMP_DUAL"),
+            "error must name the extends target: {text}"
+        );
+
+        // Batch variant reports it per-entry.
+        let batch = handle_batch_get_pin_locations(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["U1"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&content_text(&batch)).unwrap();
+        let err = out["components"][0]["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("Device:OPAMP_DUAL"),
+            "batch entry must carry the stub error: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_component_sets_validated_unit() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:OPAMP_DUAL",
+                "x": 100.0, "y": 80.0,
+                "reference": "U1",
+                "unit": 1
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Out-of-range unit on the new symbol is rejected before any write.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = handle_replace_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "new_lib_id": "Device:OPAMP_DUAL",
+                "unit": 99
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(bad.is_error, "unit 99 must be rejected");
+        assert!(content_text(&bad).contains("3 unit"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Valid unit is written to the symbol and its instances entry.
+        let ok = handle_replace_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "new_lib_id": "Device:OPAMP_DUAL",
+                "unit": 2
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!ok.is_error, "{:?}", ok.content);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("(unit 2)"),
+            "unit must be updated to 2:\n{raw}"
+        );
+        assert!(
+            !raw.contains("(unit 1)"),
+            "no stale (unit 1) may remain in the instance:\n{raw}"
+        );
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.symbols.by_reference("U1").unwrap().unit, 2);
     }
 
     #[tokio::test]

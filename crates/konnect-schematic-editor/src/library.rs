@@ -174,6 +174,35 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
     true
 }
 
+/// Number of units of the symbol `lib_id` resolves to, following the
+/// `(extends "Parent")` chain when the symbol has no unit sub-symbols of its
+/// own (#35). The count is the maximum `N >= 1` over `Name_N_M` sub-symbol
+/// names; symbols with only a `_0_1` body (or none) count as 1. Returns
+/// `None` when `lib_id` cannot be resolved at all.
+pub fn symbol_unit_count(lib_id: &str) -> Option<u32> {
+    let mut current = lib_id.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while visited.insert(current.clone()) {
+        let node = resolve_lib_symbol_node(&current)?;
+        let max_unit = node
+            .find_all("symbol")
+            .iter()
+            .filter_map(|s| s.value())
+            .filter_map(konnect_sexp::schematic::parse_subsymbol_unit)
+            .filter(|&n| n >= 1)
+            .max();
+        if let Some(n) = max_unit {
+            return Some(n);
+        }
+        // No unit sub-symbols: a derived symbol inherits the parent's units.
+        match node.get_value("extends") {
+            Some(parent) if parent.contains(':') => current = parent.to_string(),
+            _ => return Some(1),
+        }
+    }
+    Some(1) // cyclic extends: treat as single-unit rather than erroring
+}
+
 /// Whether `library_name` (e.g. "Device") exists in any installed symbol dir,
 /// in either the KiCAD 10 symdir layout or the legacy single-file one.
 pub fn library_exists(library_name: &str) -> bool {

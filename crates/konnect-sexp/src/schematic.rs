@@ -180,6 +180,9 @@ pub struct SymbolInstance {
     pub mirror_x: bool,
     pub mirror_y: bool,
     pub uuid: Option<String>,
+    /// Selected unit of a multi-unit symbol (`(unit N)`, 1-based). Defaults
+    /// to 1 when the instance carries no unit — eeschema always writes one.
+    pub unit: u32,
 }
 
 impl SymbolInstance {
@@ -230,6 +233,8 @@ pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
                 .and_then(|u| u.as_str())
                 .map(String::from);
 
+            let unit = node.find_f64("unit").map(|u| u as u32).unwrap_or(1);
+
             Some(SymbolInstance {
                 reference: prop("Reference"),
                 value: prop("Value"),
@@ -241,6 +246,7 @@ pub fn extract_symbol_instances(tree: &SexpNode) -> Vec<SymbolInstance> {
                 mirror_x,
                 mirror_y,
                 uuid,
+                unit,
             })
         })
         .collect()
@@ -291,7 +297,7 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
         let sub_unit = sub
             .get(1)
             .and_then(|n| n.as_str())
-            .and_then(parse_unit_from_subsymbol_name);
+            .and_then(parse_subsymbol_unit);
         match sub_unit {
             Some(n) if n != 0 && n != unit => {} // another unit's pins: skip
             // n == 0 (common), n == unit, or an un-suffixed name: keep all.
@@ -304,7 +310,7 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
 /// Parse the unit number `N` out of a `Name_N_M` sub-symbol name. Returns
 /// `None` when the name doesn't end in two `_`-separated integers (base names
 /// may themselves contain underscores and digits, e.g. `R_Small_1_1` → 1).
-fn parse_unit_from_subsymbol_name(name: &str) -> Option<u32> {
+pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
     let mut it = name.rsplitn(3, '_');
     let _style: u32 = it.next()?.parse().ok()?;
     let unit: u32 = it.next()?.parse().ok()?;
@@ -508,13 +514,13 @@ mod unit_pin_tests {
 
     #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
-        assert_eq!(parse_unit_from_subsymbol_name("R_Small_1_1"), Some(1));
-        assert_eq!(parse_unit_from_subsymbol_name("OP_DUAL_2_1"), Some(2));
-        assert_eq!(parse_unit_from_subsymbol_name("X_0_1"), Some(0));
+        assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
+        assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
+        assert_eq!(parse_subsymbol_unit("X_0_1"), Some(0));
         // No trailing _N_M suffix → None (pins are then always kept).
-        assert_eq!(parse_unit_from_subsymbol_name("R"), None);
-        assert_eq!(parse_unit_from_subsymbol_name("R_1"), None);
-        assert_eq!(parse_unit_from_subsymbol_name("Name_A_1"), None);
+        assert_eq!(parse_subsymbol_unit("R"), None);
+        assert_eq!(parse_subsymbol_unit("R_1"), None);
+        assert_eq!(parse_subsymbol_unit("Name_A_1"), None);
     }
 }
 
