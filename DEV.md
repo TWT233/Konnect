@@ -8,7 +8,8 @@ Repository-wide naming, public API, branch, and pull-request rules live in
 ## Quick Start
 
 ```bash
-# Required: protoc for protobuf code generation
+# protoc is required for protobuf code generation. If PROTOC is unset, the
+# build falls back to `protoc` on PATH (see Build Requirements below).
 set PROTOC=C:\path\to\protoc.exe   # or install via `choco install protoc`
 
 cargo check                          # verify everything compiles (~15s)
@@ -51,7 +52,7 @@ Konnect/
 │   │       ├── router/
 │   │       │   ├── mod.rs           # ToolRouter: load/unload toolsets
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
-│   │       │   └── meta_tools.rs    # 4 always-visible meta-tools
+│   │       │   └── meta_tools.rs    # 6 always-visible meta-tools
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
@@ -103,10 +104,16 @@ Konnect/
 │   └── plugin.json                   # KiCAD 10 IPC plugin manifest
 │
 ├── packaging/
-│   └── metadata.json                 # KiCAD PCM package manifest
+│   ├── build-pcm.ps1                 # Build the PCM zip (Windows)
+│   ├── build-pcm.sh                  # Build the PCM zip (macOS/Linux)
+│   ├── metadata.json                 # KiCAD PCM package manifest
+│   ├── validate-pcm.py               # Validate metadata.json against the PCM schema
+│   ├── schema/                       # PCM packages.v1 JSON schema
+│   └── resources/                    # PCM package resources (icon.png)
 │
 └── .github/workflows/
     ├── ci.yml                        # Check + test + clippy on 3 platforms
+    ├── e2e-kicad.yml                 # End-to-end tests against a real KiCAD install
     └── release.yml                   # Build binaries + GitHub Release on tag push
 ```
 
@@ -175,7 +182,7 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 171 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 185 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
 ## Observability
 
@@ -196,9 +203,9 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 171 tools in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 185 tools (191 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 4 meta-tools, baseline `tools/list` is ~17 tools ≈ 2K tokens.
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is ~19 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
@@ -207,9 +214,15 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
 ## Build Requirements
 
-- Rust 1.75+ (stable)
+- Rust toolchain pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (currently 1.96.0) —
+  rustup picks it up automatically, and CI compiles with the same version. The pinned
+  version IS the MSRV: bump it deliberately, in its own commit, after running the full
+  local gate on the new version.
 - `protoc` binary (for protobuf code generation in konnect-ipc crate)
-  - Set `PROTOC` environment variable or install on PATH
+  - Set `PROTOC` environment variable, or leave it unset and `konnect-ipc/build.rs`
+    falls back to `protoc` found on PATH
+  - Well-known-type includes are derived from `<PROTOC>/../../include` (i.e. a standard
+    protoc release layout with `bin/protoc` next to `include/`) when that directory exists
   - Download: https://github.com/protocolbuffers/protobuf/releases
 - For schematic-viewer (built separately from the workspace — see Quick Start):
   - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`
@@ -253,7 +266,7 @@ convention for other `kicad-cli`-calling code.
 
 - **18 toolsets, 185 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~191 tools / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 191 tools (185 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

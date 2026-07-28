@@ -18,7 +18,7 @@ use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 
-/// Return the 4 meta-tool MCP descriptions (always in the tools/list response).
+/// Return the 6 meta-tool MCP descriptions (always in the tools/list response).
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {

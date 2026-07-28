@@ -45,13 +45,22 @@ output, and unrelated cleanup out of the diff.
 
 ## Pull request checklist
 
-- `cargo test --workspace --lib --tests` passes
-- `cargo clippy --workspace -- -D warnings` is clean
-- `cargo fmt --all` applied
+These are exactly the commands CI runs — if they pass locally, CI should be green:
+
+- `cargo test --workspace --locked --lib --tests` passes
+- `cargo test --workspace --locked --doc` passes
+- `cargo clippy --workspace --locked -- -D warnings` is clean
+- `cargo fmt --all -- --check` is clean
 - New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
   changes include compatibility handling and migration notes
-- If you added or removed tools: update `tool_count` in `router/registry.rs` and
-  regenerate the matching section of `tool-directory.md`
+- If you added or removed tools: update `tool_count` in `router/registry.rs`,
+  regenerate the matching section of `tool-directory.md`, and update the total tool
+  counts in DEV.md's "Current Stats" and the README — those three counts have
+  drifted apart before precisely because only one of them got updated
+
+First PR from a fork? CI workflows may sit at "waiting for approval" until a
+maintainer approves the run — that's a GitHub setting for first-time contributors,
+not a failure on your part.
 
 ## Contributor License Agreement
 

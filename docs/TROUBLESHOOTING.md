@@ -53,6 +53,21 @@ Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
 or in `konnect-settings.json` (`kicad_cli`).
 
+## Tools don't appear after `load_toolset`
+
+After a successful `load_toolset` call the server sends a
+`notifications/tools/list_changed` notification, and MCP clients are expected to
+re-fetch `tools/list` in response. If newly loaded tools never show up:
+
+1. Check your client honors `notifications/tools/list_changed` (most current MCP
+   clients do; some cache the initial tool list forever).
+2. Disable any competing tool-search or tool-filter layer sitting between the
+   model and the server. A Chrome-extension "tool search" that shadowed the real
+   tool list caused exactly this in
+   [#67](https://github.com/mixelpixx/Konnect/issues/67).
+3. Re-issue `tools/list` (e.g. restart the client session) — the loaded toolset
+   state lives in the server process and survives a list refresh.
+
 ## Plugin doesn't appear in KiCAD
 
 Install via **Plugin and Content Manager → Install from File** with the
