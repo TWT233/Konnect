@@ -829,7 +829,7 @@ async fn handle_import_svg_logo(
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
     if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        let shape = builders::board_polygon(&layer_ipc, true, &placed_ipc);
+        let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc);
         let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
         c.create_items(vec![any])
     })

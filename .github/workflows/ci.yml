@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
     branches: [main]
+
+# A new push to the same branch/PR supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,26 +18,52 @@ jobs:
   check:
     name: Check & Test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
+      - name: Test (unit + integration)
+        run: cargo test --workspace --locked --lib --tests
+      # --doc cannot be combined with --lib/--tests; doctests broke silently
+      # once (PR #49) because they were never run in CI.
+      - name: Doctests
+        run: cargo test --workspace --locked --doc
+
+  # schematic-viewer is intentionally outside the workspace (Tauri app), so
+  # --workspace never touches it. Without this job a viewer break ships
+  # silently: release builds it with continue-on-error and the PCM scripts
+  # omit a missing viewer binary without failing.
+  viewer:
+    name: Schematic viewer
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: viewer
+          workspaces: crates/schematic-viewer
+      - name: Check
+        run: cargo check --locked --manifest-path crates/schematic-viewer/Cargo.toml
       - name: Test
-        run: cargo test --workspace --lib
+        run: cargo test --locked --manifest-path crates/schematic-viewer/Cargo.toml
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -40,13 +71,14 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --locked -- -D warnings
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -55,12 +87,13 @@ jobs:
   packaging:
     name: PCM packaging validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install jsonschema
+      - run: python -m pip install jsonschema
       - name: Validate repository metadata
         run: python packaging/validate-pcm.py --metadata packaging/metadata.json
 

@@ -247,10 +247,11 @@ pub fn board_circle(
     cx: f64,
     cy: f64,
     r_mm: f64,
+    filled: bool,
 ) -> kiapi::board::types::BoardGraphicShape {
     board_shape(
         layer,
-        attrs(width_mm, false),
+        attrs(width_mm, filled),
         kiapi::common::types::graphic_shape::Geometry::Circle(
             kiapi::common::types::GraphicCircleAttributes {
                 center: Some(vec2(cx, cy)),
@@ -288,9 +289,12 @@ pub fn board_arc(
 
 /// Build a BoardGraphicShape polygon (or set of polygons) from closed point
 /// loops in mm — one `PolygonWithHoles` per outline, no holes. Used by
-/// `import_svg_logo` to place flattened SVG artwork as filled board graphics.
+/// `import_svg_logo` to place flattened SVG artwork as filled board graphics
+/// (stroke width 0) and by footprint placement for `fp_poly` outlines and
+/// non-cardinal-rotation rectangles, which keep their stroke width.
 pub fn board_polygon(
     layer: &str,
+    width_mm: f64,
     filled: bool,
     outlines: &[Vec<(f64, f64)>],
 ) -> kiapi::board::types::BoardGraphicShape {
@@ -314,7 +318,7 @@ pub fn board_polygon(
 
     board_shape(
         layer,
-        attrs(0.0, filled),
+        attrs(width_mm, filled),
         kiapi::common::types::graphic_shape::Geometry::Polygon(kiapi::common::types::PolySet {
             polygons,
         }),
@@ -406,7 +410,7 @@ mod tests {
 
     #[test]
     fn circle_radius_point_is_center_plus_radius() {
-        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5);
+        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5, false);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Circle(c) => {
                 assert_eq!(c.center.unwrap().x_nm, 5_000_000);
@@ -449,7 +453,7 @@ mod tests {
             vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
             vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
         ];
-        let s = board_polygon("F.SilkS", true, &outlines);
+        let s = board_polygon("F.SilkS", 0.0, true, &outlines);
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let shape = s.shape.expect("shape");
         assert_eq!(
@@ -472,7 +476,7 @@ mod tests {
     #[test]
     fn polygon_nodes_carry_point_coordinates_in_nanometers() {
         let outlines = vec![vec![(1.0, 2.0)]];
-        let s = board_polygon("F.Cu", false, &outlines);
+        let s = board_polygon("F.Cu", 0.0, false, &outlines);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => {
                 let node = &poly_set.polygons[0].outline.as_ref().unwrap().nodes[0];
@@ -490,7 +494,7 @@ mod tests {
 
     #[test]
     fn polygon_empty_outlines_produces_empty_polyset() {
-        let s = board_polygon("F.SilkS", true, &[]);
+        let s = board_polygon("F.SilkS", 0.0, true, &[]);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => assert!(poly_set.polygons.is_empty()),
             _ => panic!("expected Polygon geometry"),

@@ -16,6 +16,10 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
+# Minimum supported Rust version. Set to the pinned toolchain
+# (rust-toolchain.toml) — the only version the gate actually verifies.
+# Lower it only after genuinely building and testing on the older compiler.
+rust-version = "1.96"
 
 [workspace.dependencies]
 # Serialization
@@ -44,7 +48,7 @@ toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # SQLite (JLCPCB database)
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Error handling
 anyhow = "1"
@@ -64,7 +68,7 @@ base64 = "0.22"
 dirs = "5"
 
 # SVG parsing (import_svg_logo)
-usvg = "0.44"
+usvg = "0.47"
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }
