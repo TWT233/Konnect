@@ -359,63 +359,16 @@ async fn handle_add_schematic_component(
     sym.at.rotation = Some(rotation);
     sym.unit = unit;
 
-    // Helper: build an effects sub-node  (font (size 1.27 1.27))  with optional (hide yes)
-    let effects_node = |hide: bool| -> cse::sexp::SexpNode {
-        let font = cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("font"),
-            cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("size"),
-                cse::sexp::atom("1.27"),
-                cse::sexp::atom("1.27"),
-            ]),
-        ]);
-        let mut children = vec![cse::sexp::atom("effects"), font];
-        if hide {
-            children.push(cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("hide"),
-                cse::sexp::atom("yes"),
-            ]));
-        }
-        cse::sexp::SexpNode::List(children)
-    };
-
-    // Helper: build an (at X Y ROT) sub-node
-    let at_node = |px: f64, py: f64, rot: f64| -> cse::sexp::SexpNode {
-        cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("at"),
-            cse::sexp::atom(cse::types::fmt_f64(px)),
-            cse::sexp::atom(cse::types::fmt_f64(py)),
-            cse::sexp::atom(cse::types::fmt_f64(rot)),
-        ])
-    };
-
-    // Offset Reference above component, Value below
-    let ref_y = y - 3.81;
-    let val_y = y + 3.81;
-
-    // Reference property
-    let mut ref_prop = cse::Property::new("Reference", ref_str);
-    ref_prop.sub_nodes.push(at_node(x, ref_y, 0.0));
-    ref_prop.sub_nodes.push(effects_node(false));
-    sym.properties.push(ref_prop);
-
-    // Value property
-    let mut val_prop = cse::Property::new("Value", val_str);
-    val_prop.sub_nodes.push(at_node(x, val_y, 0.0));
-    val_prop.sub_nodes.push(effects_node(false));
-    sym.properties.push(val_prop);
-
-    // Footprint property (hidden)
-    let mut fp_prop = cse::Property::new("Footprint", "");
-    fp_prop.sub_nodes.push(at_node(x, y, 0.0));
-    fp_prop.sub_nodes.push(effects_node(true));
-    sym.properties.push(fp_prop);
-
-    // Datasheet property (hidden)
-    let mut ds_prop = cse::Property::new("Datasheet", "");
-    ds_prop.sub_nodes.push(at_node(x, y, 0.0));
-    ds_prop.sub_nodes.push(effects_node(true));
-    sym.properties.push(ds_prop);
+    // Reference above the component, Value below; Footprint/Datasheet hidden.
+    let positioned = crate::tools::positioned_property;
+    sym.properties
+        .push(positioned("Reference", ref_str, x, y - 3.81, 0.0, false));
+    sym.properties
+        .push(positioned("Value", val_str, x, y + 3.81, 0.0, false));
+    sym.properties
+        .push(positioned("Footprint", "", x, y, 0.0, true));
+    sym.properties
+        .push(positioned("Datasheet", "", x, y, 0.0, true));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))

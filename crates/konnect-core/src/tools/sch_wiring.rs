@@ -1160,52 +1160,15 @@ async fn handle_add_power_symbol(
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
     // #PWR piles up in the top-left corner. Hide Reference like eeschema does.
-    let effects_node = |hide: bool| -> cse::sexp::SexpNode {
-        let font = cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("font"),
-            cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("size"),
-                cse::sexp::atom("1.27"),
-                cse::sexp::atom("1.27"),
-            ]),
-        ]);
-        let mut children = vec![cse::sexp::atom("effects"), font];
-        if hide {
-            children.push(cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("hide"),
-                cse::sexp::atom("yes"),
-            ]));
-        }
-        cse::sexp::SexpNode::List(children)
-    };
-    let at_node = |px: f64, py: f64, rot: f64| -> cse::sexp::SexpNode {
-        cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("at"),
-            cse::sexp::atom(cse::types::fmt_f64(px)),
-            cse::sexp::atom(cse::types::fmt_f64(py)),
-            cse::sexp::atom(cse::types::fmt_f64(rot)),
-        ])
-    };
-
-    let mut ref_prop = cse::Property::new("Reference", &pwr_ref);
-    ref_prop.sub_nodes.push(at_node(x, y - 3.81, 0.0));
-    ref_prop.sub_nodes.push(effects_node(true));
-    sym.properties.push(ref_prop);
-
-    let mut val_prop = cse::Property::new("Value", &power_net);
-    val_prop.sub_nodes.push(at_node(x, y + 3.81, 0.0));
-    val_prop.sub_nodes.push(effects_node(false));
-    sym.properties.push(val_prop);
-
-    let mut fp_prop = cse::Property::new("Footprint", "");
-    fp_prop.sub_nodes.push(at_node(x, y, 0.0));
-    fp_prop.sub_nodes.push(effects_node(true));
-    sym.properties.push(fp_prop);
-
-    let mut ds_prop = cse::Property::new("Datasheet", "");
-    ds_prop.sub_nodes.push(at_node(x, y, 0.0));
-    ds_prop.sub_nodes.push(effects_node(true));
-    sym.properties.push(ds_prop);
+    let positioned = crate::tools::positioned_property;
+    sym.properties
+        .push(positioned("Reference", &pwr_ref, x, y - 3.81, 0.0, true));
+    sym.properties
+        .push(positioned("Value", &power_net, x, y + 3.81, 0.0, false));
+    sym.properties
+        .push(positioned("Footprint", "", x, y, 0.0, true));
+    sym.properties
+        .push(positioned("Datasheet", "", x, y, 0.0, true));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
