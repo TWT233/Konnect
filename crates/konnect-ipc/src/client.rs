@@ -232,13 +232,16 @@ impl KiCadIpcClient {
             .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(30)))
             .context("Failed to set NNG receive timeout")?;
 
-        // Build the dial URL
-        let dial_url =
-            if self.socket_path.starts_with("ipc://") || self.socket_path.starts_with("tcp://") {
-                self.socket_path.clone()
-            } else {
-                format!("ipc://{}", self.socket_path)
-            };
+        // Build the dial URL. inproc:// is same-process only — used by the
+        // mock-KiCAD test servers, where it avoids TCP port races entirely.
+        let dial_url = if self.socket_path.starts_with("ipc://")
+            || self.socket_path.starts_with("tcp://")
+            || self.socket_path.starts_with("inproc://")
+        {
+            self.socket_path.clone()
+        } else {
+            format!("ipc://{}", self.socket_path)
+        };
 
         socket.dial(&dial_url).map_err(|error| {
             anyhow::Error::new(TransportUnreachable).context(format!(
