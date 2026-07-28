@@ -1156,11 +1156,56 @@ async fn handle_add_power_symbol(
     sym.in_bom = true;
     sym.on_board = true;
     sym.uuid = uuid::Uuid::new_v4().to_string();
-    sym.properties
-        .push(cse::Property::new("Reference", &pwr_ref));
-    sym.properties.push(cse::Property::new("Value", &power_net));
-    sym.properties.push(cse::Property::new("Footprint", ""));
-    sym.properties.push(cse::Property::new("Datasheet", ""));
+
+    // Property (at …) is absolute sheet coords — same as add_schematic_component.
+    // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
+    // #PWR piles up in the top-left corner. Hide Reference like eeschema does.
+    let effects_node = |hide: bool| -> cse::sexp::SexpNode {
+        let font = cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("font"),
+            cse::sexp::SexpNode::List(vec![
+                cse::sexp::atom("size"),
+                cse::sexp::atom("1.27"),
+                cse::sexp::atom("1.27"),
+            ]),
+        ]);
+        let mut children = vec![cse::sexp::atom("effects"), font];
+        if hide {
+            children.push(cse::sexp::SexpNode::List(vec![
+                cse::sexp::atom("hide"),
+                cse::sexp::atom("yes"),
+            ]));
+        }
+        cse::sexp::SexpNode::List(children)
+    };
+    let at_node = |px: f64, py: f64, rot: f64| -> cse::sexp::SexpNode {
+        cse::sexp::SexpNode::List(vec![
+            cse::sexp::atom("at"),
+            cse::sexp::atom(cse::types::fmt_f64(px)),
+            cse::sexp::atom(cse::types::fmt_f64(py)),
+            cse::sexp::atom(cse::types::fmt_f64(rot)),
+        ])
+    };
+
+    let mut ref_prop = cse::Property::new("Reference", &pwr_ref);
+    ref_prop.sub_nodes.push(at_node(x, y - 3.81, 0.0));
+    ref_prop.sub_nodes.push(effects_node(true));
+    sym.properties.push(ref_prop);
+
+    let mut val_prop = cse::Property::new("Value", &power_net);
+    val_prop.sub_nodes.push(at_node(x, y + 3.81, 0.0));
+    val_prop.sub_nodes.push(effects_node(false));
+    sym.properties.push(val_prop);
+
+    let mut fp_prop = cse::Property::new("Footprint", "");
+    fp_prop.sub_nodes.push(at_node(x, y, 0.0));
+    fp_prop.sub_nodes.push(effects_node(true));
+    sym.properties.push(fp_prop);
+
+    let mut ds_prop = cse::Property::new("Datasheet", "");
+    ds_prop.sub_nodes.push(at_node(x, y, 0.0));
+    ds_prop.sub_nodes.push(effects_node(true));
+    sym.properties.push(ds_prop);
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -1996,5 +2041,83 @@ mod wire_delete_tests {
         assert_eq!(wires.len(), 2);
         assert!(after.contains("(junction"));
         assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
+    }
+}
+
+#[cfg(test)]
+mod power_symbol_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_places_hidden_reference_near_the_symbol() {
+        // Pre-seed lib_symbols so ensure_lib_symbol succeeds without a KiCad install.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"GND\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        let ref_prop = sym
+            .properties
+            .iter()
+            .find(|p| p.name == "Reference")
+            .unwrap();
+        let ref_sexp = cse::sexp::writer::write(&ref_prop.to_sexp());
+        assert!(
+            ref_sexp.contains("(at 100") && ref_sexp.contains("76.19"),
+            "Reference must sit near the symbol, not sheet origin: {ref_sexp}"
+        );
+        assert!(
+            ref_sexp.contains("hide"),
+            "eeschema hides #PWR references: {ref_sexp}"
+        );
+        let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
+        let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
+        assert!(
+            val_sexp.contains("(at 100") && val_sexp.contains("83.81"),
+            "Value must sit near the symbol: {val_sexp}"
+        );
+        assert!(
+            !after.contains("(property \"Reference\" \"#PWR001\")\n"),
+            "must not write a bare Reference with no (at)"
+        );
     }
 }
