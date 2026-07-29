@@ -468,13 +468,19 @@ mod tests {
         let mut sym = Symbol::new("Device:R", 100.0, 50.0);
         let mut reference = Property::new("Reference", "R1");
         // Property (at) is absolute: text sits 2.54mm right of the symbol.
-        reference.sub_nodes.push(At::with_rotation(102.54, 50.0, 0.0).to_sexp());
+        reference
+            .sub_nodes
+            .push(At::with_rotation(102.54, 50.0, 0.0).to_sexp());
         sym.properties.push(reference);
 
         sym.move_to(110.0, 60.0);
 
         let at = At::from_sexp(&sym.properties[0].sub_nodes[0]).unwrap();
-        assert_eq!((at.x, at.y), (112.54, 60.0), "property must keep its offset");
+        assert_eq!(
+            (at.x, at.y),
+            (112.54, 60.0),
+            "property must keep its offset"
+        );
         assert_eq!((sym.at.x, sym.at.y), (110.0, 60.0));
     }
 }

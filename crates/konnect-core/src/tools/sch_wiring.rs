@@ -1897,8 +1897,14 @@ mod label_tests {
         assert!(!result.is_error);
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.contains("(at 102.54 98.73 0)"), "first label moved: {after}");
-        assert!(after.contains("(at 202.54 98.73 0)"), "second label moved: {after}");
+        assert!(
+            after.contains("(at 102.54 98.73 0)"),
+            "first label moved: {after}"
+        );
+        assert!(
+            after.contains("(at 202.54 98.73 0)"),
+            "second label moved: {after}"
+        );
     }
 
     #[tokio::test]
