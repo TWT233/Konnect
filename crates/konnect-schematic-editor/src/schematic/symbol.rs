@@ -260,13 +260,24 @@ impl Symbol {
     }
 
     pub fn move_to(&mut self, x: f64, y: f64) {
-        self.at.x = x;
-        self.at.y = y;
+        self.translate(x - self.at.x, y - self.at.y);
     }
 
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.x += dx;
         self.at.y += dy;
+        // Property (at) coordinates are absolute in .kicad_sch, so the
+        // Reference/Value text must move with the symbol.
+        for prop in &mut self.properties {
+            for node in &mut prop.sub_nodes {
+                if node.tag() == Some("at") {
+                    if let Some(mut at) = At::from_sexp(node) {
+                        at.translate(dx, dy);
+                        *node = at.to_sexp();
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_rotation(&mut self, rot: f64) {
@@ -446,4 +457,30 @@ impl<'a> IntoIterator for &'a mut SymbolCollection {
 fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     let (dx, dy) = (ax - bx, ay - by);
     (dx * dx + dy * dy).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_to_carries_property_text_along() {
+        let mut sym = Symbol::new("Device:R", 100.0, 50.0);
+        let mut reference = Property::new("Reference", "R1");
+        // Property (at) is absolute: text sits 2.54mm right of the symbol.
+        reference
+            .sub_nodes
+            .push(At::with_rotation(102.54, 50.0, 0.0).to_sexp());
+        sym.properties.push(reference);
+
+        sym.move_to(110.0, 60.0);
+
+        let at = At::from_sexp(&sym.properties[0].sub_nodes[0]).unwrap();
+        assert_eq!(
+            (at.x, at.y),
+            (112.54, 60.0),
+            "property must keep its offset"
+        );
+        assert_eq!((sym.at.x, sym.at.y), (110.0, 60.0));
+    }
 }

@@ -1050,7 +1050,7 @@ async fn handle_rotate_label(
 
 async fn handle_move_labels_by_offset(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let net = match require_str(args, "net") {
@@ -1066,23 +1066,45 @@ async fn handle_move_labels_by_offset(
         Err(e) => return Ok(e),
     };
 
-    let (_, tree) = read_schematic(&sch_path)?;
-    let labels = konnect_sexp::schematic::extract_labels(&tree);
-
-    let matching: Vec<_> = labels.iter().filter(|l| l.net == net).cloned().collect();
-    let mut moved = 0usize;
-
-    for label in &matching {
-        let rotate_args = json!({
-            "schematic": sch_path.display().to_string(),
-            "net": net,
-            "x": label.x + dx,
-            "y": label.y + dy,
-            "rotation": label.rotation
-        });
-        handle_rotate_label(&rotate_args, ctx).await?;
-        moved += 1;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let labels = find_label_blocks(&content);
+    let matching: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
+    if matching.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No label named '{}' in this schematic",
+            net
+        )));
     }
+
+    // Edit each label's (at X Y ROT) anchor in place, preserving the rotation.
+    let mut edits = Vec::new();
+    for label in &matching {
+        let (block_start, block_end) = find_balanced_block(&content, label.start)
+            .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
+        let block = &content[block_start..block_end];
+        let at_rel = block
+            .find("(at ")
+            .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
+        let at_val = block_start + at_rel + "(at ".len();
+        let at_close = content[at_val..]
+            .find(')')
+            .map(|o| at_val + o)
+            .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
+        let rotation = content[at_val..at_close]
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("0")
+            .to_string();
+        edits.push(SexpEdit::replace(
+            at_val,
+            at_close,
+            format!("{} {} {}", label.x + dx, label.y + dy, rotation),
+        ));
+    }
+
+    let moved = edits.len();
+    let new_content = apply_edits(content, edits);
+    write_atomic(&sch_path, &new_content)?;
 
     Ok(CallToolResult::json(
         &json!({ "moved_labels": moved, "net": net }),
@@ -1859,6 +1881,44 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
         assert!(result.is_error, "must not rotate the nearest label instead");
+    }
+
+    // ─── move by offset ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn move_labels_by_offset_actually_moves_every_matching_label() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": "VCC", "dx": 2.54, "dy": -1.27 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 102.54 98.73 0)"),
+            "first label moved: {after}"
+        );
+        assert!(
+            after.contains("(at 202.54 98.73 0)"),
+            "second label moved: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_labels_by_offset_errors_on_unknown_net() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": "NOPE", "dx": 1.0, "dy": 1.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "zero matches must not report success");
+        assert_eq!(before, std::fs::read_to_string(&path).unwrap());
     }
 }
 
