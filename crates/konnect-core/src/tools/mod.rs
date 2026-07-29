@@ -332,6 +332,10 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
 /// eeschema's default 1.27mm font. The `(at)` node is mandatory: a property
 /// written without one is defaulted to the sheet origin by KiCAD, which is how
 /// every `#PWR` reference used to pile up in the top-left corner (PR #95).
+///
+/// Hidden properties get KiCAD 10's property-level `(hide yes)` — a sibling
+/// before `(effects)`, exactly as eeschema writes instances (PR #96); the
+/// legacy hide-inside-effects form renders the same but round-trips dirty.
 pub(crate) fn positioned_property(
     name: &str,
     value: &str,
@@ -350,15 +354,17 @@ pub(crate) fn positioned_property(
         atom(fmt_f64(y)),
         atom(fmt_f64(rotation)),
     ]));
-    let font = SexpNode::List(vec![
-        atom("font"),
-        SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
-    ]);
-    let mut effects = vec![atom("effects"), font];
     if hide {
-        effects.push(SexpNode::List(vec![atom("hide"), atom("yes")]));
+        prop.sub_nodes
+            .push(SexpNode::List(vec![atom("hide"), atom("yes")]));
     }
-    prop.sub_nodes.push(SexpNode::List(effects));
+    prop.sub_nodes.push(SexpNode::List(vec![
+        atom("effects"),
+        SexpNode::List(vec![
+            atom("font"),
+            SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+        ]),
+    ]));
     prop
 }
 

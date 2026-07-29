@@ -1159,7 +1159,8 @@ async fn handle_add_power_symbol(
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
-    // #PWR piles up in the top-left corner. Hide Reference like eeschema does.
+    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
+    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
     let positioned = crate::tools::positioned_property;
     sym.properties
         .push(positioned("Reference", &pwr_ref, x, y - 3.81, 0.0, true));
@@ -2068,15 +2069,23 @@ mod power_symbol_tests {
             ref_sexp.contains("(at 100") && ref_sexp.contains("76.19"),
             "Reference must sit near the symbol, not sheet origin: {ref_sexp}"
         );
+        let hide_at = ref_sexp
+            .find("(hide yes)")
+            .expect("KiCad 10 property-level hide");
+        let effects_at = ref_sexp.find("(effects").expect("effects");
         assert!(
-            ref_sexp.contains("hide"),
-            "eeschema hides #PWR references: {ref_sexp}"
+            hide_at < effects_at,
+            "hide must be a property sibling before effects (not inside effects): {ref_sexp}"
         );
         let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
         let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
         assert!(
             val_sexp.contains("(at 100") && val_sexp.contains("83.81"),
             "Value must sit near the symbol: {val_sexp}"
+        );
+        assert!(
+            !val_sexp.contains("hide"),
+            "Value must stay visible on power symbols: {val_sexp}"
         );
         assert!(
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),

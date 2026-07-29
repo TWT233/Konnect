@@ -360,9 +360,18 @@ async fn handle_add_schematic_component(
     sym.unit = unit;
 
     // Reference above the component, Value below; Footprint/Datasheet hidden.
+    // Power symbols get their Reference hidden too, matching eeschema: a
+    // #PWR designator is never shown on the sheet.
+    let hide_reference = lib_id.starts_with("power:") || ref_str.starts_with("#PWR");
     let positioned = crate::tools::positioned_property;
-    sym.properties
-        .push(positioned("Reference", ref_str, x, y - 3.81, 0.0, false));
+    sym.properties.push(positioned(
+        "Reference",
+        ref_str,
+        x,
+        y - 3.81,
+        0.0,
+        hide_reference,
+    ));
     sym.properties
         .push(positioned("Value", val_str, x, y + 3.81, 0.0, false));
     sym.properties
@@ -1649,5 +1658,63 @@ mod tests {
         let msg = format!("{:?}", result.content);
         assert!(msg.contains("Device:CP"));
         assert!(msg.contains("no embedded definition"));
+    }
+
+    #[tokio::test]
+    async fn add_schematic_component_hides_power_reference() {
+        // Pre-seed lib_symbols so ensure_lib_symbol succeeds without KiCad.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-via-add.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0) (hide yes))\n      (property \"Value\" \"GND\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "power:GND",
+                "x": 50.0,
+                "y": 60.0,
+                "reference": "#PWR010",
+                "value": "GND"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR010"))
+            .expect("power instance");
+        let ref_sexp = cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == "Reference")
+                .unwrap()
+                .to_sexp(),
+        );
+        let hide_at = ref_sexp.find("(hide yes)").expect("property-level hide");
+        let effects_at = ref_sexp.find("(effects").expect("effects");
+        assert!(
+            hide_at < effects_at,
+            "power: via add_schematic_component must hide Reference like add_power_symbol: {ref_sexp}"
+        );
+        let val_sexp = cse::sexp::writer::write(
+            &sym.properties
+                .iter()
+                .find(|p| p.name == "Value")
+                .unwrap()
+                .to_sexp(),
+        );
+        assert!(
+            !val_sexp.contains("hide"),
+            "Value stays visible: {val_sexp}"
+        );
     }
 }
