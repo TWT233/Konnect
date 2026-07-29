@@ -1,6 +1,6 @@
 //! IPC client tests against a mock KiCAD NNG server — no KiCAD required.
 //!
-//! A rep0 socket on tcp://127.0.0.1:<port> plays KiCAD: it decodes the
+//! A rep0 socket on inproc://<unique-name> plays KiCAD: it decodes the
 //! ApiRequest envelope and returns canned ApiResponse messages. This lets CI
 //! exercise the full encode → transport → decode → error-mapping path that
 //! previously only ran against a live KiCAD session.
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// A rep0 server answering each request via `respond`.
-/// Returns the tcp:// URL to dial. The server thread exits when the socket
+/// Returns the inproc:// URL to dial. The server thread exits when the socket
 /// errors (i.e. when `_socket_keepalive` is dropped by the returned guard).
 struct MockKicad {
     url: String,
@@ -25,16 +25,20 @@ fn spawn_mock<F>(respond: F) -> MockKicad
 where
     F: Fn(kiapi::common::ApiRequest) -> Option<kiapi::common::ApiResponse> + Send + 'static,
 {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let url = format!("tcp://127.0.0.1:{port}");
+    // inproc:// needs no port, so there is no bind-a-TcpListener-then-relisten
+    // TOCTOU window (that pattern intermittently died with AddressInUse on CI
+    // when another process grabbed the probed port). The name only has to be
+    // unique within this test process; a counter suffices.
+    static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let url = format!(
+        "inproc://mock-kicad-{}",
+        NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Listen BEFORE returning (and before the receive thread spawns): the
     // client dials the moment spawn_mock returns, and NNG's dial fails
-    // immediately with Connection refused if nothing is bound yet. Doing the
-    // listen inside the thread raced the caller — flaky on slow CI runners.
+    // immediately if nothing is bound yet. Doing the listen inside the
+    // thread raced the caller — flaky on slow CI runners.
     let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
     socket
         .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))

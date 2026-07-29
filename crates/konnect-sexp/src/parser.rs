@@ -11,7 +11,7 @@ use nom::{
     combinator::{map, recognize},
     multi::many0,
     sequence::{delimited, preceded},
-    IResult,
+    IResult, Parser,
 };
 
 // ─── AST ─────────────────────────────────────────────────────────────────────
@@ -121,28 +121,31 @@ fn sexp(input: &str) -> IResult<&str, SexpNode> {
     preceded(
         multispace0,
         alt((parse_list, parse_quoted_string, parse_atom)),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_list(input: &str) -> IResult<&str, SexpNode> {
     map(
         delimited(char('('), many0(sexp), preceded(multispace0, char(')'))),
         SexpNode::List,
-    )(input)
+    )
+    .parse(input)
 }
 
 fn parse_quoted_string(input: &str) -> IResult<&str, SexpNode> {
     // Handle empty strings "" as a special case, then fall back to escaped content.
-    let (input, _) = char('"')(input)?;
-    if let Ok((rest, _)) = char::<&str, nom::error::Error<&str>>('"')(input) {
+    let (input, _) = char('"').parse(input)?;
+    if let Ok((rest, _)) = char::<&str, nom::error::Error<&str>>('"').parse(input) {
         return Ok((rest, SexpNode::Str(String::new())));
     }
     let (input, content) = recognize(escaped(
         none_of("\\\""),
         '\\',
         nom::character::complete::anychar,
-    ))(input)?;
-    let (input, _) = char('"')(input)?;
+    ))
+    .parse(input)?;
+    let (input, _) = char('"').parse(input)?;
     Ok((input, SexpNode::Str(unescape(content))))
 }
 
@@ -150,7 +153,8 @@ fn parse_atom(input: &str) -> IResult<&str, SexpNode> {
     map(
         take_while1(|c: char| !c.is_whitespace() && c != '(' && c != ')' && c != '"'),
         |s: &str| SexpNode::Atom(s.to_string()),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn unescape(s: &str) -> String {

@@ -1159,55 +1159,17 @@ async fn handle_add_power_symbol(
 
     // Property (at …) is absolute sheet coords — same as add_schematic_component.
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
-    // #PWR piles up in the top-left corner. Hide Reference with KiCad 10's
-    // property-level `(hide yes)` (sibling of effects), matching power.kicad_sym.
-    let effects_node = || -> cse::sexp::SexpNode {
-        cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("effects"),
-            cse::sexp::SexpNode::List(vec![
-                cse::sexp::atom("font"),
-                cse::sexp::SexpNode::List(vec![
-                    cse::sexp::atom("size"),
-                    cse::sexp::atom("1.27"),
-                    cse::sexp::atom("1.27"),
-                ]),
-            ]),
-        ])
-    };
-    let hide_node = || -> cse::sexp::SexpNode {
-        cse::sexp::SexpNode::List(vec![cse::sexp::atom("hide"), cse::sexp::atom("yes")])
-    };
-    let at_node = |px: f64, py: f64, rot: f64| -> cse::sexp::SexpNode {
-        cse::sexp::SexpNode::List(vec![
-            cse::sexp::atom("at"),
-            cse::sexp::atom(cse::types::fmt_f64(px)),
-            cse::sexp::atom(cse::types::fmt_f64(py)),
-            cse::sexp::atom(cse::types::fmt_f64(rot)),
-        ])
-    };
-
-    let mut ref_prop = cse::Property::new("Reference", &pwr_ref);
-    ref_prop.sub_nodes.push(at_node(x, y - 3.81, 0.0));
-    ref_prop.sub_nodes.push(hide_node());
-    ref_prop.sub_nodes.push(effects_node());
-    sym.properties.push(ref_prop);
-
-    let mut val_prop = cse::Property::new("Value", &power_net);
-    val_prop.sub_nodes.push(at_node(x, y + 3.81, 0.0));
-    val_prop.sub_nodes.push(effects_node());
-    sym.properties.push(val_prop);
-
-    let mut fp_prop = cse::Property::new("Footprint", "");
-    fp_prop.sub_nodes.push(at_node(x, y, 0.0));
-    fp_prop.sub_nodes.push(hide_node());
-    fp_prop.sub_nodes.push(effects_node());
-    sym.properties.push(fp_prop);
-
-    let mut ds_prop = cse::Property::new("Datasheet", "");
-    ds_prop.sub_nodes.push(at_node(x, y, 0.0));
-    ds_prop.sub_nodes.push(hide_node());
-    ds_prop.sub_nodes.push(effects_node());
-    sym.properties.push(ds_prop);
+    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
+    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
+    let positioned = crate::tools::positioned_property;
+    sym.properties
+        .push(positioned("Reference", &pwr_ref, x, y - 3.81, 0.0, true));
+    sym.properties
+        .push(positioned("Value", &power_net, x, y + 3.81, 0.0, false));
+    sym.properties
+        .push(positioned("Footprint", "", x, y, 0.0, true));
+    sym.properties
+        .push(positioned("Datasheet", "", x, y, 0.0, true));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -2107,7 +2069,9 @@ mod power_symbol_tests {
             ref_sexp.contains("(at 100") && ref_sexp.contains("76.19"),
             "Reference must sit near the symbol, not sheet origin: {ref_sexp}"
         );
-        let hide_at = ref_sexp.find("(hide yes)").expect("KiCad 10 property-level hide");
+        let hide_at = ref_sexp
+            .find("(hide yes)")
+            .expect("KiCad 10 property-level hide");
         let effects_at = ref_sexp.find("(effects").expect("effects");
         assert!(
             hide_at < effects_at,

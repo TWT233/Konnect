@@ -328,6 +328,46 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
     }
 }
 
+/// A symbol-instance property positioned in absolute sheet coordinates, with
+/// eeschema's default 1.27mm font. The `(at)` node is mandatory: a property
+/// written without one is defaulted to the sheet origin by KiCAD, which is how
+/// every `#PWR` reference used to pile up in the top-left corner (PR #95).
+///
+/// Hidden properties get KiCAD 10's property-level `(hide yes)` — a sibling
+/// before `(effects)`, exactly as eeschema writes instances (PR #96); the
+/// legacy hide-inside-effects form renders the same but round-trips dirty.
+pub(crate) fn positioned_property(
+    name: &str,
+    value: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    hide: bool,
+) -> konnect_schematic_editor::Property {
+    use konnect_schematic_editor::sexp::{atom, SexpNode};
+    use konnect_schematic_editor::types::fmt_f64;
+
+    let mut prop = konnect_schematic_editor::Property::new(name, value);
+    prop.sub_nodes.push(SexpNode::List(vec![
+        atom("at"),
+        atom(fmt_f64(x)),
+        atom(fmt_f64(y)),
+        atom(fmt_f64(rotation)),
+    ]));
+    if hide {
+        prop.sub_nodes
+            .push(SexpNode::List(vec![atom("hide"), atom("yes")]));
+    }
+    prop.sub_nodes.push(SexpNode::List(vec![
+        atom("effects"),
+        SexpNode::List(vec![
+            atom("font"),
+            SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+        ]),
+    ]));
+    prop
+}
+
 // ─── Schematic text helpers ──────────────────────────────────────────────────
 
 /// Byte range of the placed `(symbol …)` block whose Reference property is
