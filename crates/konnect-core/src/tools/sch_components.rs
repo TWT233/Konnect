@@ -387,13 +387,18 @@ async fn handle_add_schematic_component(
     sch.add_symbol(sym);
     sch.overwrite()?;
 
+    // A pin landing mid-segment on an existing wire needs a junction dot,
+    // or KiCad ERC reports it as not connected.
+    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
+
     Ok(CallToolResult::json(&json!({
         "added": lib_id,
         "reference": ref_str,
         "value": val_str,
         "x": x, "y": y,
         "unit": unit,
-        "uuid": uuid
+        "uuid": uuid,
+        "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
     })))
 }
 

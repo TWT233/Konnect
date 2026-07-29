@@ -13,8 +13,8 @@ use crate::tools::{
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
-        format_net_label, format_wire, pin_endpoint, read_schematic,
+        extract_junctions, extract_labels, extract_lib_pins, extract_symbol_instances,
+        extract_wires, format_net_label, format_wire, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -959,7 +959,8 @@ async fn handle_validate_component_connections(
         .collect();
 
     // Build net graph so we can check connectivity
-    let mut g = build_net_graph(&wires, &labels);
+    let junctions = extract_junctions(&tree);
+    let mut g = build_net_graph(&wires, &labels, &junctions);
     // Also build flat wire-endpoint list for direct presence checks
     let all_wire_eps: Vec<(f64, f64)> = wires
         .iter()
@@ -972,6 +973,17 @@ async fn handle_validate_component_connections(
         if all_wire_eps
             .iter()
             .any(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
+        {
+            return true;
+        }
+        // Pin mid-wire connects only via a junction dot (KiCad semantics:
+        // verified with kicad-cli 10 — junction alone connects, no split needed)
+        if junctions
+            .iter()
+            .any(|(jx, jy)| points_coincident(px, py, *jx, *jy, tol))
+            && wires
+                .iter()
+                .any(|w| point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol))
         {
             return true;
         }
@@ -1072,5 +1084,70 @@ mod batch_delete_tests {
         assert!(after.contains("keep me"));
         assert!(after.contains("(sheet_instances"));
         assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod midwire_pin_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// U1 has a single pin at (100,80), sitting strictly mid-segment on a wire
+    /// from (90,80) to (110,80).
+    fn midwire_schematic(with_junction: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let junction = if with_junction {
+            "\t(junction (at 100 80) (diameter 0) (color 0 0 0 0) (uuid \"j1\"))\n"
+        } else {
+            ""
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwire.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Test:P1\"\n\t\t\t(symbol \"P1_1_1\"\n\t\t\t\t(pin passive line (at 0 0 0) (length 2.54)\n\t\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(wire\n\t\t(pts (xy 90 80) (xy 110 80))\n\t\t(uuid \"w1\")\n\t)\n{junction}\t(symbol\n\t\t(lib_id \"Test:P1\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 100 75 0)\n\t\t)\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// KiCad connects a pin mid-wire only through a junction dot; the
+    /// validator must mirror that instead of demanding a wire endpoint.
+    #[tokio::test]
+    async fn midwire_pin_connects_with_junction_only() {
+        for (with_junction, expect_valid) in [(true, true), (false, false)] {
+            let (_d, path) = midwire_schematic(with_junction);
+            let result = handle_validate_component_connections(
+                &json!({ "schematic": path.display().to_string() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body["valid"].as_bool(),
+                Some(expect_valid),
+                "with_junction={with_junction}: {body}"
+            );
+        }
     }
 }
