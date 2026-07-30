@@ -1050,7 +1050,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "array",
                         "description": "Layers to include (empty = default copper + silkscreen)",
                         "items": { "type": "string" }
-                    }
+                    },
+                    "width":  { "type": "integer", "default": 800, "description": "Render width in pixels, clamped to 100-4000 (kept small since the image lands in LLM context, raise it when detail matters)" },
+                    "height": { "type": "integer", "default": 600, "description": "Render height in pixels, clamped to 100-4000" }
                 },
                 "required": ["board"]
             }),
@@ -1713,9 +1715,20 @@ async fn handle_get_board_2d_view(
             ]
         });
 
+    let width = args["width"].as_u64().unwrap_or(800).clamp(100, 4000) as u32;
+    let height = args["height"].as_u64().unwrap_or(600).clamp(100, 4000) as u32;
+
     let tmp = board_path.with_extension("render.png");
     let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
-    super::cli::render_pcb_png(&ctx.config.kicad_cli, &board_path, &tmp, &layer_refs).await?;
+    super::cli::render_pcb_png(
+        &ctx.config.kicad_cli,
+        &board_path,
+        &tmp,
+        &layer_refs,
+        width,
+        height,
+    )
+    .await?;
     let bytes = tokio::fs::read(&tmp).await?;
     let _ = tokio::fs::remove_file(&tmp).await;
 
