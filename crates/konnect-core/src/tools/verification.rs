@@ -36,6 +36,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "array",
                         "description": "Specific DRC test IDs to run (empty = all tests)",
                         "items": { "type": "string" }
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of violations to return",
+                        "default": 50
                     }
                 },
                 "required": ["board"]
@@ -180,6 +185,7 @@ async fn handle_run_drc(
     let board = get_path(args, "board")?;
     let severity_filter = args["severity"].as_str().unwrap_or("warning");
     let min_rank = severity_rank(severity_filter);
+    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
     let violations = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
@@ -197,15 +203,19 @@ async fn handle_run_drc(
 
     let errors = filtered.iter().filter(|v| v.severity == "error").count();
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
+    let shown = filtered.len().min(limit);
+    let truncated = filtered.len() > limit;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "total_violations": violations.len(),
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,
             "severity_filter": severity_filter,
-            "violations": filtered.iter().map(|v| json!({
+            "shown": shown,
+            "truncated": truncated,
+            "violations": filtered.iter().take(limit).map(|v| json!({
                 "severity": v.severity,
                 "description": v.description,
                 "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
@@ -316,7 +326,7 @@ async fn handle_set_design_rules(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "changed": changed
         }))
@@ -332,7 +342,7 @@ async fn handle_get_design_rules(
     let content = tokio::fs::read_to_string(&board).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
             "rules": {
                 "min_clearance": read_constraint(&content, "min_clearance"),
@@ -419,7 +429,7 @@ async fn handle_check_kicad_ui(
 
     if !running {
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "running": false,
                 "ipc_responsive": false
             }))
@@ -438,7 +448,7 @@ async fn handle_check_kicad_ui(
     .unwrap_or(false);
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "running": true,
             "ipc_responsive": ipc_ok
         }))
@@ -481,7 +491,7 @@ async fn handle_launch_kicad_ui(
 
                     if ok {
                         return Ok(CallToolResult::text(
-                            serde_json::to_string_pretty(&json!({
+                            serde_json::to_string(&json!({
                                 "launched": true,
                                 "ipc_ready": true
                             }))
@@ -490,7 +500,7 @@ async fn handle_launch_kicad_ui(
                     }
                     if std::time::Instant::now() >= deadline {
                         return Ok(CallToolResult::text(
-                            serde_json::to_string_pretty(&json!({
+                            serde_json::to_string(&json!({
                                 "launched": true,
                                 "ipc_ready": false,
                                 "note": "KiCAD launched but IPC not yet responsive within timeout"
@@ -502,7 +512,7 @@ async fn handle_launch_kicad_ui(
             }
 
             Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&json!({
+                serde_json::to_string(&json!({
                     "launched": true,
                     "ipc_ready": null
                 }))
@@ -559,7 +569,7 @@ async fn handle_copy_routing_pattern(
 
     if new_tracks.is_empty() {
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "copied": 0,
                 "note": "No routing elements found in the specified source region"
             }))
@@ -583,7 +593,7 @@ async fn handle_copy_routing_pattern(
     write_atomic(&board, &new_content)?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "copied": new_tracks.len(),
             "dx": dx,
             "dy": dy
@@ -800,7 +810,7 @@ async fn handle_set_layer_constraints(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "layer": layer,
             "changed": changed
