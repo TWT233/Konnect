@@ -331,7 +331,7 @@ async fn handle_search_templates(
     debug!(query = %query, results = results.len(), "Template search complete");
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "query": query,
             "count": results.len(),
             "templates": results
@@ -357,9 +357,7 @@ async fn handle_get_template(
         .find(|t| t["id"].as_str() == Some(&template_id));
 
     match tmpl {
-        Some(t) => Ok(CallToolResult::text(
-            serde_json::to_string_pretty(t).unwrap(),
-        )),
+        Some(t) => Ok(CallToolResult::text(serde_json::to_string(t).unwrap())),
         None => {
             warn!(template_id = %template_id, "Template not found");
             Ok(CallToolResult::error(format!(
@@ -520,7 +518,7 @@ async fn handle_apply_template(
         .collect();
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "template": template_id,
             "components_placed": placed,
             "connections_to_wire": mapped_connections,
@@ -550,7 +548,7 @@ async fn handle_list_categories(
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "categories": sorted.iter().map(|(cat, count)| json!({"category": cat, "count": count})).collect::<Vec<_>>(),
             "total_templates": templates.len()
         }))

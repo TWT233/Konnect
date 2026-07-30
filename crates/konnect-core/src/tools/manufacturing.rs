@@ -234,7 +234,7 @@ async fn handle_export_manufacturing_package(
     );
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "fab_house": fab_house,
             "output_dir": output_dir.to_str().unwrap_or(""),
             "files": all_files,
@@ -345,7 +345,7 @@ async fn handle_validate_for_manufacturing(
     );
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "verdict": verdict,
             "fab_house": fab_house,
             "board_info": {
@@ -436,7 +436,7 @@ async fn handle_estimate_cost(
     );
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "fab_house": fab_house,
             "quantity": quantity,
             "board": {

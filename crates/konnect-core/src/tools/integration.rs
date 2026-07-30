@@ -247,7 +247,7 @@ async fn handle_download_jlcpcb(
     if db_path.exists() && !force {
         let meta = tokio::fs::metadata(&db_path).await?;
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "status": "already_exists",
                 "path": db_path.to_str().unwrap_or(""),
                 "size_bytes": meta.len(),
@@ -280,7 +280,7 @@ async fn handle_download_jlcpcb(
     tokio::fs::write(&db_path, &bytes).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "path": db_path.to_str().unwrap_or(""),
             "size_bytes": bytes.len()
@@ -327,9 +327,7 @@ async fn handle_search_jlcpcb_parts(
     if let Some(cached) = ctx.jlcpcb_cache.get(&key) {
         let mut body = cached;
         body["cached"] = json!(true);
-        return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&body).unwrap(),
-        ));
+        return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
     }
 
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
@@ -378,9 +376,7 @@ async fn handle_search_jlcpcb_parts(
 
     let mut body = body;
     body["cached"] = json!(false);
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&body).unwrap(),
-    ))
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
@@ -414,7 +410,7 @@ async fn handle_get_jlcpcb_part(
     if let Some(mut cached) = ctx.jlcpcb_cache.get(&key) {
         cached["cached"] = json!(true);
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&cached).unwrap(),
+            serde_json::to_string(&cached).unwrap(),
         ));
     }
 
@@ -435,9 +431,7 @@ async fn handle_get_jlcpcb_part(
             ctx.jlcpcb_cache.put(key, part.clone());
             let mut part = part;
             part["cached"] = json!(false);
-            Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&part).unwrap(),
-            ))
+            Ok(CallToolResult::text(serde_json::to_string(&part).unwrap()))
         }
         None => Ok(CallToolResult::error(format!(
             "Part not found in database: {}",
@@ -484,9 +478,7 @@ async fn handle_suggest_alternatives(
     if let Some(cached) = ctx.jlcpcb_cache.get(&key) {
         let mut body = cached;
         body["cached"] = json!(true);
-        return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&body).unwrap(),
-        ));
+        return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
     }
 
     let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
@@ -521,9 +513,7 @@ async fn handle_suggest_alternatives(
 
     let mut body = body;
     body["cached"] = json!(false);
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&body).unwrap(),
-    ))
+    Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()))
 }
 
 async fn handle_jlcpcb_stats(
@@ -533,7 +523,7 @@ async fn handle_jlcpcb_stats(
     let db_path = resolve_db_path(args, ctx);
     if !db_path.exists() {
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "exists": false,
                 "note": "Run download_jlcpcb_database to fetch the parts database"
             }))
@@ -555,7 +545,7 @@ async fn handle_jlcpcb_stats(
     .await??;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "exists": true,
             "path": db_path.to_str().unwrap_or(""),
             "size_bytes": size_bytes,
@@ -589,7 +579,7 @@ async fn handle_enrich_datasheets(
 
     if lcsc_ids.is_empty() {
         return Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "updated": 0,
                 "note": "No LCSC property found in schematic components"
             }))
@@ -662,7 +652,7 @@ async fn handle_enrich_datasheets(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "lcsc_ids_found": lcsc_ids.len(),
             "datasheets_enriched": enriched,
             "schematic": sch_path.to_str().unwrap_or("")
@@ -700,7 +690,7 @@ async fn handle_get_datasheet_url(
                         .and_then(|v| v.as_str())
                     {
                         return Ok(CallToolResult::text(
-                            serde_json::to_string_pretty(&json!({
+                            serde_json::to_string(&json!({
                                 "lcsc_id": id,
                                 "datasheet_url": ds_url
                             }))
@@ -713,7 +703,7 @@ async fn handle_get_datasheet_url(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "mpn": mpn,
             "lcsc_id": lcsc_id,
             "datasheet_url": null,
@@ -766,7 +756,7 @@ async fn handle_check_freerouting(
 
     match jar {
         None => Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "available": false,
                 "note": "freerouting.jar not found. Download from https://github.com/freerouting/freerouting/releases"
             }))
@@ -789,7 +779,7 @@ async fn handle_check_freerouting(
             };
 
             Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&json!({
+                serde_json::to_string(&json!({
                     "available": true,
                     "jar_path": jar_path.to_str().unwrap_or(""),
                     "version_output": version

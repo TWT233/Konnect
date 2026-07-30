@@ -297,7 +297,7 @@ async fn handle_load_user_config(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "config": config,
             "path": path.to_str().unwrap_or(""),
             "note": "User preferences loaded. Project config may override these values."
@@ -326,7 +326,7 @@ async fn handle_save_user_config(
     write_config(&path, &config).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "updated": key_path,
             "value": value,
             "config": config
@@ -345,7 +345,7 @@ async fn handle_load_project_config(
     let config = read_config(&path, default_project_config()).await;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "config": config,
             "project_dir": project_dir.to_str().unwrap_or(""),
             "path": path.to_str().unwrap_or("")
@@ -374,7 +374,7 @@ async fn handle_save_project_config(
     write_config(&path, &config).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "updated": key_path,
             "value": value,
             "project_dir": project_dir.to_str().unwrap_or("")
@@ -399,7 +399,7 @@ async fn handle_get_effective_config(
     let effective = deep_merge(&user_config, &project_config);
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "effective_config": effective,
             "note": "Merged user defaults + project overrides. Use these values for all design decisions."
         }))
@@ -441,7 +441,7 @@ async fn handle_add_design_rule(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "added_rule": rule,
             "scope": scope
         }))
@@ -479,7 +479,7 @@ async fn handle_list_design_rules(
     };
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "user_rules": user_rules,
             "project_rules": project_rules,
             "total": user_rules.len() + project_rules.len()
