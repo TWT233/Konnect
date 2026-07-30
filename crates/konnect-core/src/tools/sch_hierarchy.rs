@@ -59,7 +59,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "new_file": { "type": "string" },
                     "x": { "type": "number" }, "y": { "type": "number" },
                     "width": { "type": "number" }, "height": { "type": "number" },
-                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -108,7 +108,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "source_sheet_name": { "type": "string" },
                     "new_sheet_name": { "type": "string" },
                     "new_file": { "type": "string", "description": "Filename for the copy, resolved relative to the parent's directory. Must not already exist." },
-                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
@@ -124,7 +124,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic"]
             }),
@@ -140,7 +140,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic"]
             }),
@@ -159,7 +159,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_name": { "type": "string" },
                     "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" },
-                    "project_name": { "type": "string", "description": "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)" }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -176,7 +176,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string" },
                     "sheet_name": { "type": "string" },
                     "pin_name": { "type": "string" },
-                    "pin_type": { "type": "string", "enum": ["input", "output", "bidirectional", "tri_state", "passive"] },
+                    "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
                     "x": { "type": "number" }, "y": { "type": "number" }
                 },
                 "required": ["schematic", "sheet_name", "pin_name", "pin_type", "x", "y"]
@@ -194,7 +194,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "sheet_name": { "type": "string" },
                     "pin_name": { "type": "string", "description": "Current pin name to look up" },
                     "new_name": { "type": "string" },
-                    "pin_type": { "type": "string", "enum": ["input", "output", "bidirectional", "tri_state", "passive"] },
+                    "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
                     "x": { "type": "number" }, "y": { "type": "number" }
                 },
                 "required": ["schematic", "sheet_name", "pin_name"]
@@ -238,6 +238,8 @@ pub fn tools() -> Vec<ToolDef> {
 const MAX_HIERARCHY_DEPTH: usize = 20;
 const ALLOWED_PIN_TYPES: &[&str] = &["input", "output", "bidirectional", "tri_state", "passive"];
 const SHEET_PIN_SPACING_MM: f64 = 2.54;
+const PROJECT_NAME_DESC: &str =
+    "Project name key for instance entries. Default: the schematic file's stem (matching eeschema)";
 
 fn validate_pin_type(pin_type: &str) -> Result<(), CallToolResult> {
     if ALLOWED_PIN_TYPES.contains(&pin_type) {
