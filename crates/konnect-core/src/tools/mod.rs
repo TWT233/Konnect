@@ -360,8 +360,8 @@ pub(crate) fn add_pin_midwire_junctions(
 ) -> anyhow::Result<Vec<(f64, f64)>> {
     use konnect_sexp::geometry::{point_on_segment, points_coincident};
     use konnect_sexp::schematic::{
-        extract_junctions, extract_lib_pins, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        extract_junctions, extract_lib_pins, extract_symbol_instances, extract_wires, pin_endpoint,
+        read_schematic,
     };
     let tol = 0.01;
     let (_, tree) = read_schematic(sch_path)?;

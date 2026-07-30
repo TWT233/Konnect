@@ -512,9 +512,11 @@ async fn handle_add_wire(
     let (_, tree) = read_schematic(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
     for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-        if !sch.junctions.iter().any(|j| {
-            konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01)
-        }) {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+        {
             sch.add_junction(px, py);
         }
     }
@@ -565,9 +567,11 @@ async fn handle_batch_add_wire(
         }
         // Pins this wire passes over mid-segment also need junction dots.
         for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-            if !sch.junctions.iter().any(|j| {
-                konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01)
-            }) {
+            if !sch
+                .junctions
+                .iter()
+                .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+            {
                 sch.add_junction(px, py);
             }
         }
