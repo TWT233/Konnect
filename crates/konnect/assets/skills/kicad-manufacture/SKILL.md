@@ -26,9 +26,9 @@ load_toolset('verification')     # get_drc_violations, validate_for_manufacturin
 Load additional toolsets as needed:
 
 ```
-load_toolset('sch_query')        # inspect nets, verify footprints assigned
-load_toolset('jlcpcb')           # search_jlcpcb_parts, suggest_jlcpcb_alternatives, estimate_cost
-load_toolset('3d')               # export_3d for visual verification
+load_toolset('sch_analysis')     # inspect nets, verify footprints assigned
+load_toolset('integration')      # search_jlcpcb_parts, suggest_jlcpcb_alternatives, estimate_cost
+load_toolset('pcb_export')       # export_3d for visual verification
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
