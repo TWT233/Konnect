@@ -283,24 +283,31 @@ fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, Sexp
         directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
 
+    Ok(lock_directory.join(document_lock_name(canonical_parent.as_os_str(), file_name)))
+}
+
+fn document_lock_name(canonical_parent: &OsStr, file_name: &OsStr) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"konnect-document-lock-v1\0");
-    hash_native_os_str(&mut hasher, canonical_parent.as_os_str());
-    hasher.update([0]);
+    hash_native_os_str(&mut hasher, canonical_parent);
     hash_native_os_str(&mut hasher, file_name);
-    Ok(lock_directory.join(format!("{:x}.lock", hasher.finalize())))
+    format!("{:x}.lock", hasher.finalize())
 }
 
 #[cfg(unix)]
 fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
     use std::os::unix::ffi::OsStrExt;
-    hasher.update(value.as_bytes());
+    let bytes = value.as_bytes();
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 #[cfg(windows)]
 fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
     use std::os::windows::ffi::OsStrExt;
-    for unit in value.encode_wide() {
+    let units: Vec<_> = value.encode_wide().collect();
+    hasher.update(((units.len() as u64) * 2).to_le_bytes());
+    for unit in units {
         hasher.update(unit.to_le_bytes());
     }
 }
@@ -828,6 +835,24 @@ mod atomic_write_tests {
             document_lock_path_in(state.path(), &second_path).unwrap()
         );
         assert_eq!(first_lock.parent().unwrap(), state.path().join("locks"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lock_identity_length_prefixes_windows_native_components() {
+        use std::os::windows::ffi::OsStringExt;
+
+        // Without component lengths these pairs both encode as
+        // 61 00 00 62 00 63 00 when separated by one zero byte.
+        let first_parent = std::ffi::OsString::from_wide(&[0x0061]);
+        let first_name = std::ffi::OsString::from_wide(&[0x0062, 0x0063]);
+        let second_parent = std::ffi::OsString::from_wide(&[0x0061, 0x6200]);
+        let second_name = std::ffi::OsString::from_wide(&[0x0063]);
+
+        assert_ne!(
+            document_lock_name(&first_parent, &first_name),
+            document_lock_name(&second_parent, &second_name)
+        );
     }
 
     #[cfg(any(unix, windows))]
