@@ -7,4 +7,6 @@ crates/schematic-viewer/target/
 *.dylib
 *.tmp
 *.bak
+.konnect-transaction-*.json
+.konnect-transaction-*.abandoned.json
 dist/

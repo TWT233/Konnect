@@ -12,11 +12,17 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
+    commit_command,
     geometry::snap_point,
+    parse_sexp,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
+        SexpEdit,
+    },
+    ItemId, SchematicCommand,
 };
 use serde_json::json;
 
@@ -293,7 +299,7 @@ async fn handle_create_schematic(
     let template = crate::tools::blank_schematic_template();
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
-    write_atomic(&path, &template)?;
+    write_new_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
     Ok(CallToolResult::json(
@@ -477,7 +483,8 @@ async fn handle_edit_schematic_component(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut changed = Vec::new();
 
     // Helper: update a property field value in-place within the symbol block
@@ -541,7 +548,14 @@ async fn handle_edit_schematic_component(
     }
 
     if !changed.is_empty() {
-        write_atomic(&sch_path, &content)?;
+        let item_id = symbol_item_id(&expected, &reference)?;
+        let command = SchematicCommand::replace_item_from_document(
+            &expected,
+            &content,
+            item_id,
+            format!("Edit {reference}"),
+        )?;
+        commit_command(&sch_path, &command)?;
     }
 
     let mut result = json!({
@@ -964,7 +978,8 @@ async fn handle_add_component_annotation(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     // Find the symbol block for this reference
     let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
@@ -990,13 +1005,30 @@ async fn handle_add_component_annotation(
     );
 
     let new_content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
-    write_atomic(&sch_path, &new_content)?;
+    let item_id = symbol_item_id(&expected, &reference)?;
+    let command = SchematicCommand::replace_item_from_document(
+        &expected,
+        &new_content,
+        item_id,
+        format!("Add {key} property to {reference}"),
+    )?;
+    commit_command(&sch_path, &command)?;
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "added_property": key,
         "value": value
     })))
+}
+
+fn symbol_item_id(content: &str, reference: &str) -> anyhow::Result<ItemId> {
+    let (start, end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| anyhow::anyhow!("component '{reference}' not found"))?;
+    let symbol = parse_sexp(&content[start..end])?;
+    let uuid = symbol
+        .find_str("uuid")
+        .ok_or_else(|| anyhow::anyhow!("component '{reference}' has no UUID"))?;
+    Ok(ItemId::new(uuid.to_owned())?)
 }
 
 async fn handle_group_components(
@@ -1021,8 +1053,10 @@ async fn handle_group_components(
         return Ok(CallToolResult::error("No references provided"));
     }
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut grouped = Vec::new();
+    let mut item_ids = Vec::new();
 
     for reference in &refs {
         let (sym_start, sym_end) = match find_symbol_instance_block(&content, reference) {
@@ -1041,10 +1075,19 @@ async fn handle_group_components(
         );
 
         content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
+        item_ids.push(symbol_item_id(&expected, reference)?);
         grouped.push(reference.clone());
     }
 
-    write_atomic(&sch_path, &content)?;
+    if !item_ids.is_empty() {
+        let command = SchematicCommand::replace_items_from_document(
+            &expected,
+            &content,
+            item_ids,
+            format!("Group components as {group_name}"),
+        )?;
+        commit_command(&sch_path, &command)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "group_name": group_name,
@@ -1068,7 +1111,8 @@ async fn handle_replace_component(
     };
     let new_unit = opt_f64(args, "unit").map(|u| u as u32);
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
+    let mut content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     // Find the symbol block for this reference
     let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
@@ -1150,7 +1194,7 @@ async fn handle_replace_component(
     if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
     }
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "reference": reference,

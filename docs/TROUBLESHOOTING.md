@@ -53,6 +53,51 @@ Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
 or in `konnect-settings.json` (`kicad_cli`).
 
+## Transaction recovery is blocked by divergent content
+
+Multi-file schematic changes persist a `.konnect-transaction-<id>.json`
+write-ahead journal in the project before changing any target. On restart,
+Konnect safely completes files that still match either the recorded before
+image or intended replacement. It never overwrites a file changed by KiCad or
+another process after the journal was written.
+
+Inspect active journals without printing their contents:
+
+```text
+konnect transaction status <project-dir>
+```
+
+Each target is reported as `pending`, `applied`, or `divergent`. Retry safe
+recovery with:
+
+```text
+konnect transaction recover <project-dir>
+```
+
+If a target is divergent, first inspect the schematic in KiCad and preserve
+the version you want. To unblock future transactions without changing any
+schematic file, explicitly abandon the journal:
+
+```text
+konnect transaction abandon <project-dir> <transaction-id> --force
+```
+
+Abandonment renames the journal to
+`.konnect-transaction-<id>.abandoned.json`; it does not restore, replace, or
+delete a target. The abandoned file is retained as recovery evidence and is
+ignored by future transactions. Delete it only after you have made any backup
+you need.
+
+Active and abandoned journals contain complete before/after images of every
+affected schematic. Treat them as sensitive, do not attach them to bug reports
+without reviewing their contents, and do not commit them. Both forms are
+ignored by the repository `.gitignore`.
+
+Cooperative document locks are stored outside the project under the platform
+local-data directory. Set `KONNECT_STATE_DIR` to an absolute directory to
+override that location. A relative override is rejected rather than falling
+back to project-local sidecars.
+
 ## Tools don't appear after `load_toolset`
 
 After a successful `load_toolset` call the server sends a

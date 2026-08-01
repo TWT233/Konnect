@@ -130,7 +130,31 @@ Konnect/
 - Direct read/write of `.kicad_sch` files
 - Symbol definitions auto-embedded from KiCAD 10's `.kicad_symdir` format
 - Power symbols (VCC, GND) embedded from `power.kicad_symdir`
-- All edits use `write_atomic` (write to .tmp → fsync → rename)
+- Existing-file edits use revision-checked atomic replacement: read the exact
+  source, acquire a cooperative lock, reject any intervening KiCad or Konnect
+  change, write a unique sibling scratch file, fsync, and rename.
+- Cooperative lock files live under `KONNECT_STATE_DIR/locks` when that
+  absolute override is set, otherwise under the platform local-data directory
+  (`konnect/locks`). Reads never create files in the KiCad project.
+- Multi-file schematic changes use project-local
+  `.konnect-transaction-*.json` write-ahead journals. These journals contain
+  complete before/after images and must be treated as sensitive project data.
+
+`konnect_schematic_editor::Schematic` deliberately distinguishes creation from
+replacement:
+
+- `save(new_path)` is create-only and refuses to replace an existing path.
+- `save(loaded_path)` and `overwrite()` replace only when the file still
+  exactly matches the source loaded into the model. KiCad autosave therefore
+  produces a conflict that callers must resolve by reloading and reapplying.
+- Callers that intentionally replace an existing file must use the explicit
+  revision-aware writer/command APIs; they must not delete the destination or
+  weaken `save()` into an unconditional overwrite.
+
+For journal diagnosis and recovery, use `konnect transaction status`,
+`konnect transaction recover`, and the explicit force-gated `konnect
+transaction abandon` escape hatch documented in
+[Troubleshooting](docs/TROUBLESHOOTING.md#transaction-recovery-is-blocked-by-divergent-content).
 
 ### kicad-cli v10 (Subprocess)
 - Verified commands: `sch erc`, `sch export svg/pdf/bom/netlist`, `pcb drc`, `pcb export gerbers/drill/pdf/svg/step/vrml/pos/ipcd356`, `pcb render`

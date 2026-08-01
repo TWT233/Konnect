@@ -18,7 +18,8 @@ use konnect_sexp::{
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        find_direct_child_blocks, find_enclosing_block, write_atomic, SexpEdit,
+        find_direct_child_blocks, find_enclosing_block, read_consistent, write_atomic_if_unchanged,
+        SexpEdit,
     },
 };
 use serde_json::json;
@@ -577,7 +578,7 @@ async fn handle_batch_add_wire(
         let (x1, y1) = snap_point(x1, y1, 1.27);
         let (x2, y2) = snap_point(x2, y2, 1.27);
 
-        // T-junction detection for each wire added incrementally
+        // T-junction detection for each wire added incrementally.
         let mut existing_wires = cse_wires_to_sexp(&sch);
         existing_wires.push(konnect_sexp::schematic::Wire {
             x1,
@@ -614,7 +615,8 @@ async fn handle_delete_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let delete_range = if let Some(uuid) = opt_str(args, "uuid") {
         let search = format!(r#"(uuid "{uuid}")"#);
@@ -659,7 +661,7 @@ async fn handle_delete_wire(
 
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text("Wire deleted."))
 }
 
@@ -675,7 +677,8 @@ async fn handle_batch_delete_wire(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut errors = Vec::new();
 
     // Collect all delete ranges first, then apply in reverse order
@@ -708,7 +711,7 @@ async fn handle_batch_delete_wire(
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
     let content = apply_edits(content, edits);
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "deleted": deleted,
         "errors": errors
@@ -807,13 +810,14 @@ async fn handle_split_wire_at_point(
         return Ok(delete_result);
     }
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
     let junc = format_junction(px, py);
     let insert = format!("{w1}{w2}{junc}");
     let new_content = insert_before_close(&content, &insert);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "split_at": { "x": px, "y": py },
@@ -894,7 +898,8 @@ async fn handle_delete_net_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let labels = find_label_blocks(&content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
@@ -949,7 +954,7 @@ async fn handle_delete_net_label(
     let kind = label.kind;
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::json(&json!({
         "deleted_label": net,
         "type": kind,
@@ -1037,7 +1042,8 @@ async fn handle_rotate_label(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
 
     let labels = find_label_blocks(&content);
     let named: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
@@ -1130,7 +1136,7 @@ async fn handle_rotate_label(
     }
 
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::json(&json!({
         "rotated_label": net,
         "type": label.kind,
@@ -1157,7 +1163,8 @@ async fn handle_move_labels_by_offset(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let labels = find_label_blocks(&content);
     let matching: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
     if matching.is_empty() {
@@ -1195,7 +1202,7 @@ async fn handle_move_labels_by_offset(
 
     let moved = edits.len();
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(
         &json!({ "moved_labels": moved, "net": net }),
@@ -1346,14 +1353,15 @@ async fn handle_delete_no_connect(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let Some((del_start, del_end)) = find_no_connect_block_at(&content, x, y) else {
         return Ok(CallToolResult::error(
             "No-connect not found at that position",
         ));
     };
     let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
     Ok(CallToolResult::text("No-connect deleted."))
 }
 
@@ -1400,7 +1408,8 @@ async fn handle_batch_delete_no_connect(
     // but that handler returns `Ok(CallToolResult::error(..))` when nothing
     // matches, so every failure counted as a success and the tool reported
     // deletions it had not made (#114).
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for pos in &positions {
@@ -1429,7 +1438,7 @@ async fn handle_batch_delete_no_connect(
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
     let content = apply_edits(content, edits);
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "deleted": deleted,
         "errors": errors
@@ -1586,6 +1595,7 @@ async fn handle_connect_pins(
 
     // Parse the schematic tree
     let (content, tree) = read_schematic(&sch_path)?;
+    let expected = content.clone();
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
@@ -1600,7 +1610,7 @@ async fn handle_connect_pins(
     // Route wire(s) between the two pin endpoints
     let new_content = route_between(content, x1, y1, x2, y2);
 
-    write_atomic(&sch_path, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "connected": {
@@ -1667,10 +1677,11 @@ async fn handle_add_schematic_connection(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&sch_path)?;
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
     let content = route_between(content, x1, y1, x2, y2);
 
-    write_atomic(&sch_path, &content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
