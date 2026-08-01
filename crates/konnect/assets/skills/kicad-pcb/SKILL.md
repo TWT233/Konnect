@@ -36,13 +36,13 @@ load_toolset('pcb_components')   # place, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
 ```
 
+Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
+
 Load additional toolsets as needed:
 
 ```
-load_toolset('pcb_zones')        # copper pours, keepouts, zone fills
-load_toolset('pcb_query')        # find components, nets, DRC results
-load_toolset('pcb_batch')        # bulk operations
-load_toolset('pcb_design_rules') # netclasses, clearances, track widths
+load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
+load_toolset('verification')     # run_drc, set_design_rules, get_design_rules, check_clearance
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -83,10 +83,8 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `place_component`         | Position a single footprint at x,y          |
 | `move_component`          | Relocate an existing footprint              |
 | `rotate_component`        | Rotate footprint (0/90/180/270)             |
-| `flip_component`          | Move to opposite board side (F.Cu <-> B.Cu) |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
-| `distribute_components`   | Equal spacing between components            |
 
 ### Placement Tips
 
@@ -168,7 +166,7 @@ Common netclass configurations:
 
 ## Copper Pour
 
-Load `pcb_zones` toolset for zone operations.
+Zone tools live in the `pcb_board` toolset.
 
 ### add_zone
 
