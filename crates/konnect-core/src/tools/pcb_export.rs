@@ -331,7 +331,7 @@ async fn handle_export_gerber(
     files.sort();
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output_dir": output_dir.to_str().unwrap_or(""),
             "files": files
@@ -362,7 +362,7 @@ async fn handle_export_pdf(
     cli::export_pdf(cli, &board, &output, &layer_refs).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or("")
         }))
@@ -391,7 +391,7 @@ async fn handle_export_svg(
     cli::export_svg_pcb(cli, &board, &output, &layer_refs).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or("")
         }))
@@ -411,7 +411,7 @@ async fn handle_export_3d(
     cli::export_3d(cli, &board, &output, format).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "format": format,
             "output": output.to_str().unwrap_or("")
@@ -432,7 +432,7 @@ async fn handle_export_bom(
     cli::export_bom(cli, &schematic, &output, format).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or("")
         }))
@@ -454,7 +454,7 @@ async fn handle_export_netlist(
     cli::export_netlist(cli, &board, &output, format).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "format": format,
             "output": output.to_str().unwrap_or("")
@@ -477,7 +477,7 @@ async fn handle_export_position_file(
     cli::export_position_file(cli, &board, &output, format).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "format": format,
             "side": side,
@@ -518,7 +518,7 @@ async fn handle_export_dxf(
     files.sort();
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output_dir": output_dir.to_str().unwrap_or(""),
             "files": files
@@ -538,7 +538,7 @@ async fn handle_export_gencad(
     cli::export_gencad(cli, &board, &output).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "output": output.to_str().unwrap_or("")
         }))
@@ -559,7 +559,7 @@ async fn handle_export_ipc2581(
     cli::export_ipc2581(cli, &board, &output, units, compress).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "units": units,
             "compressed": compress,
@@ -582,7 +582,7 @@ async fn handle_export_odb(
     cli::export_odb(cli, &board, &output, units, compression).await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "units": units,
             "compression": compression,
@@ -612,7 +612,7 @@ async fn handle_refill_zones(
 
     match result {
         Ok(Ok(())) => Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
+            serde_json::to_string(&json!({
                 "success": true,
                 "method": "ipc",
                 "board": board.to_str().unwrap_or("")
@@ -624,7 +624,7 @@ async fn handle_refill_zones(
             // kicad-cli pcb export gerber fills zones as a side effect
             // For now report the limitation
             Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&json!({
+                serde_json::to_string(&json!({
                     "success": false,
                     "note": "Zone refill requires a running KiCAD instance with IPC enabled, or manual zone fill in KiCAD GUI",
                     "board": board.to_str().unwrap_or("")
@@ -670,7 +670,7 @@ async fn handle_get_drc_violations(
     });
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&summary).unwrap(),
+        serde_json::to_string(&summary).unwrap(),
     ))
 }
 

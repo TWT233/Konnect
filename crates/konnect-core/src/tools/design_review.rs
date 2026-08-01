@@ -222,7 +222,7 @@ async fn handle_audit_decoupling(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "audit": "decoupling",
             "findings": findings,
             "pass_count": pass_count,
@@ -325,7 +325,7 @@ async fn handle_audit_connections(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "audit": "connections",
             "findings": findings,
             "summary": format!("{} connection issues found.", findings.len())
@@ -404,7 +404,7 @@ async fn handle_audit_power_rails(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "audit": "power_rails",
             "power_nets": power_nets,
             "findings": findings,
@@ -509,7 +509,7 @@ async fn handle_audit_manufacturing(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "audit": "manufacturing",
             "fab_house": fab_house,
             "components": { "front": front_count, "back": back_count },
@@ -612,7 +612,7 @@ async fn handle_run_design_review(
     };
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "design_review": {
                 "verdict": verdict,
                 "errors": error_count,
@@ -704,7 +704,7 @@ async fn handle_check_bom_health(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "audit": "bom_health",
             "total_components": total_components,
             "missing_mpn": missing_mpn,

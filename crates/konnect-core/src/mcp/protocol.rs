@@ -171,7 +171,7 @@ impl CallToolResult {
     }
 
     pub fn json(v: &impl Serialize) -> Self {
-        let text = serde_json::to_string_pretty(v).unwrap_or_default();
+        let text = serde_json::to_string(v).unwrap_or_default();
         CallToolResult::text(text)
     }
 
