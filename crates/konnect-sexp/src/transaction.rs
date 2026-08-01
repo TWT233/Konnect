@@ -795,16 +795,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn transaction_journal_round_trips_a_non_unicode_target_path() {
+    fn non_unicode_journal_fixture(root: &Path) -> (Journal, PathBuf) {
         use std::os::unix::ffi::OsStringExt;
 
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let root = directory.path().canonicalize().unwrap();
         let relative = PathBuf::from(std::ffi::OsString::from_vec(
             b"sheet-\xff.kicad_sch".to_vec(),
         ));
-        let target = root.join(&relative);
         let journal = Journal {
             version: JOURNAL_VERSION,
             id: "non-unicode-fixture".to_owned(),
@@ -814,11 +810,35 @@ mod tests {
                 replacement: "created".to_owned(),
             }],
         };
+        (journal, root.join(relative))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_journal_codec_round_trips_a_non_unicode_target_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        let (journal, _) = non_unicode_journal_fixture(&root);
         let path = journal_path(&root, &journal.id);
         persist_journal(&path, &journal).expect("journal serializes");
 
         let decoded = read_validated_journal(&root, &path).expect("journal deserializes");
-        assert_eq!(decoded.entries[0].path, relative);
+        assert_eq!(decoded.entries[0].path, journal.entries[0].path);
+        remove_journal(&path).unwrap();
+    }
+
+    // Linux filesystems accept arbitrary non-NUL filename bytes. macOS APIs
+    // reject ill-formed UTF-8 with EILSEQ, so only the codec/identity contract
+    // is portable there rather than creation of such a path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transaction_recovers_a_non_unicode_target_path_on_linux() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().canonicalize().unwrap();
+        let (journal, target) = non_unicode_journal_fixture(&root);
+        let path = journal_path(&root, &journal.id);
+        persist_journal(&path, &journal).expect("journal serializes");
+
         recover_file_transaction(&root, &journal.id).expect("non-Unicode recovery commits");
 
         assert_eq!(std::fs::read_to_string(target).unwrap(), "created");
