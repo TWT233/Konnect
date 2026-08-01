@@ -1347,40 +1347,93 @@ async fn handle_delete_no_connect(
     };
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let search = format!("(no_connect (at {x} {y})");
-    let pos = match content.find(&search) {
-        Some(p) => p,
-        None => {
-            return Ok(CallToolResult::error(
-                "No-connect not found at that position",
-            ))
-        }
+    let Some((del_start, del_end)) = find_no_connect_block_at(&content, x, y) else {
+        return Ok(CallToolResult::error(
+            "No-connect not found at that position",
+        ));
     };
-    let (del_start, del_end) = find_block_with_leading_whitespace(&content, pos)
-        .ok_or_else(|| anyhow::anyhow!("Cannot parse no_connect block"))?;
-    let edits = vec![SexpEdit::delete(del_start, del_end)];
-    let new_content = apply_edits(content, edits);
+    let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
     write_atomic(&sch_path, &new_content)?;
     Ok(CallToolResult::text("No-connect deleted."))
 }
 
+/// Byte range of the `(no_connect …)` block whose `(at …)` is `(x, y)`.
+///
+/// The previous implementation searched for the literal
+/// `"(no_connect (at {x} {y})"`. No-connect blocks are never written on one
+/// line — this crate's writer takes the multi-line branch for any node with
+/// list children, and eeschema does the same with tabs — so that string never
+/// matched anything and both delete tools were inert (#114). Same failure
+/// class as the wire deletion in #64; this reuses the #69 block machinery the
+/// wire path already uses, including its coordinate tolerance.
+fn find_no_connect_block_at(content: &str, x: f64, y: f64) -> Option<(usize, usize)> {
+    const TOLERANCE: f64 = 1e-6;
+    let same = |a: f64, b: f64| (a - b).abs() <= TOLERANCE;
+
+    for start in find_block_starts(content, "no_connect") {
+        let Some((block_start, block_end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        let Ok(node) = parse_sexp(&content[block_start..block_end]) else {
+            continue;
+        };
+        let Some(at) = node.find("at") else { continue };
+        let (Some(bx), Some(by)) = (at.get_f64(1), at.get_f64(2)) else {
+            continue;
+        };
+        if same(bx, x) && same(by, y) {
+            return find_block_with_leading_whitespace(content, block_start);
+        }
+    }
+    None
+}
+
 async fn handle_batch_delete_no_connect(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let positions = args["positions"].as_array().cloned().unwrap_or_default();
-    let mut deleted = 0usize;
+
+    // One read, collect every range, one write — matching batch_delete_wire.
+    // The old loop delegated to the single-item handler and counted `.is_ok()`,
+    // but that handler returns `Ok(CallToolResult::error(..))` when nothing
+    // matches, so every failure counted as a success and the tool reported
+    // deletions it had not made (#114).
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for pos in &positions {
-        let del_args = json!({
-            "schematic": sch_path.display().to_string(),
-            "x": pos["x"], "y": pos["y"]
-        });
-        if handle_delete_no_connect(&del_args, ctx).await.is_ok() {
-            deleted += 1;
+        let (Some(x), Some(y)) = (pos["x"].as_f64(), pos["y"].as_f64()) else {
+            errors.push(format!("Position {pos} needs numeric x and y"));
+            continue;
+        };
+        match find_no_connect_block_at(&content, x, y) {
+            Some(range) => ranges.push(range),
+            None => errors.push(format!("No no-connect at ({x}, {y})")),
         }
     }
-    Ok(CallToolResult::json(&json!({ "deleted": deleted })))
+    ranges.sort_unstable();
+    ranges.dedup();
+    let deleted = ranges.len();
+
+    if deleted == 0 && !positions.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No no-connects deleted: {}",
+            errors.join("; ")
+        )));
+    }
+
+    let edits: Vec<SexpEdit> = ranges
+        .into_iter()
+        .map(|(s, e)| SexpEdit::delete(s, e))
+        .collect();
+    let content = apply_edits(content, edits);
+    write_atomic(&sch_path, &content)?;
+    Ok(CallToolResult::json(&json!({
+        "deleted": deleted,
+        "errors": errors
+    })))
 }
 
 async fn handle_add_junction(
@@ -2279,5 +2332,128 @@ mod power_symbol_tests {
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),
             "must not write a bare Reference with no (at)"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_connect_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Tab-indented, multi-line no-connects — the shape eeschema and this
+    /// crate's own writer both produce. The old literal-string search looked
+    /// for `(no_connect (at X Y)` on one line, which no real file contains.
+    fn schematic_with_two_no_connects() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nc.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch
+	(version 20250610)
+	(generator \"eeschema\")
+	(uuid \"root\")
+	(paper \"A4\")
+	(no_connect
+		(at 127 63.5)
+		(uuid \"nc-1\")
+	)
+	(no_connect
+		(at 140 70)
+		(uuid \"nc-2\")
+	)
+)
+",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn delete_no_connect_removes_a_multiline_block() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let result = handle_delete_no_connect(
+            &json!({ "schematic": path.display().to_string(), "x": 127.0, "y": 63.5 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("nc-1"),
+            "the targeted no-connect is still on disk: {after}"
+        );
+        assert!(after.contains("nc-2"), "deleted the wrong block: {after}");
+        assert!(
+            konnect_sexp::parse_sexp(&after).is_ok(),
+            "file no longer parses: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_no_connect_reports_an_error() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_delete_no_connect(
+            &json!({ "schematic": path.display().to_string(), "x": 999.0, "y": 999.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "a miss must not report success");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a failed delete must leave the file byte-identical"
+        );
+    }
+
+    /// The batch variant used to count `.is_ok()` on a handler that returns
+    /// `Ok(CallToolResult::error(..))` for a miss, so it reported a deletion
+    /// for every position whether or not anything was removed.
+    #[tokio::test]
+    async fn batch_delete_counts_only_what_it_removed() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let result = handle_batch_delete_no_connect(
+            &json!({
+                "schematic": path.display().to_string(),
+                "positions": [ { "x": 127.0, "y": 63.5 }, { "x": 999.0, "y": 999.0 } ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["deleted"], 1, "only one position exists: {body}");
+        assert_eq!(
+            body["errors"].as_array().map(|e| e.len()),
+            Some(1),
+            "the missing position must be reported: {body}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("nc-1"));
+        assert!(after.contains("nc-2"));
     }
 }
