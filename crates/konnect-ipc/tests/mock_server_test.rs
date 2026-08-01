@@ -571,6 +571,36 @@ fn delete_items_surfaces_per_item_failure() {
     assert!(error.contains("missing-id"), "{error}");
 }
 
+/// KiCad 10 builds per-item deletion results and never attaches them, so a
+/// successful delete comes back with an empty `deleted_items`. Treating that
+/// as failure is what made delete_component report "0 deletion results" for
+/// deletions that had actually happened (#116).
+#[test]
+fn an_empty_deletion_result_list_is_not_a_failure() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request message");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            Some(open_board_response())
+        } else {
+            assert!(message.type_url.ends_with("DeleteItems"));
+            let response = kiapi::common::commands::DeleteItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                deleted_items: vec![],
+            };
+            Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.DeleteItemsResponse",
+            )))
+        }
+    });
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client
+        .delete_items(vec!["some-id".to_string()])
+        .expect("an empty result list means KiCad said nothing, not that it failed");
+}
+
 #[test]
 fn failed_multi_step_commit_is_dropped() {
     let actions = Arc::new(Mutex::new(Vec::new()));

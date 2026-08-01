@@ -614,6 +614,18 @@ impl KiCadIpcClient {
             "DeleteItems",
         )?;
         ensure_item_request_ok(response.status, "item deletion")?;
+        // KiCad 10 builds per-item results in
+        // API_HANDLER_EDITOR::handleDeleteItems and then never attaches them
+        // to the response, so `deleted_items` comes back empty on every
+        // successful delete. Treating that as failure made delete_component
+        // report "0 deletion results" for deletions that had in fact happened
+        // (#116). An empty list carries no information either way, so callers
+        // that need certainty verify the item is gone; a NON-empty list is
+        // still validated strictly, so this stays correct if KiCad starts
+        // populating it.
+        if response.deleted_items.is_empty() {
+            return Ok(());
+        }
         if response.deleted_items.len() != expected_count {
             anyhow::bail!(
                 "KiCad returned {} deletion results for {} requested items",
@@ -1026,7 +1038,17 @@ impl KiCadIpcClient {
     /// Delete a footprint by reference.
     pub fn delete_footprint(&self, reference: &str) -> Result<()> {
         let kiid = self.find_footprint_kiid(reference)?;
-        self.delete_items(vec![kiid])
+        self.delete_items(vec![kiid])?;
+        // KiCad returns no per-item deletion results (#116), so the response
+        // alone cannot distinguish "deleted" from "silently skipped". Ask the
+        // board instead — reporting success without evidence is the failure
+        // mode #99 was closed to eliminate.
+        match self.find_footprint_kiid(reference) {
+            Err(_) => Ok(()),
+            Ok(_) => anyhow::bail!(
+                "KiCad reported no error but footprint '{reference}' is still on the board"
+            ),
+        }
     }
 
     /// Build a typed footprint item suitable for [`Self::create_items`].
