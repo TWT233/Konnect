@@ -22,6 +22,7 @@
 use crate::SexpError;
 use fs4::FileExt;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -197,12 +198,37 @@ pub(crate) fn read_string_unlocked(path: &Path) -> Result<String, SexpError> {
 
 pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError> {
     let lock_path = document_lock_path(path)?;
-    Ok(OpenOptions::new()
+    open_lock_file(&lock_path)
+}
+
+fn open_lock_file(lock_path: &Path) -> Result<std::fs::File, SexpError> {
+    reject_non_file_lock_path(lock_path)?;
+    let lock = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(lock_path)?)
+        .open(lock_path)?;
+    reject_non_file_lock_path(lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(SexpError::InvalidValue(format!(
+            "document lock is not a regular file: {}",
+            lock_path.display()
+        )));
+    }
+    Ok(lock)
+}
+
+fn reject_non_file_lock_path(path: &Path) -> Result<(), SexpError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(SexpError::InvalidValue(format!(
+            "document lock must be a regular file, not a symlink or directory: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn document_lock_path(path: &Path) -> Result<PathBuf, SexpError> {
@@ -237,18 +263,46 @@ fn document_lock_path_in(state_root: &Path, path: &Path) -> Result<PathBuf, Sexp
 
     let lock_directory = state_root.join("locks");
     std::fs::create_dir_all(&lock_directory)?;
+    let lock_directory_metadata = std::fs::symlink_metadata(&lock_directory)?;
+    if !lock_directory_metadata.file_type().is_dir() {
+        return Err(SexpError::InvalidValue(format!(
+            "Konnect lock state must be a real directory, not a symlink or file: {}",
+            lock_directory.display()
+        )));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_directory, std::fs::Permissions::from_mode(0o700))?;
+        let directory = std::fs::File::open(&lock_directory)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(SexpError::InvalidValue(format!(
+                "Konnect lock state is not a directory: {}",
+                lock_directory.display()
+            )));
+        }
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
 
     let mut hasher = Sha256::new();
     hasher.update(b"konnect-document-lock-v1\0");
-    hasher.update(canonical_parent.as_os_str().as_encoded_bytes());
+    hash_native_os_str(&mut hasher, canonical_parent.as_os_str());
     hasher.update([0]);
-    hasher.update(file_name.as_encoded_bytes());
+    hash_native_os_str(&mut hasher, file_name);
     Ok(lock_directory.join(format!("{:x}.lock", hasher.finalize())))
+}
+
+#[cfg(unix)]
+fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    hasher.update(value.as_bytes());
+}
+
+#[cfg(windows)]
+fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    for unit in value.encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
 }
 
 /// Atomically create a new file without replacing an existing destination.
@@ -790,6 +844,41 @@ mod atomic_write_tests {
             Some("lock")
         );
         assert!(!path.exists(), "lock identity must not create the target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_lock_refuses_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        let lock = directory.path().join("planted.lock");
+        std::fs::write(&victim, "unchanged").unwrap();
+        symlink(&victim, &lock).unwrap();
+
+        assert!(open_lock_file(&lock).is_err());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_lock_refuses_a_symlinked_lock_directory() {
+        use std::os::unix::fs::symlink;
+
+        let state = tempfile::tempdir().unwrap();
+        let redirected = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        symlink(redirected.path(), state.path().join("locks")).unwrap();
+
+        let error = document_lock_path_in(state.path(), &project.path().join("design.kicad_sch"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("real directory"));
+        assert!(std::fs::read_dir(redirected.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     /// The precondition for the collision, stated without threads.
