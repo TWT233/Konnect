@@ -421,7 +421,11 @@ mod tests {
 
         let error = SchematicBuilder::new().save(&path).unwrap_err();
 
-        assert!(error.to_string().contains("File exists"));
+        assert!(matches!(
+            error.downcast_ref::<konnect_sexp::SexpError>(),
+            Some(konnect_sexp::SexpError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "keep me");
     }
 
