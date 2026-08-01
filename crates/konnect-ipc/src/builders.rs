@@ -102,12 +102,19 @@ pub fn build_via(
     size_mm: f64,
 ) -> kiapi::board::types::Via {
     use kiapi::board::types::{
-        BoardLayer, DrillProperties, PadStack, PadStackLayer, PadStackShape, PadStackType, ViaType,
+        BoardLayer, DrillProperties, DrillShape, PadStack, PadStackLayer, PadStackShape,
+        PadStackType, ViaType,
     };
 
-    // A round copper pad of `size_mm` diameter on the given layer.
-    let copper_pad = |layer: BoardLayer| kiapi::board::types::PadStackLayer {
-        layer: layer as i32,
+    // A PST_NORMAL padstack carries exactly ONE copper-layer entry, keyed to
+    // KiCad's ALL_LAYERS sentinel (== F_Cu). PADSTACK::unpackCopperLayer
+    // rejects any other layer while the mode is NORMAL, which fails the whole
+    // PCB_VIA deserialization ("could not unpack PCB_VIA", AS_BAD_REQUEST) —
+    // sending an F.Cu + B.Cu pair here is what broke add_via in v0.2.1 (#117).
+    // The through span is defined by the drill's start/end layers, not by the
+    // copper entries.
+    let copper_pad = PadStackLayer {
+        layer: BoardLayer::BlFCu as i32,
         shape: PadStackShape::PssCircle as i32,
         size: Some(vec2(size_mm, size_mm)),
         ..PadStackLayer::default()
@@ -120,9 +127,10 @@ pub fn build_via(
             start_layer: BoardLayer::BlFCu as i32,
             end_layer: BoardLayer::BlBCu as i32,
             diameter: Some(vec2(drill_mm, drill_mm)),
+            shape: DrillShape::DsCircle as i32,
             ..DrillProperties::default()
         }),
-        copper_layers: vec![copper_pad(BoardLayer::BlFCu), copper_pad(BoardLayer::BlBCu)],
+        copper_layers: vec![copper_pad],
         ..PadStack::default()
     };
 
@@ -370,7 +378,7 @@ pub fn board_text(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
 
@@ -526,17 +534,59 @@ mod tests {
             vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32]
         );
 
-        // Drill diameter honored on both outer layers.
+        // The drill's start/end layers are what make it a through via.
         let drill = ps.drill.expect("drill");
         assert_eq!(drill.start_layer, BoardLayer::BlFCu as i32);
         assert_eq!(drill.end_layer, BoardLayer::BlBCu as i32);
         assert_eq!(drill.diameter.unwrap().x_nm, 200_000);
+        assert_eq!(
+            drill.shape,
+            kiapi::board::types::DrillShape::DsCircle as i32,
+            "leaving the drill shape at the proto default (DS_UNKNOWN) is what \
+             the working footprint-pad path avoids"
+        );
 
-        // Copper pad on both layers, round, at the requested diameter.
-        assert_eq!(ps.copper_layers.len(), 2);
-        for layer in &ps.copper_layers {
-            assert_eq!(layer.shape, PadStackShape::PssCircle as i32);
-            assert_eq!(layer.size.unwrap().x_nm, 450_000);
+        // Exactly one copper entry — see assert_normal_padstack_is_unpackable.
+        assert_eq!(ps.copper_layers.len(), 1);
+        assert_eq!(ps.copper_layers[0].shape, PadStackShape::PssCircle as i32);
+        assert_eq!(ps.copper_layers[0].size.unwrap().x_nm, 450_000);
+
+        assert_normal_padstack_is_unpackable(&ps, "build_via");
+    }
+
+    /// KiCad's own rule, enforceable without a running KiCAD.
+    ///
+    /// `PADSTACK::unpackCopperLayer` bails when `m_mode == MODE::NORMAL` and
+    /// the entry's layer is not `ALL_LAYERS` (`== F_Cu`), which fails the
+    /// enclosing `PCB_VIA::Deserialize` / `PAD::Deserialize` and comes back as
+    /// `AS_BAD_REQUEST "could not unpack …"`. Sending F.Cu *and* B.Cu entries
+    /// is what broke `add_via` in v0.2.1 (#117); the through span belongs to
+    /// the drill, not to the copper list.
+    ///
+    /// Anything constructing a PST_NORMAL padstack should assert this — the
+    /// mock server echoes requests back rather than running KiCad's parser, so
+    /// no transport test can catch a malformed padstack for us.
+    pub(crate) fn assert_normal_padstack_is_unpackable(
+        ps: &kiapi::board::types::PadStack,
+        what: &str,
+    ) {
+        use kiapi::board::types::{BoardLayer, PadStackType};
+
+        if ps.r#type != PadStackType::PstNormal as i32 {
+            return;
         }
+        assert_eq!(
+            ps.copper_layers.len(),
+            1,
+            "{what}: a PST_NORMAL padstack must carry exactly one copper layer, \
+             got {} — KiCad rejects the whole message",
+            ps.copper_layers.len()
+        );
+        assert_eq!(
+            ps.copper_layers[0].layer,
+            BoardLayer::BlFCu as i32,
+            "{what}: the single copper entry of a PST_NORMAL padstack must be \
+             keyed to F_Cu (KiCad's ALL_LAYERS sentinel)"
+        );
     }
 }

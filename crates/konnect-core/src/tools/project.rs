@@ -320,7 +320,7 @@ async fn handle_open_viewer(
 
             match child {
                 Ok(_) => Ok(CallToolResult::text(
-                    serde_json::to_string_pretty(&json!({
+                    serde_json::to_string(&json!({
                         "launched": true,
                         "viewer": viewer_path.to_str().unwrap_or(""),
                         "schematic": sch_path.to_str().unwrap_or(""),
