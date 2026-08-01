@@ -54,6 +54,13 @@ fn collect_geometry(node: &SexpNode, output: &mut Vec<(String, f64, f64)>) {
     }
 }
 
+/// Footprint-relative child coordinates, in a canonical order.
+///
+/// KiCad is free to re-serialize a footprint's graphics in a different order
+/// when it rewrites the file — a rotate on a footprint with several silk and
+/// courtyard segments reliably shuffles them. The invariant under test is that
+/// no child coordinate *changed*, not that KiCad preserved its own ordering,
+/// so compare as a sorted multiset.
 fn child_geometry(footprint: &SexpNode) -> Vec<(String, f64, f64)> {
     let mut output = Vec::new();
     for child in footprint.children().unwrap_or_default() {
@@ -63,6 +70,11 @@ fn child_geometry(footprint: &SexpNode) -> Vec<(String, f64, f64)> {
             collect_geometry(child, &mut output);
         }
     }
+    output.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.total_cmp(&b.1))
+            .then(a.2.total_cmp(&b.2))
+    });
     output
 }
 
