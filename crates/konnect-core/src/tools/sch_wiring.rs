@@ -421,10 +421,23 @@ fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> 
         .collect()
 }
 
-fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+pub(crate) fn insert_wire_with_junctions(
+    content: String,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> String {
     // Parse existing wires to detect new T-junctions
     let tree = konnect_sexp::parse_sexp(&content).ok();
     let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
+
+    // Existing junction positions, so a hit already marked isn't re-inserted
+    // (L-bends, and any loop calling this repeatedly, would otherwise double it).
+    let existing_junctions = tree
+        .as_ref()
+        .map(konnect_sexp::schematic::extract_junctions)
+        .unwrap_or_default();
 
     // Add the new wire to the set before checking junctions (it may form T's too)
     let new_wire = konnect_sexp::schematic::Wire {
@@ -442,14 +455,9 @@ fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f6
         .as_ref()
         .map(crate::tools::all_pin_endpoints)
         .unwrap_or_default();
-    let existing_juncs = tree
-        .as_ref()
-        .map(konnect_sexp::schematic::extract_junctions)
-        .unwrap_or_default();
     for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
         if !junctions
             .iter()
-            .chain(existing_juncs.iter())
             .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(px, py, jx, jy, 0.01))
         {
             junctions.push((px, py));
@@ -459,9 +467,28 @@ fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f6
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
     for (jx, jy) in junctions {
+        if existing_junctions
+            .iter()
+            .any(|(ex, ey)| konnect_sexp::geometry::points_coincident(jx, jy, *ex, *ey, 0.01))
+        {
+            continue;
+        }
         c = insert_before_close(&c, &format_junction(jx, jy));
     }
     c
+}
+
+/// Route a wire between two points: a single straight wire when axis-aligned,
+/// otherwise an H-then-V L-bend, each leg going through T-junction detection.
+pub(crate) fn route_between(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+        insert_wire_with_junctions(content, x1, y1, x2, y2)
+    } else {
+        let mid_x = x2;
+        let mid_y = y1;
+        let content = insert_wire_with_junctions(content, x1, y1, mid_x, mid_y);
+        insert_wire_with_junctions(content, mid_x, mid_y, x2, y2)
+    }
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -1518,17 +1545,7 @@ async fn handle_connect_pins(
     let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
 
     // Route wire(s) between the two pin endpoints
-    let mut new_content = content;
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single wire
-        new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2);
-    } else {
-        // L-bend: horizontal then vertical
-        let mid_x = x2;
-        let mid_y = y1;
-        new_content = insert_wire_with_junctions(new_content.clone(), x1, y1, mid_x, mid_y);
-        new_content = insert_wire_with_junctions(new_content, mid_x, mid_y, x2, y2);
-    }
+    let new_content = route_between(content, x1, y1, x2, y2);
 
     write_atomic(&sch_path, &new_content)?;
 
@@ -1542,7 +1559,7 @@ async fn handle_connect_pins(
 
 /// Resolve a pin's schematic-space endpoint by reference and pin number.
 /// Uses the same pattern as sch_analysis::handle_get_pin_connections.
-fn resolve_pin_endpoint(
+pub(crate) fn resolve_pin_endpoint(
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
     reference: &str,
@@ -1597,18 +1614,8 @@ async fn handle_add_schematic_connection(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
-
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single wire
-        content = insert_wire_with_junctions(content, x1, y1, x2, y2);
-    } else {
-        // Route with an L-bend: H segment then V segment
-        let mid_x = x2;
-        let mid_y = y1;
-        content = insert_wire_with_junctions(content.clone(), x1, y1, mid_x, mid_y);
-        content = insert_wire_with_junctions(content, mid_x, mid_y, x2, y2);
-    }
+    let content = std::fs::read_to_string(&sch_path)?;
+    let content = route_between(content, x1, y1, x2, y2);
 
     write_atomic(&sch_path, &content)?;
     Ok(CallToolResult::json(&json!({

@@ -329,8 +329,15 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
 }
 
 /// All symbol pin connection points in a parsed schematic tree.
+///
+/// Unit-aware: a multi-unit library symbol superimposes every unit's pins on
+/// one placement, so an instance of unit 1 must not report unit 2's pins (#35).
+/// These coordinates drive junction insertion, and a dot dropped on a phantom
+/// pin where two wires cross would short them.
 pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
-    use konnect_sexp::schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint};
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint,
+    };
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -342,7 +349,7 @@ pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
                 pts.push(pin_endpoint(&pin, t));
             }
         }
@@ -360,8 +367,8 @@ pub(crate) fn add_pin_midwire_junctions(
 ) -> anyhow::Result<Vec<(f64, f64)>> {
     use konnect_sexp::geometry::{point_on_segment, points_coincident};
     use konnect_sexp::schematic::{
-        extract_junctions, extract_lib_pins, extract_symbol_instances, extract_wires, pin_endpoint,
-        read_schematic,
+        extract_junctions, extract_lib_pins_for_unit, extract_symbol_instances, extract_wires,
+        pin_endpoint, read_schematic,
     };
     let tol = 0.01;
     let (_, tree) = read_schematic(sch_path)?;
@@ -386,7 +393,9 @@ pub(crate) fn add_pin_midwire_junctions(
             continue;
         };
         let t = inst.pin_transform();
-        for pin in extract_lib_pins(sym) {
+        // Unit-aware for the same reason as all_pin_endpoints: this one writes
+        // to the user's file, so a phantom-pin junction is a real defect.
+        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
             let (px, py) = pin_endpoint(&pin, t);
             let mid_wire = wires.iter().any(|w| {
                 point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol)

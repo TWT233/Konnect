@@ -20,15 +20,18 @@ Load the required toolsets for design review:
 
 ```
 load_toolset('sch_analysis')     # find_orphan_items, find_shorted_nets, find_single_pin_nets
-load_toolset('verification')     # run_erc, get_drc_violations, validate_for_manufacturing
+load_toolset('verification')     # run_drc, check_clearance, get_design_rules
+load_toolset('sch_export')       # run_erc
+load_toolset('pcb_export')       # get_drc_violations
+load_toolset('manufacturing')    # validate_for_manufacturing
 load_toolset('design_review')    # audit_decoupling, audit_connections, audit_power_rails, etc.
 ```
 
 Optional (for deeper analysis):
 
 ```
-load_toolset('sch_query')        # get net info, trace connections, inspect components
-load_toolset('pcb_query')        # check routing, zone fills, stackup
+load_toolset('sch_analysis')     # get net info, trace connections, inspect components
+load_toolset('pcb_routing')      # query_traces, get_nets_list
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -150,17 +153,6 @@ Checks:
 - Power sequencing considered for multi-rail designs
 - Power flags present (avoids ERC false positives)
 
-### ESD Protection Audit
-
-```
-audit_esd_protection()
-```
-
-Checks:
-- External connectors have ESD protection (TVS diodes, clamps)
-- USB, Ethernet, antenna ports have proper protection
-- Current limiting on exposed signal lines
-
 ### Manufacturing Audit
 
 ```
@@ -195,8 +187,7 @@ Equivalent to running:
 6. audit_decoupling
 7. audit_connections
 8. audit_power_rails
-9. audit_esd_protection
-10. audit_manufacturing
+9. audit_manufacturing
 
 ---
 

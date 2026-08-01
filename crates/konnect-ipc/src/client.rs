@@ -1136,14 +1136,13 @@ impl KiCadIpcClient {
                     "chamfered_rect" => kiapi::board::types::PadStackShape::PssChamferedrect,
                     _ => kiapi::board::types::PadStackShape::PssRectangle,
                 };
-                let copper_layer =
-                    if layers.contains(&(kiapi::board::types::BoardLayer::BlFCu as i32)) {
-                        kiapi::board::types::BoardLayer::BlFCu
-                    } else {
-                        kiapi::board::types::BoardLayer::BlBCu
-                    };
+                // Always F_Cu: it is KiCad's ALL_LAYERS sentinel for a
+                // PST_NORMAL stack, not a statement about which side the pad
+                // is on (that is `layers`). PADSTACK::unpackCopperLayer
+                // rejects any other value while the mode is NORMAL, failing
+                // the whole deserialization — see #117.
                 let copper = kiapi::board::types::PadStackLayer {
-                    layer: copper_layer as i32,
+                    layer: kiapi::board::types::BoardLayer::BlFCu as i32,
                     shape: shape as i32,
                     size: Some(crate::builders::vec2(pad.size_x, pad.size_y)),
                     corner_rounding_ratio: pad.roundrect_ratio,
@@ -1811,5 +1810,61 @@ mod footprint_graphics_tests {
             c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
             500_000
         );
+    }
+
+    /// #117 guard for the pad path: the same PST_NORMAL rule that broke
+    /// `add_via` applies to every pad we build, including the back-side case
+    /// that B.Cu placement (#115) will eventually exercise.
+    #[test]
+    fn pad_stacks_are_unpackable_on_both_sides() {
+        use crate::builders::tests::assert_normal_padstack_is_unpackable;
+
+        let pad = |layer: &str| IpcPadDefinition {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            x: 0.0,
+            y: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            layers: vec![layer.to_string()],
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            roundrect_ratio: 0.0,
+            rotation: 0.0,
+        };
+
+        for layer in ["F.Cu", "B.Cu"] {
+            let client = KiCadIpcClient::new("tcp://never-dialed");
+            let any = client
+                .build_footprint_item(
+                    "Lib:Fp",
+                    "R1",
+                    "R",
+                    &[pad(layer)],
+                    &[],
+                    &crate::types::IpcFieldPlacement::default(),
+                    10.0,
+                    10.0,
+                    0.0,
+                    "F.Cu",
+                )
+                .unwrap();
+            let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+            let pad_any = fp
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .find(|any| any.type_url.ends_with("types.Pad"))
+                .expect("pad item");
+            let decoded = kiapi::board::types::Pad::decode(pad_any.value.as_slice()).unwrap();
+            assert_normal_padstack_is_unpackable(
+                decoded.pad_stack.as_ref().expect("pad_stack"),
+                &format!("build_footprint_item pad on {layer}"),
+            );
+        }
     }
 }

@@ -226,7 +226,7 @@ Dimension format: `LxW` in mm (body dimensions, not pad-to-pad).
 
 ### Add LCSC Number to Existing Components
 
-1. Load `sch_query` toolset
+1. Load `sch_analysis` toolset
 2. Find components missing LCSC field
 3. Search JLCPCB parts for matching part numbers
 4. Update component fields with LCSC numbers
