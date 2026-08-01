@@ -13,6 +13,29 @@ use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
+/// The pin-item object schema (number/name/type/x/y/angle/length) shared by
+/// `pins`, `units[].pins`, and `power_pins` in the create_symbol schema below.
+/// `type_desc` parameterizes the one wording difference between call sites.
+fn pin_item_schema(type_desc: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "number": { "type": "string" },
+            "name": { "type": "string" },
+            "type": {
+                "type": "string",
+                "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
+                "description": type_desc
+            },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "angle": { "type": "number", "default": 0 },
+            "length": { "type": "number", "default": 2.54 }
+        },
+        "required": ["number", "name", "type", "x", "y"]
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -133,23 +156,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "pins": {
                         "type": "array",
                         "description": "Pin definitions",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "number": { "type": "string" },
-                                "name": { "type": "string" },
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
-                                    "description": "Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected')."
-                                },
-                                "x": { "type": "number" },
-                                "y": { "type": "number" },
-                                "angle": { "type": "number", "default": 0 },
-                                "length": { "type": "number", "default": 2.54 }
-                            },
-                            "required": ["number", "name", "type", "x", "y"]
-                        }
+                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').")
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
                     "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true },
@@ -162,23 +169,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "pins": {
                                     "type": "array",
                                     "description": "Pins for this unit",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "number": { "type": "string" },
-                                            "name": { "type": "string" },
-                                            "type": {
-                                                "type": "string",
-                                                "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
-                                                "description": "Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected')."
-                                            },
-                                            "x": { "type": "number" },
-                                            "y": { "type": "number" },
-                                            "angle": { "type": "number", "default": 0 },
-                                            "length": { "type": "number", "default": 2.54 }
-                                        },
-                                        "required": ["number", "name", "type", "x", "y"]
-                                    }
+                                    "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').")
                                 }
                             },
                             "required": ["pins"]
@@ -187,23 +178,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "power_pins": {
                         "type": "array",
                         "description": "Shared power pins (V+/V-, VCC/GND). Only meaningful with `units`: they become a dedicated final 'power unit' (e.g. Unit C of a dual op-amp, Unit E of a quad gate) placed once, following KiCAD's own 74xx convention. This avoids drawing the power pins on every unit (which would each need wiring to pass ERC). Same shape as `pins`.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "number": { "type": "string" },
-                                "name": { "type": "string" },
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
-                                    "description": "Pin electrical type — exactly one of KiCAD's 12 values (power pins are usually 'power_in'). Note: NC pins are 'no_connect' (not 'not_connected')."
-                                },
-                                "x": { "type": "number" },
-                                "y": { "type": "number" },
-                                "angle": { "type": "number", "default": 0 },
-                                "length": { "type": "number", "default": 2.54 }
-                            },
-                            "required": ["number", "name", "type", "x", "y"]
-                        }
+                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values (power pins are usually 'power_in'). Note: NC pins are 'no_connect' (not 'not_connected').")
                     }
                 },
                 "required": ["library_path", "name", "reference_prefix"]
@@ -229,7 +204,8 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" }
+                    "library_path": { "type": "string", "description": "Path to .kicad_sym library file" },
+                    "limit": { "type": "integer", "description": "Maximum number of symbols to return", "default": 100 }
                 },
                 "required": ["library_path"]
             }),
@@ -685,7 +661,7 @@ async fn handle_create_footprint(
     write_atomic(&output, &content)?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "footprint": name,
             "output": output.to_str().unwrap_or(""),
@@ -817,7 +793,7 @@ async fn handle_edit_footprint_pad(
     write_atomic(&path, &new_content)?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "pad": pad_number
         }))
@@ -1206,7 +1182,7 @@ async fn handle_register_footprint_library(
     .await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
@@ -1251,7 +1227,7 @@ async fn handle_list_footprint_libraries(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "count": all_libs.len(),
             "libraries": all_libs
         }))
@@ -1289,7 +1265,7 @@ async fn handle_register_symbol_library(
     .await?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
@@ -1336,7 +1312,7 @@ async fn handle_list_symbol_libraries(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "count": all_libs.len(),
             "libraries": all_libs
         }))
@@ -1684,7 +1660,7 @@ async fn handle_create_symbol(
     write_atomic(&lib_path, &new_content)?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "symbol": name,
             "library": lib_path.to_str().unwrap_or(""),
@@ -1740,7 +1716,7 @@ async fn handle_delete_symbol(
     write_atomic(&lib_path, &new_content)?;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "success": true,
             "deleted": symbol_name
         }))
@@ -1891,12 +1867,15 @@ async fn handle_list_symbols_in_library(
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
     let symbols = top_level_symbol_names(&content)?;
+    let limit = args["limit"].as_u64().unwrap_or(100) as usize;
+    let truncated = symbols.len() > limit;
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "library": lib_path.to_str().unwrap_or(""),
             "count": symbols.len(),
-            "symbols": symbols
+            "truncated": truncated,
+            "symbols": symbols.into_iter().take(limit).collect::<Vec<_>>()
         }))
         .unwrap(),
     ))
@@ -1952,7 +1931,7 @@ async fn handle_search_symbols(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "query": query,
             "count": results.len(),
             "results": results
@@ -1988,7 +1967,7 @@ async fn handle_list_library_footprints(
     footprints.sort();
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "library": library_path_str,
             "count": footprints.len(),
             "footprints": footprints
@@ -2034,7 +2013,7 @@ async fn handle_get_footprint_info(
     let has_3d = content.contains("(model ");
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "name": fp_name,
             "description": description,
             "pad_count": pad_count,
@@ -2088,7 +2067,7 @@ async fn handle_search_footprints(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "query": args["query"].as_str().unwrap_or(""),
             "count": results.len(),
             "results": results
@@ -2182,7 +2161,7 @@ async fn handle_get_symbol_info(
     }
 
     Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
+        serde_json::to_string(&json!({
             "lib_id": lib_id,
             "name": sym_name,
             "library": lib_nick,
