@@ -89,6 +89,17 @@ pub fn extract_wires(tree: &SexpNode) -> Vec<Wire> {
         .collect()
 }
 
+/// Extract all junction dot positions from a parsed schematic tree.
+pub fn extract_junctions(tree: &SexpNode) -> Vec<(f64, f64)> {
+    tree.find_all("junction")
+        .iter()
+        .filter_map(|node| {
+            let at = node.find("at")?;
+            Some((at.get_f64(1)?, at.get_f64(2)?))
+        })
+        .collect()
+}
+
 // ─── Net label ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]

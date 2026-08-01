@@ -351,6 +351,17 @@ async fn handle_add_schematic_component(
 
     sch.overwrite()?;
 
+    // A pin landing mid-segment on an existing wire needs a junction dot, or
+    // KiCad's netlister treats it as unconnected. Runs after the write because
+    // it re-reads the saved file; `place_one_component` stays pure so the batch
+    // path can do one junction pass for the whole batch instead of one per part.
+    let mut result = result;
+    let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
+    result["junctions_added"] = json!(junctions
+        .iter()
+        .map(|(x, y)| json!({ "x": x, "y": y }))
+        .collect::<Vec<_>>());
+
     Ok(CallToolResult::json(&result))
 }
 

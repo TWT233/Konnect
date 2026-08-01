@@ -9,7 +9,10 @@ use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, Too
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
-    schematic::{extract_labels, extract_symbol_instances, extract_wires, read_schematic, Wire},
+    schematic::{
+        extract_junctions, extract_labels, extract_symbol_instances, extract_wires, read_schematic,
+        Wire,
+    },
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -263,13 +266,29 @@ impl NetGraph {
 pub(crate) fn build_net_graph(
     wires: &[Wire],
     labels: &[konnect_sexp::schematic::Label],
+    junctions: &[(f64, f64)],
 ) -> NetGraph {
     let mut g = NetGraph::new();
     for w in wires {
         g.add_wire(w);
     }
+    // Labels and junction dots connect anywhere along a wire, not only at
+    // endpoints — union each such point with the segment it sits on.
+    // ponytail: O(P×W) scan; fine at schematic scale, index wires if it hurts.
+    let attach = |g: &mut NetGraph, x: f64, y: f64| {
+        for w in wires {
+            if point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, 0.01) {
+                g.union(pt_key(x, y), pt_key(w.x1, w.y1));
+            }
+        }
+    };
     for l in labels {
         g.add_label(l.x, l.y, &l.net);
+        attach(&mut g, l.x, l.y);
+    }
+    for &(jx, jy) in junctions {
+        g.ensure(pt_key(jx, jy));
+        attach(&mut g, jx, jy);
     }
     g
 }
@@ -348,7 +367,7 @@ async fn handle_get_net_connections(
         .filter(|l| l.net == net)
         .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
         .collect();
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
     let pts = g.points_on_net(&net).len();
     Ok(CallToolResult::json(
         &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
@@ -367,7 +386,7 @@ async fn handle_get_net_connectivity(
     let sch = cse::Schematic::load(&sch_path)?;
     let wires = super::sch_bridge::all_wires_as_sexp(&sch);
     let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let net_wires: Vec<_> = wires
         .iter()
@@ -436,7 +455,7 @@ async fn handle_get_pin_connections(
             )))
         }
     };
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
     ))
@@ -466,7 +485,7 @@ async fn handle_get_component_nets(
     let lib_sym = lib_syms
         .iter()
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let t = inst.pin_transform();
         konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
@@ -498,7 +517,7 @@ async fn handle_get_net_components(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let result: Vec<serde_json::Value> = instances
         .iter()
@@ -547,7 +566,7 @@ async fn handle_trace_from_point(
     let sch = cse::Schematic::load(&sch_path)?;
     let wires = super::sch_bridge::all_wires_as_sexp(&sch);
     let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
     let on_wire: Vec<_> = wires
         .iter()
         .filter(|w| {
@@ -605,7 +624,7 @@ async fn handle_find_shorted_nets(
     let sch = cse::Schematic::load(&sch_path)?;
     let wires = super::sch_bridge::all_wires_as_sexp(&sch);
     let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
     let mut root_nets: HashMap<(i64, i64), Vec<String>> = HashMap::new();
     for l in &labels {
         let root = g.find(pt_key(l.x, l.y));
@@ -684,7 +703,7 @@ async fn handle_get_connected_items(
     let lib_sym = lib_syms
         .iter()
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
 
     // Get nets for each pin
     let mut connected_nets: HashSet<String> = HashSet::new();

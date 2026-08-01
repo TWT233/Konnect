@@ -199,7 +199,11 @@ async fn handle_export_netlist_summary(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
-    let mut g = build_net_graph(&wires, &labels);
+    let mut g = build_net_graph(
+        &wires,
+        &labels,
+        &konnect_sexp::schematic::extract_junctions(&tree),
+    );
 
     // Collect distinct net names
     let mut net_names: Vec<String> = labels.iter().map(|l| l.net.clone()).collect();

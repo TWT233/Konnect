@@ -96,7 +96,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "split_wire_at_point",
-            "Split a wire at a given point, creating two wire segments and a junction.",
+            "Split a wire at a given point, creating two wire segments and a junction. \
+             Note: a pin landing mid-wire only needs a junction dot to connect \
+             (see add_junction) — splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -262,7 +264,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_junction",
-            "Add a junction dot at a point where wires cross or T-intersect.",
+            "Add a junction dot at a point where wires cross or T-intersect, or where \
+             a pin lands mid-wire. A junction alone connects a mid-wire pin; \
+             splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -402,6 +406,21 @@ fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire>
 
 // ─── Wire insertion with T-junction detection ─────────────────────────────────
 
+/// Pin endpoints that lie strictly inside a wire segment. Each needs a
+/// junction dot: KiCad connects a mid-wire pin only through a junction
+/// (verified with kicad-cli 10 — no wire split required).
+fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64)> {
+    let tol = 0.01;
+    pins.iter()
+        .copied()
+        .filter(|&(px, py)| {
+            konnect_sexp::geometry::point_on_segment(px, py, x1, y1, x2, y2, tol)
+                && !konnect_sexp::geometry::points_coincident(px, py, x1, y1, tol)
+                && !konnect_sexp::geometry::points_coincident(px, py, x2, y2, tol)
+        })
+        .collect()
+}
+
 pub(crate) fn insert_wire_with_junctions(
     content: String,
     x1: f64,
@@ -415,17 +434,9 @@ pub(crate) fn insert_wire_with_junctions(
 
     // Existing junction positions, so a hit already marked isn't re-inserted
     // (L-bends, and any loop calling this repeatedly, would otherwise double it).
-    let existing_junctions: Vec<(f64, f64)> = tree
+    let existing_junctions = tree
         .as_ref()
-        .map(|t| {
-            t.find_all("junction")
-                .iter()
-                .filter_map(|n| {
-                    let at = n.find("at")?;
-                    Some((at.get_f64(1)?, at.get_f64(2)?))
-                })
-                .collect()
-        })
+        .map(konnect_sexp::schematic::extract_junctions)
         .unwrap_or_default();
 
     // Add the new wire to the set before checking junctions (it may form T's too)
@@ -438,7 +449,20 @@ pub(crate) fn insert_wire_with_junctions(
     };
     existing_wires.push(new_wire);
 
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let mut junctions = find_t_junctions(&existing_wires, 0.01);
+    // Existing pins the new wire passes over also need junction dots.
+    let pins = tree
+        .as_ref()
+        .map(crate::tools::all_pin_endpoints)
+        .unwrap_or_default();
+    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+        if !junctions
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(px, py, jx, jy, 0.01))
+        {
+            junctions.push((px, py));
+        }
+    }
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
@@ -511,6 +535,18 @@ async fn handle_add_wire(
     for (jx, jy) in &junctions {
         sch.add_junction(*jx, *jy);
     }
+    // Pins the new wire passes over mid-segment also need junction dots.
+    let (_, tree) = read_schematic(&sch_path)?;
+    let pins = crate::tools::all_pin_endpoints(&tree);
+    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+        {
+            sch.add_junction(px, py);
+        }
+    }
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -527,6 +563,11 @@ async fn handle_batch_add_wire(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
+
+    // Pin endpoints are fixed for the whole batch (only wires change below).
+    let pins = read_schematic(&sch_path)
+        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
+        .unwrap_or_default();
 
     for w in &wires {
         let x1 = w["x1"].as_f64().unwrap_or(0.0);
@@ -550,6 +591,16 @@ async fn handle_batch_add_wire(
         sch.add_wire(x1, y1, x2, y2);
         for (jx, jy) in &junctions {
             sch.add_junction(*jx, *jy);
+        }
+        // Pins this wire passes over mid-segment also need junction dots.
+        for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+            if !sch
+                .junctions
+                .iter()
+                .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+            {
+                sch.add_junction(px, py);
+            }
         }
         added += 1;
     }
@@ -1247,10 +1298,15 @@ async fn handle_add_power_symbol(
     sch.add_symbol(sym);
     sch.overwrite()?;
 
+    // A power pin landing mid-segment on an existing wire needs a junction
+    // dot, or KiCad ERC reports it as not connected.
+    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
+
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
         "reference": pwr_ref,
-        "x": x, "y": y
+        "x": x, "y": y,
+        "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
     })))
 }
 
@@ -1413,6 +1469,19 @@ async fn handle_connect_to_net(
     sch.add_wire(pin_x, pin_y, label_x, label_y);
     for (jx, jy) in &junctions {
         sch.add_junction(*jx, *jy);
+    }
+    // Pins the stub passes over mid-segment also need junction dots.
+    let pins = read_schematic(&sch_path)
+        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
+        .unwrap_or_default();
+    for (px, py) in pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y) {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+        {
+            sch.add_junction(px, py);
+        }
     }
 
     // Add label
@@ -1651,6 +1720,45 @@ mod unit_aware_wiring_tests {
         assert!(
             msg.contains("unit 1"),
             "error should name the instance unit: {msg}"
+        );
+    }
+
+    /// U1 has a single pin at (101.6, 76.2) — on the 1.27 grid so add_wire's
+    /// snapping keeps the new wire exactly through it.
+    fn single_pin_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Test:P1\"\n\t\t\t(symbol \"P1_1_1\"\n\t\t\t\t(pin passive line (at 0 0 0) (length 2.54)\n\t\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Test:P1\")\n\t\t(at 101.6 76.2 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 101.6 71.12 0)\n\t\t)\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// Drawing a wire across an existing pin mid-segment must auto-insert a
+    /// junction dot — KiCad connects a mid-wire pin only through a junction.
+    #[tokio::test]
+    async fn add_wire_over_pin_inserts_junction() {
+        let (_d, path) = single_pin_schematic();
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 96.52, "y1": 76.2, "x2": 106.68, "y2": 76.2
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let tree = konnect_sexp::parse_sexp(&after).unwrap();
+        let juncs = konnect_sexp::schematic::extract_junctions(&tree);
+        assert!(
+            juncs
+                .iter()
+                .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
+            "junction expected at the mid-wire pin, got {juncs:?}"
         );
     }
 }

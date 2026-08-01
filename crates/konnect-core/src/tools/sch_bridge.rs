@@ -69,6 +69,11 @@ pub fn all_labels_as_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::
     labels
 }
 
+/// Collect all junction dot positions from a schematic.
+pub fn all_junctions(sch: &cse::Schematic) -> Vec<(f64, f64)> {
+    sch.junctions.iter().map(|j| (j.x, j.y)).collect()
+}
+
 /// Collect all wires from a schematic into konnect-sexp Wire format.
 pub fn all_wires_as_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire> {
     sch.wires.iter().map(wire_to_sexp).collect()
