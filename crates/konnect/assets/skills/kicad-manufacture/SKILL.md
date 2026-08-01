@@ -19,15 +19,15 @@ ALL modifications go through MCP tools — never edit project files directly.
 Before any manufacturing work, load the required toolsets:
 
 ```
-load_toolset('manufacturing')    # export_gerber, export_bom, export_position_file, export_manufacturing_package
-load_toolset('verification')     # get_drc_violations, validate_for_manufacturing
+load_toolset('pcb_export')       # export_gerber, export_bom, export_position_file, get_drc_violations
+load_toolset('manufacturing')    # export_manufacturing_package, validate_for_manufacturing, estimate_cost
 ```
 
 Load additional toolsets as needed:
 
 ```
 load_toolset('sch_analysis')     # inspect nets, verify footprints assigned
-load_toolset('integration')      # search_jlcpcb_parts, suggest_jlcpcb_alternatives, estimate_cost
+load_toolset('integration')      # search_jlcpcb_parts, suggest_jlcpcb_alternatives
 load_toolset('pcb_export')       # export_3d for visual verification
 ```
 

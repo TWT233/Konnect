@@ -24,7 +24,7 @@ load_toolset("design_review")
 
 If the project involves PCB layout, also load:
 ```
-load_toolset("pcb_layout")
+load_toolset("pcb_components")
 load_toolset("pcb_routing")
 ```
 
