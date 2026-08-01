@@ -5,6 +5,7 @@ pub mod symbol;
 pub mod wire;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::Result;
 use crate::sexp::{atom, parser, qstr, tagged, writer, SexpNode};
@@ -67,7 +68,7 @@ impl<'a> LocatedElement<'a> {
 /// ```
 pub struct Schematic {
     filepath: PathBuf,
-    original_source: String,
+    original_source: Mutex<String>,
 
     pub version: Option<u32>,
     pub generator: Option<String>,
@@ -106,7 +107,14 @@ impl Schematic {
         let path = path.as_ref();
         let text = writer::write(&self.to_sexp());
         if path == self.filepath {
-            atomic_write_revision(path, &self.original_source, &text)
+            let mut original_source = self.original_source.lock().map_err(|_| {
+                crate::error::Error::Io(std::io::Error::other(
+                    "schematic revision state is unavailable after a panic",
+                ))
+            })?;
+            atomic_write_revision(path, &original_source, &text)?;
+            *original_source = text;
+            Ok(())
         } else {
             atomic_create(path, &text)
         }
@@ -431,7 +439,7 @@ impl Schematic {
 
         Ok(Schematic {
             filepath,
-            original_source,
+            original_source: Mutex::new(original_source),
             version,
             generator,
             generator_version,

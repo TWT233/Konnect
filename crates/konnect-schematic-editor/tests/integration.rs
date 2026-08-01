@@ -348,6 +348,61 @@ fn overwrite_rejects_a_stale_loaded_revision() {
 }
 
 #[test]
+fn repeated_overwrites_advance_the_owned_revision_baseline() {
+    let tmp = fresh_minimal_file();
+    let mut schematic = Schematic::load(tmp.path()).unwrap();
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("4.7k");
+    schematic.overwrite().unwrap();
+
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("1k");
+    schematic.overwrite().unwrap();
+
+    let reloaded = Schematic::load(tmp.path()).unwrap();
+    assert_eq!(
+        reloaded.symbols.by_reference("R1").unwrap().value_str(),
+        Some("1k")
+    );
+}
+
+#[test]
+fn overwrite_still_rejects_an_external_change_after_a_successful_save() {
+    let tmp = fresh_minimal_file();
+    let mut schematic = Schematic::load(tmp.path()).unwrap();
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("4.7k");
+    schematic.overwrite().unwrap();
+
+    let external_revision = std::fs::read_to_string(tmp.path())
+        .unwrap()
+        .replace("4.7k", "22k");
+    std::fs::write(tmp.path(), &external_revision).unwrap();
+    schematic
+        .symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("1k");
+
+    let error = schematic.overwrite().unwrap_err();
+
+    assert!(matches!(error, Error::Conflict(_)));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        external_revision
+    );
+}
+
+#[test]
 fn save_as_refuses_to_replace_an_existing_document() {
     let source = fresh_minimal_file();
     let destination = tempfile::Builder::new()
