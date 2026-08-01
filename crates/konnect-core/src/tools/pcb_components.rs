@@ -1041,16 +1041,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_board_2d_view",
-            "Render the PCB as a 2-D image using kicad-cli and return it as a base64 PNG.",
+            "Render the board with kicad-cli and return it as a base64 PNG. Note this is              kicad-cli's 3-D board render viewed from the top, not a layer plot -- there is              no layer selection. Use export_svg for layer-aware 2-D output.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":  { "type": "string" },
-                    "layers": {
-                        "type": "array",
-                        "description": "Layers to include (empty = default copper + silkscreen)",
-                        "items": { "type": "string" }
-                    },
                     "width":  { "type": "integer", "default": 800, "description": "Render width in pixels, clamped to 100-4000 (kept small since the image lands in LLM context, raise it when detail matters)" },
                     "height": { "type": "integer", "default": 600, "description": "Render height in pixels, clamped to 100-4000" }
                 },
@@ -1698,37 +1693,11 @@ async fn handle_get_board_2d_view(
 ) -> anyhow::Result<CallToolResult> {
     use base64::Engine;
     let board_path = get_path(args, "board")?;
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                "F.Cu".into(),
-                "B.Cu".into(),
-                "F.SilkS".into(),
-                "B.SilkS".into(),
-                "Edge.Cuts".into(),
-            ]
-        });
-
     let width = args["width"].as_u64().unwrap_or(800).clamp(100, 4000) as u32;
     let height = args["height"].as_u64().unwrap_or(600).clamp(100, 4000) as u32;
 
     let tmp = board_path.with_extension("render.png");
-    let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
-    super::cli::render_pcb_png(
-        &ctx.config.kicad_cli,
-        &board_path,
-        &tmp,
-        &layer_refs,
-        width,
-        height,
-    )
-    .await?;
+    super::cli::render_pcb_png(&ctx.config.kicad_cli, &board_path, &tmp, width, height).await?;
     let bytes = tokio::fs::read(&tmp).await?;
     let _ = tokio::fs::remove_file(&tmp).await;
 

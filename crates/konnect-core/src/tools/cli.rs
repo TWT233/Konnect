@@ -566,27 +566,33 @@ pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) ->
     export_schematic_svg(cli, schematic, output_dir).await
 }
 
-/// KiCAD 10: `pcb render --output <path> [--layers <layer>]... --width <w> --height <h> <input>`
+/// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
+///
+/// `pcb render` is the 3-D renderer and takes **no** `--layers`: passing it
+/// makes kicad-cli exit non-zero with `Unknown argument: --layers`, which is
+/// how this was broken from 1ec5b81 (2026-07-08) through v0.2.0 and v0.2.1 —
+/// every call failed, and nothing tested it. Layer-aware 2-D output is
+/// `pcb export svg`, tracked separately.
 pub async fn render_pcb_png(
     cli: &str,
     pcb: &Path,
     output: &Path,
-    layers: &[&str],
     width: u32,
     height: u32,
 ) -> Result<()> {
     let width_str = width.to_string();
     let height_str = height.to_string();
-    let mut args = vec!["pcb", "render", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
-    }
-    args.push("--width");
-    args.push(&width_str);
-    args.push("--height");
-    args.push(&height_str);
-    args.push(pcb.to_str().unwrap());
+    let args = vec![
+        "pcb",
+        "render",
+        "--output",
+        output.to_str().unwrap(),
+        "--width",
+        &width_str,
+        "--height",
+        &height_str,
+        pcb.to_str().unwrap(),
+    ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
