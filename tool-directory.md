@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **185 registered tools** + **6 always-visible meta-tools** = **191 total**
+- **187 registered tools** + **6 always-visible meta-tools** = **193 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -127,7 +127,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find overlapping symbols or labels that may indicate placement errors. |
 
-### `sch_batch` · 10 tools
+### `sch_batch` · 12 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -143,6 +143,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
+| `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
+| `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
 ### `sch_export` · 6 tools
 **Purpose:** Export schematic to SVG/PDF/netlist, run ERC.

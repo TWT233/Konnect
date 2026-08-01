@@ -142,3 +142,63 @@ fn moving_and_rotating_footprint_preserves_child_geometry() {
         "rotating a footprint must preserve all child-relative geometry"
     );
 }
+
+/// #117 regression: v0.2.1 shipped an `add_via` that KiCad rejected outright
+/// with `AS_BAD_REQUEST "could not unpack PCB_VIA"`, because the padstack
+/// carried two copper entries under PST_NORMAL.
+///
+/// Nothing offline can catch that class: the message is schema-valid, so it
+/// encodes and decodes cleanly — only KiCad's own `Deserialize` refuses it.
+/// This test is the gate; run it (and the rest of this file) before tagging a
+/// release, not just weekly.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn adding_a_via_actually_creates_it_on_the_board() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    let net = client
+        .get_nets()
+        .expect("net list query failed")
+        .into_iter()
+        .find(|net| !net.name.is_empty())
+        .expect("board has no named net to attach a via to");
+
+    client.save_board().expect("initial board save failed");
+    let vias_before = load_board(Path::new(&board)).find_all("via").len();
+
+    // Somewhere clear of the EuroCard template's own content.
+    let (x, y) = (40.0, 40.0);
+    client
+        .add_via(&net.name, x, y, 0.4, 0.8)
+        .expect("add_via reported an error");
+    client
+        .save_board()
+        .expect("board save after add_via failed");
+
+    let after = load_board(Path::new(&board));
+    let vias: Vec<_> = after.find_all("via");
+    assert_eq!(
+        vias.len(),
+        vias_before + 1,
+        "add_via returned Ok but the saved board has no new via — this is \
+         exactly the v0.2.1 failure mode (silent success, nothing created)"
+    );
+    let placed = vias
+        .iter()
+        .find(|via| {
+            via.find("at")
+                .map(|node| {
+                    (node.get_f64(1).unwrap_or_default() - x).abs() < 1e-6
+                        && (node.get_f64(2).unwrap_or_default() - y).abs() < 1e-6
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("no via at ({x}, {y}) in the saved board"));
+    assert!(
+        placed.find("size").is_some() && placed.find("drill").is_some(),
+        "via is missing its size/drill: {placed:?}"
+    );
+}

@@ -26,9 +26,9 @@ load_toolset('sch_wiring')       # wires, net labels, power symbols, connections
 Load additional toolsets as needed:
 
 ```
-load_toolset('sch_library')      # search_symbols, get_symbol_info, list_libraries
+load_toolset('library')          # search_symbols, get_symbol_info, list_symbol_libraries
 load_toolset('sch_batch')        # batch operations for 3+ items
-load_toolset('sch_query')        # find components, get pin info, inspect nets
+load_toolset('sch_analysis')     # find components, get pin info, inspect nets
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -42,7 +42,7 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 1. Search the library first: use `search_symbols` to find the correct lib_id
 2. Get pin info: use `get_symbol_info` to see pin names, numbers, and positions
 3. Place on the 1.27mm grid (KiCAD default schematic grid)
-4. Verify placement with `get_schematic_components`
+4. Verify placement with `list_schematic_components`
 
 ### Common Library IDs
 
@@ -143,7 +143,7 @@ Load `sch_batch` toolset when placing 3 or more components or making bulk connec
 
 ### batch_place_components
 
-Place multiple components in one call. Provide an array of placements with lib_id, position, and reference.
+Place multiple components in one call. Provide `schematic` and a `components` array of `{lib_id, x, y, rotation?, reference?, value?, unit?}` objects. Pass `reference` explicitly for each component -- it is not auto-assigned.
 
 ### batch_connect_to_net
 

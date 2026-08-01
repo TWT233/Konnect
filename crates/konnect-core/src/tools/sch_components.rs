@@ -322,12 +322,7 @@ async fn handle_add_schematic_component(
     let reference = opt_str(args, "reference");
     let value = opt_str(args, "value");
     let unit = opt_f64(args, "unit").unwrap_or(1.0) as u32;
-
-    // Snap to 1.27mm grid
-    let (x, y) = snap_point(x, y, 1.27);
-
     let ref_str = reference.unwrap_or("?");
-    let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
 
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
@@ -338,35 +333,76 @@ async fn handle_add_schematic_component(
     let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
     let project_name = project_name_for(&sch_path);
 
+    let result = match place_one_component(
+        &mut sch,
+        &root_uuid,
+        &project_name,
+        &lib_id,
+        x,
+        y,
+        rotation,
+        ref_str,
+        value,
+        unit,
+    ) {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&result))
+}
+
+/// Place one symbol into `sch`: embeds the lib_symbols definition, validates
+/// the unit, and adds the positioned instance. Does not write the file --
+/// callers own the read/write cycle (single-add and batch-add alike).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_one_component(
+    sch: &mut cse::Schematic,
+    root_uuid: &str,
+    project_name: &str,
+    lib_id: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    reference: &str,
+    value: Option<&str>,
+    unit: u32,
+) -> Result<serde_json::Value, CallToolResult> {
+    // Snap to 1.27mm grid
+    let (x, y) = snap_point(x, y, 1.27);
+    let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
+
     // Embed the library symbol definition
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    if !cse::library::ensure_lib_symbol(sch, lib_id) {
+        return Err(crate::tools::lib_symbol_not_found_error(lib_id));
     }
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
     // netlister mis-assigns its pins (#35).
-    let unit_count = cse::library::symbol_unit_count(&lib_id).unwrap_or(1);
+    let unit_count = cse::library::symbol_unit_count(lib_id).unwrap_or(1);
     if unit < 1 || unit > unit_count {
-        return Ok(CallToolResult::error(format!(
+        return Err(CallToolResult::error(format!(
             "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
             unit, lib_id, unit_count, unit_count
         )));
     }
 
     // Build the Symbol struct
-    let mut sym = cse::Symbol::new(&lib_id, x, y);
+    let mut sym = cse::Symbol::new(lib_id, x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = unit;
 
     // Reference above the component, Value below; Footprint/Datasheet hidden.
     // Power symbols get their Reference hidden too, matching eeschema: a
     // #PWR designator is never shown on the sheet.
-    let hide_reference = lib_id.starts_with("power:") || ref_str.starts_with("#PWR");
+    let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
     let positioned = crate::tools::positioned_property;
     sym.properties.push(positioned(
         "Reference",
-        ref_str,
+        reference,
         x,
         y - 3.81,
         0.0,
@@ -381,20 +417,19 @@ async fn handle_add_schematic_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(&project_name, &format!("/{}", root_uuid), ref_str, unit);
+    sym.set_instance_path(project_name, &format!("/{}", root_uuid), reference, unit);
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
-    sch.overwrite()?;
 
-    Ok(CallToolResult::json(&json!({
+    Ok(json!({
         "added": lib_id,
-        "reference": ref_str,
+        "reference": reference,
         "value": val_str,
         "x": x, "y": y,
         "unit": unit,
         "uuid": uuid
-    })))
+    }))
 }
 
 async fn handle_delete_schematic_component(

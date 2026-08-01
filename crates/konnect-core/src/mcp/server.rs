@@ -15,7 +15,7 @@ impl McpServerState {
 
     pub fn build_initialize_result() -> InitializeResult {
         InitializeResult {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: "2025-06-18".to_string(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(true),
