@@ -1,6 +1,7 @@
 mod config;
 mod install;
 mod manifest;
+mod transaction_cli;
 mod transport;
 
 use anyhow::Result;
@@ -24,6 +25,7 @@ async fn main() -> Result<()> {
             let name = args.get(2).map(String::as_str).unwrap_or("");
             return install::print_skill_content(name);
         }
+        Some("transaction") => return transaction_cli::run(&args[2..]),
         Some("--version") | Some("-V") => {
             println!("konnect {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -123,6 +125,9 @@ fn print_help() {
     println!("  konnect uninstall        Remove all installed files");
     println!("  konnect status           Show install state");
     println!("  konnect skill <name>     Print skill content (for hooks)");
+    println!("  konnect transaction status <project-dir>");
+    println!("  konnect transaction recover <project-dir>");
+    println!("  konnect transaction abandon <project-dir> <id> --force");
     println!("  konnect --config <path>  Start server with config file");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");
