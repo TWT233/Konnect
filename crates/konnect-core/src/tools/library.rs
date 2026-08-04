@@ -2816,6 +2816,7 @@ mod tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )

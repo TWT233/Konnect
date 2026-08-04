@@ -62,7 +62,8 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
         McpToolDescription {
             name: "unload_toolset".to_string(),
             description: "Unload a toolset to remove its tools from the active session. \
-                 Use this to keep the tool list manageable when switching tasks."
+                 Use this to keep the tool list manageable when switching tasks. \
+                 With auto_load_toolsets enabled, tools reload on use."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

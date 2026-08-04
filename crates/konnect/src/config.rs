@@ -36,6 +36,13 @@ pub struct Config {
     /// Log level (error, warn, info, debug, trace)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Auto-load a tool's toolset on call instead of returning
+    /// `toolset_not_loaded`. Off by default: toolsets accumulate monotonically
+    /// once loaded, so auto-load trades one recoverable error for permanent
+    /// context growth -- opt in only if that trade is worth it for your client.
+    #[serde(default)]
+    pub auto_load_toolsets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -142,6 +149,7 @@ impl Default for Config {
             http_address: default_http_address(),
             jlcpcb_db_path: None,
             log_level: default_log_level(),
+            auto_load_toolsets: false,
         }
     }
 }

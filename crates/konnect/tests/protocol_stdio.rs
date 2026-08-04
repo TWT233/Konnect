@@ -17,7 +17,18 @@ struct McpProcess {
 
 impl McpProcess {
     fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_konnect"))
+        Self::spawn_in_dir(None)
+    }
+
+    /// Spawn with the process working directory set to `dir`, so
+    /// `Config::load()`'s first search path (`konnect.toml` in cwd) picks up
+    /// a test config file placed there.
+    fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -345,5 +356,45 @@ fn load_toolset_batch_total_failure_is_typed_error() {
     assert!(
         body["message"].as_str().unwrap().contains("list_toolboxes"),
         "{body:#?}"
+    );
+}
+
+/// With `auto_load_toolsets = true` in `konnect.toml` (picked up from the
+/// server process's cwd), calling a tool from an unloaded toolset auto-loads
+/// it and executes in the same call instead of returning `toolset_not_loaded`.
+/// Default-off behavior (no config file) is covered by
+/// `structured_errors_guide_recovery`.
+#[test]
+fn auto_load_toolsets_config_loads_and_executes_on_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("konnect.toml"),
+        "auto_load_toolsets = true\n",
+    )
+    .unwrap();
+    let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
+
+    // route_trace is in pcb_routing, not loaded at startup. With auto-load on,
+    // the toolset loads, a list_changed notification fires, and the call
+    // reaches the handler's own missing-argument check (net_name) instead of
+    // failing with toolset_not_loaded.
+    let lines = p.call_tool_then_fence("route_trace", json!({}));
+    let r = lines
+        .iter()
+        .find(|v| v.get("result").is_some())
+        .expect("expected a tools/call result")["result"]
+        .clone();
+    assert_eq!(r["isError"], json!(true));
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["error"]["kind"], "invalid_argument");
+    assert_eq!(body["error"]["field"], "net_name");
+
+    let saw_notification = lines.iter().any(|v| {
+        v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")
+            && v.get("id").is_none()
+    });
+    assert!(
+        saw_notification,
+        "expected notifications/tools/list_changed after auto-load; saw: {lines:#?}"
     );
 }
