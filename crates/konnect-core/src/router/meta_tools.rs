@@ -1,7 +1,7 @@
 //! The 6 always-visible meta-tools.
 //!
 //! Discovery / routing:
-//!   list_toolboxes()          — show all 17 toolsets with descriptions and load state
+//!   list_toolboxes()          — show all 18 toolsets with descriptions and load state
 //!   load_toolset(name)        — activate a toolset, expose its tools in tools/list
 //!   unload_toolset(name)      — deactivate a toolset, remove its tools from tools/list
 //!   get_active_toolsets()     — list currently loaded toolsets
@@ -14,6 +14,7 @@
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
 //! `load_toolset(name)` to expose the tools it actually needs for the task.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
@@ -41,14 +42,18 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
             description:
                 "Load a toolset by name so its tools appear in tools/list and can be called. \
                  Returns the list of tools that were added. Use list_toolboxes() first to \
-                 see valid names."
+                 see valid names. Pass an array to load several toolsets in one call -- \
+                 cheaper, one tools/list refresh."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": {
-                        "type": "string",
-                        "description": "Toolset name (e.g. 'sch_components', 'pcb_routing')"
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ],
+                        "description": "Toolset name (e.g. 'sch_components', 'pcb_routing'), or an array of names"
                     }
                 },
                 "required": ["name"]
@@ -167,27 +172,86 @@ async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolRes
 }
 
 async fn handle_load_toolset(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
-    let name = match args["name"].as_str() {
-        Some(n) => n,
-        None => return CallToolResult::error("Missing required argument: name"),
-    };
+    match &args["name"] {
+        // Legacy single-name form: result shape is byte-identical to the
+        // pre-batch behavior (`loaded` is a string, `tools` echoes descriptions).
+        Value::String(name) => match ctx.router.load(name).await {
+            Some(tools) => {
+                let tool_list: Vec<Value> = tools
+                    .iter()
+                    .map(|t| json!({ "name": t.name, "description": t.description }))
+                    .collect();
+                CallToolResult::json(&json!({
+                    "loaded": name,
+                    "tools_added": tools.len(),
+                    "tools": tool_list
+                }))
+            }
+            None => CallToolResult::error(format!(
+                "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
+                name
+            )),
+        },
+        // New array form: one load, one tools/list_changed notification.
+        Value::Array(arr) => {
+            let mut names: Vec<String> =
+                match arr.iter().map(|v| v.as_str().map(str::to_string)).collect() {
+                    Some(names) => names,
+                    None => return CallToolResult::error("name array must contain only strings"),
+                };
+            // Duplicate names in one call would double-count tools_added.
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|n| seen.insert(n.clone()));
 
-    match ctx.router.load(name).await {
-        Some(tools) => {
-            let tool_list: Vec<Value> = tools
-                .iter()
-                .map(|t| json!({ "name": t.name, "description": t.description }))
-                .collect();
+            let mut loaded = Vec::new();
+            let mut tools_added = 0usize;
+            let mut tool_list: Vec<Value> = Vec::new();
+            let mut errors = Vec::new();
+
+            for name in &names {
+                match ctx.router.load(name).await {
+                    Some(tools) => {
+                        loaded.push(name.clone());
+                        tools_added += tools.len();
+                        tool_list.extend(
+                            tools
+                                .iter()
+                                .map(|t| json!({ "name": t.name, "description": t.description })),
+                        );
+                    }
+                    None => errors.push(format!(
+                        "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
+                        name
+                    )),
+                }
+            }
+
+            // Nothing loaded at all -- a typed error so the observer keeps a kind,
+            // rather than a JSON body with a manually-set is_error flag.
+            if loaded.is_empty() {
+                let kind = ToolErrorKind::InvalidArgument {
+                    field: "name".to_string(),
+                    reason: names.join(", "),
+                };
+                return CallToolResult::error_kind(
+                    kind,
+                    format!(
+                        "No toolsets loaded -- all names were unknown: {}. Call list_toolboxes() to see valid names.",
+                        names.join(", ")
+                    ),
+                );
+            }
+
+            // Partial success (some names unknown, some loaded) is not an error --
+            // the caller gets what loaded plus an errors array for the rest.
             CallToolResult::json(&json!({
-                "loaded": name,
-                "tools_added": tools.len(),
-                "tools": tool_list
+                "loaded": loaded,
+                "tools_added": tools_added,
+                "tools": tool_list,
+                "errors": errors,
             }))
         }
-        None => CallToolResult::error(format!(
-            "Unknown toolset '{}'. Call list_toolboxes() to see valid names.",
-            name
-        )),
+        _ => CallToolResult::error("Missing required argument: name (string or array of strings)"),
     }
 }
 

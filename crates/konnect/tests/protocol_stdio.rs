@@ -267,3 +267,83 @@ fn unload_toolset_emits_list_changed_over_stdio() {
         "expected notifications/tools/list_changed after unload_toolset; saw: {lines:#?}"
     );
 }
+
+/// `load_toolset` accepts an array of names in one call: all listed toolsets
+/// load, tools_added sums across them, and only one list_changed notification
+/// fires for the whole batch.
+#[test]
+fn load_toolset_batch_form_loads_all_and_notifies_once() {
+    let mut p = McpProcess::spawn();
+    let lines = p.call_tool_then_fence(
+        "load_toolset",
+        json!({"name": ["sch_components", "sch_wiring"]}),
+    );
+    let r = lines
+        .iter()
+        .find(|v| v.get("result").is_some())
+        .expect("expected a tools/call result")["result"]
+        .clone();
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["tools_added"].as_u64(), Some(36));
+    // tools items are {name, description} objects, matching the legacy
+    // single-name result shape -- not bare name strings.
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(!tools.is_empty());
+    for t in tools {
+        assert!(t.get("name").and_then(Value::as_str).is_some(), "{t:#?}");
+        assert!(
+            t.get("description").and_then(Value::as_str).is_some(),
+            "{t:#?}"
+        );
+    }
+
+    let notification_count = lines
+        .iter()
+        .filter(|v| {
+            v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")
+                && v.get("id").is_none()
+        })
+        .count();
+    assert_eq!(
+        notification_count, 1,
+        "expected exactly one list_changed notification for the batch; saw: {lines:#?}"
+    );
+
+    // Mixed valid/invalid names: partial failure is not isError, but the
+    // errors array names the unknown toolset and loaded lists only the real one.
+    let lines = p.call_tool_then_fence(
+        "load_toolset",
+        json!({"name": ["templates", "bogus_toolset"]}),
+    );
+    let r = lines
+        .iter()
+        .find(|v| v.get("result").is_some())
+        .expect("expected a tools/call result")["result"]
+        .clone();
+    assert_ne!(r["isError"].as_bool(), Some(true), "{r:#?}");
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["loaded"], json!(["templates"]));
+    let errors = body["errors"].as_array().expect("errors array");
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].as_str().unwrap().contains("list_toolboxes"),
+        "{errors:#?}"
+    );
+}
+
+/// All names in one `load_toolset` call unknown -> a typed `invalid_argument`
+/// error (not a JSON body with a hand-set `isError`), so the observer keeps a
+/// real `error_kind` column instead of degrading to `handler_error`.
+#[test]
+fn load_toolset_batch_total_failure_is_typed_error() {
+    let mut p = McpProcess::spawn();
+    let r = p.call_tool("load_toolset", json!({"name": ["bogus_one", "bogus_two"]}));
+    assert_eq!(r["isError"], json!(true));
+    let body = McpProcess::tool_body(&r);
+    assert_eq!(body["error"]["kind"], "invalid_argument");
+    assert_eq!(body["error"]["field"], "name");
+    assert!(
+        body["message"].as_str().unwrap().contains("list_toolboxes"),
+        "{body:#?}"
+    );
+}
