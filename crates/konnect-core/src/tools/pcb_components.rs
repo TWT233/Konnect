@@ -1883,6 +1883,7 @@ mod tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
@@ -2199,6 +2200,7 @@ mod tests {
                 ipc_address: spawn_rejecting_kicad(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );

@@ -81,6 +81,8 @@ get_active_toolsets     → See what's currently loaded
 unload_toolset("name")  → Remove a toolset when done
 ```
 
+`load_toolset` also accepts an array of names to load several toolsets in one call, with a single context refresh.
+
 ### Available Toolsets
 
 | Category | Toolsets |

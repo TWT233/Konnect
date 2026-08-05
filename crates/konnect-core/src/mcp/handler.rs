@@ -225,8 +225,19 @@ impl McpHandler {
             return (result, status, None);
         }
 
-        // Loaded domain tool?
-        if let Some(tool_def) = self.ctx.router.get_tool(name).await {
+        // Loaded domain tool? If not and auto-load is enabled (opt-in, off by
+        // default -- see `ServerConfig::auto_load_toolsets`), load its toolset
+        // and retry in the same call instead of erroring.
+        let mut tool_def = self.ctx.router.get_tool(name).await;
+        if tool_def.is_none() && self.ctx.config.auto_load_toolsets {
+            if let Some(toolset) = self.ctx.router.find_toolset_for_tool(name) {
+                self.ctx.router.load(toolset).await;
+                self.notify_tools_list_changed().await;
+                tool_def = self.ctx.router.get_tool(name).await;
+            }
+        }
+
+        if let Some(tool_def) = tool_def {
             return match (tool_def.handler)(args, self.ctx.clone()).await {
                 Ok(result) => {
                     let status = if result.is_error {

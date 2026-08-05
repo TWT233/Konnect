@@ -1247,6 +1247,7 @@ mod batch_delete_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1331,6 +1332,7 @@ mod batch_place_and_connect_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1514,6 +1516,7 @@ mod midwire_pin_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
