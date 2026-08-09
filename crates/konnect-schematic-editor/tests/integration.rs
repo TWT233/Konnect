@@ -586,3 +586,93 @@ fn editing_one_symbol_does_not_corrupt_the_others() {
     assert!(out.contains(r#"(lib_name "R_1")"#), "{out}");
     assert!(out.contains("(dnp yes)"), "{out}");
 }
+
+/// A symbol whose unmodelled tokens are scattered *between* the modelled ones,
+/// which is how KiCad may write them: `pin` ahead of `at`, `convert` before
+/// `uuid`, `default_instance` between two properties.
+fn interleaved_symbol_sch() -> &'static str {
+    r#"(kicad_sch
+  (version 20250114)
+  (generator "eeschema")
+  (uuid "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:R"
+      (property "Reference" "R" (at 2.032 0 90))
+    )
+  )
+  (symbol
+    (pin "1" (uuid "55555555-0003-4111-8111-111111111111"))
+    (lib_id "Device:R")
+    (at 88.9 63.5 0)
+    (convert 2)
+    (unit 1)
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (dnp no)
+    (uuid "44444444-0002-4111-8111-111111111111")
+    (property "Reference" "R2" (at 91.44 62.23 0))
+    (default_instance
+      (reference "R")
+      (unit 1)
+    )
+    (property "Value" "22k" (at 91.44 64.77 0))
+    (instances
+      (project "interleaved"
+        (path "/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" (reference "R2") (unit 1))
+      )
+    )
+  )
+)"#
+}
+
+#[test]
+fn raw_and_typed_symbol_children_survive_interleaving() {
+    // Contract asserted here is *survival and uniqueness*, not byte-identity:
+    // `to_sexp` emits the preserved raw children after the typed fields, so a
+    // symbol whose unmodelled tokens were interleaved comes back with them
+    // grouped at the end. KiCad's parser is order-insensitive for these, so
+    // this is valid — but it does mean a round-trip is not byte-faithful for
+    // such files. Re-interleaving to the original positions is deliberately
+    // left as follow-up; this test pins today's behaviour so that change is a
+    // conscious one.
+    let tmp = tempfile::Builder::new()
+        .suffix(".kicad_sch")
+        .tempfile()
+        .expect("create tempfile");
+    std::fs::write(tmp.path(), interleaved_symbol_sch()).unwrap();
+    let out = Schematic::load(tmp.path()).unwrap().to_source();
+
+    for token in [
+        "(lib_id \"Device:R\")",
+        "(convert 2)",
+        "(exclude_from_sim no)",
+        "(default_instance",
+        "(pin \"1\"",
+        "(instances",
+        "(property \"Reference\" \"R2\"",
+        "(property \"Value\" \"22k\"",
+    ] {
+        assert_eq!(
+            out.matches(token).count(),
+            1,
+            "{token} must appear exactly once — not dropped, not duplicated by \
+             both the typed path and raw_sub_nodes:\n{out}"
+        );
+    }
+
+    // Re-parsing the output must yield the same field values.
+    let reparsed = tempfile::Builder::new()
+        .suffix(".kicad_sch")
+        .tempfile()
+        .expect("create tempfile");
+    std::fs::write(reparsed.path(), &out).unwrap();
+    let sch = Schematic::load(reparsed.path()).unwrap();
+    let r2 = sch.symbols.by_reference("R2").unwrap();
+    assert_eq!(r2.lib_id, "Device:R");
+    assert_eq!(r2.lib_name, None);
+    assert_eq!(r2.exclude_from_sim, Some(false));
+    assert_eq!(r2.unit, 1);
+    assert_eq!(r2.value_str(), Some("22k"));
+}
