@@ -244,15 +244,17 @@ fn unit_suffix_of<'a>(name: &'a str, base: &str) -> Option<&'a str> {
 /// yields empty pin lists downstream (#34).
 #[must_use]
 pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
-    // Check if already present
-    let check_name = format!("\"{}\"", lib_id);
+    // Check if already present. This is a structural match on the direct
+    // children of lib_symbols: it used to substring-search a `{:?}` debug
+    // rendering of the whole node, which matched on any nested occurrence of
+    // the name — a property value, a unit sub-symbol, or an unrelated entry
+    // that merely contains it (#143).
     let already_present = schematic.raw_other.iter().any(|node| {
-        if node.tag() == Some("lib_symbols") {
-            let content = format!("{:?}", node);
-            content.contains(&check_name)
-        } else {
-            false
-        }
+        node.tag() == Some("lib_symbols")
+            && node
+                .find_all("symbol")
+                .iter()
+                .any(|s| s.value() == Some(lib_id))
     });
     if already_present {
         return true;

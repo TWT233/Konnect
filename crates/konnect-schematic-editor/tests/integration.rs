@@ -447,3 +447,142 @@ fn changeset_display() {
     assert_eq!(cs.len(), 2);
     assert!(cs.summary().contains("R1.Value"));
 }
+
+// ---- unmodelled-token preservation (#143) -----------------------------------
+
+/// A symbol block in the shape eeschema writes for a locally edited library
+/// symbol: `lib_name` ahead of `lib_id`, plus tokens the typed model does not
+/// reconstruct field-by-field.
+fn derived_symbol_sch() -> &'static str {
+    r#"(kicad_sch
+  (version 20250114)
+  (generator "eeschema")
+  (uuid "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:R"
+      (property "Reference" "R" (at 2.032 0 90))
+    )
+    (symbol "R_1"
+      (property "Reference" "R" (at 2.032 0 90))
+    )
+  )
+  (symbol
+    (lib_name "R_1")
+    (lib_id "Device:R")
+    (at 88.9 63.5 0)
+    (unit 1)
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (dnp no)
+    (uuid "44444444-0002-4111-8111-111111111111")
+    (property "Reference" "R2" (at 91.44 62.23 0))
+    (property "Value" "22k" (at 91.44 64.77 0))
+    (convert 2)
+    (default_instance
+      (reference "R")
+      (unit 1)
+    )
+    (pin "1" (uuid "55555555-0003-4111-8111-111111111111"))
+    (instances
+      (project "derived"
+        (path "/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" (reference "R2") (unit 1))
+      )
+    )
+  )
+)"#
+}
+
+fn load_derived() -> Schematic {
+    let tmp = tempfile::Builder::new()
+        .suffix(".kicad_sch")
+        .tempfile()
+        .expect("create tempfile");
+    std::fs::write(tmp.path(), derived_symbol_sch()).unwrap();
+    Schematic::load(tmp.path()).unwrap()
+}
+
+#[test]
+fn lib_name_is_parsed_into_its_own_field() {
+    let sch = load_derived();
+    let r2 = sch.symbols.by_reference("R2").unwrap();
+    assert_eq!(r2.lib_name.as_deref(), Some("R_1"));
+    assert_eq!(r2.lib_id, "Device:R");
+}
+
+#[test]
+fn lib_symbol_name_prefers_lib_name_over_lib_id() {
+    let sch = load_derived();
+    // The derived entry is what KiCAD resolves through; lib_id is provenance.
+    assert_eq!(
+        sch.symbols.by_reference("R2").unwrap().lib_symbol_name(),
+        "R_1"
+    );
+    // A symbol with no lib_name falls back to lib_id.
+    let plain = load_minimal();
+    assert_eq!(
+        plain.symbols.by_reference("R1").unwrap().lib_symbol_name(),
+        "Device:R"
+    );
+}
+
+#[test]
+fn lib_name_survives_a_load_and_save_round_trip() {
+    // The whole point of #143: dropping this silently re-points the symbol at
+    // the base definition and rewires the netlist.
+    let out = load_derived().to_source();
+    assert!(
+        out.contains(r#"(lib_name "R_1")"#),
+        "lib_name must survive the round-trip:\n{out}"
+    );
+}
+
+#[test]
+fn lib_name_is_written_before_lib_id_like_eeschema() {
+    let out = load_derived().to_source();
+    let lib_name = out.find(r#"(lib_name "R_1")"#).expect("lib_name emitted");
+    let lib_id = out.find(r#"(lib_id "Device:R")"#).expect("lib_id emitted");
+    assert!(
+        lib_name < lib_id,
+        "eeschema writes lib_name ahead of lib_id:\n{out}"
+    );
+}
+
+#[test]
+fn unmodelled_symbol_children_survive_a_round_trip() {
+    let out = load_derived().to_source();
+    for token in ["(exclude_from_sim no)", "(convert 2)", "(default_instance"] {
+        assert!(out.contains(token), "{token} was dropped:\n{out}");
+    }
+}
+
+#[test]
+fn exclude_from_sim_keeps_its_eeschema_position() {
+    let out = load_derived().to_source();
+    let unit = out.find("(unit 1)").expect("unit emitted");
+    let excl = out
+        .find("(exclude_from_sim no)")
+        .expect("exclude_from_sim emitted");
+    let in_bom = out.find("(in_bom yes)").expect("in_bom emitted");
+    assert!(unit < excl && excl < in_bom, "wrong ordering:\n{out}");
+}
+
+#[test]
+fn a_symbol_without_exclude_from_sim_does_not_gain_one() {
+    // Older files omit the token; inventing it on save would be a silent
+    // format upgrade.
+    let out = load_minimal().to_source();
+    assert!(!out.contains("exclude_from_sim"), "{out}");
+}
+
+#[test]
+fn editing_one_symbol_does_not_corrupt_the_others() {
+    // The reported failure mode: a single add/edit re-serializes every symbol
+    // in the file, so untouched symbols lost their lib_name too.
+    let mut sch = load_derived();
+    sch.symbols.by_reference_mut("R2").unwrap().dnp = true;
+    let out = sch.to_source();
+    assert!(out.contains(r#"(lib_name "R_1")"#), "{out}");
+    assert!(out.contains("(dnp yes)"), "{out}");
+}

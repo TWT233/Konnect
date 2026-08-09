@@ -20,6 +20,28 @@ use sheet::{Sheet, SheetCollection};
 use symbol::{Symbol, SymbolCollection};
 use wire::{Wire, WireCollection};
 
+// ---- raw child preservation -------------------------------------------------
+
+/// Collect the children of `node` that `to_sexp` does *not* reconstruct from
+/// typed fields, so they survive a load/save round-trip verbatim.
+///
+/// This is a deny-list on purpose. It used to be an allow-list naming the two
+/// or three sub-nodes we happened to care about, which silently deleted every
+/// other token KiCAD writes — most damagingly `(lib_name …)`, whose loss
+/// re-points a symbol at the wrong `lib_symbols` entry and rewires the
+/// netlist without any error from KiCAD or from us (#143).
+pub(crate) fn unmodelled_children(node: &SexpNode, modelled: &[&str]) -> Vec<SexpNode> {
+    node.args()
+        .iter()
+        .filter(|n| match n.tag() {
+            Some(tag) => !modelled.contains(&tag),
+            // Bare atoms (e.g. a lone flag token) are unmodelled by definition.
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 // ---- LocatedElement ---------------------------------------------------------
 
 pub enum LocatedElement<'a> {
