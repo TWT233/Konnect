@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
 use serde_json::json;
@@ -1402,12 +1403,13 @@ async fn register_in_lib_table(
 // ─── Symbol library tools ─────────────────────────────────────────────────────
 
 /// Minimal pin geometry for deriving the symbol body.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PinGeom {
     x: f64,
     y: f64,
     angle: f64,
     length: f64,
+    name: String,
 }
 
 /// The point where a pin meets the symbol body. In KiCAD symbols the pin's
@@ -1420,12 +1422,44 @@ fn pin_root(x: f64, y: f64, angle_deg: f64, length: f64) -> (f64, f64) {
     (x + length * a.cos(), y + length * a.sin())
 }
 
+/// The body edge a pin attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinEdge {
+    Left,
+    Right,
+    Bottom,
+    Top,
+}
+
+/// Which edge a pin sits on, from its orientation (Y up): a pin pointing right
+/// (0) sits on the left edge, left (180) on the right edge, up (90) on the
+/// bottom edge, down (270) on the top edge. A degree of tolerance absorbs
+/// callers whose 360 arithmetic lands just off. `None` for anything diagonal.
+fn pin_edge(angle_deg: f64) -> Option<PinEdge> {
+    let a = angle_deg.rem_euclid(360.0);
+    let near = |t: f64| {
+        let d = (a - t).abs();
+        !(1.0..=359.0).contains(&d)
+    };
+    if near(0.0) {
+        Some(PinEdge::Left)
+    } else if near(180.0) {
+        Some(PinEdge::Right)
+    } else if near(90.0) {
+        Some(PinEdge::Bottom)
+    } else if near(270.0) {
+        Some(PinEdge::Top)
+    } else {
+        None
+    }
+}
+
 /// Body rectangle `(min_x, min_y, max_x, max_y)` for a symbol: edges that pins
 /// attach to pass through those pins' roots (so each pin's far end touches the
 /// border and its connection bulb sits outside), and edges with no pins are
 /// pushed out by a margin so there is clear spacing beyond the outermost pins.
 /// `None` when there are no pins.
-fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
+fn symbol_body_rect(pins: &[PinGeom], show_names: bool) -> Option<(f64, f64, f64, f64)> {
     if pins.is_empty() {
         return None;
     }
@@ -1444,24 +1478,15 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
         max_y = max_y.max(y);
     }
 
-    // Which edges have pins attaching, by orientation (Y up): a pin pointing
-    // right (0) sits on the left edge, left (180) on the right edge, up (90) on
-    // the bottom edge, down (270) on the top edge.
-    let norm = |a: f64| ((a % 360.0) + 360.0) % 360.0;
-    let near = |a: f64, t: f64| {
-        let d = (norm(a) - t).abs();
-        !(1.0..=359.0).contains(&d)
-    };
+    // Which edges have pins attaching.
     let (mut has_left, mut has_right, mut has_bottom, mut has_top) = (false, false, false, false);
     for p in pins {
-        if near(p.angle, 0.0) {
-            has_left = true;
-        } else if near(p.angle, 180.0) {
-            has_right = true;
-        } else if near(p.angle, 90.0) {
-            has_bottom = true;
-        } else if near(p.angle, 270.0) {
-            has_top = true;
+        match pin_edge(p.angle) {
+            Some(PinEdge::Left) => has_left = true,
+            Some(PinEdge::Right) => has_right = true,
+            Some(PinEdge::Bottom) => has_bottom = true,
+            Some(PinEdge::Top) => has_top = true,
+            None => {}
         }
     }
 
@@ -1492,7 +1517,82 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
         min_y = c - min_size / 2.0;
         max_y = c + min_size / 2.0;
     }
+
+    // A box that only touches the pin roots is too small for the names KiCad
+    // draws inside it: with long names the two columns run into each other.
+    if show_names {
+        grow_to(&mut min_x, &mut max_x, names_span(pins, Axis::Horizontal));
+        grow_to(&mut min_y, &mut max_y, names_span(pins, Axis::Vertical));
+    }
     Some((min_x, min_y, max_x, max_y))
+}
+
+/// The pair of facing edges a name span is measured across.
+#[derive(Debug, Clone, Copy)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// Outer size needed so the pin names on two facing edges never meet.
+///
+/// Pins level with each other share a row, which needs both names plus a gap.
+/// Horizontally that pairs the left and right edges with rows keyed by Y;
+/// vertically the bottom and top edges with rows keyed by X.
+fn names_span(pins: &[PinGeom], axis: Axis) -> f64 {
+    let (a, b) = match axis {
+        Axis::Horizontal => (PinEdge::Left, PinEdge::Right),
+        Axis::Vertical => (PinEdge::Bottom, PinEdge::Top),
+    };
+    let mut rows: std::collections::HashMap<i64, (f64, f64)> = std::collections::HashMap::new();
+    for p in pins {
+        let Some(edge) = pin_edge(p.angle).filter(|e| *e == a || *e == b) else {
+            continue;
+        };
+        let w = pin_name_width(&p.name, PIN_TEXT);
+        if w == 0.0 {
+            continue;
+        }
+        let across = match axis {
+            Axis::Horizontal => p.y,
+            Axis::Vertical => p.x,
+        };
+        let row = rows
+            .entry((across * 1000.0).round() as i64)
+            .or_insert((0.0, 0.0));
+        let col = if edge == a { &mut row.0 } else { &mut row.1 };
+        *col = col.max(w);
+    }
+    let widest = rows
+        .values()
+        .map(|&(a, b)| {
+            if a > 0.0 && b > 0.0 {
+                a + b + PIN_NAME_GAP
+            } else {
+                a + b
+            }
+        })
+        .fold(0.0, f64::max);
+    if widest == 0.0 {
+        0.0
+    } else {
+        widest + 2.0 * PIN_NAME_OFFSET
+    }
+}
+
+/// Widen `lo..hi` symmetrically to at least `needed`, keeping the new edges on
+/// the schematic grid so pins pushed out to meet them stay on it too.
+fn grow_to(lo: &mut f64, hi: &mut f64, needed: f64) {
+    if needed <= *hi - *lo {
+        return;
+    }
+    let centre = (*lo + *hi) / 2.0;
+    let half = needed / 2.0;
+    // Snap each edge outwards on its own: rounding the half-extent instead only
+    // lands on the grid when the centre already does. `+ 0.0` turns the `-0.0`
+    // floor/ceil produce at the origin back into `0`.
+    *lo = ((centre - half) / SYMBOL_GRID).floor() * SYMBOL_GRID + 0.0;
+    *hi = ((centre + half) / SYMBOL_GRID).ceil() * SYMBOL_GRID + 0.0;
 }
 
 /// KiCAD's 12 valid pin electrical types — the first token of a
@@ -1696,8 +1796,35 @@ const PIN_TEXT: f64 = 1.27;
 /// them without enlarging the body and breaking the library-matching shape.
 const GLYPH_PIN_NAME_TEXT: f64 = 0.762;
 
+/// Average advance per character of KiCad's stroke font, as a multiple of the
+/// text height. Measured off a 400 dpi render of KiCad 10 output: an
+/// 18-character name at 1.27 mm spans 24.03 mm. The font is proportional, so
+/// this is an average — [`PIN_NAME_GAP`] absorbs the variance.
+const STROKE_ADVANCE_RATIO: f64 = 1.05;
+/// Clear space kept between the two columns of pin names inside a body.
+const PIN_NAME_GAP: f64 = 2.54;
+/// Gap KiCad leaves between the body outline and the start of a pin name,
+/// emitted as `(pin_names (offset …))`.
+const PIN_NAME_OFFSET: f64 = 1.016;
+/// Schematic grid. Body edges land on it so pins pushed out to meet them do too.
+const SYMBOL_GRID: f64 = 1.27;
+
+/// Width of a pin name as KiCad draws it. `~{FOO}` is an overbar rather than
+/// four extra glyphs, and a bare `~` means "unnamed" and draws nothing.
+fn pin_name_width(name: &str, size: f64) -> f64 {
+    if name == "~" {
+        return 0.0;
+    }
+    let glyphs = name.chars().filter(|c| !"~{}".contains(*c)).count();
+    glyphs as f64 * size * STROKE_ADVANCE_RATIO
+}
+
 /// One `(pin …)` S-expression. `name_font` sets the pin-name text height;
 /// numbers stay at the default (they sit outside the body and don't crowd).
+///
+/// Coordinates go through [`fmt_f64`] so binary floating-point artifacts stay
+/// out of the file: `25.4 + 5.08` is `30.479999999999997` and `{}` prints it in
+/// full.
 #[allow(clippy::too_many_arguments)]
 fn emit_pin(
     pin_type: &str,
@@ -1712,7 +1839,18 @@ fn emit_pin(
 ) -> String {
     format!(
         "\n    (pin {} {} (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
-        pin_type, style, x, y, angle, length, name, name_font, name_font, number, PIN_TEXT, PIN_TEXT
+        pin_type,
+        style,
+        fmt_f64(x),
+        fmt_f64(y),
+        fmt_f64(angle),
+        fmt_f64(length),
+        name,
+        name_font,
+        name_font,
+        number,
+        PIN_TEXT,
+        PIN_TEXT
     )
 }
 
@@ -2044,10 +2182,12 @@ fn build_glyph_unit(
 ///
 /// Errors (#55) when a pin's electrical type is not one of KiCAD's 12 valid
 /// values — the caller must not write anything to disk in that case.
+/// Glyph units keep their fixed library-matching shape, so `show_names` only
+/// reaches the rectangle path.
 fn build_symbol_unit(
     pins_val: &[serde_json::Value],
-    with_body: bool,
     glyph: Option<Glyph>,
+    show_names: bool,
 ) -> anyhow::Result<(String, SymbolRect, Option<String>)> {
     validate_pin_types(pins_val)?;
     if let Some(g) = glyph {
@@ -2055,46 +2195,58 @@ fn build_symbol_unit(
             match build_glyph_unit(pins_val, g) {
                 Ok((sexp, rect)) => return Ok((sexp, rect, None)),
                 Err(reason) => {
-                    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+                    let (sexp, rect) = build_rect_unit(pins_val, show_names);
                     return Ok((sexp, rect, Some(reason)));
                 }
             }
         }
     }
-    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+    let (sexp, rect) = build_rect_unit(pins_val, show_names);
     Ok((sexp, rect, None))
 }
 
 /// The default rectangle body + caller-positioned pins. Pin types are assumed
 /// already validated by `build_symbol_unit`.
-fn build_rect_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String, SymbolRect) {
-    let mut pins_sexp = String::new();
+fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String, SymbolRect) {
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
     for pin in pins_val {
-        let number = pin["number"].as_str().unwrap_or("1");
-        let pin_name = pin["name"].as_str().unwrap_or("~");
-        let pin_type = pin["type"].as_str().unwrap_or("passive");
-        let style = pin_style_token(pin["style"].as_str());
-        let x = pin["x"].as_f64().unwrap_or(0.0);
-        let y = pin["y"].as_f64().unwrap_or(0.0);
-        let angle = pin["angle"].as_f64().unwrap_or(0.0);
-        let length = pin["length"].as_f64().unwrap_or(2.54);
-
         pin_geoms.push(PinGeom {
-            x,
-            y,
-            angle,
-            length,
+            x: pin["x"].as_f64().unwrap_or(0.0),
+            y: pin["y"].as_f64().unwrap_or(0.0),
+            angle: pin["angle"].as_f64().unwrap_or(0.0),
+            length: pin["length"].as_f64().unwrap_or(2.54),
+            name: pin["name"].as_str().unwrap_or("~").to_string(),
         });
+    }
+    let body = symbol_body_rect(&pin_geoms, show_names);
+    // Fitting the names can push the body past the pins that defined it.
+    // Slide them back out, keeping the length the caller asked for.
+    if let Some((min_x, min_y, max_x, max_y)) = body {
+        for g in &mut pin_geoms {
+            match pin_edge(g.angle) {
+                Some(PinEdge::Left) => g.x = min_x - g.length,
+                Some(PinEdge::Right) => g.x = max_x + g.length,
+                Some(PinEdge::Bottom) => g.y = min_y - g.length,
+                Some(PinEdge::Top) => g.y = max_y + g.length,
+                None => {}
+            }
+        }
+    }
+
+    let mut pins_sexp = String::new();
+    for (pin, g) in pins_val.iter().zip(&pin_geoms) {
         pins_sexp.push_str(&emit_pin(
-            pin_type, style, x, y, angle, length, pin_name, number, PIN_TEXT,
+            pin["type"].as_str().unwrap_or("passive"),
+            pin_style_token(pin["style"].as_str()),
+            g.x,
+            g.y,
+            g.angle,
+            g.length,
+            &g.name,
+            pin["number"].as_str().unwrap_or("1"),
+            PIN_TEXT,
         ));
     }
-    let body = if with_body {
-        symbol_body_rect(&pin_geoms)
-    } else {
-        None
-    };
     let body_sexp = match body {
         Some((min_x, min_y, max_x, max_y)) => format!(
             "\n      (rectangle (start {:.4} {:.4}) (end {:.4} {:.4})\n        (stroke (width 0.254) (type default))\n        (fill (type background))\n      )",
@@ -2161,7 +2313,7 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let (inner1, body1, warn1) = match build_symbol_unit(&signal, true, sym_glyph) {
+            let (inner1, body1, warn1) = match build_symbol_unit(&signal, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2171,7 +2323,7 @@ async fn handle_create_symbol(
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, true, None) {
+            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2183,7 +2335,7 @@ async fn handle_create_symbol(
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let (inner, body, warn) = match build_symbol_unit(&pins_val, true, sym_glyph) {
+            let (inner, body, warn) = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2219,7 +2371,7 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let (inner, body, warn) = match build_symbol_unit(&unit_pins, true, unit_glyph) {
+            let (inner, body, warn) = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2239,7 +2391,7 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let (inner, _, _) = match build_symbol_unit(&power_pins, true, None) {
+            let (inner, _, _) = match build_symbol_unit(&power_pins, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2263,8 +2415,16 @@ async fn handle_create_symbol(
     let names_vis = if show_names { "" } else { " hide" };
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset 1.016){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
-        name, numbers_vis, names_vis, ref_prefix, ref_y, value_str, value_y, units_sexp
+        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset {}){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
+        name,
+        numbers_vis,
+        fmt_f64(PIN_NAME_OFFSET),
+        names_vis,
+        ref_prefix,
+        ref_y,
+        value_str,
+        value_y,
+        units_sexp
     );
 
     // If file doesn't exist, create scaffold
@@ -3396,42 +3556,30 @@ mod tests {
         assert!(ux.abs() < 1e-9 && (uy - -2.46).abs() < 1e-9, "up {ux},{uy}");
     }
 
+    /// A pin for the body-sizing tests. `"~"` is KiCAD's "unnamed" sentinel, so
+    /// it contributes no name width.
+    fn test_pin(x: f64, y: f64, angle: f64, length: f64, name: &str) -> PinGeom {
+        PinGeom {
+            x,
+            y,
+            angle,
+            length,
+            name: name.into(),
+        }
+    }
+
     #[test]
     fn symbol_body_rect_touches_side_pins_and_spaces_the_ends() {
+        let pin = |x, y, angle| test_pin(x, y, angle, 2.54, "~");
         // Three pins on the left (point right), two on the right (point left).
         let pins = vec![
-            PinGeom {
-                x: -10.16,
-                y: 2.54,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: -10.16,
-                y: 0.0,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: -10.16,
-                y: -2.54,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: 10.16,
-                y: 2.54,
-                angle: 180.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: 10.16,
-                y: -2.54,
-                angle: 180.0,
-                length: 2.54,
-            },
+            pin(-10.16, 2.54, 0.0),
+            pin(-10.16, 0.0, 0.0),
+            pin(-10.16, -2.54, 0.0),
+            pin(10.16, 2.54, 180.0),
+            pin(10.16, -2.54, 180.0),
         ];
-        let (min_x, min_y, max_x, max_y) = symbol_body_rect(&pins).unwrap();
+        let (min_x, min_y, max_x, max_y) = symbol_body_rect(&pins, true).unwrap();
         // Left/right edges pass through the pin roots (pins touch the border).
         assert!((min_x - -7.62).abs() < 1e-9, "left edge {min_x}");
         assert!((max_x - 7.62).abs() < 1e-9, "right edge {max_x}");
@@ -3440,7 +3588,145 @@ mod tests {
         // Top/bottom edges have no pins → spacing beyond the outermost pins.
         assert!(max_y >= 2.54 + 2.5, "top spacing {max_y}");
         assert!(min_y <= -2.54 - 2.5, "bottom spacing {min_y}");
-        assert!(symbol_body_rect(&[]).is_none());
+        assert!(symbol_body_rect(&[], true).is_none());
+    }
+
+    /// A box that only touches the pin roots leaves the two columns of pin
+    /// names overlapping: here a 26-character name facing an 8-character one.
+    #[test]
+    fn body_widens_so_facing_pin_names_do_not_collide() {
+        let pin = |x, angle, name| test_pin(x, 0.0, angle, 5.08, name);
+        let pins = vec![
+            pin(-25.4, 0.0, "LONG/MULTI/FUNCTION/NAME/X"),
+            pin(25.4, 180.0, "SHORT/NM"),
+        ];
+        let roots_only = symbol_body_rect(&pins, false).unwrap();
+        assert!(
+            (roots_only.2 - roots_only.0 - 40.64).abs() < 1e-9,
+            "without names the body still hugs the pin roots: {roots_only:?}"
+        );
+
+        let (min_x, _, max_x, _) = symbol_body_rect(&pins, true).unwrap();
+        let inner = max_x - min_x - 2.0 * PIN_NAME_OFFSET;
+        let text = pin_name_width("LONG/MULTI/FUNCTION/NAME/X", PIN_TEXT)
+            + pin_name_width("SHORT/NM", PIN_TEXT);
+        assert!(
+            inner >= text + PIN_NAME_GAP,
+            "body {:.2} mm leaves {:.2} mm for {:.2} mm of names",
+            max_x - min_x,
+            inner,
+            text
+        );
+        // Edges stay on the schematic grid so the pins meeting them do too.
+        assert!(
+            (min_x / SYMBOL_GRID).fract().abs() < 1e-9,
+            "off grid {min_x}"
+        );
+    }
+
+    /// Name width counts drawn glyphs, not the markup around them.
+    #[test]
+    fn body_width_ignores_unnamed_and_overbar_markup() {
+        assert_eq!(pin_name_width("~", PIN_TEXT), 0.0);
+        // `~{RST}` is RST with an overbar: three glyphs, not six.
+        assert!(
+            (pin_name_width("~{RST}", PIN_TEXT) - pin_name_width("RST", PIN_TEXT)).abs() < 1e-9
+        );
+    }
+
+    /// A row with only one name needs room for that name, not for a gap too.
+    #[test]
+    fn a_row_with_one_name_reserves_no_column_gap() {
+        let name = "SOLO/PIN/NAME";
+        let one_sided = names_span(&[test_pin(-25.4, 0.0, 0.0, 5.08, name)], Axis::Horizontal);
+        assert!(
+            (one_sided - (pin_name_width(name, PIN_TEXT) + 2.0 * PIN_NAME_OFFSET)).abs() < 1e-9,
+            "one name reserved {one_sided} mm"
+        );
+        // The same two names on separate rows never share one, so neither does.
+        let staggered = names_span(
+            &[
+                test_pin(-25.4, 0.0, 0.0, 5.08, name),
+                test_pin(25.4, 2.54, 180.0, 5.08, name),
+            ],
+            Axis::Horizontal,
+        );
+        assert!(
+            (staggered - one_sided).abs() < 1e-9,
+            "staggered {staggered}"
+        );
+    }
+
+    /// Vertical pins get the same treatment on height — their names are drawn
+    /// across it just as horizontal pins' names are drawn across the width.
+    #[test]
+    fn body_widens_vertically_for_facing_top_and_bottom_names() {
+        let pins = vec![
+            test_pin(0.0, -25.4, 90.0, 5.08, "LONG/MULTI/FUNCTION/NAME/X"),
+            test_pin(0.0, 25.4, 270.0, 5.08, "SHORT/NM"),
+        ];
+        let (_, min_y, _, max_y) = symbol_body_rect(&pins, true).unwrap();
+        let inner = max_y - min_y - 2.0 * PIN_NAME_OFFSET;
+        let text = pin_name_width("LONG/MULTI/FUNCTION/NAME/X", PIN_TEXT)
+            + pin_name_width("SHORT/NM", PIN_TEXT);
+        assert!(
+            inner >= text + PIN_NAME_GAP,
+            "body {:.2} mm tall leaves {:.2} mm for {:.2} mm of names",
+            max_y - min_y,
+            inner,
+            text
+        );
+    }
+
+    /// `grow_to` snaps both edges to the grid even when the box it widens is
+    /// centred off it — otherwise the pins slid out to meet them land off grid.
+    #[test]
+    fn grow_to_lands_on_grid_from_an_off_grid_centre() {
+        let (mut lo, mut hi) = (-20.32, 16.51);
+        grow_to(&mut lo, &mut hi, 50.0);
+        assert!(hi - lo >= 50.0, "grew to {lo}..{hi}");
+        for edge in [lo, hi] {
+            assert!((edge / SYMBOL_GRID).fract().abs() < 1e-9, "off grid {edge}");
+        }
+    }
+
+    /// Pins that defined the original box must slide out to meet the widened
+    /// one, or they float inside the body, off its outline.
+    #[tokio::test]
+    async fn widening_the_body_slides_pins_out_to_meet_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("w.kicad_sym");
+        handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "WIDE",
+                "pins": [
+                    {"number":"1","name":"LONG/MULTI/FUNCTION/NAME/X","type":"bidirectional",
+                     "x":-25.4,"y":0.0,"angle":0,"length":5.08},
+                    {"number":"2","name":"SHORT/NM","type":"bidirectional",
+                     "x":25.4,"y":0.0,"angle":180,"length":5.08}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let out = std::fs::read_to_string(&lib).unwrap();
+        let tree = konnect_sexp::parse_sexp(&out).unwrap();
+        // kicad_symbol_lib → (symbol "WIDE") → (symbol "WIDE_0_1") → body + pins
+        let unit = tree.find("symbol").unwrap().find("symbol").unwrap();
+        let rect = unit.find("rectangle").unwrap();
+        let (sx, _) = konnect_sexp::schematic::parse_start(rect).unwrap();
+        let (ex, _) = konnect_sexp::schematic::parse_end(rect).unwrap();
+        for pin in unit.find_all("pin") {
+            let (px, _, angle) = konnect_sexp::schematic::parse_at(pin).unwrap();
+            let root = if angle == 0.0 { px + 5.08 } else { px - 5.08 };
+            let edge = if angle == 0.0 { sx } else { ex };
+            assert!(
+                (root - edge).abs() < 1e-6,
+                "pin at {px} (angle {angle}) roots at {root}, body edge is {edge}"
+            );
+        }
     }
 
     #[test]
@@ -4295,8 +4581,10 @@ mod tests {
         });
         handle_create_symbol(&args, &test_ctx()).await.unwrap();
         let rc = std::fs::read_to_string(&lib).unwrap();
+        // Position is not asserted: the body is sized to fit the pin name, which
+        // can slide the pin out to meet it (see symbol_body_rect).
         assert!(
-            rc.contains("(pin input inverted (at -7.62 0 0)"),
+            rc.contains("(pin input inverted (at "),
             "inverted style on a rectangle pin:\n{rc}"
         );
     }
