@@ -115,13 +115,21 @@ connect_pins(from_component, from_pin, to_component, to_pin)
 Use for named nets. Creates a short stub wire and attaches a net label.
 
 ```
-connect_to_net(component_reference, pin_number, net_name)
+connect_to_net(schematic, reference, pin_number, net)
 ```
 
 - Preferred for signals that connect to 3+ pins
 - Preferred for named buses and control signals
 - Keeps schematic clean and readable
 - Net name must be consistent across all connections
+- Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
+  from the symbol body on its own, instead of the label text running back
+  across the pin names. Override with `direction` only to fix a layout clash.
+- `batch_connect_to_net` does the same for many pins in one read/write, and
+  places its labels directly on the pin endpoints without stubs.
+- Placing a label by hand with `add_schematic_net_label` instead? Take its
+  rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
+  text reads back across the symbol's pin names.
 
 ### add_power_symbol
 

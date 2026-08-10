@@ -401,6 +401,42 @@ pub fn pin_endpoint(pin: &LibPin, t: PinTransform) -> (f64, f64) {
     transform_pin(pin.local_x, pin.local_y, t)
 }
 
+/// The on-screen direction leading *away* from the symbol body at this pin —
+/// where a label or wire stub belongs. One of 0/90/180/270.
+///
+/// A KiCad pin's own angle points from its tip toward the body (see
+/// [`pin_endpoint`]), so outward is the opposite; [`transform_direction`]
+/// then applies the instance's rotation and mirror.
+pub fn pin_outward_direction(pin: &LibPin, t: PinTransform) -> f64 {
+    crate::geometry::transform_direction(pin.rotation + 180.0, t)
+}
+
+/// The rotation a label at this pin's endpoint needs so its text reads away
+/// from the symbol body instead of across it. Pairs with [`label_justify`].
+///
+/// Horizontal pins take the outward direction — not our convention: across the
+/// 115 KiCad 10 demo schematics all 249 labels on a horizontal pin do this,
+/// with no counter-examples (32 of 33 on mirrored instances included).
+///
+/// Vertical pins keep the text horizontal, since that corpus never rotates a
+/// pin-anchored label to 90 or 270. It splits 6/4 on *which* horizontal, so
+/// `0` is our tie-break, not eeschema's.
+pub fn pin_label_rotation(pin: &LibPin, t: PinTransform) -> f64 {
+    horizontal_label_rotation(pin_outward_direction(pin, t))
+}
+
+/// Keep a label's text horizontal: pass 0/180 through, fold 90/270 to 0.
+///
+/// Shared with the wire-stub paths, whose `direction` argument can also ask
+/// for an up/down stub. See [`pin_label_rotation`] for the corpus evidence.
+pub fn horizontal_label_rotation(direction: f64) -> f64 {
+    if direction.rem_euclid(360.0) == 180.0 {
+        180.0
+    } else {
+        0.0
+    }
+}
+
 // ─── T-Junction detection ─────────────────────────────────────────────────────
 
 use crate::geometry::point_on_segment;
@@ -943,5 +979,105 @@ mod label_justify_tests {
         );
         let east = format_net_label("SIG", 10.0, 20.0, 0.0);
         assert!(east.contains("(justify left bottom)"), "got: {east}");
+    }
+}
+
+#[cfg(test)]
+mod pin_label_rotation_tests {
+    use super::*;
+
+    /// One pin per edge of a square IC body, in the KiCad convention where a
+    /// pin's angle points from its tip toward the body.
+    fn edge_pin(angle: f64) -> LibPin {
+        let rad = angle.to_radians();
+        LibPin {
+            number: "1".into(),
+            name: "PIN".into(),
+            // Tip sits 10 mm out from the origin, opposite the way it points.
+            local_x: -10.0 * rad.cos(),
+            local_y: -10.0 * rad.sin(),
+            rotation: angle,
+            length: 2.54,
+        }
+    }
+
+    fn placed(rotation_deg: f64, mirror_x: bool, mirror_y: bool) -> PinTransform {
+        PinTransform {
+            comp_x: 100.0,
+            comp_y: 100.0,
+            rotation_deg,
+            mirror_x,
+            mirror_y,
+        }
+    }
+
+    #[test]
+    fn horizontal_pins_point_their_label_away_from_the_body() {
+        let t = placed(0.0, false, false);
+        // Left-edge pin (angle 0, body to its right): text must run left.
+        assert_eq!(pin_label_rotation(&edge_pin(0.0), t), 180.0);
+        // Right-edge pin (angle 180, body to its left): text runs right.
+        assert_eq!(pin_label_rotation(&edge_pin(180.0), t), 0.0);
+    }
+
+    #[test]
+    fn vertical_pins_keep_their_label_horizontal() {
+        let t = placed(0.0, false, false);
+        // Outward is north and south respectively, but no pin-anchored label
+        // in the KiCad demo corpus is rotated 90 or 270.
+        assert_eq!(pin_outward_direction(&edge_pin(270.0), t), 90.0);
+        assert_eq!(pin_label_rotation(&edge_pin(270.0), t), 0.0);
+        assert_eq!(pin_outward_direction(&edge_pin(90.0), t), 270.0);
+        assert_eq!(pin_label_rotation(&edge_pin(90.0), t), 0.0);
+    }
+
+    #[test]
+    fn rotating_the_symbol_carries_the_label_with_it() {
+        // A left-edge pin on a symbol turned 180° is now on the right.
+        assert_eq!(
+            pin_label_rotation(&edge_pin(0.0), placed(180.0, false, false)),
+            0.0
+        );
+        // Turned 90°, the pin is vertical, so the text stays horizontal.
+        assert_eq!(
+            pin_label_rotation(&edge_pin(0.0), placed(90.0, false, false)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn mirroring_the_symbol_flips_left_and_right() {
+        let mirrored = placed(0.0, false, true);
+        assert_eq!(pin_label_rotation(&edge_pin(0.0), mirrored), 0.0);
+        assert_eq!(pin_label_rotation(&edge_pin(180.0), mirrored), 180.0);
+        // Mirroring about the other axis leaves a horizontal pin alone.
+        assert_eq!(
+            pin_label_rotation(&edge_pin(0.0), placed(0.0, true, false)),
+            180.0
+        );
+    }
+
+    /// The thing the user actually sees: a left-edge pin's label must be
+    /// right-justified, so its text runs away from the pin names inside the body.
+    #[test]
+    fn justify_pairs_with_the_derived_rotation() {
+        let t = placed(0.0, false, false);
+        assert_eq!(
+            label_justify(pin_label_rotation(&edge_pin(0.0), t)),
+            "right"
+        );
+        assert_eq!(
+            label_justify(pin_label_rotation(&edge_pin(180.0), t)),
+            "left"
+        );
+    }
+
+    #[test]
+    fn folding_a_direction_keeps_only_west() {
+        assert_eq!(horizontal_label_rotation(0.0), 0.0);
+        assert_eq!(horizontal_label_rotation(180.0), 180.0);
+        assert_eq!(horizontal_label_rotation(90.0), 0.0);
+        assert_eq!(horizontal_label_rotation(270.0), 0.0);
+        assert_eq!(horizontal_label_rotation(-180.0), 180.0);
     }
 }

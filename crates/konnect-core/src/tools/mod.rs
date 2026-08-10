@@ -328,33 +328,116 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
     }
 }
 
-/// All symbol pin connection points in a parsed schematic tree.
+/// Every pin placed on the sheet, paired with the transform that put it there.
 ///
 /// Unit-aware: a multi-unit library symbol superimposes every unit's pins on
 /// one placement, so an instance of unit 1 must not report unit 2's pins (#35).
-/// These coordinates drive junction insertion, and a dot dropped on a phantom
-/// pin where two wires cross would short them.
-pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
-    use konnect_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint,
-    };
+pub(crate) fn placed_pins(
+    tree: &konnect_sexp::SexpNode,
+) -> Vec<(
+    konnect_sexp::schematic::LibPin,
+    konnect_sexp::geometry::PinTransform,
+)> {
+    use konnect_sexp::schematic::{extract_lib_pins_for_unit, extract_symbol_instances};
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut pts = Vec::new();
+    let mut pins = Vec::new();
     for inst in extract_symbol_instances(tree) {
-        if let Some(sym) = lib_syms
+        let Some(sym) = lib_syms
             .iter()
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
-                pts.push(pin_endpoint(&pin, t));
-            }
+        else {
+            continue;
+        };
+        let t = inst.pin_transform();
+        pins.extend(
+            extract_lib_pins_for_unit(sym, inst.unit)
+                .into_iter()
+                .map(|p| (p, t)),
+        );
+    }
+    pins
+}
+
+/// All symbol pin connection points in a parsed schematic tree. These drive
+/// junction insertion, and a dot dropped on a phantom pin where two wires
+/// cross would short them — hence [`placed_pins`]' unit-awareness.
+pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
+    placed_pins(tree)
+        .into_iter()
+        .map(|(p, t)| konnect_sexp::schematic::pin_endpoint(&p, t))
+        .collect()
+}
+
+/// The direction leading away from the symbol body at `(x, y)`. `None` when
+/// no pin sits there, or when stacked pins disagree about which way is out.
+pub(crate) fn pin_outward_at(tree: &konnect_sexp::SexpNode, x: f64, y: f64) -> Option<f64> {
+    use konnect_sexp::geometry::points_coincident;
+    use konnect_sexp::schematic::{pin_endpoint, pin_outward_direction};
+    let mut found: Option<f64> = None;
+    for (pin, t) in placed_pins(tree) {
+        let (px, py) = pin_endpoint(&pin, t);
+        if !points_coincident(px, py, x, y, 0.01) {
+            continue;
+        }
+        let outward = pin_outward_direction(&pin, t);
+        match found {
+            Some(d) if d != outward => return None,
+            _ => found = Some(outward),
         }
     }
-    pts
+    found
+}
+
+/// The stub directions, as name, unit offset, and the angle that offset points
+/// along. Schematic Y grows downward, so "up" is negative. `"right"` leads:
+/// it is the fallback for an unknown name and for an unresolvable `"auto"`.
+const STUB_DIRECTIONS: [(&str, f64, f64, f64); 4] = [
+    ("right", 1.0, 0.0, 0.0),
+    ("up", 0.0, -1.0, 90.0),
+    ("left", -1.0, 0.0, 180.0),
+    ("down", 0.0, 1.0, 270.0),
+];
+
+/// A resolved stub direction: which way the wire leaves the anchor, and how to
+/// orient the label at its far end.
+pub(crate) struct StubDirection {
+    pub name: &'static str,
+    /// Unit offset in schematic space (Y grows downward).
+    pub dx: f64,
+    pub dy: f64,
+    pub label_rotation: f64,
+}
+
+/// Resolve a `direction` argument against an already-known outward direction.
+/// `"auto"` follows `outward`, falling back to `"right"` — the default before
+/// `"auto"` existed — when the caller could not determine one.
+pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirection {
+    use konnect_sexp::schematic::horizontal_label_rotation;
+    let row = match direction {
+        // Outward angles are snapped to quadrants, so this compares exactly.
+        "auto" => outward.and_then(|d| STUB_DIRECTIONS.iter().find(|r| r.3 == d)),
+        name => STUB_DIRECTIONS.iter().find(|r| r.0 == name),
+    }
+    .unwrap_or(&STUB_DIRECTIONS[0]);
+    StubDirection {
+        name: row.0,
+        dx: row.1,
+        dy: row.2,
+        label_rotation: horizontal_label_rotation(row.3),
+    }
+}
+
+/// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is
+/// exact; matching one by position gives up when stacked pins there disagree.
+pub(crate) fn resolve_stub_direction(
+    direction: &str,
+    anchor: (f64, f64),
+    tree: &konnect_sexp::SexpNode,
+) -> StubDirection {
+    stub_direction(direction, pin_outward_at(tree, anchor.0, anchor.1))
 }
 
 /// Add junction dots for pins of `reference` that land mid-segment on a wire.
