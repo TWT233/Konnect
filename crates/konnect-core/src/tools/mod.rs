@@ -758,15 +758,8 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
         return true;
     }
 
-    // Resolve the symbol from KiCAD libraries. Prefer the flattened resolver:
-    // derived symbols ((extends "Parent")) must be embedded with the parent's
-    // units copied in, not as a stub kicad-cli can't netlist (#35). Fall back
-    // to the local raw resolver for parity with the pre-flattening behavior.
-    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
-        .or_else(|| resolve_lib_symbol(lib_id))
-    {
-        Some(s) => s,
-        None => return false,
+    let Some(sym_def) = resolve_lib_symbol_for_embed(lib_id) else {
+        return false;
     };
 
     // Ensure lib_symbols section exists
@@ -793,20 +786,117 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
                 _ => {}
             }
         }
-        let indented = sym_def
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    String::new()
-                } else {
-                    format!("\t\t{}", l)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        content.insert_str(ls_end, &format!("\n{}\n\t", indented));
+        content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
     }
     true
+}
+
+/// The library definition of `lib_id`, ready to embed in a schematic.
+///
+/// Prefers the flattened resolver: derived symbols (`(extends "Parent")`) must
+/// be embedded with the parent's units copied in, not as a stub kicad-cli
+/// can't netlist (#35). Falls back to the local raw resolver — which searches a
+/// different directory list — for parity with the pre-flattening behavior.
+fn resolve_lib_symbol_for_embed(lib_id: &str) -> Option<String> {
+    konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
+        .or_else(|| resolve_lib_symbol(lib_id))
+}
+
+/// A resolved library definition indented to sit inside `lib_symbols`. Shared
+/// so an embedded copy can be compared against the library it came from.
+fn indent_lib_symbol(sym_def: &str) -> String {
+    sym_def
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("\t\t{}", l)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Outcome of re-embedding one symbol definition.
+pub(crate) enum ReembedOutcome {
+    Updated,
+    /// The embedded copy already matches the library.
+    Unchanged,
+    /// The library no longer resolves this lib_id.
+    Unresolved,
+    /// The schematic has no embedded copy to replace.
+    NotEmbedded,
+}
+
+/// Replace each embedded definition in `lib_ids` with the library's current
+/// one, returning an outcome per entry in the same order.
+///
+/// [`ensure_lib_symbol_in_schematic`] deliberately leaves an existing copy
+/// alone, so a symbol edited in its library keeps rendering from the stale
+/// copy — what KiCad reports as "doesn't match copy in library". This is the
+/// explicit refresh, mirroring eeschema's "Update Symbols from Library".
+///
+/// Takes the whole batch so `lib_symbols` is located once rather than per
+/// symbol, and so the edits can be applied back to front against offsets that
+/// stay valid.
+pub(crate) fn reembed_lib_symbols(content: &mut String, lib_ids: &[String]) -> Vec<ReembedOutcome> {
+    let blocks = konnect_sexp::writer::find_direct_child_blocks(content, "lib_symbols");
+    let mut outcomes = Vec::with_capacity(lib_ids.len());
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for lib_id in lib_ids {
+        let Some(&(start, end)) = blocks
+            .iter()
+            .find(|&&(s, e)| lib_symbol_name(&content[s..e]) == Some(lib_id.as_str()))
+        else {
+            outcomes.push(ReembedOutcome::NotEmbedded);
+            continue;
+        };
+        let Some(sym_def) = resolve_lib_symbol_for_embed(lib_id) else {
+            outcomes.push(ReembedOutcome::Unresolved);
+            continue;
+        };
+        // The leading indentation is already in place before `start`.
+        let indented = indent_lib_symbol(&sym_def);
+        let fresh = indented.trim_start();
+        // Compare parsed, not byte for byte: the two embed paths lay a
+        // definition out differently, and reflowing one is not an update worth
+        // writing. A block that won't parse counts as changed.
+        let unchanged = matches!(
+            (
+                konnect_sexp::parse_sexp(&content[start..end]),
+                konnect_sexp::parse_sexp(fresh)
+            ),
+            (Ok(embedded), Ok(library)) if embedded == library
+        );
+        if unchanged {
+            outcomes.push(ReembedOutcome::Unchanged);
+            continue;
+        }
+        edits.push((start, end, fresh.to_string()));
+        outcomes.push(ReembedOutcome::Updated);
+    }
+
+    edits.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
+    for (start, end, fresh) in edits {
+        content.replace_range(start..end, &fresh);
+    }
+    outcomes
+}
+
+/// The quoted name in a `(symbol "Lib:Name" …)` definition.
+///
+/// The name may sit on the same line as `(symbol` or on the next one depending
+/// on which embed path wrote it, so this skips whitespace rather than
+/// pattern-matching a single layout.
+fn lib_symbol_name(block: &str) -> Option<&str> {
+    block
+        .strip_prefix("(symbol")?
+        .trim_start()
+        .strip_prefix('"')?
+        .split('"')
+        .next()
 }
 
 /// Roots under which KiCAD ships its bundled libraries — the directory that

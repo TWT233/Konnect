@@ -7,8 +7,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, require_f64,
-    require_str, ToolContext, ToolDef,
+    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, reembed_lib_symbols,
+    require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -272,6 +272,28 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
             |args, ctx| async move { handle_replace_component(args, ctx).await }
+        ),
+        tool!(
+            "update_symbols_from_library",
+            "Re-embed placed symbols' definitions from their libraries, like KiCad's \
+             'Update Symbols from Library'. A schematic carries its own copy of every \
+             symbol, so editing one in its library leaves the sheet drawing the old \
+             shape — this refreshes it. Pin positions can move as a result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "references": {
+                        "type": "array",
+                        "description": "Component references to update (e.g. ['U1']). Omit to update every symbol in the schematic.",
+                        "items": { "type": "string" }
+                    },
+                    "dry_run": { "type": "boolean", "default": false,
+                        "description": "Report what would change without writing." }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
         ),
         tool!(
             "get_schematic_view",
@@ -1096,6 +1118,78 @@ async fn handle_group_components(
     })))
 }
 
+async fn handle_update_symbols_from_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only: Option<Vec<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+
+    let (mut content, tree) = read_schematic(&sch_path)?;
+    let expected = content.clone();
+
+    let instances = extract_symbol_instances(&tree);
+    if let Some(refs) = &only {
+        if let Some(missing) = refs
+            .iter()
+            .find(|r| !instances.iter().any(|i| &i.reference == *r))
+        {
+            return Ok(CallToolResult::error(format!(
+                "Component '{}' not found in {}",
+                missing,
+                sch_path.display()
+            )));
+        }
+    }
+
+    // One definition serves every instance of a lib_id, so refresh each once.
+    let mut lib_ids: Vec<String> = Vec::new();
+    for inst in instances {
+        if only.as_ref().is_some_and(|r| !r.contains(&inst.reference)) {
+            continue;
+        }
+        if !lib_ids.contains(&inst.lib_id) {
+            lib_ids.push(inst.lib_id);
+        }
+    }
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut errors = Vec::new();
+    let outcomes = reembed_lib_symbols(&mut content, &lib_ids);
+    for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
+        match outcome {
+            ReembedOutcome::Updated => updated.push(lib_id.clone()),
+            ReembedOutcome::Unchanged => unchanged.push(lib_id.clone()),
+            ReembedOutcome::Unresolved => errors.push(format!(
+                "'{}' no longer resolves in any registered library — the \
+                 embedded copy is left as it is",
+                lib_id
+            )),
+            ReembedOutcome::NotEmbedded => {
+                errors.push(format!("'{}' has no embedded definition to update", lib_id))
+            }
+        }
+    }
+
+    if !updated.is_empty() && !dry_run {
+        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "updated": updated,
+        "updated_count": updated.len(),
+        "unchanged": unchanged,
+        "errors": errors,
+        "dry_run": dry_run
+    })))
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1807,5 +1901,99 @@ mod tests {
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
         );
+    }
+
+    /// A schematic keeps its own copy of every symbol, so editing the library
+    /// leaves the sheet drawing the old shape — what KiCad reports as
+    /// "doesn't match copy in library".
+    #[tokio::test]
+    async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("WIDENED"));
+
+        // Edit the library out from under the schematic.
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib).unwrap().replace(
+            "(property \"Value\" \"R\"",
+            "(property \"Value\" \"WIDENED\"",
+        );
+        std::fs::write(&lib, edited).unwrap();
+
+        // A dry run reports the stale copy without touching the file.
+        let dry = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "dry_run": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &dry.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]));
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("WIDENED"),
+            "dry_run must not write"
+        );
+
+        let done = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!done.is_error, "{done:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("WIDENED"), "{after}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+
+        // Idempotent: a second run finds nothing to do.
+        let again = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &again.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0));
+        assert_eq!(body["unchanged"], json!(["Device:R"]));
+    }
+
+    #[tokio::test]
+    async fn update_symbols_from_library_rejects_an_unknown_reference() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["U9"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
     }
 }
