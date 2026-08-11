@@ -420,25 +420,48 @@ pub(crate) fn place_one_component(
     sym.at.rotation = Some(rotation);
     sym.unit = unit;
 
-    // Reference above the component, Value below; Footprint/Datasheet hidden.
+    // Reference and Value go where the library anchors them, carried through
+    // the placement transform so they follow a rotated body (#101);
+    // Footprint/Datasheet stay hidden at the origin.
     // Power symbols get their Reference hidden too, matching eeschema: a
     // #PWR designator is never shown on the sheet.
     let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
+    let anchors = cse::library::field_anchors(sch, lib_id);
+    let t = konnect_sexp::geometry::PinTransform {
+        comp_x: x,
+        comp_y: y,
+        rotation_deg: rotation,
+        mirror_x: false,
+        mirror_y: false,
+    };
+    let (ref_x, ref_y, ref_rot) =
+        crate::tools::field_at(anchors.reference_at, crate::tools::FALLBACK_REFERENCE_AT, t);
+    let (val_x, val_y, val_rot) =
+        crate::tools::field_at(anchors.value_at, crate::tools::FALLBACK_VALUE_AT, t);
     let positioned = crate::tools::positioned_property;
+    let centred = cse::library::FieldJustify::default();
     sym.properties.push(positioned(
         "Reference",
         reference,
-        x,
-        y - 3.81,
-        0.0,
+        ref_x,
+        ref_y,
+        ref_rot,
         hide_reference,
+        anchors.reference_justify,
+    ));
+    sym.properties.push(positioned(
+        "Value",
+        val_str,
+        val_x,
+        val_y,
+        val_rot,
+        false,
+        anchors.value_justify,
     ));
     sym.properties
-        .push(positioned("Value", val_str, x, y + 3.81, 0.0, false));
+        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
     sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true));
+        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -2026,6 +2049,148 @@ mod tests {
         let msg = format!("{:?}", result.content);
         assert!(msg.contains("Device:CP"));
         assert!(msg.contains("no embedded definition"));
+    }
+
+    /// Fields follow the library anchor through the instance rotation (#101).
+    /// `Device:R` anchors Reference beside the body at (2.032, 0) rotated 90°,
+    /// so an upright resistor labels its right-hand side vertically and a
+    /// 90°-rotated one labels above, horizontally — a fixed ±3.81 offset at 0°
+    /// put both beside the wrong edge.
+    async fn place_rotated_resistor(rotation: f64) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rot.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                // Already on the 1.27mm grid the placement snaps to, so the
+                // expected field coordinates are the anchors plus the origin.
+                "x": 101.6,
+                "y": 50.8,
+                "rotation": rotation,
+                "reference": "R1",
+                "value": "10k"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .expect("placed resistor");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        (field("Reference"), field("Value"))
+    }
+
+    /// An anchor without its justification collides: this symbol anchors
+    /// Reference and Value on the same row and relies on `justify left` to
+    /// keep `U2` off `AP2112K-3.3`. Device:R, which the tests above place,
+    /// justifies nothing — centred stays spelled as no `(justify …)`.
+    #[tokio::test]
+    async fn placement_carries_the_librarys_field_justification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("justify.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Regulator_Linear:AP2112K-3.3\"\n      (property \"Reference\" \"U\" (at -5.08 5.715 0) (effects (font (size 1.27 1.27)) (justify left)))\n      (property \"Value\" \"AP2112K-3.3\" (at 0 5.715 0) (effects (font (size 1.27 1.27)) (justify left)))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Regulator_Linear:AP2112K-3.3",
+                "x": 101.6,
+                "y": 50.8,
+                "reference": "U2",
+                "value": "AP2112K-3.3"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("U2"))
+            .expect("placed regulator");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        for name in ["Reference", "Value"] {
+            let written = field(name);
+            assert!(
+                written.contains("(justify left)"),
+                "{name} must keep the library's justification: {written}"
+            );
+        }
+        // Hidden fields have no library anchor here, so they stay centred.
+        assert!(!field("Footprint").contains("justify"));
+
+        let (reference, _) = place_rotated_resistor(0.0).await;
+        assert!(
+            !reference.contains("justify"),
+            "a centred library field must not gain a justify: {reference}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrotated_symbol_takes_the_librarys_field_anchors() {
+        let (reference, value) = place_rotated_resistor(0.0).await;
+        // Same numbers eeschema writes for this library symbol at (100, 50).
+        assert!(
+            reference.contains("(at 103.632 50.8 90)"),
+            "Reference belongs beside the body, rotated: {reference}"
+        );
+        assert!(
+            value.contains("(at 101.6 50.8 90)"),
+            "Value belongs on the body's axis, rotated: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_symbol_carries_its_fields_around_with_it() {
+        let (reference, value) = place_rotated_resistor(90.0).await;
+        // The anchor rotates with the body: 2.032mm to the right of the
+        // origin becomes 2.032mm above it. The stored angle stays at the
+        // library's 90° — KiCad adds the symbol's rotation when it draws, so
+        // this renders horizontally above the now-horizontal body.
+        assert!(
+            reference.contains("(at 101.6 48.768 90)"),
+            "Reference must follow the rotated body: {reference}"
+        );
+        assert!(
+            value.contains("(at 101.6 50.8 90)"),
+            "Value must follow the rotated body: {value}"
+        );
     }
 
     #[tokio::test]
