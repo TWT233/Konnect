@@ -1025,7 +1025,7 @@ fn footprint_with_pads(reference: &str, pads: Vec<prost_types::Any>) -> prost_ty
     )
 }
 
-fn spawn_kicad_with_footprints(items: Vec<prost_types::Any>) -> MockKicad {
+fn spawn_kicad_holding_items(items: Vec<prost_types::Any>) -> MockKicad {
     spawn_mock(move |request| {
         let message = request.message.expect("request must pack a command");
         if message.type_url.ends_with("GetOpenDocuments") {
@@ -1047,8 +1047,43 @@ fn spawn_kicad_with_footprints(items: Vec<prost_types::Any>) -> MockKicad {
 }
 
 #[test]
+fn a_failed_item_read_is_an_error_not_an_empty_board() {
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound as i32,
+                items: vec![],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+
+    let error = client
+        .get_footprint_pads_in(document, "U1")
+        .expect_err("a failed request must not read as a board with no footprints");
+    assert!(
+        error.to_string().contains("IRS_DOCUMENT_NOT_FOUND"),
+        "the failure must name KiCad's status, got: {error}"
+    );
+}
+
+#[test]
 fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![
             pad_at("A4", 101.155, 66.11, "/VBUS"),
@@ -1077,7 +1112,7 @@ fn footprint_pads_come_back_in_board_coordinates_with_their_nets() {
 
 #[test]
 fn an_unreadable_live_pad_is_reported_instead_of_silently_dropped() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![prost_types::Any {
             type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
@@ -1104,7 +1139,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
         },
         "kiapi.board.types.Pad",
     );
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads("U1", vec![pad])]);
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads("U1", vec![pad])]);
     let client = KiCadIpcClient::new(&mock.url);
     let document = client
         .find_open_board(std::path::Path::new("test.kicad_pcb"))
@@ -1118,7 +1153,7 @@ fn a_live_pad_without_a_position_is_reported_instead_of_fabricated_at_zero() {
 
 #[test]
 fn a_footprint_absent_from_the_live_board_reads_as_none() {
-    let mock = spawn_kicad_with_footprints(vec![footprint_with_pads(
+    let mock = spawn_kicad_holding_items(vec![footprint_with_pads(
         "U1",
         vec![pad_at("1", 1.0, 2.0, "GND")],
     )]);

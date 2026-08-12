@@ -260,6 +260,35 @@ macro_rules! tool {
     }};
 }
 
+// ─── IPC helpers ──────────────────────────────────────────────────────────────
+
+/// Run `f` against KiCad's IPC API, classifying a failure as
+/// transport-unreachable vs KiCad-rejected via [`konnect_ipc::IpcFailure`].
+///
+/// This is the typed gate for the file-editing fallback — never a text match
+/// on the error message — and it is shared rather than copied per toolset:
+/// the toolsets' plain `with_ipc` helpers have already drifted from each
+/// other, and this is the one decision (is it safe to edit a board file behind
+/// a live KiCad?) whose copies must not.
+pub async fn with_ipc_classified<T, F>(
+    address: String,
+    f: F,
+) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        f(&konnect_ipc::client::KiCadIpcClient::new(&address))
+            .map_err(konnect_ipc::IpcFailure::from_error)
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => Err(anyhow::anyhow!("Thread error: {}", e)),
+    }
+}
+
 // ─── Argument helpers ─────────────────────────────────────────────────────────
 
 /// Build a structured `InvalidArgument` CallToolResult. Used by the

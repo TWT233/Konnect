@@ -237,7 +237,7 @@ where
     F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
 {
     let requested = board_path.to_path_buf();
-    match crate::tools::pcb_components::with_ipc_classified(addr, move |c| {
+    match crate::tools::with_ipc_classified(addr, move |c| {
         c.ensure_board_is_active(&requested)?;
         f(c)
     })
@@ -268,10 +268,8 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
     what: &str,
 ) -> anyhow::Result<Option<CallToolResult>> {
     let requested = board_path.to_path_buf();
-    match crate::tools::pcb_components::with_ipc_classified(addr, move |c| {
-        c.ensure_board_is_active(&requested)
-    })
-    .await?
+    match crate::tools::with_ipc_classified(addr, move |c| c.ensure_board_is_active(&requested))
+        .await?
     {
         Ok(()) => Ok(Some(CallToolResult::error(format!(
             "KiCAD currently holds this board open, and a {what} written to the file would \
@@ -1851,21 +1849,25 @@ mod layers_block_tests {
     }
 }
 
+/// Shared scaffolding for this module's tests: a `ToolContext` pointed at a
+/// given IPC address, and a mock KiCad that answers `GetOpenDocuments` with
+/// one board and delegates every other command to the test.
 #[cfg(test)]
-mod svg_logo_tests {
-    use super::*;
+mod board_mock {
     use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
+    use crate::tools::{ServerConfig, ToolContext};
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
     use std::sync::Arc;
 
-    fn test_ctx() -> ToolContext {
+    /// An empty `address` classifies as transport-unreachable, which is the
+    /// file-editing path — no live KiCad needed.
+    pub fn ctx_talking_to(address: String) -> ToolContext {
         ToolContext::new(
-            // Deliberately empty ipc_address: with_ipc fails fast against it,
-            // exercising the file-fallback path without needing live KiCAD.
             ServerConfig {
                 kicad_cli: String::new(),
                 kicad_binary: String::new(),
-                ipc_address: String::new(),
+                ipc_address: address,
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
@@ -1873,6 +1875,79 @@ mod svg_logo_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    /// A rep0 endpoint playing a KiCad that holds `board` open. `respond`
+    /// answers the commands the test cares about and returns `None` for the
+    /// rest; the socket, the envelope, and the `GetOpenDocuments` answer are
+    /// handled here so each test only writes its own command arms.
+    pub fn spawn_kicad_holding_board(
+        board: &std::path::Path,
+        respond: impl Fn(&prost_types::Any) -> Option<prost_types::Any> + Send + 'static,
+    ) -> String {
+        use nng::options::Options;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let board = board.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else {
+                    respond(&command)
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                };
+                if socket
+                    .send(nng::Message::from(response.encode_to_vec().as_slice()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        url
+    }
+}
+
+#[cfg(test)]
+mod svg_logo_tests {
+    use super::board_mock::ctx_talking_to;
+    use super::*;
+
+    fn test_ctx() -> ToolContext {
+        ctx_talking_to(String::new())
     }
 
     fn blank_board() -> &'static str {
@@ -1971,24 +2046,11 @@ mod svg_logo_tests {
 
 #[cfg(test)]
 mod net_count_tests {
+    use super::board_mock::ctx_talking_to;
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
-    use std::sync::Arc;
 
     fn test_ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
+        ctx_talking_to(String::new())
     }
 
     async fn net_count_of(board: &str) -> i64 {
@@ -2770,31 +2832,13 @@ mod board_size_tests {
 /// and net_count 0 for a board KiCad was showing fully populated.
 #[cfg(test)]
 mod board_info_source_tests {
+    use super::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
     use konnect_ipc::gen::kiapi;
-    use prost::Message;
-    use std::sync::Arc;
 
     /// A board saved before anything was placed on it: the empty stub the
     /// file-only reader kept reporting.
     const EMPTY_STUB: &str = "(kicad_pcb\n\t(version 20260206)\n\t(paper \"A3\")\n)\n";
-
-    fn ctx_talking_to(address: String) -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: address,
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
-    }
 
     /// A KiCad holding `board` open with `layers` enabled, `copper` of them
     /// copper, and `nets` real nets — none of it saved to the file.
@@ -2808,91 +2852,45 @@ mod board_info_source_tests {
         copper: u32,
         nets: usize,
     ) -> String {
-        use nng::options::Options;
-
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("tcp://127.0.0.1:{port}");
-        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
-        socket
-            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        socket.listen(&url).expect("mock listen");
-
-        let board = board.to_string_lossy().to_string();
-        std::thread::spawn(move || {
-            while let Ok(message) = socket.recv() {
-                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
-                let command = request.message.expect("a command");
-                let body = if command.type_url.ends_with("GetOpenDocuments") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::commands::GetOpenDocumentsResponse {
-                            documents: vec![kiapi::common::types::DocumentSpecifier {
-                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
-                                project: None,
-                                identifier: Some(
-                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                        board.clone(),
-                                    ),
-                                ),
-                            }],
-                        },
-                        "kiapi.common.commands.GetOpenDocumentsResponse",
-                    ))
-                } else if command.type_url.ends_with("GetTitleBlockInfo") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::common::types::TitleBlockInfo {
-                            title: "Live title".to_string(),
-                            revision: "B".to_string(),
-                            ..Default::default()
-                        },
-                        "kiapi.common.types.TitleBlockInfo",
-                    ))
-                } else if command.type_url.ends_with("GetBoardEnabledLayers") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::board::commands::BoardEnabledLayersResponse {
-                            copper_layer_count: copper,
-                            layers: (0..layers as i32).collect(),
-                        },
-                        "kiapi.board.commands.BoardEnabledLayersResponse",
-                    ))
-                } else if command.type_url.ends_with("GetNets") {
-                    Some(konnect_ipc::builders::pack_any(
-                        &kiapi::board::commands::NetsResponse {
-                            nets: std::iter::once(kiapi::board::types::Net {
-                                code: Some(kiapi::board::types::NetCode { value: 0 }),
-                                name: String::new(),
-                            })
-                            .chain((1..=nets).map(|index| kiapi::board::types::Net {
-                                code: Some(kiapi::board::types::NetCode {
-                                    value: index as i32,
-                                }),
-                                name: format!("N{index}"),
-                            }))
-                            .collect(),
-                        },
-                        "kiapi.board.commands.NetsResponse",
-                    ))
-                } else {
-                    None
-                };
-                let response = kiapi::common::ApiResponse {
-                    status: Some(kiapi::common::ApiResponseStatus {
-                        status: kiapi::common::ApiStatusCode::AsOk as i32,
-                        error_message: String::new(),
-                    }),
-                    header: None,
-                    message: body,
-                };
-                let out = nng::Message::from(response.encode_to_vec().as_slice());
-                if socket.send(out).is_err() {
-                    break;
-                }
+        spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetTitleBlockInfo") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::types::TitleBlockInfo {
+                        title: "Live title".to_string(),
+                        revision: "B".to_string(),
+                        ..Default::default()
+                    },
+                    "kiapi.common.types.TitleBlockInfo",
+                ))
+            } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::BoardEnabledLayersResponse {
+                        copper_layer_count: copper,
+                        layers: (0..layers as i32).collect(),
+                    },
+                    "kiapi.board.commands.BoardEnabledLayersResponse",
+                ))
+            } else if command.type_url.ends_with("GetNets") {
+                Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse {
+                        nets: std::iter::once(kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode { value: 0 }),
+                            name: String::new(),
+                        })
+                        .chain((1..=nets).map(|index| kiapi::board::types::Net {
+                            code: Some(kiapi::board::types::NetCode {
+                                value: index as i32,
+                            }),
+                            name: format!("N{index}"),
+                        }))
+                        .collect(),
+                    },
+                    "kiapi.board.commands.NetsResponse",
+                ))
+            } else {
+                None
             }
-        });
-        url
+        })
     }
 
     async fn board_info(board: &std::path::Path, ctx: &ToolContext) -> serde_json::Value {
