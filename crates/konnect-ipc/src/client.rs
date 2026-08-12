@@ -216,6 +216,61 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// Decode an item only when it carries `type_name`. protobuf decoding is
+/// lenient — a `BoardText` body decodes as a `BoardGraphicShape` without
+/// error, yielding an item with no geometry and an empty UUID — so the
+/// type_url is what says which message this is.
+fn decode_as<M: Message + Default>(item: &prost_types::Any, type_name: &str) -> Option<M> {
+    if !item.type_url.ends_with(type_name) {
+        return None;
+    }
+    M::decode(item.value.as_slice()).ok()
+}
+
+/// A KIID's textual value, or `""` when KiCad sent an item without one.
+fn kiid_value(id: Option<kiapi::common::types::Kiid>) -> String {
+    id.map(|id| id.value).unwrap_or_default()
+}
+
+fn point_in_mm(point: kiapi::common::types::Vector2) -> IpcVector2 {
+    IpcVector2 {
+        x: nm_to_mm(point.x_nm),
+        y: nm_to_mm(point.y_nm),
+    }
+}
+
+/// The normalized kind name and first defining point of a graphic shape.
+fn shape_kind_and_origin(
+    shape: Option<&kiapi::common::types::GraphicShape>,
+) -> (&'static str, Option<IpcVector2>) {
+    use kiapi::common::types::graphic_shape::Geometry;
+    use kiapi::common::types::poly_line_node::Geometry as NodeGeometry;
+
+    let Some(geometry) = shape.and_then(|s| s.geometry.as_ref()) else {
+        return ("shape", None);
+    };
+    match geometry {
+        Geometry::Segment(segment) => ("line", segment.start.map(point_in_mm)),
+        Geometry::Rectangle(rectangle) => ("rect", rectangle.top_left.map(point_in_mm)),
+        Geometry::Arc(arc) => ("arc", arc.start.map(point_in_mm)),
+        Geometry::Circle(circle) => ("circle", circle.center.map(point_in_mm)),
+        Geometry::Polygon(polygon) => (
+            "poly",
+            polygon
+                .polygons
+                .first()
+                .and_then(|p| p.outline.as_ref())
+                .and_then(|outline| outline.nodes.first())
+                .and_then(|node| match node.geometry.as_ref() {
+                    Some(NodeGeometry::Point(point)) => Some(point_in_mm(*point)),
+                    Some(NodeGeometry::Arc(arc)) => arc.start.map(point_in_mm),
+                    None => None,
+                }),
+        ),
+        Geometry::Bezier(bezier) => ("curve", bezier.start.map(point_in_mm)),
+    }
+}
+
 fn unpack_required<M: Message + Default>(
     response: Option<prost_types::Any>,
     command_name: &str,
@@ -1094,6 +1149,76 @@ impl KiCadIpcClient {
             found = Some(pads);
         }
         Ok(found)
+    }
+
+    /// Read the board's graphics — shapes, text, textboxes, and dimensions —
+    /// from a specific open document.
+    ///
+    /// Reference images are not included: KiCad 10's `ReferenceImage` message
+    /// is an empty placeholder, so the API cannot name one, let alone identify
+    /// it for deletion.
+    pub fn get_board_graphics_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcGraphic>> {
+        use kiapi::board::types as board;
+        use kiapi::common::types::KiCadObjectType as Kot;
+
+        let items = self.get_items_of_types_in(
+            document,
+            &[
+                Kot::KotPcbShape,
+                Kot::KotPcbText,
+                Kot::KotPcbTextbox,
+                Kot::KotPcbDimension,
+            ],
+        )?;
+
+        let mut graphics = Vec::new();
+        for item in &items {
+            let graphic = if let Some(shape) =
+                decode_as::<board::BoardGraphicShape>(item, "kiapi.board.types.BoardGraphicShape")
+            {
+                let (kind, origin) = shape_kind_and_origin(shape.shape.as_ref());
+                IpcGraphic {
+                    uuid: kiid_value(shape.id),
+                    kind: kind.to_string(),
+                    layer: layer_enum_to_name(shape.layer).to_string(),
+                    origin,
+                }
+            } else if let Some(text) =
+                decode_as::<board::BoardText>(item, "kiapi.board.types.BoardText")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(text.id),
+                    kind: "text".to_string(),
+                    layer: layer_enum_to_name(text.layer).to_string(),
+                    origin: text.text.and_then(|t| t.position).map(point_in_mm),
+                }
+            } else if let Some(textbox) =
+                decode_as::<board::BoardTextBox>(item, "kiapi.board.types.BoardTextBox")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(textbox.id),
+                    kind: "textbox".to_string(),
+                    layer: layer_enum_to_name(textbox.layer).to_string(),
+                    origin: textbox.textbox.and_then(|t| t.top_left).map(point_in_mm),
+                }
+            } else if let Some(dimension) =
+                decode_as::<board::Dimension>(item, "kiapi.board.types.Dimension")
+            {
+                IpcGraphic {
+                    uuid: kiid_value(dimension.id),
+                    kind: "dimension".to_string(),
+                    layer: layer_enum_to_name(dimension.layer).to_string(),
+                    origin: dimension.text.and_then(|t| t.position).map(point_in_mm),
+                }
+            } else {
+                continue;
+            };
+            graphics.push(graphic);
+        }
+        Ok(graphics)
     }
 
     /// Read the title block of a specific open document.
