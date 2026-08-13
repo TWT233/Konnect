@@ -15,8 +15,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
-        format_net_label, format_wire, pin_endpoint, read_schematic,
+        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
+        extract_wires, format_net_label, format_wire, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -367,20 +367,25 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        let inst = match instances.iter().find(|i| i.reference == reference) {
-            Some(i) => i,
-            None => {
-                errors.push(format!("Component '{}' not found", reference));
-                continue;
-            }
-        };
-
-        let lib_sym = lib_syms
+        // A multi-unit symbol is placed as one instance PER UNIT, all sharing
+        // the reference. The requested pin lives in exactly one of them and
+        // must be transformed by *that* instance's placement. Taking the first
+        // instance and transforming every pin by it puts the label on unit 1's
+        // pin instead — silently shorting two nets together, with no error.
+        let candidates: Vec<_> = instances
             .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            .filter(|i| i.reference == reference)
+            .collect();
+        if candidates.is_empty() {
+            errors.push(format!("Component '{}' not found", reference));
+            continue;
+        }
 
-        let pin_ep = lib_sym.and_then(|sym| {
-            extract_lib_pins(sym)
+        let pin_ep = candidates.iter().find_map(|inst| {
+            let sym = lib_syms
+                .iter()
+                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+            extract_lib_pins_for_unit(sym, inst.unit)
                 .into_iter()
                 .find(|p| p.number == pin_number)
                 .map(|p| pin_endpoint(&p, inst.pin_transform()))
@@ -1564,5 +1569,106 @@ mod midwire_pin_tests {
                 "with_junction={with_junction}: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_pin_tests {
+    use crate::tools::sch_batch::tools;
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
+    };
+    use std::io::Write;
+
+    /// Two units of one symbol, placed 15.24mm apart. Unit 1 owns pin 1, unit 2
+    /// owns pin 3; both sit at local x = -7.62 in their own unit's drawing.
+    const SCH: &str = r#"(kicad_sch
+	(version 20241209)
+	(lib_symbols
+		(symbol "74xx:74HC14"
+			(symbol "74HC14_1_1"
+				(pin input line (at -7.62 0 0) (length 2.54)
+					(name "A" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+			)
+			(symbol "74HC14_2_1"
+				(pin input line (at -7.62 0 0) (length 2.54)
+					(name "A" (effects (font (size 1.27 1.27))))
+					(number "3" (effects (font (size 1.27 1.27))))
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 100 0)
+		(unit 1)
+		(property "Reference" "U1" (at 100 100 0))
+		(property "Value" "74HC14" (at 100 100 0))
+	)
+	(symbol
+		(lib_id "74xx:74HC14")
+		(at 100 115.24 0)
+		(unit 2)
+		(property "Reference" "U1" (at 100 115.24 0))
+		(property "Value" "74HC14" (at 100 115.24 0))
+	)
+)
+"#;
+
+    /// The regression: resolving a pin used the FIRST instance with a matching
+    /// reference, so every pin of a multi-unit part was transformed by unit 1's
+    /// placement. Two nets then landed on one coordinate and were silently
+    /// shorted — no error, no warning.
+    #[test]
+    fn each_unit_resolves_its_own_pin_position() {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let (_c, tree) = read_schematic(f.path()).unwrap();
+        let instances = extract_symbol_instances(&tree);
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+
+        let resolve = |number: &str| -> Option<(f64, f64)> {
+            instances
+                .iter()
+                .filter(|i| i.reference == "U1")
+                .find_map(|inst| {
+                    let sym = lib_syms
+                        .iter()
+                        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+                    extract_lib_pins_for_unit(sym, inst.unit)
+                        .into_iter()
+                        .find(|p| p.number == number)
+                        .map(|p| pin_endpoint(&p, inst.pin_transform()))
+                })
+        };
+
+        let p1 = resolve("1").expect("unit 1 pin 1");
+        let p3 = resolve("3").expect("unit 2 pin 3");
+
+        assert!(
+            (p1.1 - p3.1).abs() > 1.0,
+            "unit 1 and unit 2 pins must not land on the same point \
+             (got {p1:?} and {p3:?}) — that is the short this guards against"
+        );
+        assert!(
+            (p1.1 - 100.0).abs() < 0.01,
+            "unit 1 pin should sit at y=100, got {p1:?}"
+        );
+        assert!(
+            (p3.1 - 115.24).abs() < 0.01,
+            "unit 2 pin should sit at y=115.24, got {p3:?}"
+        );
+    }
+
+    #[test]
+    fn batch_connect_to_net_is_registered() {
+        assert!(tools().iter().any(|t| t.name == "batch_connect_to_net"));
     }
 }
