@@ -838,6 +838,32 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
+/// Directory of the nearest ancestor of `file` that holds a `.kicad_pro`,
+/// falling back to the file's own directory when it belongs to no project — a
+/// loose schematic keeps resolving against the tables beside it.
+///
+/// The project file is found by scanning for the extension rather than by name:
+/// a sheet's filename says nothing about what the project is called.
+fn project_root_for(file: &Path) -> Option<PathBuf> {
+    let start = file.parent()?;
+    start
+        .ancestors()
+        .find(|dir| holds_kicad_pro(dir))
+        .map(Path::to_path_buf)
+        .or_else(|| Some(start.to_path_buf()))
+}
+
+/// Whether `dir` contains a `.kicad_pro`. An unreadable directory holds none.
+fn holds_kicad_pro(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pro"))
+        })
+    })
+}
+
 /// Symbol libraries resolved as KiCad does: project `sym-lib-table` (shadowing
 /// same-nickname global entries), then global, then the conventional
 /// `<nickname>.kicad_symdir` / `.kicad_sym` layout. Same order as
@@ -862,9 +888,13 @@ impl KiCadSymbolSource {
         }
     }
 
-    /// For a `.kicad_sch` or `.kicad_pcb` — `sym-lib-table` sits beside it.
+    /// For a `.kicad_sch` or `.kicad_pcb` — `sym-lib-table` sits at the project
+    /// root, which is the nearest ancestor holding a `.kicad_pro`. A
+    /// hierarchical sheet under `<proj>/sheets/` therefore still resolves
+    /// against `<proj>/sym-lib-table`: KiCad anchors `KIPRJMOD` at the project,
+    /// not at the sheet.
     pub(crate) fn for_file(file: &Path) -> Self {
-        Self::new(file.parent().map(Path::to_path_buf))
+        Self::new(project_root_for(file))
     }
 
     /// Project entries first so they shadow same-nickname global ones.
@@ -4589,6 +4619,67 @@ mod symbol_source_tests {
         assert!(
             candidates.contains(&install.path().join("Device.kicad_sym")),
             "expected the single-file fallback, got {candidates:?}"
+        );
+    }
+
+    /// Reported on #136: a sheet under `<proj>/sheets/` saw no project library,
+    /// because the table was looked for beside the sheet rather than at the
+    /// project root. `add_hierarchical_sheet` accepts such a `sheet_file`, so
+    /// this is reachable through Konnect alone.
+    #[test]
+    fn a_sheet_in_a_subdirectory_resolves_against_the_project_table() {
+        let proj = tempfile::tempdir().unwrap();
+        let file = proj.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(proj.path().join("board.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"MyLib\") (type \"KiCad\") (uri \"${KIPRJMOD}/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let sheets = proj.path().join("sheets");
+        std::fs::create_dir_all(&sheets).unwrap();
+        let child = sheets.join("child.kicad_sch");
+        std::fs::write(&child, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&child).candidates("MyLib");
+        assert!(
+            candidates.contains(&file),
+            "a sub-sheet must see the project table at the root, got {candidates:?}"
+        );
+    }
+
+    /// The fallback the walk must not break: a schematic belonging to no
+    /// project still resolves against the tables sitting beside it.
+    #[test]
+    fn a_schematic_with_no_project_falls_back_to_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Loose\") (type \"KiCad\") (uri \"${KIPRJMOD}/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let sch = dir.path().join("loose.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Loose");
+        assert!(
+            candidates.contains(&file),
+            "a projectless schematic must still use the table beside it, got {candidates:?}"
+        );
+    }
+
+    /// `Path::new("board.kicad_sch").parent()` is `Some("")`, not `None`. The
+    /// walk must leave that as-is so a bare relative path keeps resolving
+    /// against the working directory.
+    #[test]
+    fn a_bare_relative_schematic_keeps_an_empty_project_dir() {
+        assert_eq!(
+            project_root_for(Path::new("board.kicad_sch")),
+            Some(PathBuf::new())
         );
     }
 
