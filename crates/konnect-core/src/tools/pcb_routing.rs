@@ -180,7 +180,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "query_traces",
-            "List trace segments on the board, optionally filtered by net and/or layer.",
+            "List trace segments on the board, optionally filtered by net and/or layer. \
+             Each result includes the track's UUID, which delete_trace takes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -543,6 +544,7 @@ async fn handle_query_traces(
         .iter()
         .map(|t| {
             json!({
+                "uuid": t.uuid,
                 "net": t.net_name, "layer": t.layer, "width": t.width,
                 "x1": t.start.x, "y1": t.start.y,
                 "x2": t.end.x,   "y2": t.end.y
