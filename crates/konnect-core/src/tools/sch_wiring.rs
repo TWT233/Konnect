@@ -13,8 +13,8 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
-        parse_at, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
+        format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -1265,8 +1265,9 @@ async fn handle_add_power_symbol(
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
     // Build the Symbol struct
@@ -1632,10 +1633,8 @@ pub(crate) fn resolve_pin_endpoint(
         .iter()
         .find(|i| i.reference == reference)
         .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
+    let lib_sym = find_lib_symbol(lib_syms, inst)
+        .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_symbol_name()))?;
 
     // Unit-aware (#35): only this instance's unit owns the pin — asking unit 1
     // of an LM2904 for pin 7 must fail, not wire to a superimposed phantom.

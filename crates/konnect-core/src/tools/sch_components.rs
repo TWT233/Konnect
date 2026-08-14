@@ -16,7 +16,8 @@ use konnect_sexp::{
     geometry::snap_point,
     parse_sexp,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
+        read_schematic,
     },
     writer::{
         apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
@@ -350,6 +351,7 @@ async fn handle_add_schematic_component(
         ref_str,
         value,
         unit,
+        &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
     ) {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -386,20 +388,21 @@ pub(crate) fn place_one_component(
     reference: &str,
     value: Option<&str>,
     unit: u32,
+    src: &dyn cse::library::SymbolLibrarySource,
 ) -> Result<serde_json::Value, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
 
     // Embed the library symbol definition
-    if !cse::library::ensure_lib_symbol(sch, lib_id) {
-        return Err(crate::tools::lib_symbol_not_found_error(lib_id));
+    if !cse::library::ensure_lib_symbol(sch, lib_id, src) {
+        return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
     // netlister mis-assigns its pins (#35).
-    let unit_count = cse::library::symbol_unit_count(lib_id).unwrap_or(1);
+    let unit_count = cse::library::symbol_unit_count(lib_id, src).unwrap_or(1);
     if unit < 1 || unit > unit_count {
         return Err(CallToolResult::error(format!(
             "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
@@ -802,9 +805,7 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+    let lib_sym = find_lib_symbol(&lib_syms, inst);
 
     // A missing embedded definition is an error, not an empty pin list —
     // silently returning [] hid every bad-lib_id component until wiring or
@@ -816,7 +817,8 @@ async fn handle_get_schematic_pin_locations(
              doesn't exist in the installed libraries, so it is invisible to \
              KiCAD's netlister. Re-add it with a valid lib_id \
              (delete_schematic_component + add_schematic_component).",
-            reference, inst.lib_id
+            reference,
+            inst.lib_symbol_name()
         )));
     };
     // Unit-aware: only this instance's unit (plus _0_1 commons), not every
@@ -835,7 +837,10 @@ async fn handle_get_schematic_pin_locations(
                  part). Re-add the component (delete_schematic_component + \
                  add_schematic_component) so the definition is embedded in \
                  full, or place the parent symbol '{}' directly.",
-                reference, inst.lib_id, parent, parent
+                reference,
+                inst.lib_symbol_name(),
+                parent,
+                parent
             )));
         }
     }
@@ -890,9 +895,7 @@ async fn handle_batch_get_pin_locations(
                 Some(i) => i,
                 None => return json!({ "reference": reference, "error": "not found" }),
             };
-            let lib_sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            let lib_sym = find_lib_symbol(&lib_syms, inst);
             // Per-entry error rather than a silent empty pin list (#34).
             let Some(sym) = lib_sym else {
                 return json!({
@@ -900,7 +903,7 @@ async fn handle_batch_get_pin_locations(
                     "error": format!(
                         "no embedded definition for '{}' in lib_symbols — \
                          likely added with a nonexistent lib_id",
-                        inst.lib_id
+                        inst.lib_symbol_name()
                     )
                 });
             };
@@ -915,7 +918,7 @@ async fn handle_batch_get_pin_locations(
                             "embedded definition for '{}' is an (extends \"{}\") \
                              stub with no pins — re-add the component so it is \
                              embedded in full",
-                            inst.lib_id, parent
+                            inst.lib_symbol_name(), parent
                         )
                     });
                 }
@@ -1157,8 +1160,9 @@ async fn handle_replace_component(
 
     // Optional unit change, validated against the NEW symbol's unit count
     // (#35). Applied before the embed so all edits land in one write.
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
     if let Some(unit) = new_unit {
-        let unit_count = cse::library::symbol_unit_count(&new_lib_id).unwrap_or(1);
+        let unit_count = cse::library::symbol_unit_count(&new_lib_id, &src).unwrap_or(1);
         if unit < 1 || unit > unit_count {
             return Ok(CallToolResult::error(format!(
                 "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
@@ -1191,8 +1195,8 @@ async fn handle_replace_component(
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
     // a replace that can't embed its definition would leave the component
     // netlist-invisible (#34).
-    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
+    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id, &src));
     }
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
@@ -1227,12 +1231,20 @@ mod tests {
         )
     }
 
-    /// Serializes tests that set KICAD10_SYMBOL_DIR (process-wide env).
-    static SYMBOL_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that set KICAD10_SYMBOL_DIR (process-wide env), shared
+    /// with every other module that does so.
+    use crate::tools::KICAD_ENV_LOCK as SYMBOL_DIR_ENV;
+
+    /// Only the stub carries this, so asserting on it proves a placement
+    /// resolved the fixture and not a KiCad library installed on the machine.
+    const STUB_MARKER: &str = "stub://device";
 
     /// A stub symbol library so component adds resolve without an installed
-    /// KiCAD (CI has none): Device:R and Device:C_Polarized in the KiCAD 10
-    /// symdir layout. Returns (tempdir guard, env lock).
+    /// KiCad (CI has none): Device:R and Device:C_Polarized in the KiCad 10
+    /// symdir layout, plus a `sym-lib-table` registering them.
+    ///
+    /// The returned tempdir doubles as the project directory — put the test's
+    /// schematic in it, so the project table is the one consulted.
     fn stub_symbol_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
         let guard = SYMBOL_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -1240,7 +1252,7 @@ mod tests {
         std::fs::create_dir_all(&symdir).unwrap();
         let symbol = |name: &str| {
             format!(
-                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"{STUB_MARKER}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
             )
         };
         std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
@@ -1271,6 +1283,18 @@ mod tests {
             "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"OPAMP_DERIVED\"\n\t\t(extends \"OPAMP_DUAL\")\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"OPAMP_DERIVED\" (at 0 0 0))\n\t)\n)\n",
         )
         .unwrap();
+        // A project sym-lib-table, checked before the global one, is what
+        // makes this hermetic: KICAD10_SYMBOL_DIR alone is not enough, because
+        // the global table's own `Device` entry resolves to whatever KiCad the
+        // developer has installed and would shadow the stub.
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"Device\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                symdir.display()
+            ),
+        )
+        .unwrap();
         std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
         (dir, guard)
     }
@@ -1295,8 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_writes_eeschema_style_instance_path() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("amp.kicad_sch");
         let ctx = test_ctx();
 
@@ -1316,6 +1339,15 @@ mod tests {
         .unwrap();
         assert!(!result.is_error);
 
+        // Guards the fixture itself: the project sym-lib-table must win over
+        // any real Device library the developer has installed, or these tests
+        // silently stop exercising the stub they set up.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(STUB_MARKER),
+            "Device:R must resolve from the stub, not an installed KiCad library"
+        );
+
         let sch = cse::Schematic::load(&path).unwrap();
         let root_uuid = sch.uuid.clone().expect("root uuid present");
         let sym = sch.symbols.by_reference("R1").unwrap();
@@ -1329,8 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_writes_requested_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("multi.kicad_sch");
         let ctx = test_ctx();
 
@@ -1370,8 +1401,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_rejects_out_of_range_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("units.kicad_sch");
         let ctx = test_ctx();
 
@@ -1428,8 +1458,7 @@ mod tests {
     async fn pin_locations_are_unit_aware() {
         // The #35 repro: an LM2904-style dual op-amp placed as unit 1 and as
         // unit 2 must report DISJOINT pin sets, not all units superimposed.
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("dual.kicad_sch");
         let ctx = test_ctx();
 
@@ -1559,9 +1588,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_component_sets_validated_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
+    async fn pin_locations_resolve_through_lib_name_not_lib_id() {
+        // eeschema stores a locally edited library symbol under a derived name
+        // and points the instance at it with (lib_name …). Resolving on lib_id
+        // alone picks the *base* definition, whose pins sit elsewhere — the
+        // wrong answer is returned silently, and every wire placed from it
+        // lands off-pin (#143).
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(symbol \"R_1_1\"\n\t\t\t\t(pin passive line (at 0 3.81 270) (length 1.27) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t\t(symbol \"R_1\"\n\t\t\t(symbol \"R_1_1_1\"\n\t\t\t\t(pin passive line (at 0 6.35 270) (length 1.27) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t\t(symbol \"C_1\"\n\t\t\t(symbol \"C_1_1_1\"\n\t\t\t\t(pin passive line (at 0 3.81 270) (length 3.048) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_name \"R_1\")\n\t\t(lib_id \"Device:R\")\n\t\t(at 88.9 63.5 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-000000000001\")\n\t\t(property \"Reference\" \"R2\" (at 91.44 62.23 0))\n\t)\n\t(symbol\n\t\t(lib_name \"C_1\")\n\t\t(lib_id \"Device:C\")\n\t\t(at 139.7 63.5 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-000000000002\")\n\t\t(property \"Reference\" \"C1\" (at 142.24 62.23 0))\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let res = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "R2" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{}", content_text(&res));
+        let out: serde_json::Value = serde_json::from_str(&content_text(&res)).unwrap();
+        // R_1's pin sits at local +6.35 => 63.5 - 6.35; Device:R's would be
+        // 63.5 - 3.81 = 59.69.
+        assert_eq!(out["pins"][0]["y"].as_f64().unwrap(), 57.15);
+
+        // Device:C is not embedded at all — only the derived C_1 is. Matching
+        // on lib_id reported "no embedded definition ... nonexistent lib_id",
+        // which is both wrong and dangerous advice.
+        let batch = handle_batch_get_pin_locations(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["C1"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&content_text(&batch)).unwrap();
+        assert!(
+            out["components"][0]["error"].is_null(),
+            "C1 must resolve through C_1: {out}"
+        );
+        assert_eq!(
+            out["components"][0]["pins"][0]["y"].as_f64().unwrap(),
+            59.69
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_component_sets_validated_unit() {
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("swap.kicad_sch");
         let ctx = test_ctx();
 
@@ -1626,8 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_repairs_legacy_file_without_root_uuid() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("legacy.kicad_sch");
         // File shape produced by Konnect before root UUIDs were written.
         std::fs::write(
@@ -1658,8 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_with_nonexistent_lib_id_errors_with_suggestion() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("ghost.kicad_sch");
         let ctx = test_ctx();
 
@@ -1694,8 +1771,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_with_unknown_library_says_so() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("nolib.kicad_sch");
         let ctx = test_ctx();
 

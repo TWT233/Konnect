@@ -49,6 +49,8 @@ pub enum ToolErrorKind {
     InvalidArgument { field: String, reason: String },
     /// A referenced file doesn't exist or can't be read.
     FileNotFound { path: String },
+    /// A mutation would replace one or more existing filesystem targets.
+    Conflict { paths: Vec<String> },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
@@ -64,6 +66,7 @@ impl ToolErrorKind {
             Self::UnknownTool { .. } => "unknown_tool",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::FileNotFound { .. } => "file_not_found",
+            Self::Conflict { .. } => "conflict",
             Self::HandlerError { .. } => "handler_error",
         }
     }
@@ -160,6 +163,9 @@ mod tests {
                 reason: "r".into(),
             },
             ToolErrorKind::FileNotFound { path: "p".into() },
+            ToolErrorKind::Conflict {
+                paths: vec!["p".into()],
+            },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

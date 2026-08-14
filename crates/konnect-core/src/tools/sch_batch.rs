@@ -16,7 +16,8 @@ use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
         extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
-        extract_wires, format_net_label, format_wire, pin_endpoint, read_schematic,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -392,10 +393,14 @@ async fn handle_batch_connect_to_net(
             continue;
         }
 
+        // find_lib_symbol, not a lib_id match: an instance carrying a
+        // (lib_name …) is a sheet-local derived symbol whose pins can sit at
+        // different coordinates than the base definition, and matching on
+        // lib_id returns the wrong one — or nothing, when the base was never
+        // embedded (#143). Every unit of a multi-unit part is resolved this
+        // way, so the two fixes compose rather than one undoing the other.
         let pin_ep = candidates.iter().find_map(|inst| {
-            let sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+            let sym = find_lib_symbol(&lib_syms, inst)?;
             extract_lib_pins_for_unit(sym, inst.unit)
                 .into_iter()
                 .find(|p| p.number == pin_number)
@@ -454,6 +459,8 @@ async fn handle_batch_place_components(
     let mut sch = cse::Schematic::load(&sch_path)?;
     let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
     let project_name = project_name_for(&sch_path);
+    // Built once: the lib-table parse is memoised across the whole batch.
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
 
     let mut placed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -483,6 +490,7 @@ async fn handle_batch_place_components(
             reference,
             value,
             unit,
+            &src,
         ) {
             Ok(v) => placed.push(v),
             Err(e) => errors.push(error_text(&e)),
@@ -1082,9 +1090,7 @@ async fn handle_validate_wire_connections(
     // Collect all valid pin endpoints
     let mut pin_points: Vec<(f64, f64)> = Vec::new();
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {
@@ -1230,9 +1236,7 @@ async fn handle_validate_component_connections(
         if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
             continue;
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {
