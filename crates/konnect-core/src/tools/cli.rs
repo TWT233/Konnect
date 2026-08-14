@@ -308,18 +308,68 @@ pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) ->
     Ok(())
 }
 
-/// KiCAD 10: `sch export bom --output <path> <input>`
-/// Note: v10 BOM does NOT use --format. It uses --fields, --labels, --field-delimiter.
-/// Default output is CSV-like with Reference,Value,Footprint,Qty,DNP fields.
-pub async fn export_bom(cli: &str, schematic: &Path, output: &Path, _format: &str) -> Result<()> {
-    let args = [
-        "sch",
-        "export",
-        "bom",
-        "--output",
-        output.to_str().unwrap(),
-        schematic.to_str().unwrap(),
-    ];
+/// Column and filtering options for `sch export bom`.
+///
+/// All-`None`/`false` reproduces kicad-cli's own defaults: the fixed
+/// `Reference,Value,Footprint,QUANTITY,DNP` column set, ungrouped, DNP rows
+/// included.
+#[derive(Debug, Default, Clone)]
+pub struct BomOptions<'a> {
+    /// Ordered field list, e.g. `Reference,Value,Footprint,MPN,${QUANTITY}`.
+    /// Any schematic field name works, which is how MPN/LCSC columns reach the
+    /// fab; generated fields (`QUANTITY`, `DNP`, `ITEM_NUMBER`, …) may be
+    /// written with or without `${}`.
+    pub fields: Option<&'a str>,
+    /// Ordered column headings. When omitted KiCad labels each column with its
+    /// field name.
+    pub labels: Option<&'a str>,
+    /// Fields whose matching references collapse into one row, e.g.
+    /// `Value,Footprint`.
+    pub group_by: Option<&'a str>,
+    /// Drop Do-Not-Populate symbols.
+    pub exclude_dnp: bool,
+}
+
+/// Argument vector for the BOM export, factored out so the flags can be
+/// asserted without a kicad-cli on the machine.
+fn bom_args<'a>(output: &'a str, schematic: &'a str, options: &BomOptions<'a>) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "bom", "--output", output];
+    if let Some(fields) = options.fields {
+        args.push("--fields");
+        args.push(fields);
+    }
+    if let Some(labels) = options.labels {
+        args.push("--labels");
+        args.push(labels);
+    }
+    if let Some(group_by) = options.group_by {
+        args.push("--group-by");
+        args.push(group_by);
+    }
+    if options.exclude_dnp {
+        args.push("--exclude-dnp");
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export bom --output <path> [--fields …] [--labels …]
+/// [--group-by …] [--exclude-dnp] <input>`
+///
+/// Note: v10 BOM does NOT use `--format`. Without `--fields` kicad-cli emits
+/// its fixed `Reference,Value,Footprint,QUANTITY,DNP` set, so every custom
+/// schematic field (MPN, LCSC, supplier part numbers) is dropped.
+pub async fn export_bom(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &BomOptions<'_>,
+) -> Result<()> {
+    let args = bom_args(
+        output.to_str().unwrap_or(""),
+        schematic.to_str().unwrap_or(""),
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -374,18 +424,66 @@ pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<(
     Ok(())
 }
 
-/// KiCAD 10: `pcb export drill --output <dir> <input>`
-pub async fn export_drill(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
-    let args = [
+/// `--output` for a drill export names a *directory*, and some kicad-cli
+/// versions decide directory-vs-file by the trailing separator alone. An empty
+/// string is left alone so we never hand kicad-cli a bare separator, which
+/// would mean the filesystem root. Credit to @anyn99 (#161) for catching this.
+fn drill_output_dir_arg(output_dir: &str) -> String {
+    let mut arg = output_dir.to_string();
+    if !arg.is_empty() && !arg.ends_with(['/', '\\']) {
+        arg.push(std::path::MAIN_SEPARATOR);
+    }
+    arg
+}
+
+/// Argument vector for the drill export, factored out so the flags can be
+/// asserted without a kicad-cli on the machine.
+fn drill_args<'a>(output_dir: &'a str, pcb: &'a str) -> Vec<&'a str> {
+    vec![
         "pcb",
         "export",
         "drill",
+        // Plated and non-plated holes as separate files. Without this flag
+        // KiCad emits ONE `MixedPlating` file in which the NPTH tools are
+        // distinguished only by an `#@! TA.AperFunction ... NonPlated`
+        // comment — a comment most Excellon readers drop, so the fab plates
+        // holes that must stay unplated (connector flanges, mounting holes).
+        "--excellon-separate-th",
         "--output",
-        output.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+        output_dir,
+        pcb,
+    ]
+}
+
+/// The `.drl` files in `dir`, sorted.
+async fn drill_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("drl") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// KiCAD 10: `pcb export drill --output <dir> <input>`
+///
+/// `--output` is a **directory**, not a file: kicad-cli names the outputs after
+/// the board (`<board>-PTH.drl` and `<board>-NPTH.drl`). Handing it a filename
+/// makes KiCad create a *directory* of that name and hide the real drill files
+/// one level down.
+///
+/// Returns the `.drl` files produced, sorted.
+pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    tokio::fs::create_dir_all(output_dir).await?;
+    let dir_arg = drill_output_dir_arg(output_dir.to_str().unwrap_or(""));
+    let args = drill_args(&dir_arg, pcb.to_str().unwrap_or(""));
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    Ok(())
+    Ok(drill_files_in(output_dir).await)
 }
 
 /// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
@@ -678,6 +776,137 @@ mod erc_parse_tests {
         assert!(
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod drill_export_tests {
+    use super::*;
+
+    /// Non-plated holes must come out as their own Excellon file. The merged
+    /// default marks them with nothing but an `#@! TA.AperFunction` comment,
+    /// which most fab-side Excellon readers discard — so a connector flange or
+    /// mounting hole arrives plated.
+    #[test]
+    fn drill_export_separates_plated_from_non_plated_holes() {
+        let args = drill_args("/out/gerbers", "/tmp/board.kicad_pcb");
+        assert!(
+            args.contains(&"--excellon-separate-th"),
+            "NPTH holes need their own file: {args:?}"
+        );
+    }
+
+    /// `--output` is a directory. Passing a filename makes kicad-cli create a
+    /// directory with that name and write the real drill files inside it.
+    #[test]
+    fn drill_export_output_is_the_directory_it_was_given() {
+        let args = drill_args("/out/gerbers", "/tmp/board.kicad_pcb");
+        let output = args
+            .iter()
+            .position(|a| *a == "--output")
+            .map(|i| args[i + 1])
+            .expect("--output");
+        assert_eq!(output, "/out/gerbers");
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[tokio::test]
+    async fn drill_files_are_collected_sorted_and_filtered_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["board-PTH.drl", "board-NPTH.drl", "board-drl_map.pdf"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let files = drill_files_in(dir.path()).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["board-NPTH.drl", "board-PTH.drl"]);
+    }
+
+    /// Some kicad-cli versions read directory-vs-file from the trailing
+    /// separator alone, so the directory argument carries one.
+    #[test]
+    fn drill_output_directory_argument_ends_in_a_separator() {
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            drill_output_dir_arg("/out/gerbers"),
+            format!("/out/gerbers{sep}")
+        );
+    }
+
+    /// Already separator-terminated input must not grow a second one, and an
+    /// empty path must not become a bare separator — that would be the root.
+    #[test]
+    fn drill_output_directory_argument_is_idempotent_and_skips_empty() {
+        assert_eq!(drill_output_dir_arg("/out/gerbers/"), "/out/gerbers/");
+        assert_eq!(drill_output_dir_arg(r"C:\out\gerbers\"), r"C:\out\gerbers\");
+        assert_eq!(drill_output_dir_arg(""), "");
+    }
+}
+
+#[cfg(test)]
+mod bom_export_tests {
+    use super::*;
+
+    /// Custom schematic fields are the whole point of a fab BOM: without
+    /// `--fields` kicad-cli emits only Reference,Value,Footprint,QUANTITY,DNP
+    /// and an MPN column never reaches the manufacturer.
+    #[test]
+    fn requested_fields_and_labels_reach_kicad_cli() {
+        let options = BomOptions {
+            fields: Some("Reference,Value,Footprint,MPN,${QUANTITY}"),
+            labels: Some("Refs,Value,Footprint,MPN,Qty"),
+            group_by: Some("Value,Footprint"),
+            exclude_dnp: false,
+        };
+        let args = bom_args("/out/bom.csv", "/tmp/board.kicad_sch", &options);
+        let flag = |name: &str| {
+            args.iter()
+                .position(|a| *a == name)
+                .map(|i| args[i + 1])
+                .unwrap_or_else(|| panic!("{name} missing from {args:?}"))
+        };
+        assert_eq!(
+            flag("--fields"),
+            "Reference,Value,Footprint,MPN,${QUANTITY}"
+        );
+        assert_eq!(flag("--labels"), "Refs,Value,Footprint,MPN,Qty");
+        assert_eq!(flag("--group-by"), "Value,Footprint");
+        assert_eq!(flag("--output"), "/out/bom.csv");
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_sch"));
+    }
+
+    /// `exclude_dnp` has been in the export_bom schema (default true) since the
+    /// tool shipped, but the handler never read it and the flag was never sent.
+    #[test]
+    fn exclude_dnp_is_passed_only_when_asked_for() {
+        let on = BomOptions {
+            exclude_dnp: true,
+            ..Default::default()
+        };
+        assert!(bom_args("/out/bom.csv", "/s.kicad_sch", &on).contains(&"--exclude-dnp"));
+
+        let off = BomOptions::default();
+        assert!(!bom_args("/out/bom.csv", "/s.kicad_sch", &off).contains(&"--exclude-dnp"));
+    }
+
+    /// Defaults must reproduce the previous argv exactly, so a caller that
+    /// wants KiCAD's own BOM keeps getting it.
+    #[test]
+    fn default_options_are_the_bare_kicad_cli_invocation() {
+        let args = bom_args("/out/bom.csv", "/s.kicad_sch", &BomOptions::default());
+        assert_eq!(
+            args,
+            [
+                "sch",
+                "export",
+                "bom",
+                "--output",
+                "/out/bom.csv",
+                "/s.kicad_sch"
+            ]
         );
     }
 }

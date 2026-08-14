@@ -41,6 +41,18 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Production quantity (for BOM pricing context)",
                         "default": 5
+                    },
+                    "bom_fields": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated BOM columns, e.g. 'Reference,Value,Footprint,MPN,${QUANTITY}'. Any schematic field name works — this is how MPN/LCSC columns reach the fab. Omit for KiCAD's default Reference,Value,Footprint,QUANTITY,DNP."
+                    },
+                    "bom_labels": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated BOM column headings matching 'bom_fields'. Omit to label each column with its field name."
+                    },
+                    "bom_group_by": {
+                        "type": "string",
+                        "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -140,15 +152,26 @@ async fn handle_export_manufacturing_package(
         }
     }
 
-    // 2. Export drill files
-    let drill_path = output_dir.join("drill.drl");
-    match cli::export_drill(cli_path, &board, &drill_path).await {
-        Ok(()) => {
-            info!("[BETA] Drill export succeeded");
-            files_generated.push(json!({
-                "type": "drill",
-                "path": drill_path.to_str().unwrap_or("")
-            }));
+    // 2. Export drill files, into the gerber directory so a fab receives the
+    //    plated and non-plated Excellon files alongside the layers they belong
+    //    to. `--output` is a directory; the old `output_dir.join("drill.drl")`
+    //    made KiCad create a directory named drill.drl, so the package
+    //    advertised a "drill" file that was really an empty-looking folder and
+    //    the real Excellon output never appeared in the file list at all.
+    match cli::export_drill(cli_path, &board, &gerber_dir).await {
+        Ok(drill_files) => {
+            if drill_files.is_empty() {
+                warn!("[BETA] Drill export produced no .drl files");
+                warnings.push("Drill export produced no .drl files.".to_string());
+            } else {
+                info!(files = drill_files.len(), "[BETA] Drill export succeeded");
+                for file in &drill_files {
+                    files_generated.push(json!({
+                        "type": "drill",
+                        "path": file.to_str().unwrap_or("")
+                    }));
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "[BETA] Drill export failed (may be included in gerbers)");
@@ -182,13 +205,23 @@ async fn handle_export_manufacturing_package(
         // BOM
         if let Some(ref sch) = schematic {
             let bom_path = output_dir.join("bom.csv");
-            match cli::export_bom(cli_path, sch, &bom_path, "csv").await {
+            // Without bom_fields the package gets kicad-cli's fixed
+            // Reference,Value,Footprint,QUANTITY,DNP set — no MPN, no supplier
+            // part number, nothing a fab can source a part from.
+            let bom_options = cli::BomOptions {
+                fields: args["bom_fields"].as_str(),
+                labels: args["bom_labels"].as_str(),
+                group_by: args["bom_group_by"].as_str(),
+                ..Default::default()
+            };
+            match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
                 Ok(()) => {
                     info!("[BETA] BOM export succeeded");
                     files_generated.push(json!({
                         "type": "bom",
                         "path": bom_path.to_str().unwrap_or(""),
-                        "format": "csv"
+                        "format": "csv",
+                        "fields": bom_options.fields
                     }));
                 }
                 Err(e) => {
@@ -320,8 +353,7 @@ async fn handle_validate_for_manufacturing(
     }
 
     // Check for unrouted nets (ratsnest)
-    let net_count = content.matches("\n  (net ").count();
-    let track_count = content.matches("(segment ").count() + content.matches("(via ").count();
+    let (net_count, track_count) = count_nets_and_tracks(&tree);
     if net_count > 3 && track_count == 0 {
         issues.push(json!({
             "severity": "error",
@@ -465,6 +497,58 @@ async fn handle_estimate_cost(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Distinct nets and routed items on the board, read from the parsed tree.
+///
+/// Both net shapes have to be handled. KiCad ≤ 9 declares each net once at top
+/// level — `(net 1 "GND")` — and items refer to it by number, `(net 1)`. KiCad
+/// 10 dropped the top-level table entirely and writes the name on every item,
+/// `(net "GND")`. Counting names when any are present covers both without
+/// double-counting a KiCad 9 net through its declaration *and* its references.
+///
+/// Tracks are always direct children of `(kicad_pcb …)`, so they are counted
+/// there rather than by walking: `(arc …)` also appears inside `(pts …)` of a
+/// zone outline, which is not routed copper.
+fn count_nets_and_tracks(tree: &konnect_sexp::SexpNode) -> (usize, usize) {
+    use std::collections::HashSet;
+
+    fn walk(node: &konnect_sexp::SexpNode, names: &mut HashSet<String>, ids: &mut HashSet<String>) {
+        let Some(children) = node.children() else {
+            return;
+        };
+        if node.head() == Some("net") {
+            match children.last() {
+                // (net 1 "GND") and (net "GND") both end in the quoted name.
+                Some(konnect_sexp::SexpNode::Str(name)) if !name.is_empty() => {
+                    names.insert(name.clone());
+                }
+                // (net 1) — a bare reference in a file whose table we have not
+                // seen. Net 0 is the unconnected pseudo-net.
+                Some(konnect_sexp::SexpNode::Atom(id)) if id != "0" => {
+                    ids.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+        for child in children {
+            walk(child, names, ids);
+        }
+    }
+
+    let mut names = HashSet::new();
+    let mut ids = HashSet::new();
+    walk(tree, &mut names, &mut ids);
+    let net_count = if names.is_empty() {
+        ids.len()
+    } else {
+        names.len()
+    };
+
+    let track_count =
+        tree.find_all("segment").len() + tree.find_all("via").len() + tree.find_all("arc").len();
+
+    (net_count, track_count)
+}
+
 fn find_setup_value(content: &str, key: &str) -> Option<f64> {
     let pat = format!("({} ", key);
     let pos = content.find(&pat)?;
@@ -541,4 +625,140 @@ fn extract_coord(block: &str, keyword: &str, index: usize) -> Option<f64> {
     let rest = &block[pos..];
     let parts: Vec<&str> = rest.split([' ', ')']).collect();
     parts.get(index)?.parse().ok()
+}
+
+#[cfg(test)]
+mod net_track_count_tests {
+    use super::*;
+    use konnect_sexp::parser::parse_sexp;
+
+    /// KiCad 10 (file format 20260206) writes tab indentation, puts each
+    /// `(segment …)` / `(via …)` on its own multi-line form, and has **no**
+    /// top-level net table — every item names its net instead. The old
+    /// substring probes (`"\n  (net "`, `"(segment "`, `"(via "`) match none of
+    /// that, so a fully routed board reported net_count 0 / track_count 0 and
+    /// still came back READY.
+    const KICAD_10_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(segment\n\t\t(start 110 110)\n\t\t(end 120 110)\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"GND\")\n\t)\n\
+        \t(segment\n\t\t(start 120 110)\n\t\t(end 130 120)\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"GND\")\n\t)\n\
+        \t(via\n\t\t(at 130 120)\n\t\t(size 0.6)\n\t\t(drill 0.3)\n\t\t(net \"GND\")\n\t)\n\
+        \t(segment\n\t\t(start 110 130)\n\t\t(end 120 130)\n\t\t(width 0.2)\n\t\t(layer \"B.Cu\")\n\t\t(net \"VCC\")\n\t)\n\
+        )\n";
+
+    /// KiCad ≤ 9: a top-level net table plus numeric references on the items.
+    /// The same net must not be counted once for its declaration and again for
+    /// every segment that mentions it.
+    const KICAD_9_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20241229)\n\
+        \t(net 0 \"\")\n\
+        \t(net 1 \"GND\")\n\
+        \t(net 2 \"VCC\")\n\
+        \t(segment (start 110 110) (end 120 110) (width 0.2) (layer \"F.Cu\") (net 1))\n\
+        \t(segment (start 120 110) (end 130 120) (width 0.2) (layer \"F.Cu\") (net 1))\n\
+        \t(via (at 130 120) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net 1))\n\
+        \t(segment (start 110 130) (end 120 130) (width 0.2) (layer \"B.Cu\") (net 2))\n\
+        )\n";
+
+    #[test]
+    fn counts_a_kicad_10_board_with_no_top_level_net_table() {
+        let tree = parse_sexp(KICAD_10_BOARD).unwrap();
+        assert_eq!(count_nets_and_tracks(&tree), (2, 4));
+    }
+
+    #[test]
+    fn counts_a_kicad_9_board_without_double_counting_declarations() {
+        let tree = parse_sexp(KICAD_9_BOARD).unwrap();
+        assert_eq!(count_nets_and_tracks(&tree), (2, 4));
+    }
+
+    #[test]
+    fn the_unconnected_pseudo_net_does_not_count() {
+        let tree = parse_sexp("(kicad_pcb\n\t(net 0 \"\")\n)\n").unwrap();
+        assert_eq!(count_nets_and_tracks(&tree), (0, 0));
+    }
+
+    /// A zone outline may carry `(arc …)` inside its `(pts …)`; that is a
+    /// polygon corner, not routed copper.
+    #[test]
+    fn zone_outline_arcs_are_not_routed_copper() {
+        let board = "(kicad_pcb\n\
+            \t(zone\n\t\t(net \"GND\")\n\t\t(polygon\n\t\t\t(pts\n\t\t\t\t(xy 0 0)\n\t\t\t\t(arc (start 1 0) (mid 2 1) (end 1 2))\n\t\t\t)\n\t\t)\n\t)\n\
+            )\n";
+        let tree = parse_sexp(board).unwrap();
+        assert_eq!(count_nets_and_tracks(&tree), (1, 0));
+    }
+
+    // ─── End to end through the tool ─────────────────────────────────────────
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    async fn validate(board_text: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let result = handle_validate_for_manufacturing(
+            &json!({ "board": board.to_str().unwrap() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_kicad_10_board_reports_its_nets_and_tracks() {
+        let report = validate(KICAD_10_BOARD).await;
+        assert_eq!(report["board_info"]["net_count"], json!(2));
+        assert_eq!(report["board_info"]["track_count"], json!(4));
+    }
+
+    /// The symptom that surfaced this: an unrouted board came back READY on the
+    /// routing check because both counts read zero, so the `net_count > 3 &&
+    /// track_count == 0` guard could never fire.
+    #[tokio::test]
+    async fn an_unrouted_kicad_10_board_is_flagged_not_ready() {
+        let board = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
+            \t(footprint \"R:R_0402\"\n\
+            \t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (net \"GND\"))\n\
+            \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net \"VCC\"))\n\
+            \t)\n\
+            \t(footprint \"R:R_0402\"\n\
+            \t\t(pad \"1\" smd rect (at 5 0) (size 1 1) (net \"SDA\"))\n\
+            \t\t(pad \"2\" smd rect (at 6 0) (size 1 1) (net \"SCL\"))\n\
+            \t)\n\
+            )\n";
+        let report = validate(board).await;
+        assert_eq!(report["board_info"]["net_count"], json!(4));
+        assert_eq!(report["board_info"]["track_count"], json!(0));
+        assert_eq!(report["verdict"], json!("NOT READY"));
+        let issues = report["issues"].as_array().unwrap();
+        assert!(
+            issues.iter().any(|i| i["issue"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no traces routed")),
+            "{issues:?}"
+        );
+    }
 }

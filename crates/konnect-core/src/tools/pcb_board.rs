@@ -178,6 +178,53 @@ fn find_net_id(content: &str, net_name: &str) -> Option<i32> {
     before[num_start..num_start + num_end].parse().ok()
 }
 
+/// Byte offset of the `)` that closes the block opening at `open_pos`.
+///
+/// Balances parens while skipping quoted strings, so it is independent of how
+/// the file is indented — KiCad 9 writes two spaces, KiCad 10 writes tabs, and
+/// a probe for either is wrong on the other.
+fn close_of_block(content: &str, open_pos: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in content[open_pos..].char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open_pos + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The leading whitespace of the first entry inside the block at `open_pos`,
+/// so an inserted sibling matches the file it is written into.
+fn entry_indent(content: &str, open_pos: usize) -> Option<String> {
+    let after = &content[open_pos..];
+    let nl = after.find('\n')?;
+    let line = &after[nl + 1..];
+    let indent: String = line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    (!indent.is_empty() && line[indent.len()..].starts_with('(')).then_some(indent)
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
@@ -200,7 +247,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_board_info",
-            "Return metadata about the PCB: title, revision, company, layer count, paper size.",
+            "Return metadata about the PCB: title, revision, company, layer count, paper size, \
+             and the number of distinct nets (excluding the unconnected pseudo-net).",
             json!({
                 "type": "object",
                 "properties": {
@@ -450,10 +498,12 @@ async fn handle_get_board_info(
         .unwrap_or("")
         .to_string();
 
-    let layers = tree
-        .find("layers")
-        .map(|n| n.find_all("").len())
-        .unwrap_or(0);
+    // A layer is `(0 "F.Cu" signal)`, keyed by its ordinal rather than by a
+    // tag, so find_all("") — which matches on the head — never matched one and
+    // this was always 0. See konnect_sexp::layers.
+    let stack = konnect_sexp::layers::layers(&tree);
+    let layer_count = stack.len();
+    let copper_layer_count = konnect_sexp::layers::copper(&stack).len();
     let paper = tree
         .find("paper")
         .and_then(|n| n.get(1))
@@ -461,13 +511,18 @@ async fn handle_get_board_info(
         .unwrap_or("A4")
         .to_string();
 
-    let net_count = tree.find_all("net").len().saturating_sub(1); // exclude net 0
+    // Not find_all("net"): that counts only direct children of (kicad_pcb …),
+    // i.e. the top-level net table — which KiCad 10 does not write at all, so
+    // every KiCad 10 board reported 0. Collect from wherever the nets actually
+    // are and de-duplicate; see konnect_sexp::net.
+    let net_count = konnect_sexp::net::count_distinct_nets(&tree);
 
     Ok(CallToolResult::json(&json!({
         "file": board_path.display().to_string(),
         "title": title, "date": date, "revision": rev, "company": company,
         "paper": paper,
-        "layer_count": layers,
+        "layer_count": layer_count,
+        "copper_layer_count": copper_layer_count,
         "net_count": net_count
     })))
 }
@@ -543,28 +598,25 @@ async fn handle_get_layer_list(
     let content = std::fs::read_to_string(&board_path)?;
     let tree = parse_sexp(&content)?;
 
-    let layers_node = match tree.find("layers") {
-        Some(n) => n,
-        None => {
-            return Ok(CallToolResult::error(
-                "No (layers) section found in board file",
-            ))
-        }
-    };
+    if tree.find("layers").is_none() {
+        return Ok(CallToolResult::error(
+            "No (layers) section found in board file",
+        ));
+    }
 
-    // Each child of layers looks like: (0 "F.Cu" signal)
-    let layers: Vec<serde_json::Value> = layers_node
-        .find_all("")
-        .iter()
-        .filter_map(|node| {
-            let id = node.get_f64(1).map(|n| n as i32)?;
-            let name = node.get(2)?.as_str()?.to_string();
-            let kind = node
-                .get(3)
-                .and_then(|n| n.as_str())
-                .unwrap_or("user")
-                .to_string();
-            Some(json!({ "id": id, "name": name, "type": kind }))
+    // Each child of layers looks like: (0 "F.Cu" signal). The ordinal is the
+    // head of the list, so the fields sit one place earlier than the accessors
+    // used to assume — and find_all("") never returned any of them anyway.
+    let layers: Vec<serde_json::Value> = konnect_sexp::layers::layers(&tree)
+        .into_iter()
+        .map(|l| {
+            json!({
+                "id": l.id,
+                "name": l.name,
+                "type": l.kind,
+                "user_name": l.user_name,
+                "copper": l.is_copper(),
+            })
         })
         .collect();
 
@@ -584,6 +636,21 @@ async fn handle_add_layer(
     };
     let layer_type = args["layer_type"].as_str().unwrap_or("signal");
 
+    // Fail closed on a name KiCad does not define. The layer set is closed, and
+    // a board carrying an unknown name does not open at all — so writing one
+    // returns success and hands back a file the user cannot load. Verified
+    // against KiCAD 10: `(53 "User.8" user)` loads, `(53 "TestLayer" user)` is
+    // refused with "Failed to load board".
+    if !konnect_sexp::layers::is_canonical_name(&layer_name) {
+        return Ok(CallToolResult::error(format!(
+            "'{layer_name}' is not a KiCAD layer name, and a board containing one \
+             cannot be opened. Names are fixed: F.Cu, B.Cu, In1.Cu..In30.Cu, \
+             User.1..User.45, and the technical layers (Edge.Cuts, F.Mask, …). \
+             To give a layer your own label, add the canonical layer and set its \
+             user name — `(53 \"User.8\" user \"{layer_name}\")`."
+        )));
+    }
+
     let content = std::fs::read_to_string(&board_path)?;
 
     // Find the (layers ...) block and insert before its closing paren
@@ -592,28 +659,45 @@ async fn handle_add_layer(
         None => return Ok(CallToolResult::error("No (layers) section found")),
     };
 
-    // Determine the next available inner copper ID (first unused ID in 1-30 range)
+    // Determine the next available inner copper ID (first unused ID in 1-30 range).
+    // The ids have to be read by shape — see konnect_sexp::layers. Reading them
+    // with find_all("") returned nothing, so every call allocated id 1 and
+    // duplicated In1.Cu on any board that already had an inner layer.
     let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = tree
-        .find("layers")
-        .map(|n| {
-            n.find_all("")
-                .iter()
-                .filter_map(|node| node.get_f64(1).map(|n| n as i32))
-                .collect()
-        })
-        .unwrap_or_default();
-    let new_id = (1..=30).find(|id| !used_ids.contains(id)).unwrap_or(1);
+    let used_ids: std::collections::HashSet<i32> = konnect_sexp::layers::layers(&tree)
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    let new_id = match (1..=30).find(|id| !used_ids.contains(id)) {
+        Some(id) => id,
+        None => {
+            return Ok(CallToolResult::error(
+                "No free inner copper layer id: 1-30 are all in use",
+            ))
+        }
+    };
 
-    // Find close of the layers block
-    let layers_block = &content[layers_pos..];
-    let close_rel = layers_block
-        .find("\n  )")
-        .or_else(|| layers_block.find(')'))
-        .unwrap_or(layers_block.len().saturating_sub(1));
-    let insert_pos = layers_pos + close_rel;
+    // Close of the layers block, by paren balance. The previous probe looked for
+    // a literal "\n  )", which a tab-indented KiCad 10 file never contains; the
+    // fallback then found the first ')' in the block — the close of the *first
+    // layer entry* — and the new layer was written inside it.
+    let close = match close_of_block(&content, layers_pos) {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(
+                "Unbalanced (layers) block; refusing to write",
+            ))
+        }
+    };
+    // Insert after the last entry rather than immediately before the close, so
+    // the newline and indent that already sit in front of `)` stay in front of
+    // it and the block keeps KiCad's own layout.
+    let insert_pos = content[..close].trim_end().len();
 
-    let new_layer = format!("\n    ({new_id} \"{layer_name}\" {layer_type})");
+    // Match whatever the file already indents entries with, rather than
+    // hardcoding spaces into a file that may be tab-indented.
+    let indent = entry_indent(&content, layers_pos).unwrap_or_else(|| "    ".to_string());
+    let new_layer = format!("\n{indent}({new_id} \"{layer_name}\" {layer_type})");
     let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
     write_atomic(&board_path, &new_content)?;
 
@@ -956,6 +1040,113 @@ async fn handle_import_svg_logo(
 }
 
 #[cfg(test)]
+mod layers_block_tests {
+    use super::*;
+
+    // Both indent styles, same content: KiCad 9 writes two spaces, 10 writes tabs.
+    const SPACES: &str =
+        "(kicad_pcb\n  (layers\n    (0 \"F.Cu\" signal)\n    (2 \"B.Cu\" signal)\n  )\n)";
+    const TABS: &str =
+        "(kicad_pcb\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t)\n)";
+
+    fn layers_close(content: &str) -> usize {
+        close_of_block(content, content.find("(layers").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn close_of_block_finds_the_same_close_under_either_indent() {
+        for content in [SPACES, TABS] {
+            let close = layers_close(content);
+            // Everything up to the close balances, and the block ends after the
+            // last entry rather than inside the first one.
+            assert_eq!(&content[close..close + 1], ")");
+            assert!(content[..close].contains("B.Cu"));
+        }
+    }
+
+    #[test]
+    fn close_of_block_is_not_the_first_paren_in_the_block() {
+        // The old probe fell back to the first ')' — the close of entry one —
+        // and wrote the new layer inside it.
+        let content = TABS;
+        let start = content.find("(layers").unwrap();
+        let first = start + content[start..].find(')').unwrap();
+        assert_ne!(layers_close(content), first);
+    }
+
+    #[test]
+    fn close_of_block_ignores_parens_inside_strings() {
+        let content = "(kicad_pcb\n\t(layers\n\t\t(0 \"F.Cu)(\" signal)\n\t)\n)";
+        let close = layers_close(content);
+        assert!(content[..close].contains("F.Cu)("));
+    }
+
+    #[test]
+    fn close_of_block_refuses_an_unbalanced_block() {
+        assert_eq!(close_of_block("(layers\n\t(0 \"F.Cu\" signal)", 0), None);
+    }
+
+    #[test]
+    fn entry_indent_matches_the_file() {
+        assert_eq!(
+            entry_indent(SPACES, SPACES.find("(layers").unwrap()).as_deref(),
+            Some("    ")
+        );
+        assert_eq!(
+            entry_indent(TABS, TABS.find("(layers").unwrap()).as_deref(),
+            Some("\t\t")
+        );
+    }
+
+    #[test]
+    fn entry_indent_declines_an_empty_block_rather_than_guessing() {
+        let empty = "(kicad_pcb\n\t(layers\n\t)\n)";
+        assert_eq!(entry_indent(empty, empty.find("(layers").unwrap()), None);
+    }
+
+    #[test]
+    fn layers_canonical_names_match_kicads_own_enum() {
+        // Guards konnect_sexp::layers::is_canonical_name against drift: the
+        // authority is KiCAD's BoardLayer enum, shipped in the API protos.
+        // Variant name -> file name is `BL_` off, remaining `_` to `.`.
+        use konnect_ipc::gen::kiapi::board::types::BoardLayer;
+        let sentinels = ["BL_UNKNOWN", "BL_UNDEFINED", "BL_UNSELECTED"];
+        let mut checked = 0;
+        for i in 0..=200i32 {
+            let Ok(layer) = BoardLayer::try_from(i) else {
+                continue;
+            };
+            let variant = layer.as_str_name();
+            if sentinels.contains(&variant) {
+                continue;
+            }
+            let name = variant.trim_start_matches("BL_").replacen('_', ".", 1);
+            assert!(
+                konnect_sexp::layers::is_canonical_name(&name),
+                "{variant} maps to '{name}', which is_canonical_name rejects"
+            );
+            checked += 1;
+        }
+        // Cheap guard against the loop silently matching nothing.
+        assert!(checked > 90, "only {checked} layers checked");
+    }
+
+    #[test]
+    fn ids_in_use_are_seen_so_a_new_layer_does_not_collide() {
+        // The regression this PR is about: with the ids unreadable, the free-id
+        // search always returned 1 and duplicated an existing In1.Cu.
+        let four_layer = "(kicad_pcb\n\t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(1 \"In1.Cu\" signal)\n\t\t(2 \"B.Cu\" signal)\n\t)\n)";
+        let tree = parse_sexp(four_layer).unwrap();
+        let used: std::collections::HashSet<i32> = konnect_sexp::layers::layers(&tree)
+            .iter()
+            .map(|l| l.id)
+            .collect();
+        assert!(used.contains(&1));
+        assert_eq!((1..=30).find(|id| !used.contains(id)), Some(3));
+    }
+}
+
+#[cfg(test)]
 mod svg_logo_tests {
     use super::*;
     use crate::router::ToolRouter;
@@ -1069,6 +1260,79 @@ mod svg_logo_tests {
 
         let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod net_count_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    async fn net_count_of(board: &str) -> i64 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result =
+            handle_get_board_info(&json!({ "board": path.to_str().unwrap() }), &test_ctx())
+                .await
+                .expect("handler should succeed");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["net_count"].as_i64().expect("net_count")
+    }
+
+    /// KiCad 10 has no top-level net table, so the old
+    /// `find_all("net").len().saturating_sub(1)` — direct children only —
+    /// reported 0 for every board saved by KiCad 10, however many nets it had.
+    #[tokio::test]
+    async fn a_kicad_10_board_with_no_net_table_still_counts_its_nets() {
+        let board = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(footprint \"R\"\n\t\t(pad \"1\" smd rect (at 0 0) (net \"GND\"))\n\
+            \t\t(pad \"2\" smd rect (at 1 0) (net \"VCC\"))\n\t)\n\
+            \t(segment (start 0 0) (end 1 0) (net \"GND\"))\n\
+            )\n";
+        assert_eq!(net_count_of(board).await, 2);
+    }
+
+    /// A KiCad ≤ 9 net is declared once and referenced many times; the old
+    /// code happened to be right here only because it looked at the table.
+    #[tokio::test]
+    async fn a_kicad_9_board_counts_each_net_once() {
+        let board = "(kicad_pcb\n\
+            \t(version 20241229)\n\
+            \t(net 0 \"\")\n\t(net 1 \"GND\")\n\t(net 2 \"VCC\")\n\
+            \t(segment (start 0 0) (end 1 0) (net 1))\n\
+            \t(via (at 1 0) (net 1))\n\
+            )\n";
+        assert_eq!(net_count_of(board).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_board_with_only_the_unconnected_pseudo_net_counts_zero() {
+        assert_eq!(
+            net_count_of("(kicad_pcb\n  (version 20250610)\n  (net 0 \"\")\n)\n").await,
+            0
+        );
     }
 }
 
