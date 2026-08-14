@@ -1290,15 +1290,46 @@ async fn handle_add_power_symbol(
     // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
     // #PWR piles up in the top-left corner. Hide Reference like eeschema does
     // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
+    //
+    // The library anchors matter most here: GND anchors Value below the
+    // graphic but VCC/+5V/+3V3 anchor it above, so one fixed offset cannot
+    // suit both (#101).
+    let anchors = cse::library::field_anchors(&sch, &lib_id);
+    let t = konnect_sexp::geometry::PinTransform {
+        comp_x: x,
+        comp_y: y,
+        rotation_deg: rotation,
+        mirror_x: false,
+        mirror_y: false,
+    };
+    let (ref_x, ref_y, ref_rot) =
+        crate::tools::field_at(anchors.reference_at, crate::tools::FALLBACK_REFERENCE_AT, t);
+    let (val_x, val_y, val_rot) =
+        crate::tools::field_at(anchors.value_at, crate::tools::FALLBACK_VALUE_AT, t);
     let positioned = crate::tools::positioned_property;
+    let centred = cse::library::FieldJustify::default();
+    sym.properties.push(positioned(
+        "Reference",
+        &pwr_ref,
+        ref_x,
+        ref_y,
+        ref_rot,
+        true,
+        anchors.reference_justify,
+    ));
+    sym.properties.push(positioned(
+        "Value",
+        &power_net,
+        val_x,
+        val_y,
+        val_rot,
+        false,
+        anchors.value_justify,
+    ));
     sym.properties
-        .push(positioned("Reference", &pwr_ref, x, y - 3.81, 0.0, true));
+        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
     sym.properties
-        .push(positioned("Value", &power_net, x, y + 3.81, 0.0, false));
-    sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true));
+        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -2559,7 +2590,9 @@ mod power_symbol_tests {
         let path = dir.path().join("power.kicad_sch");
         std::fs::write(
             &path,
-            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"GND\" (at 0 0 0))\n    )\n  )\n)\n",
+            // Anchors copied from KiCad 10's power.kicad_sym: GND points down,
+            // so both fields anchor below the origin in Y-up library space.
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
         )
         .unwrap();
 
@@ -2590,8 +2623,9 @@ mod power_symbol_tests {
             .unwrap();
         let ref_sexp = cse::sexp::writer::write(&ref_prop.to_sexp());
         assert!(
-            ref_sexp.contains("(at 100") && ref_sexp.contains("76.19"),
-            "Reference must sit near the symbol, not sheet origin: {ref_sexp}"
+            ref_sexp.contains("(at 100") && ref_sexp.contains("86.35"),
+            "Reference must sit at the library's anchor near the symbol, not \
+             sheet origin: {ref_sexp}"
         );
         let hide_at = ref_sexp
             .find("(hide yes)")
@@ -2614,6 +2648,46 @@ mod power_symbol_tests {
         assert!(
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),
             "must not write a bare Reference with no (at)"
+        );
+    }
+
+    /// An up-pointing rail anchors its Value *above* the graphic, where a
+    /// fixed +3.81 offset used to put it below (#101). VCC's library anchor is
+    /// (0, +3.556) in Y-up space, so the sheet coordinate is y − 3.556.
+    #[tokio::test]
+    async fn up_pointing_power_symbol_puts_value_above_the_graphic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vcc.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:VCC\"\n      (property \"Reference\" \"#PWR\" (at 0 -3.81 0))\n      (property \"Value\" \"VCC\" (at 0 3.556 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "VCC",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
+        let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
+        assert!(
+            val_sexp.contains("76.444"),
+            "VCC's Value belongs above the symbol at y-3.556, not below: {val_sexp}"
         );
     }
 }
