@@ -1402,6 +1402,14 @@ async fn handle_replace_component(
 
 // Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
 
+// `stub_symbol_dir` returns a MutexGuard that the async tests then hold across
+// their `.await`s, which is what `await_holding_lock` warns about. It is
+// deliberate and safe here: the lock serialises process-wide `KICAD*_DIR`
+// environment variables, which the awaited calls read, so releasing it early
+// would defeat its only purpose. cargo runs each test on its own OS thread with
+// its own current-thread runtime, and each runtime drives exactly one task, so
+// there is no second task that could contend for the guard and deadlock.
+#[allow(clippy::await_holding_lock)]
 #[cfg(test)]
 mod tests {
     use super::*;
