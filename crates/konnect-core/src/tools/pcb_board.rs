@@ -161,7 +161,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_board_info",
-            "Return metadata about the PCB: title, revision, company, layer count, paper size.",
+            "Return metadata about the PCB: title, revision, company, layer count, paper size, \
+             and the number of distinct nets (excluding the unconnected pseudo-net).",
             json!({
                 "type": "object",
                 "properties": {
@@ -422,7 +423,11 @@ async fn handle_get_board_info(
         .unwrap_or("A4")
         .to_string();
 
-    let net_count = tree.find_all("net").len().saturating_sub(1); // exclude net 0
+    // Not find_all("net"): that counts only direct children of (kicad_pcb …),
+    // i.e. the top-level net table — which KiCad 10 does not write at all, so
+    // every KiCad 10 board reported 0. Collect from wherever the nets actually
+    // are and de-duplicate; see konnect_sexp::net.
+    let net_count = konnect_sexp::net::count_distinct_nets(&tree);
 
     Ok(CallToolResult::json(&json!({
         "file": board_path.display().to_string(),
@@ -975,5 +980,78 @@ mod svg_logo_tests {
 
         let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod net_count_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    async fn net_count_of(board: &str) -> i64 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result =
+            handle_get_board_info(&json!({ "board": path.to_str().unwrap() }), &test_ctx())
+                .await
+                .expect("handler should succeed");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["net_count"].as_i64().expect("net_count")
+    }
+
+    /// KiCad 10 has no top-level net table, so the old
+    /// `find_all("net").len().saturating_sub(1)` — direct children only —
+    /// reported 0 for every board saved by KiCad 10, however many nets it had.
+    #[tokio::test]
+    async fn a_kicad_10_board_with_no_net_table_still_counts_its_nets() {
+        let board = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(footprint \"R\"\n\t\t(pad \"1\" smd rect (at 0 0) (net \"GND\"))\n\
+            \t\t(pad \"2\" smd rect (at 1 0) (net \"VCC\"))\n\t)\n\
+            \t(segment (start 0 0) (end 1 0) (net \"GND\"))\n\
+            )\n";
+        assert_eq!(net_count_of(board).await, 2);
+    }
+
+    /// A KiCad ≤ 9 net is declared once and referenced many times; the old
+    /// code happened to be right here only because it looked at the table.
+    #[tokio::test]
+    async fn a_kicad_9_board_counts_each_net_once() {
+        let board = "(kicad_pcb\n\
+            \t(version 20241229)\n\
+            \t(net 0 \"\")\n\t(net 1 \"GND\")\n\t(net 2 \"VCC\")\n\
+            \t(segment (start 0 0) (end 1 0) (net 1))\n\
+            \t(via (at 1 0) (net 1))\n\
+            )\n";
+        assert_eq!(net_count_of(board).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_board_with_only_the_unconnected_pseudo_net_counts_zero() {
+        assert_eq!(
+            net_count_of("(kicad_pcb\n  (version 20250610)\n  (net 0 \"\")\n)\n").await,
+            0
+        );
     }
 }
