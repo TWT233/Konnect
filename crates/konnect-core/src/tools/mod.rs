@@ -170,6 +170,9 @@ pub struct ServerConfig {
     pub ipc_address: String,
     pub project_dir: Option<std::path::PathBuf>,
     pub jlcpcb_db_path: Option<std::path::PathBuf>,
+    /// Auto-load a tool's toolset on call instead of returning
+    /// `toolset_not_loaded`. Off by default (see `konnect::Config::auto_load_toolsets`).
+    pub auto_load_toolsets: bool,
 }
 
 #[cfg(test)]

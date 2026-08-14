@@ -1702,6 +1702,7 @@ mod unit_aware_wiring_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1842,6 +1843,7 @@ mod label_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2132,6 +2134,7 @@ mod wire_delete_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2275,6 +2278,7 @@ mod power_symbol_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2361,6 +2365,7 @@ mod no_connect_delete_tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )

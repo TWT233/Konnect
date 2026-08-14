@@ -48,6 +48,7 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             ipc_address: config.ipc_address.clone(),
             project_dir: config.project_dir.clone(),
             jlcpcb_db_path: config.jlcpcb_db_path.clone(),
+            auto_load_toolsets: config.auto_load_toolsets,
         };
         match McpHandler::new(server_config).await {
             Ok(handler) => match config.transport {

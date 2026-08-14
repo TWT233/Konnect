@@ -13,10 +13,17 @@ use std::path::{Path, PathBuf};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-/// The pin-item object schema (number/name/type/x/y/angle/length) shared by
-/// `pins`, `units[].pins`, and `power_pins` in the create_symbol schema below.
-/// `type_desc` parameterizes the one wording difference between call sites.
-fn pin_item_schema(type_desc: &str) -> serde_json::Value {
+/// The pin-item object schema (number/name/type/style/x/y/angle/length) shared
+/// by `pins`, `units[].pins`, and `power_pins` in the create_symbol schema
+/// below. `type_desc` parameterizes the one wording difference between call
+/// sites. `require_xy` is false where a `glyph` may auto-place the pins (so x/y
+/// become optional) and true for the always-rectangular `power_pins`.
+fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
+    let mut required = vec!["number", "name", "type"];
+    if require_xy {
+        required.push("x");
+        required.push("y");
+    }
     json!({
         "type": "object",
         "properties": {
@@ -27,12 +34,17 @@ fn pin_item_schema(type_desc: &str) -> serde_json::Value {
                 "enum": ["input", "output", "bidirectional", "tri_state", "passive", "free", "unspecified", "power_in", "power_out", "open_collector", "open_emitter", "no_connect"],
                 "description": type_desc
             },
+            "style": {
+                "type": "string",
+                "enum": ["line", "inverted", "clock", "inverted_clock", "input_low", "clock_low", "output_low", "edge_clock_high", "non_logic"],
+                "description": "Pin graphic style (default 'line'). 'inverted' = active-low bubble, 'clock' = clock input, etc. Works with any body shape."
+            },
             "x": { "type": "number" },
             "y": { "type": "number" },
             "angle": { "type": "number", "default": 0 },
             "length": { "type": "number", "default": 2.54 }
         },
-        "required": ["number", "name", "type", "x", "y"]
+        "required": required
     })
 }
 
@@ -144,8 +156,11 @@ pub fn tools() -> Vec<ToolDef> {
             "create_symbol",
             "Create a new KiCAD schematic symbol and append it to a .kicad_sym library file. \
              Supports single-unit symbols (via `pins`) and multi-unit parts like dual/quad \
-             op-amps or gate banks (via `units` + optional `common_pins`). Each unit gets a \
-             rectangular body sized to its pins.",
+             op-amps or gate banks (via `units` + optional `power_pins`). By default each unit \
+             gets a rectangular body sized to its pins; set `glyph` (symbol-level and/or per \
+             unit) to draw a conventional op-amp triangle or logic-gate body instead. With a \
+             glyph, pins auto-place by their `type` (inputs left in the order listed top-to- \
+             bottom, output right, power top/bottom) and their x/y are ignored.",
             json!({
                 "type": "object",
                 "properties": {
@@ -153,23 +168,33 @@ pub fn tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "Symbol name" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
+                    "glyph": {
+                        "type": "string",
+                        "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
+                        "description": "Symbol-level default body shape. 'rectangle' (default) uses the pin x/y you supply; the others draw a fixed conventional shape and auto-place pins by type (x/y ignored). Op-amp/gate inputs are placed in the order listed, top-to-bottom (KiCAD's op-amp convention is + on top, - on bottom). Inverting glyphs (inverter/schmitt_inverter/nand/nor/xnor) draw the same body as their base and put the inversion bubble on the output pin. If a glyph's pins don't fit (wrong input count, not exactly one output), it falls back to a rectangle and reports a warning."
+                    },
                     "pins": {
                         "type": "array",
-                        "description": "Pin definitions",
-                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').")
+                        "description": "Pin definitions. x/y position the rectangle body and are ignored when a `glyph` is set.",
+                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').", false)
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
                     "show_pin_numbers": { "type": "boolean", "description": "Show pin numbers on the symbol (default true).", "default": true },
                     "units": {
                         "type": "array",
-                        "description": "For MULTI-UNIT parts (dual/quad op-amps, gate banks, multi-bank connectors). Each element is one unit (becomes Unit A, B, C...) with its own pins and its own rectangular body. When given, `units` replaces `pins` (use `pins` for single-unit symbols instead). Each unit's pins use the same shape as `pins`.",
+                        "description": "For MULTI-UNIT parts (dual/quad op-amps, gate banks, multi-bank connectors). Each element is one unit (becomes Unit A, B, C...) with its own pins and body. When given, `units` replaces `pins` (use `pins` for single-unit symbols instead). Each unit may set its own `glyph`, overriding the symbol-level default.",
                         "items": {
                             "type": "object",
                             "properties": {
+                                "glyph": {
+                                    "type": "string",
+                                    "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
+                                    "description": "Body shape for this unit, overriding the symbol-level `glyph`."
+                                },
                                 "pins": {
                                     "type": "array",
-                                    "description": "Pins for this unit",
-                                    "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').")
+                                    "description": "Pins for this unit. x/y are ignored when the unit has a `glyph`.",
+                                    "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').", false)
                                 }
                             },
                             "required": ["pins"]
@@ -177,8 +202,8 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "power_pins": {
                         "type": "array",
-                        "description": "Shared power pins (V+/V-, VCC/GND). Only meaningful with `units`: they become a dedicated final 'power unit' (e.g. Unit C of a dual op-amp, Unit E of a quad gate) placed once, following KiCAD's own 74xx convention. This avoids drawing the power pins on every unit (which would each need wiring to pass ERC). Same shape as `pins`.",
-                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values (power pins are usually 'power_in'). Note: NC pins are 'no_connect' (not 'not_connected').")
+                        "description": "Shared power pins (V+/V-, VCC/GND). Only meaningful with `units`: they become a dedicated final 'power unit' (e.g. Unit C of a dual op-amp, Unit E of a quad gate) placed once, following KiCAD's own 74xx convention. This avoids drawing the power pins on every unit (which would each need wiring to pass ERC). The power unit is always a rectangle.",
+                        "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values (power pins are usually 'power_in'). Note: NC pins are 'no_connect' (not 'not_connected').", true)
                     }
                 },
                 "required": ["library_path", "name", "reference_prefix"]
@@ -1489,23 +1514,14 @@ const ALLOWED_PIN_ELECTRICAL_TYPES: [&str; 12] = [
     "no_connect",
 ];
 
-/// Build one unit's inner S-expression — an optional body rectangle (when
-/// `with_body`) followed by its pins — and return it with the body rect (used
-/// for reference/value placement). Shared by the single- and multi-unit paths.
-///
-/// Errors when a pin's electrical type is not one of KiCAD's 12 valid values
-/// (#55) — the caller must not write anything to disk in that case.
-fn build_symbol_unit(
-    pins_val: &[serde_json::Value],
-    with_body: bool,
-) -> anyhow::Result<(String, SymbolRect)> {
-    let mut pins_sexp = String::new();
-    let mut pin_geoms: Vec<PinGeom> = Vec::new();
+/// Error when any pin's electrical type is not one of KiCAD's 12 valid values
+/// (#55) — eeschema refuses to load a library with a bad type, so nothing must
+/// be written in that case. Shared by the rectangle and glyph paths.
+fn validate_pin_types(pins_val: &[serde_json::Value]) -> anyhow::Result<()> {
     for pin in pins_val {
-        let number = pin["number"].as_str().unwrap_or("1");
-        let pin_name = pin["name"].as_str().unwrap_or("~");
         let pin_type = pin["type"].as_str().unwrap_or("passive");
         if !ALLOWED_PIN_ELECTRICAL_TYPES.contains(&pin_type) {
+            let number = pin["number"].as_str().unwrap_or("1");
             // The one mistake seen in the wild (#55) gets a targeted hint.
             let hint = if pin_type == "not_connected" {
                 " (did you mean \"no_connect\"?)"
@@ -1520,6 +1536,545 @@ fn build_symbol_unit(
                 ALLOWED_PIN_ELECTRICAL_TYPES.join(", ")
             );
         }
+    }
+    Ok(())
+}
+
+/// A conventional body shape for a symbol unit. `Rectangle` is the default (a
+/// derived box around caller-positioned pins); the others draw a fixed op-amp or
+/// logic-gate glyph copied from KiCAD's stock libraries and auto-place the pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glyph {
+    Rectangle,
+    Opamp,
+    Buffer,
+    Inverter,
+    Schmitt,
+    SchmittInverter,
+    And,
+    Nand,
+    Or,
+    Nor,
+    Xor,
+    Xnor,
+}
+
+impl Glyph {
+    fn parse(s: &str) -> Option<Glyph> {
+        Some(match s {
+            "rectangle" => Glyph::Rectangle,
+            "opamp" => Glyph::Opamp,
+            "buffer" => Glyph::Buffer,
+            "inverter" => Glyph::Inverter,
+            "schmitt" => Glyph::Schmitt,
+            "schmitt_inverter" => Glyph::SchmittInverter,
+            "and" => Glyph::And,
+            "nand" => Glyph::Nand,
+            "or" => Glyph::Or,
+            "nor" => Glyph::Nor,
+            "xor" => Glyph::Xor,
+            "xnor" => Glyph::Xnor,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Glyph::Rectangle => "rectangle",
+            Glyph::Opamp => "opamp",
+            Glyph::Buffer => "buffer",
+            Glyph::Inverter => "inverter",
+            Glyph::Schmitt => "schmitt",
+            Glyph::SchmittInverter => "schmitt_inverter",
+            Glyph::And => "and",
+            Glyph::Nand => "nand",
+            Glyph::Or => "or",
+            Glyph::Nor => "nor",
+            Glyph::Xor => "xor",
+            Glyph::Xnor => "xnor",
+        }
+    }
+
+    /// Inverting glyphs draw the same body as their non-inverting base and mark
+    /// the inversion with an `inverted` output pin (matching KiCAD's own gates,
+    /// which carry the bubble on the pin rather than as a body circle).
+    fn is_inverting(self) -> bool {
+        matches!(
+            self,
+            Glyph::Inverter | Glyph::SchmittInverter | Glyph::Nand | Glyph::Nor | Glyph::Xnor
+        )
+    }
+
+    /// How many input pins the fixed geometry has room for.
+    fn input_count(self) -> usize {
+        match self {
+            Glyph::Buffer | Glyph::Inverter | Glyph::Schmitt | Glyph::SchmittInverter => 1,
+            _ => 2,
+        }
+    }
+
+    /// The narrow triangle-bodied glyphs (op-amp and the buffer family). Their
+    /// apex leaves no room for power-pin names, so a single-unit triangular
+    /// symbol that carries power pins puts them on a separate rectangular power
+    /// unit instead (the gate glyphs have a flat back with room, so they keep
+    /// their power pins on the body).
+    fn is_triangular(self) -> bool {
+        matches!(
+            self,
+            Glyph::Opamp
+                | Glyph::Buffer
+                | Glyph::Inverter
+                | Glyph::Schmitt
+                | Glyph::SchmittInverter
+        )
+    }
+}
+
+/// Whether a pin is a supply pin (belongs on a power unit).
+fn is_power_pin(p: &serde_json::Value) -> bool {
+    matches!(p["type"].as_str(), Some("power_in") | Some("power_out"))
+}
+
+/// Lay out power pins for a standalone rectangular power unit: vertical, V+/V-
+/// style — even-indexed pins enter from the top (pointing down), odd from the
+/// bottom (pointing up), matching KiCAD's multi-unit op-amp power unit. Any
+/// caller x/y is replaced. Same spread (bulbs at y = ±7.62) as the multi-unit
+/// `power_pins` path so a single op-amp's power unit matches a dual's.
+fn layout_power_unit(power: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let n_top = power.len().div_ceil(2);
+    let n_bot = power.len() / 2;
+    let mut top_i = 0usize;
+    let mut bot_i = 0usize;
+    power
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut q = p.clone();
+            if let Some(obj) = q.as_object_mut() {
+                if i % 2 == 0 {
+                    let x = (top_i as f64 - (n_top as f64 - 1.0) / 2.0) * 2.54;
+                    obj.insert("x".into(), json!(x));
+                    obj.insert("y".into(), json!(7.62));
+                    obj.insert("angle".into(), json!(270));
+                    obj.insert("length".into(), json!(2.54));
+                    top_i += 1;
+                } else {
+                    let x = (bot_i as f64 - (n_bot as f64 - 1.0) / 2.0) * 2.54;
+                    obj.insert("x".into(), json!(x));
+                    obj.insert("y".into(), json!(-7.62));
+                    obj.insert("angle".into(), json!(90));
+                    obj.insert("length".into(), json!(2.54));
+                    bot_i += 1;
+                }
+            }
+            q
+        })
+        .collect()
+}
+
+/// Normalize a caller-supplied pin graphic style to a valid KiCAD token,
+/// defaulting to `line`.
+fn pin_style_token(s: Option<&str>) -> &'static str {
+    match s {
+        Some("inverted") => "inverted",
+        Some("clock") => "clock",
+        Some("inverted_clock") => "inverted_clock",
+        Some("input_low") => "input_low",
+        Some("clock_low") => "clock_low",
+        Some("output_low") => "output_low",
+        Some("edge_clock_high") => "edge_clock_high",
+        Some("non_logic") => "non_logic",
+        _ => "line",
+    }
+}
+
+/// Default pin name/number text height (KiCAD's default).
+const PIN_TEXT: f64 = 1.27;
+/// Smaller pin-name height for glyph units. The fixed op-amp/gate bodies are
+/// compact (KiCAD's own gates keep pin names empty on them), so real pin names
+/// at the default 1.27 mm collide; 0.762 mm (KiCAD's standard small text) fits
+/// them without enlarging the body and breaking the library-matching shape.
+const GLYPH_PIN_NAME_TEXT: f64 = 0.762;
+
+/// One `(pin …)` S-expression. `name_font` sets the pin-name text height;
+/// numbers stay at the default (they sit outside the body and don't crowd).
+#[allow(clippy::too_many_arguments)]
+fn emit_pin(
+    pin_type: &str,
+    style: &str,
+    x: f64,
+    y: f64,
+    angle: f64,
+    length: f64,
+    name: &str,
+    number: &str,
+    name_font: f64,
+) -> String {
+    format!(
+        "\n    (pin {} {} (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
+        pin_type, style, x, y, angle, length, name, name_font, name_font, number, PIN_TEXT, PIN_TEXT
+    )
+}
+
+// ── Glyph geometry (coordinates copied verbatim from KiCAD 10's stock symbols)
+
+fn fmt_pts(pts: &[(f64, f64)]) -> String {
+    pts.iter()
+        .map(|(x, y)| format!("(xy {} {})", x, y))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn g_polyline(pts: &[(f64, f64)], width: f64, fill: &str) -> String {
+    format!(
+        "\n      (polyline (pts {}) (stroke (width {}) (type default)) (fill (type {})))",
+        fmt_pts(pts),
+        width,
+        fill
+    )
+}
+
+fn g_arc(s: (f64, f64), m: (f64, f64), e: (f64, f64), fill: &str) -> String {
+    format!(
+        "\n      (arc (start {} {}) (mid {} {}) (end {} {}) (stroke (width 0.254) (type default)) (fill (type {})))",
+        s.0, s.1, m.0, m.1, e.0, e.1, fill
+    )
+}
+
+/// The OR/NOR body (also the base of XOR/XNOR): a concave back arc, two back
+/// stubs, two front arcs meeting at the apex, and KiCAD's fill-outline polyline.
+fn or_body() -> String {
+    let mut b = g_arc((-3.81, 3.81), (-2.589, 0.0), (-3.81, -3.81), "none");
+    b.push_str(&g_polyline(
+        &[(-3.81, 3.81), (-0.635, 3.81)],
+        0.254,
+        "background",
+    ));
+    b.push_str(&g_polyline(
+        &[(-3.81, -3.81), (-0.635, -3.81)],
+        0.254,
+        "background",
+    ));
+    b.push_str(&g_arc(
+        (3.81, 0.0),
+        (2.1855, -2.584),
+        (-0.6096, -3.81),
+        "background",
+    ));
+    b.push_str(&g_arc(
+        (-0.6096, 3.81),
+        (2.1928, 2.5924),
+        (3.81, 0.0),
+        "background",
+    ));
+    b.push_str(&g_polyline(
+        &[
+            (-0.635, 3.81),
+            (-3.81, 3.81),
+            (-3.81, 3.81),
+            (-3.556, 3.4036),
+            (-3.0226, 2.2606),
+            (-2.6924, 1.0414),
+            (-2.6162, -0.254),
+            (-2.7686, -1.4986),
+            (-3.175, -2.7178),
+            (-3.81, -3.81),
+            (-3.81, -3.81),
+            (-0.635, -3.81),
+        ],
+        -25.4,
+        "background",
+    ));
+    b
+}
+
+/// Fixed body + pin anchors for a glyph. Input anchors are ordered
+/// top-to-bottom; the caller's pin order maps onto them in that order.
+/// `power_top`/`power_bottom` are the points *on the body outline* where a
+/// power pin's root should land (so the pin visually touches the shape, not the
+/// bounding box).
+struct GlyphGeom {
+    body: String,
+    inputs: Vec<(f64, f64, f64, f64)>,
+    output: (f64, f64, f64, f64),
+    power_top: (f64, f64),
+    power_bottom: (f64, f64),
+    rect: (f64, f64, f64, f64),
+}
+
+fn glyph_geom(g: Glyph) -> GlyphGeom {
+    match g {
+        Glyph::Rectangle => unreachable!("rectangle is handled by the rectangle path"),
+        Glyph::Opamp => GlyphGeom {
+            body: g_polyline(
+                &[(-5.08, 5.08), (5.08, 0.0), (-5.08, -5.08), (-5.08, 5.08)],
+                0.254,
+                "background",
+            ),
+            inputs: vec![(-7.62, 2.54, 0.0, 2.54), (-7.62, -2.54, 0.0, 2.54)],
+            output: (7.62, 0.0, 180.0, 2.54),
+            // Centered on the triangle top/bottom edges (at x = 0, y = ±2.54),
+            // so the power names clear the +/- input names on the left.
+            power_top: (0.0, 2.54),
+            power_bottom: (0.0, -2.54),
+            rect: (-5.08, -5.08, 5.08, 5.08),
+        },
+        Glyph::Buffer | Glyph::Inverter => GlyphGeom {
+            body: g_polyline(
+                &[(-3.81, 3.81), (-3.81, -3.81), (3.81, 0.0), (-3.81, 3.81)],
+                0.254,
+                "background",
+            ),
+            inputs: vec![(-7.62, 0.0, 0.0, 3.81)],
+            output: (7.62, 0.0, 180.0, 3.81),
+            // Centered on the triangle top/bottom edges (x = 0, y = ±1.905).
+            power_top: (0.0, 1.905),
+            power_bottom: (0.0, -1.905),
+            rect: (-3.81, -3.81, 3.81, 3.81),
+        },
+        Glyph::Schmitt | Glyph::SchmittInverter => {
+            let mut body = g_polyline(
+                &[(-3.81, 3.81), (-3.81, -3.81), (3.81, 0.0), (-3.81, 3.81)],
+                0.254,
+                "background",
+            );
+            // Hysteresis mark (from KiCAD's 74HC14).
+            body.push_str(&g_polyline(
+                &[(-2.54, -1.27), (-0.635, -1.27), (-0.635, 1.27), (0.0, 1.27)],
+                0.254,
+                "none",
+            ));
+            body.push_str(&g_polyline(
+                &[(-1.905, -1.27), (-1.905, 1.27), (-0.635, 1.27)],
+                0.254,
+                "none",
+            ));
+            GlyphGeom {
+                body,
+                inputs: vec![(-7.62, 0.0, 0.0, 3.81)],
+                output: (7.62, 0.0, 180.0, 3.81),
+                // Centered (x = 0, y = ±1.905); the hysteresis mark sits at x <= 0.
+                power_top: (0.0, 1.905),
+                power_bottom: (0.0, -1.905),
+                rect: (-3.81, -3.81, 3.81, 3.81),
+            }
+        }
+        Glyph::And | Glyph::Nand => {
+            let mut body = g_arc((0.0, 3.81), (3.7934, 0.0), (0.0, -3.81), "background");
+            body.push_str(&g_polyline(
+                &[(0.0, 3.81), (-3.81, 3.81), (-3.81, -3.81), (0.0, -3.81)],
+                0.254,
+                "background",
+            ));
+            GlyphGeom {
+                body,
+                inputs: vec![(-7.62, 2.54, 0.0, 3.81), (-7.62, -2.54, 0.0, 3.81)],
+                output: (7.62, 0.0, 180.0, 3.81),
+                // Right end of the flat back edges (x = 0, y = ±3.81), away from
+                // the input names on the left.
+                power_top: (0.0, 3.81),
+                power_bottom: (0.0, -3.81),
+                rect: (-3.81, -3.81, 3.81, 3.81),
+            }
+        }
+        Glyph::Or | Glyph::Nor => GlyphGeom {
+            body: or_body(),
+            // Longer than the gates above: the back is a *concave* arc that sits
+            // at x ≈ -3.10 at the input height, so length 4.52 puts the roots on
+            // the curve (3.81 would leave a visible gap).
+            inputs: vec![(-7.62, 2.54, 0.0, 4.52), (-7.62, -2.54, 0.0, 4.52)],
+            output: (7.62, 0.0, 180.0, 3.81),
+            // Rightmost point of the flat back stubs (y = ±3.81, x = -0.635),
+            // away from the input names on the left.
+            power_top: (-0.635, 3.81),
+            power_bottom: (-0.635, -3.81),
+            rect: (-3.81, -3.81, 3.81, 3.81),
+        },
+        Glyph::Xor | Glyph::Xnor => {
+            // OR body plus a second offset back arc and two input stubs.
+            let mut body = g_arc((-4.4196, 3.81), (-3.2033, 0.0), (-4.4196, -3.81), "none");
+            body.push_str(&or_body());
+            body.push_str(&g_polyline(
+                &[(-3.81, 2.54), (-3.175, 2.54)],
+                0.254,
+                "background",
+            ));
+            body.push_str(&g_polyline(
+                &[(-3.81, -2.54), (-3.175, -2.54)],
+                0.254,
+                "background",
+            ));
+            GlyphGeom {
+                body,
+                inputs: vec![(-7.62, 2.54, 0.0, 4.445), (-7.62, -2.54, 0.0, 4.445)],
+                output: (7.62, 0.0, 180.0, 3.81),
+                // Rightmost flat point of the back stubs (x = -0.635, y = ±3.81).
+                power_top: (-0.635, 3.81),
+                power_bottom: (-0.635, -3.81),
+                rect: (-4.4196, -3.81, 3.81, 3.81),
+            }
+        }
+    }
+}
+
+/// Build a glyph unit: the fixed body plus auto-placed pins. Returns `Err(msg)`
+/// when the unit's pins don't fit the glyph (wrong input count, not exactly one
+/// output, or unsupported pin types) so the caller can fall back to a rectangle.
+fn build_glyph_unit(
+    pins_val: &[serde_json::Value],
+    g: Glyph,
+) -> Result<(String, SymbolRect), String> {
+    let mut inputs: Vec<&serde_json::Value> = Vec::new();
+    let mut outputs: Vec<&serde_json::Value> = Vec::new();
+    let mut powers: Vec<&serde_json::Value> = Vec::new();
+    let mut others = 0usize;
+    for p in pins_val {
+        match p["type"].as_str().unwrap_or("passive") {
+            "input" => inputs.push(p),
+            "output" | "tri_state" | "open_collector" | "open_emitter" => outputs.push(p),
+            "power_in" | "power_out" => powers.push(p),
+            _ => others += 1,
+        }
+    }
+
+    let want = g.input_count();
+    if inputs.len() != want {
+        return Err(format!(
+            "glyph '{}' expects {} input pin(s) but {} were given; drew a rectangle instead",
+            g.name(),
+            want,
+            inputs.len()
+        ));
+    }
+    if outputs.len() != 1 {
+        return Err(format!(
+            "glyph '{}' expects exactly 1 output pin but {} were given; drew a rectangle instead",
+            g.name(),
+            outputs.len()
+        ));
+    }
+    if others > 0 {
+        return Err(format!(
+            "glyph '{}' only supports input/output/power pins; drew a rectangle instead",
+            g.name()
+        ));
+    }
+
+    let geom = glyph_geom(g);
+    let mut sexp = geom.body.clone();
+
+    // Inputs map onto the glyph anchors in the caller's order (top-to-bottom).
+    for (p, &(x, y, angle, length)) in inputs.iter().zip(geom.inputs.iter()) {
+        let number = p["number"].as_str().unwrap_or("1");
+        let name = p["name"].as_str().unwrap_or("~");
+        let style = pin_style_token(p["style"].as_str());
+        sexp.push_str(&emit_pin(
+            "input",
+            style,
+            x,
+            y,
+            angle,
+            length,
+            name,
+            number,
+            GLYPH_PIN_NAME_TEXT,
+        ));
+    }
+
+    // The single output sits at the apex; inverting glyphs default to an
+    // inverted pin (the bubble), but the caller can override via `style`.
+    let out = outputs[0];
+    let out_number = out["number"].as_str().unwrap_or("1");
+    let out_name = out["name"].as_str().unwrap_or("~");
+    let out_type = out["type"].as_str().unwrap_or("output");
+    let out_style = match out["style"].as_str() {
+        Some(s) => pin_style_token(Some(s)),
+        None if g.is_inverting() => "inverted",
+        None => "line",
+    };
+    let (ox, oy, oa, ol) = geom.output;
+    sexp.push_str(&emit_pin(
+        out_type,
+        out_style,
+        ox,
+        oy,
+        oa,
+        ol,
+        out_name,
+        out_number,
+        GLYPH_PIN_NAME_TEXT,
+    ));
+
+    // Power pins (e.g. a single op-amp's V+/V-) enter vertically, alternating
+    // top/bottom, with their roots on the body outline so they touch the shape.
+    for (i, p) in powers.iter().enumerate() {
+        let number = p["number"].as_str().unwrap_or("1");
+        let name = p["name"].as_str().unwrap_or("~");
+        let ptype = p["type"].as_str().unwrap_or("power_in");
+        let style = pin_style_token(p["style"].as_str());
+        let length = 2.54;
+        let (x, y, angle) = if i % 2 == 0 {
+            let (ax, ay) = geom.power_top;
+            (ax, ay + length, 270.0) // bulb above, root on the top edge
+        } else {
+            let (ax, ay) = geom.power_bottom;
+            (ax, ay - length, 90.0) // bulb below, root on the bottom edge
+        };
+        sexp.push_str(&emit_pin(
+            ptype,
+            style,
+            x,
+            y,
+            angle,
+            length,
+            name,
+            number,
+            GLYPH_PIN_NAME_TEXT,
+        ));
+    }
+
+    Ok((sexp, Some(geom.rect)))
+}
+
+/// Build one unit's inner S-expression — an optional body (a rectangle, or a
+/// conventional `glyph` shape) followed by its pins — and return it with the
+/// body rect (used for reference/value placement) and an optional warning (e.g.
+/// a glyph that didn't fit its pins and fell back to a rectangle). Shared by the
+/// single- and multi-unit paths.
+///
+/// Errors (#55) when a pin's electrical type is not one of KiCAD's 12 valid
+/// values — the caller must not write anything to disk in that case.
+fn build_symbol_unit(
+    pins_val: &[serde_json::Value],
+    with_body: bool,
+    glyph: Option<Glyph>,
+) -> anyhow::Result<(String, SymbolRect, Option<String>)> {
+    validate_pin_types(pins_val)?;
+    if let Some(g) = glyph {
+        if g != Glyph::Rectangle {
+            match build_glyph_unit(pins_val, g) {
+                Ok((sexp, rect)) => return Ok((sexp, rect, None)),
+                Err(reason) => {
+                    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+                    return Ok((sexp, rect, Some(reason)));
+                }
+            }
+        }
+    }
+    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+    Ok((sexp, rect, None))
+}
+
+/// The default rectangle body + caller-positioned pins. Pin types are assumed
+/// already validated by `build_symbol_unit`.
+fn build_rect_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String, SymbolRect) {
+    let mut pins_sexp = String::new();
+    let mut pin_geoms: Vec<PinGeom> = Vec::new();
+    for pin in pins_val {
+        let number = pin["number"].as_str().unwrap_or("1");
+        let pin_name = pin["name"].as_str().unwrap_or("~");
+        let pin_type = pin["type"].as_str().unwrap_or("passive");
+        let style = pin_style_token(pin["style"].as_str());
         let x = pin["x"].as_f64().unwrap_or(0.0);
         let y = pin["y"].as_f64().unwrap_or(0.0);
         let angle = pin["angle"].as_f64().unwrap_or(0.0);
@@ -1531,9 +2086,8 @@ fn build_symbol_unit(
             angle,
             length,
         });
-        pins_sexp.push_str(&format!(
-            "\n    (pin {} line (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size 1.27 1.27))))\n      (number \"{}\" (effects (font (size 1.27 1.27))))\n    )",
-            pin_type, x, y, angle, length, pin_name, number
+        pins_sexp.push_str(&emit_pin(
+            pin_type, style, x, y, angle, length, pin_name, number, PIN_TEXT,
         ));
     }
     let body = if with_body {
@@ -1548,7 +2102,7 @@ fn build_symbol_unit(
         ),
         None => String::new(),
     };
-    Ok((format!("{}{}", body_sexp, pins_sexp), body))
+    (format!("{}{}", body_sexp, pins_sexp), body)
 }
 
 type SymbolRect = Option<(f64, f64, f64, f64)>;
@@ -1564,32 +2118,82 @@ async fn handle_create_symbol(
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
 
+    // Optional conventional body shape. `glyph` may be set at the symbol level
+    // (a default for every unit) and/or per unit (overriding the default).
+    let mut warnings: Vec<String> = Vec::new();
+    let sym_glyph = match args["glyph"].as_str() {
+        None => None,
+        Some(s) => match Glyph::parse(s) {
+            Some(g) => Some(g),
+            None => {
+                warnings.push(format!("unknown glyph '{}'; used a rectangle", s));
+                None
+            }
+        },
+    };
+
     // Multi-unit when `units` is a non-empty array; otherwise the single-unit
-    // `pins` path. Sub-symbols are named NAME_<unit>_1; unit 0 holds items drawn
-    // on every unit (common power pins), units 1..N are the individual units.
-    let units: Vec<Vec<serde_json::Value>> = args["units"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|u| u["pins"].as_array().cloned().unwrap_or_default())
-                .collect()
-        })
-        .unwrap_or_default();
+    // `pins` path. Sub-symbols are named NAME_<unit>_1; units 1..N are the
+    // individual units, and shared `power_pins` become a dedicated final unit.
+    let unit_objs: Vec<serde_json::Value> = args["units"].as_array().cloned().unwrap_or_default();
     let power_pins = args["power_pins"].as_array().cloned().unwrap_or_default();
 
     let mut units_sexp = String::new();
     let unit_count: usize;
     let ref_body: SymbolRect;
-    if units.is_empty() {
-        // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
+    if unit_objs.is_empty() {
         let pins_val = args["pins"].as_array().cloned().unwrap_or_default();
-        let (inner, body) = match build_symbol_unit(&pins_val, true) {
-            Ok(v) => v,
-            Err(e) => return Ok(CallToolResult::error(e.to_string())),
-        };
-        units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
-        unit_count = 1;
-        ref_body = body;
+        // A single-unit triangular glyph (op-amp/buffer/inverter/schmitt) has no
+        // room for power-pin names on its narrow apex, so if it carries power
+        // pins, split them onto a dedicated rectangular power unit (like KiCAD's
+        // multi-unit op-amps) instead of drawing them on the triangle.
+        let split_power =
+            matches!(sym_glyph, Some(g) if g.is_triangular()) && pins_val.iter().any(is_power_pin);
+        if split_power {
+            let signal: Vec<serde_json::Value> = pins_val
+                .iter()
+                .filter(|p| !is_power_pin(p))
+                .cloned()
+                .collect();
+            let power: Vec<serde_json::Value> = pins_val
+                .iter()
+                .filter(|p| is_power_pin(p))
+                .cloned()
+                .collect();
+            // Unit 1: the triangle with its signal pins.
+            let (inner1, body1, warn1) = match build_symbol_unit(&signal, true, sym_glyph) {
+                Ok(v) => v,
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            };
+            if let Some(w) = warn1 {
+                warnings.push(w);
+            }
+            units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
+            // Unit 2: a rectangular power unit.
+            let power_laid = layout_power_unit(&power);
+            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, true, None) {
+                Ok(v) => v,
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            };
+            if let Some(w) = warn2 {
+                warnings.push(w);
+            }
+            units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
+            unit_count = 2;
+            ref_body = body1;
+        } else {
+            // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
+            let (inner, body, warn) = match build_symbol_unit(&pins_val, true, sym_glyph) {
+                Ok(v) => v,
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            };
+            if let Some(w) = warn {
+                warnings.push(w);
+            }
+            units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
+            unit_count = 1;
+            ref_body = body;
+        }
     } else {
         // Multi-unit: each signal unit is NAME_1_1..NAME_N_1, and the power
         // pins (if any) become a dedicated FINAL unit rather than being drawn
@@ -1598,11 +2202,30 @@ async fn handle_create_symbol(
         // power pins appear on exactly one placed unit instead of on every
         // unit, where each duplicate would otherwise need wiring to pass ERC.
         let mut first_body: SymbolRect = None;
-        for (i, unit_pins) in units.iter().enumerate() {
-            let (inner, body) = match build_symbol_unit(unit_pins, true) {
+        for (i, u) in unit_objs.iter().enumerate() {
+            let unit_pins = u["pins"].as_array().cloned().unwrap_or_default();
+            // A per-unit `glyph` overrides the symbol-level default.
+            let unit_glyph = match u["glyph"].as_str() {
+                None => sym_glyph,
+                Some(s) => match Glyph::parse(s) {
+                    Some(g) => Some(g),
+                    None => {
+                        warnings.push(format!(
+                            "unit {}: unknown glyph '{}'; used a rectangle",
+                            i + 1,
+                            s
+                        ));
+                        Some(Glyph::Rectangle)
+                    }
+                },
+            };
+            let (inner, body, warn) = match build_symbol_unit(&unit_pins, true, unit_glyph) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
+            if let Some(w) = warn {
+                warnings.push(format!("unit {}: {}", i + 1, w));
+            }
             if i == 0 {
                 first_body = body;
             }
@@ -1613,9 +2236,10 @@ async fn handle_create_symbol(
                 inner
             ));
         }
-        let mut total = units.len();
+        let mut total = unit_objs.len();
         if !power_pins.is_empty() {
-            let (inner, _) = match build_symbol_unit(&power_pins, true) {
+            // The power unit is always a rectangle.
+            let (inner, _, _) = match build_symbol_unit(&power_pins, true, None) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -1659,15 +2283,19 @@ async fn handle_create_symbol(
     }
     write_atomic(&lib_path, &new_content)?;
 
+    let mut result = json!({
+        "success": true,
+        "symbol": name,
+        "library": lib_path.to_str().unwrap_or(""),
+        "unit_count": unit_count,
+        "power_pin_count": power_pins.len()
+    });
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
+    }
+
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "symbol": name,
-            "library": lib_path.to_str().unwrap_or(""),
-            "unit_count": unit_count,
-            "power_pin_count": power_pins.len()
-        }))
-        .unwrap(),
+        serde_json::to_string(&result).unwrap(),
     ))
 }
 
@@ -2188,6 +2816,7 @@ mod tests {
                 ipc_address: String::new(),
                 project_dir: None,
                 jlcpcb_db_path: None,
+                auto_load_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3439,6 +4068,355 @@ mod tests {
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "multi-unit symbol doesn't parse"
+        );
+    }
+
+    async fn make_symbol(glyph: &str, pins: serde_json::Value) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("g.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "G",
+            "reference_prefix": "U",
+            "glyph": glyph,
+            "pins": pins,
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error, "{glyph} create_symbol errored");
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            konnect_sexp::parser::parse_sexp(&c).is_ok(),
+            "{glyph} output doesn't parse:\n{c}"
+        );
+        c
+    }
+
+    #[tokio::test]
+    async fn glyph_opamp_draws_triangle_and_orders_inputs_top_to_bottom() {
+        // Inputs are placed in the order listed, top first. Passing + then -
+        // gives KiCAD's convention (+ on top, - on bottom).
+        let c = make_symbol(
+            "opamp",
+            json!([
+                {"number":"3","name":"+","type":"input"},
+                {"number":"2","name":"-","type":"input"},
+                {"number":"1","name":"OUT","type":"output"}
+            ]),
+        )
+        .await;
+        assert!(c.contains("(polyline"), "op-amp draws a triangle:\n{c}");
+        assert!(
+            !c.contains("(rectangle"),
+            "op-amp must not draw a rectangle"
+        );
+        // Caller x/y are ignored; pins land on the fixed anchors.
+        let top = c.find("(at -7.62 2.54 0)").expect("top input anchor");
+        let bot = c.find("(at -7.62 -2.54 0)").expect("bottom input anchor");
+        assert!(top < bot, "first-listed input (+) is emitted on top");
+        // Non-inverting output at the apex.
+        assert!(
+            c.contains("(pin output line (at 7.62 0 180)"),
+            "op-amp output is a plain line at the apex:\n{c}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glyph_opamp_with_power_splits_into_a_rect_power_unit() {
+        // A single op-amp carrying its own supply: the triangle has no room for
+        // power-pin names, so V+/V- go to a dedicated rectangular power unit
+        // (unit 2), like KiCAD's multi-unit op-amps.
+        let c = make_symbol(
+            "opamp",
+            json!([
+                {"number":"3","name":"+","type":"input"},
+                {"number":"2","name":"-","type":"input"},
+                {"number":"6","name":"OUT","type":"output"},
+                {"number":"7","name":"V+","type":"power_in"},
+                {"number":"4","name":"V-","type":"power_in"}
+            ]),
+        )
+        .await;
+        // Two units: G_1_1 (triangle) + G_2_1 (rect power). No single _0_1.
+        assert!(
+            !c.contains("G_0_1"),
+            "a split symbol must not use _0_1:\n{c}"
+        );
+        assert!(c.contains("(symbol \"G_1_1\""), "signal triangle is unit 1");
+        assert!(
+            c.contains("(symbol \"G_2_1\""),
+            "power is a separate unit 2"
+        );
+        // Exactly one triangle (the op-amp) and one rectangle (the power unit).
+        assert_eq!(c.matches("(polyline").count(), 1, "one triangle body:\n{c}");
+        assert_eq!(
+            c.matches("(rectangle").count(),
+            1,
+            "one rectangular power unit"
+        );
+        // The supply pins appear once, and on the power unit at full-size text.
+        assert_eq!(c.matches("\"V+\"").count(), 1, "V+ appears exactly once");
+        assert_eq!(c.matches("\"V-\"").count(), 1, "V- appears exactly once");
+        assert!(
+            c.contains("(name \"V+\" (effects (font (size 1.27 1.27))))"),
+            "power-unit names use the full 1.27 font (it's a rectangle):\n{c}"
+        );
+        // The triangle keeps its signal pins at the compact glyph font.
+        assert!(c.contains("(name \"+\" (effects (font (size 0.762 0.762))))"));
+        assert!(c.contains("(pin output line (at 7.62 0 180)"));
+    }
+
+    #[tokio::test]
+    async fn glyph_and_nand_share_body_and_differ_by_output_bubble() {
+        let pins = json!([
+            {"number":"1","name":"A","type":"input"},
+            {"number":"2","name":"B","type":"input"},
+            {"number":"3","name":"Y","type":"output"}
+        ]);
+        let and = make_symbol("and", pins.clone()).await;
+        let nand = make_symbol("nand", pins).await;
+        // Same AND body (an arc), no rectangle.
+        for (g, c) in [("and", &and), ("nand", &nand)] {
+            assert!(c.contains("(arc"), "{g} has the AND arc:\n{c}");
+            assert!(!c.contains("(rectangle"), "{g} must not draw a rectangle");
+        }
+        // The only difference is the output pin: AND plain, NAND inverted bubble.
+        assert!(
+            and.contains("(pin output line (at 7.62 0 180)"),
+            "AND output line"
+        );
+        assert!(
+            nand.contains("(pin output inverted (at 7.62 0 180)"),
+            "NAND output carries the bubble via an inverted pin:\n{nand}"
+        );
+        assert!(!nand.contains("(pin output line (at 7.62 0 180)"));
+    }
+
+    #[tokio::test]
+    async fn glyph_buffer_and_inverter_share_triangle() {
+        let pins = json!([
+            {"number":"1","name":"A","type":"input"},
+            {"number":"2","name":"Y","type":"output"}
+        ]);
+        let buffer = make_symbol("buffer", pins.clone()).await;
+        let inverter = make_symbol("inverter", pins).await;
+        // Single input centered on the left, plain vs inverted output.
+        assert!(
+            buffer.contains("(pin input line (at -7.62 0 0)"),
+            "buffer input centered"
+        );
+        assert!(
+            buffer.contains("(pin output line (at 7.62 0 180)"),
+            "buffer output line"
+        );
+        assert!(
+            inverter.contains("(pin output inverted (at 7.62 0 180)"),
+            "inverter output inverted:\n{inverter}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glyph_schmitt_has_hysteresis_mark_and_optional_bubble() {
+        let pins = json!([
+            {"number":"1","name":"A","type":"input"},
+            {"number":"2","name":"Y","type":"output"}
+        ]);
+        let schmitt = make_symbol("schmitt", pins.clone()).await;
+        let schmitt_inv = make_symbol("schmitt_inverter", pins).await;
+        // The hysteresis mark (from KiCAD's 74HC14) is present on both.
+        for (g, c) in [("schmitt", &schmitt), ("schmitt_inverter", &schmitt_inv)] {
+            assert!(
+                c.contains("(xy -1.905 -1.27)") && c.contains("(xy -1.905 1.27)"),
+                "{g} draws the hysteresis mark:\n{c}"
+            );
+        }
+        // Non-inverting Schmitt keeps a plain output; the inverter adds the bubble.
+        assert!(schmitt.contains("(pin output line (at 7.62 0 180)"));
+        assert!(schmitt_inv.contains("(pin output inverted (at 7.62 0 180)"));
+    }
+
+    #[tokio::test]
+    async fn glyph_or_and_xor_differ_by_the_extra_back_arc() {
+        let pins = json!([
+            {"number":"1","name":"A","type":"input"},
+            {"number":"2","name":"B","type":"input"},
+            {"number":"3","name":"Y","type":"output"}
+        ]);
+        let or = make_symbol("or", pins.clone()).await;
+        let xor = make_symbol("xor", pins.clone()).await;
+        let nor = make_symbol("nor", pins.clone()).await;
+        let xnor = make_symbol("xnor", pins).await;
+        // Both have the OR concave back arc; XOR/XNOR add a second offset arc.
+        for (g, c) in [("or", &or), ("xor", &xor)] {
+            assert!(
+                c.contains("(start -3.81 3.81)"),
+                "{g} has the OR back arc:\n{c}"
+            );
+        }
+        assert!(
+            !or.contains("(start -4.4196 3.81)"),
+            "OR has no second back arc"
+        );
+        assert!(
+            xor.contains("(start -4.4196 3.81)"),
+            "XOR adds the offset back arc:\n{xor}"
+        );
+        // Inverting variants carry the output bubble.
+        assert!(nor.contains("(pin output inverted (at 7.62 0 180)"));
+        assert!(xnor.contains("(pin output inverted (at 7.62 0 180)"));
+        assert!(or.contains("(pin output line (at 7.62 0 180)"));
+    }
+
+    #[tokio::test]
+    async fn pin_style_applies_on_glyph_and_rectangle() {
+        // A clock input on a buffer glyph emits the clock pin style.
+        let c = make_symbol(
+            "buffer",
+            json!([
+                {"number":"1","name":"CLK","type":"input","style":"clock"},
+                {"number":"2","name":"Y","type":"output"}
+            ]),
+        )
+        .await;
+        assert!(
+            c.contains("(pin input clock (at -7.62 0 0)"),
+            "clock style on a glyph input:\n{c}"
+        );
+
+        // On the rectangle path, a per-pin style is honored too.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("r.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "R",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"~RST","type":"input","style":"inverted","x":-7.62,"y":0.0,"angle":0,"length":2.54}
+            ]
+        });
+        handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        let rc = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            rc.contains("(pin input inverted (at -7.62 0 0)"),
+            "inverted style on a rectangle pin:\n{rc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glyph_falls_back_to_rectangle_on_incompatible_pins() {
+        // A NAND glyph given 3 inputs can't be drawn as a 2-input gate; it falls
+        // back to a rectangle and reports a warning instead of misrepresenting.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("fb.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "FB",
+            "reference_prefix": "U",
+            "glyph": "nand",
+            "pins": [
+                {"number":"1","name":"A","type":"input","x":-7.62,"y":2.54,"angle":0,"length":2.54},
+                {"number":"2","name":"B","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54},
+                {"number":"3","name":"C","type":"input","x":-7.62,"y":-2.54,"angle":0,"length":2.54},
+                {"number":"4","name":"Y","type":"output","x":7.62,"y":0.0,"angle":180,"length":2.54}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        let c = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            c.contains("(rectangle"),
+            "fell back to a rectangle body:\n{c}"
+        );
+        assert!(!c.contains("(arc"), "must not draw the AND arc on fallback");
+        let text = result_text(&res);
+        assert!(
+            text.contains("warnings") && text.contains("rectangle instead"),
+            "fallback reports a warning:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glyph_default_applies_to_units_and_quad_nand_layout() {
+        // Symbol-level glyph "nand" applies to every signal unit that doesn't
+        // override it; power pins stay a rectangular power unit.
+        let unit = json!({ "pins": [
+            {"number":"1","name":"A","type":"input"},
+            {"number":"2","name":"B","type":"input"},
+            {"number":"3","name":"Y","type":"output"}
+        ]});
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("quad.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "QUAD_NAND",
+            "reference_prefix": "U",
+            "glyph": "nand",
+            "units": [unit.clone(), unit.clone(), unit.clone(), unit.clone()],
+            "power_pins": [
+                {"number":"14","name":"VCC","type":"power_in","x":0.0,"y":7.62,"angle":270,"length":2.54},
+                {"number":"7","name":"GND","type":"power_in","x":0.0,"y":-7.62,"angle":90,"length":2.54}
+            ]
+        });
+        let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!res.is_error);
+        let c = std::fs::read_to_string(&lib).unwrap();
+        // Four NAND gate units (each an AND arc + inverted output) ...
+        assert_eq!(
+            c.matches("(arc").count(),
+            4,
+            "one AND body arc per gate:\n{c}"
+        );
+        assert_eq!(
+            c.matches("(pin output inverted").count(),
+            4,
+            "four inverted NAND outputs"
+        );
+        // ... plus a fifth, rectangular power unit.
+        assert!(
+            c.contains("(symbol \"QUAD_NAND_5_1\""),
+            "power unit is unit 5"
+        );
+        assert!(!c.contains("QUAD_NAND_6_1"), "exactly five units");
+        assert_eq!(
+            c.matches("(rectangle").count(),
+            1,
+            "only the power unit is a rectangle"
+        );
+        assert!(konnect_sexp::parser::parse_sexp(&c).is_ok());
+    }
+
+    #[tokio::test]
+    async fn glyph_pin_names_use_the_smaller_font_numbers_stay_default() {
+        // Glyph bodies are compact, so pin names use the 0.762 mm text to keep
+        // them from overlapping; numbers (outside the body) stay at 1.27 mm.
+        let c = make_symbol(
+            "nand",
+            json!([
+                {"number":"1","name":"A","type":"input"},
+                {"number":"2","name":"B","type":"input"},
+                {"number":"3","name":"Y","type":"output"}
+            ]),
+        )
+        .await;
+        assert!(
+            c.contains("(name \"A\" (effects (font (size 0.762 0.762))))"),
+            "glyph pin names use the compact 0.762 font:\n{c}"
+        );
+        assert!(
+            c.contains("(number \"1\" (effects (font (size 1.27 1.27))))"),
+            "glyph pin numbers keep the default 1.27 font"
+        );
+
+        // The rectangle path is unchanged (names stay at 1.27).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("r.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(), "name": "R", "reference_prefix": "U",
+            "pins": [{"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54}]
+        });
+        handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        let rc = std::fs::read_to_string(&lib).unwrap();
+        assert!(
+            rc.contains("(name \"IN\" (effects (font (size 1.27 1.27))))"),
+            "rectangle pin names keep the default 1.27 font:\n{rc}"
         );
     }
 }
