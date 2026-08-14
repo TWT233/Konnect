@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **187 registered tools** + **6 always-visible meta-tools** = **193 total**
+- **188 registered tools** + **6 always-visible meta-tools** = **194 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -55,13 +55,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Schematic
 
-### `sch_components` · 17 tools
+### `sch_components` · 19 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
 | Tool | Description |
 |------|-------------|
 | `create_schematic` | Create a new blank `.kicad_sch` schematic file. |
+| `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
 | `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
