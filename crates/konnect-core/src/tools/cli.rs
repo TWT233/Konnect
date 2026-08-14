@@ -308,18 +308,68 @@ pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) ->
     Ok(())
 }
 
-/// KiCAD 10: `sch export bom --output <path> <input>`
-/// Note: v10 BOM does NOT use --format. It uses --fields, --labels, --field-delimiter.
-/// Default output is CSV-like with Reference,Value,Footprint,Qty,DNP fields.
-pub async fn export_bom(cli: &str, schematic: &Path, output: &Path, _format: &str) -> Result<()> {
-    let args = [
-        "sch",
-        "export",
-        "bom",
-        "--output",
-        output.to_str().unwrap(),
-        schematic.to_str().unwrap(),
-    ];
+/// Column and filtering options for `sch export bom`.
+///
+/// All-`None`/`false` reproduces kicad-cli's own defaults: the fixed
+/// `Reference,Value,Footprint,QUANTITY,DNP` column set, ungrouped, DNP rows
+/// included.
+#[derive(Debug, Default, Clone)]
+pub struct BomOptions<'a> {
+    /// Ordered field list, e.g. `Reference,Value,Footprint,MPN,${QUANTITY}`.
+    /// Any schematic field name works, which is how MPN/LCSC columns reach the
+    /// fab; generated fields (`QUANTITY`, `DNP`, `ITEM_NUMBER`, …) may be
+    /// written with or without `${}`.
+    pub fields: Option<&'a str>,
+    /// Ordered column headings. When omitted KiCad labels each column with its
+    /// field name.
+    pub labels: Option<&'a str>,
+    /// Fields whose matching references collapse into one row, e.g.
+    /// `Value,Footprint`.
+    pub group_by: Option<&'a str>,
+    /// Drop Do-Not-Populate symbols.
+    pub exclude_dnp: bool,
+}
+
+/// Argument vector for the BOM export, factored out so the flags can be
+/// asserted without a kicad-cli on the machine.
+fn bom_args<'a>(output: &'a str, schematic: &'a str, options: &BomOptions<'a>) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "bom", "--output", output];
+    if let Some(fields) = options.fields {
+        args.push("--fields");
+        args.push(fields);
+    }
+    if let Some(labels) = options.labels {
+        args.push("--labels");
+        args.push(labels);
+    }
+    if let Some(group_by) = options.group_by {
+        args.push("--group-by");
+        args.push(group_by);
+    }
+    if options.exclude_dnp {
+        args.push("--exclude-dnp");
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export bom --output <path> [--fields …] [--labels …]
+/// [--group-by …] [--exclude-dnp] <input>`
+///
+/// Note: v10 BOM does NOT use `--format`. Without `--fields` kicad-cli emits
+/// its fixed `Reference,Value,Footprint,QUANTITY,DNP` set, so every custom
+/// schematic field (MPN, LCSC, supplier part numbers) is dropped.
+pub async fn export_bom(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &BomOptions<'_>,
+) -> Result<()> {
+    let args = bom_args(
+        output.to_str().unwrap_or(""),
+        schematic.to_str().unwrap_or(""),
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -678,6 +728,71 @@ mod erc_parse_tests {
         assert!(
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod bom_export_tests {
+    use super::*;
+
+    /// Custom schematic fields are the whole point of a fab BOM: without
+    /// `--fields` kicad-cli emits only Reference,Value,Footprint,QUANTITY,DNP
+    /// and an MPN column never reaches the manufacturer.
+    #[test]
+    fn requested_fields_and_labels_reach_kicad_cli() {
+        let options = BomOptions {
+            fields: Some("Reference,Value,Footprint,MPN,${QUANTITY}"),
+            labels: Some("Refs,Value,Footprint,MPN,Qty"),
+            group_by: Some("Value,Footprint"),
+            exclude_dnp: false,
+        };
+        let args = bom_args("/out/bom.csv", "/tmp/board.kicad_sch", &options);
+        let flag = |name: &str| {
+            args.iter()
+                .position(|a| *a == name)
+                .map(|i| args[i + 1])
+                .unwrap_or_else(|| panic!("{name} missing from {args:?}"))
+        };
+        assert_eq!(
+            flag("--fields"),
+            "Reference,Value,Footprint,MPN,${QUANTITY}"
+        );
+        assert_eq!(flag("--labels"), "Refs,Value,Footprint,MPN,Qty");
+        assert_eq!(flag("--group-by"), "Value,Footprint");
+        assert_eq!(flag("--output"), "/out/bom.csv");
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_sch"));
+    }
+
+    /// `exclude_dnp` has been in the export_bom schema (default true) since the
+    /// tool shipped, but the handler never read it and the flag was never sent.
+    #[test]
+    fn exclude_dnp_is_passed_only_when_asked_for() {
+        let on = BomOptions {
+            exclude_dnp: true,
+            ..Default::default()
+        };
+        assert!(bom_args("/out/bom.csv", "/s.kicad_sch", &on).contains(&"--exclude-dnp"));
+
+        let off = BomOptions::default();
+        assert!(!bom_args("/out/bom.csv", "/s.kicad_sch", &off).contains(&"--exclude-dnp"));
+    }
+
+    /// Defaults must reproduce the previous argv exactly, so a caller that
+    /// wants KiCAD's own BOM keeps getting it.
+    #[test]
+    fn default_options_are_the_bare_kicad_cli_invocation() {
+        let args = bom_args("/out/bom.csv", "/s.kicad_sch", &BomOptions::default());
+        assert_eq!(
+            args,
+            [
+                "sch",
+                "export",
+                "bom",
+                "--output",
+                "/out/bom.csv",
+                "/s.kicad_sch"
+            ]
         );
     }
 }

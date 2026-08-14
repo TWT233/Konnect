@@ -148,8 +148,15 @@ pub struct CallToolResult {
     pub is_error: bool,
 }
 
+/// MCP content block. `rename_all` covers the variant tags; the fields need
+/// `rename_all_fields` of their own, or `mime_type` ships instead of the
+/// spec's `mimeType` and clients reject the whole result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ToolContent {
     Text { text: String },
     Image { data: String, mime_type: String },
@@ -190,3 +197,44 @@ impl CallToolResult {
 
 /// Sent by server when the tool list changes (after load_toolset / unload_toolset).
 pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact keys MCP clients validate against — a rename here breaks them.
+    #[test]
+    fn image_content_serializes_with_spec_keys() {
+        let v = serde_json::to_value(CallToolResult::image("QUJD", "image/png")).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "content": [{ "type": "image", "data": "QUJD", "mimeType": "image/png" }],
+                "isError": false,
+            })
+        );
+    }
+
+    #[test]
+    fn text_content_serializes_with_spec_keys() {
+        let v = serde_json::to_value(CallToolResult::error("boom")).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": "boom" }],
+                "isError": true,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_description_serializes_input_schema_as_camel_case() {
+        let v = serde_json::to_value(McpToolDescription {
+            name: "get_board_2d_view".into(),
+            description: "Render the board.".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        })
+        .unwrap();
+        assert!(v.get("inputSchema").is_some(), "got {v}");
+    }
+}
