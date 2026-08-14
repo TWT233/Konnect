@@ -328,9 +328,13 @@ async fn handle_export_gerber(
     cli::export_gerber(cli, &board, &output_dir).await?;
 
     if drill {
-        // kicad-cli also has a dedicated drill export
-        let drill_path = output_dir.join("drill.drl");
-        let _ = cli::export_drill(cli, &board, &drill_path).await; // best-effort
+        // kicad-cli also has a dedicated drill export. Its --output is a
+        // directory: the gerber directory itself, so the PTH and NPTH files
+        // land beside the gerbers the way a fab expects them. The previous
+        // `output_dir.join("drill.drl")` made KiCad create a *directory*
+        // called drill.drl and bury the drill files inside it, where the
+        // listing below never saw them.
+        let _ = cli::export_drill(cli, &board, &output_dir).await; // best-effort
     }
 
     // List produced files

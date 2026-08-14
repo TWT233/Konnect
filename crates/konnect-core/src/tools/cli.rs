@@ -424,18 +424,66 @@ pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<(
     Ok(())
 }
 
-/// KiCAD 10: `pcb export drill --output <dir> <input>`
-pub async fn export_drill(cli: &str, pcb: &Path, output: &Path) -> Result<()> {
-    let args = [
+/// `--output` for a drill export names a *directory*, and some kicad-cli
+/// versions decide directory-vs-file by the trailing separator alone. An empty
+/// string is left alone so we never hand kicad-cli a bare separator, which
+/// would mean the filesystem root. Credit to @anyn99 (#161) for catching this.
+fn drill_output_dir_arg(output_dir: &str) -> String {
+    let mut arg = output_dir.to_string();
+    if !arg.is_empty() && !arg.ends_with(['/', '\\']) {
+        arg.push(std::path::MAIN_SEPARATOR);
+    }
+    arg
+}
+
+/// Argument vector for the drill export, factored out so the flags can be
+/// asserted without a kicad-cli on the machine.
+fn drill_args<'a>(output_dir: &'a str, pcb: &'a str) -> Vec<&'a str> {
+    vec![
         "pcb",
         "export",
         "drill",
+        // Plated and non-plated holes as separate files. Without this flag
+        // KiCad emits ONE `MixedPlating` file in which the NPTH tools are
+        // distinguished only by an `#@! TA.AperFunction ... NonPlated`
+        // comment — a comment most Excellon readers drop, so the fab plates
+        // holes that must stay unplated (connector flanges, mounting holes).
+        "--excellon-separate-th",
         "--output",
-        output.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+        output_dir,
+        pcb,
+    ]
+}
+
+/// The `.drl` files in `dir`, sorted.
+async fn drill_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("drl") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// KiCAD 10: `pcb export drill --output <dir> <input>`
+///
+/// `--output` is a **directory**, not a file: kicad-cli names the outputs after
+/// the board (`<board>-PTH.drl` and `<board>-NPTH.drl`). Handing it a filename
+/// makes KiCad create a *directory* of that name and hide the real drill files
+/// one level down.
+///
+/// Returns the `.drl` files produced, sorted.
+pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    tokio::fs::create_dir_all(output_dir).await?;
+    let dir_arg = drill_output_dir_arg(output_dir.to_str().unwrap_or(""));
+    let args = drill_args(&dir_arg, pcb.to_str().unwrap_or(""));
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    Ok(())
+    Ok(drill_files_in(output_dir).await)
 }
 
 /// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
@@ -729,6 +777,72 @@ mod erc_parse_tests {
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod drill_export_tests {
+    use super::*;
+
+    /// Non-plated holes must come out as their own Excellon file. The merged
+    /// default marks them with nothing but an `#@! TA.AperFunction` comment,
+    /// which most fab-side Excellon readers discard — so a connector flange or
+    /// mounting hole arrives plated.
+    #[test]
+    fn drill_export_separates_plated_from_non_plated_holes() {
+        let args = drill_args("/out/gerbers", "/tmp/board.kicad_pcb");
+        assert!(
+            args.contains(&"--excellon-separate-th"),
+            "NPTH holes need their own file: {args:?}"
+        );
+    }
+
+    /// `--output` is a directory. Passing a filename makes kicad-cli create a
+    /// directory with that name and write the real drill files inside it.
+    #[test]
+    fn drill_export_output_is_the_directory_it_was_given() {
+        let args = drill_args("/out/gerbers", "/tmp/board.kicad_pcb");
+        let output = args
+            .iter()
+            .position(|a| *a == "--output")
+            .map(|i| args[i + 1])
+            .expect("--output");
+        assert_eq!(output, "/out/gerbers");
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[tokio::test]
+    async fn drill_files_are_collected_sorted_and_filtered_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["board-PTH.drl", "board-NPTH.drl", "board-drl_map.pdf"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let files = drill_files_in(dir.path()).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["board-NPTH.drl", "board-PTH.drl"]);
+    }
+
+    /// Some kicad-cli versions read directory-vs-file from the trailing
+    /// separator alone, so the directory argument carries one.
+    #[test]
+    fn drill_output_directory_argument_ends_in_a_separator() {
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            drill_output_dir_arg("/out/gerbers"),
+            format!("/out/gerbers{sep}")
+        );
+    }
+
+    /// Already separator-terminated input must not grow a second one, and an
+    /// empty path must not become a bare separator — that would be the root.
+    #[test]
+    fn drill_output_directory_argument_is_idempotent_and_skips_empty() {
+        assert_eq!(drill_output_dir_arg("/out/gerbers/"), "/out/gerbers/");
+        assert_eq!(drill_output_dir_arg(r"C:\out\gerbers\"), r"C:\out\gerbers\");
+        assert_eq!(drill_output_dir_arg(""), "");
     }
 }
 

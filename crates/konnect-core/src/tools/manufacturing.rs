@@ -152,15 +152,26 @@ async fn handle_export_manufacturing_package(
         }
     }
 
-    // 2. Export drill files
-    let drill_path = output_dir.join("drill.drl");
-    match cli::export_drill(cli_path, &board, &drill_path).await {
-        Ok(()) => {
-            info!("[BETA] Drill export succeeded");
-            files_generated.push(json!({
-                "type": "drill",
-                "path": drill_path.to_str().unwrap_or("")
-            }));
+    // 2. Export drill files, into the gerber directory so a fab receives the
+    //    plated and non-plated Excellon files alongside the layers they belong
+    //    to. `--output` is a directory; the old `output_dir.join("drill.drl")`
+    //    made KiCad create a directory named drill.drl, so the package
+    //    advertised a "drill" file that was really an empty-looking folder and
+    //    the real Excellon output never appeared in the file list at all.
+    match cli::export_drill(cli_path, &board, &gerber_dir).await {
+        Ok(drill_files) => {
+            if drill_files.is_empty() {
+                warn!("[BETA] Drill export produced no .drl files");
+                warnings.push("Drill export produced no .drl files.".to_string());
+            } else {
+                info!(files = drill_files.len(), "[BETA] Drill export succeeded");
+                for file in &drill_files {
+                    files_generated.push(json!({
+                        "type": "drill",
+                        "path": file.to_str().unwrap_or("")
+                    }));
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "[BETA] Drill export failed (may be included in gerbers)");
