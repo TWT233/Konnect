@@ -13,8 +13,9 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
-        parse_at, pin_endpoint, pin_outward_direction, read_schematic,
+        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
+        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
+        read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -1272,8 +1273,9 @@ async fn handle_add_power_symbol(
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
     // Build the Symbol struct
@@ -1701,10 +1703,11 @@ pub(crate) fn resolve_placed_pin(
 
     let mut searched = Vec::new();
     for inst in &placed {
-        let Some(lib_sym) = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        else {
+        // find_lib_symbol, not a lib_id match: an instance carrying a
+        // (lib_name …) is a sheet-local derived symbol whose pins can sit
+        // elsewhere than the base definition's, or whose base was never
+        // embedded at all (#143).
+        let Some(lib_sym) = find_lib_symbol(lib_syms, inst) else {
             continue;
         };
         searched.push(inst.unit);

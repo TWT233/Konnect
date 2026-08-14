@@ -81,7 +81,10 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "add_net",
-            "Add a new net entry to the PCB file (S-expression insert, no KiCAD IPC required).",
+            "Add a new net entry to the top-level net table of a pre-KiCad-10 board \
+             (S-expression insert, no KiCAD IPC required). Fails on a KiCad 10 board, which \
+             has no net table — there, name the net on copper (route_trace, add_via, \
+             add_copper_pour) instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -180,7 +183,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "query_traces",
-            "List trace segments on the board, optionally filtered by net and/or layer.",
+            "List trace segments on the board, optionally filtered by net and/or layer. \
+             Each result includes the track's UUID, which delete_trace takes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -288,8 +292,32 @@ async fn handle_add_net(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    // Count existing nets to determine next net ID
-    let net_id = content.matches("(net ").count() as i32;
+    let tree = konnect_sexp::parse_sexp(&content)?;
+
+    if board_is_kicad_10(&tree) {
+        return Ok(CallToolResult::error(format!(
+            "Cannot add net '{net_name}' to this board: it is in the KiCad 10 format, which has \
+             no top-level net table. A net exists only by being named on an item — \
+             (net \"{net_name}\") on a pad, segment, via or zone — so there is nothing for a \
+             file-level insert to add, and appending a net node would report success while \
+             KiCad discarded it on load. Create the net by naming it on copper instead: \
+             route_trace / add_via / add_copper_pour take a net_name, as does assigning a pad \
+             in KiCad. get_nets_list reads the live net list over IPC."
+        )));
+    }
+
+    // Pre-KiCad-10: the top-level table is real, so an insert is meaningful.
+    // The next id is one past the highest in use — not the number of "(net "
+    // occurrences in the file, which counted every reference on every pad,
+    // segment and zone and so collided with existing ids almost immediately.
+    let net_id = tree
+        .find_all("net")
+        .iter()
+        .filter_map(|n| konnect_sexp::net::net_id(n))
+        .filter_map(|id| id.parse::<i32>().ok())
+        .max()
+        .map(|max| max + 1)
+        .unwrap_or(1);
     let net_sexp = format!("\n  (net {net_id} \"{net_name}\")");
     // Insert before the last closing paren
     let close_pos = content.rfind(')').unwrap_or(content.len());
@@ -299,6 +327,37 @@ async fn handle_add_net(
     Ok(CallToolResult::json(
         &json!({ "net_id": net_id, "net_name": net_name }),
     ))
+}
+
+/// Whether a board is in the KiCad 10 format, where nets are implicit.
+///
+/// Structure first: a single name-only `(net "GND")` node anywhere is
+/// conclusive, because no earlier format ever wrote that shape. Only when the
+/// board names no net at all — a blank board, where the structure cannot say —
+/// does this fall back to the format version. 20260101 is below KiCad 10's
+/// first release format (20260206) and above every 9.x one including the 9.99
+/// development builds, which still wrote `(net N "name")`.
+fn board_is_kicad_10(tree: &konnect_sexp::SexpNode) -> bool {
+    fn has_name_only_net(node: &konnect_sexp::SexpNode) -> bool {
+        let Some(children) = node.children() else {
+            return false;
+        };
+        if node.head() == Some("net")
+            && matches!(children.get(1), Some(konnect_sexp::SexpNode::Str(_)))
+        {
+            return true;
+        }
+        children.iter().any(has_name_only_net)
+    }
+
+    if has_name_only_net(tree) {
+        return true;
+    }
+    tree.find("version")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|v| v >= 20260101)
 }
 
 async fn handle_route_trace(
@@ -543,6 +602,7 @@ async fn handle_query_traces(
         .iter()
         .map(|t| {
             json!({
+                "uuid": t.uuid,
                 "net": t.net_name, "layer": t.layer, "width": t.width,
                 "x1": t.start.x, "y1": t.start.y,
                 "x2": t.end.x,   "y2": t.end.y
@@ -797,4 +857,109 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+#[cfg(test)]
+mod add_net_format_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Runs add_net against a throwaway copy of `board` and returns the
+    /// handler result together with the file as it stands afterwards, so a
+    /// test can assert both what the caller was told and what was written.
+    async fn add_net_to(board: &str) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result = handle_add_net(
+            &json!({ "board": path.to_str().unwrap(), "net_name": "NEWNET" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should return");
+        let after = std::fs::read_to_string(&path).unwrap();
+        (result, after)
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// A KiCad 10 board has no net table at all, so there is nothing an insert
+    /// can add. Writing one anyway is the "reports success, does nothing"
+    /// pattern — the board would be unchanged in KiCad's eyes while the caller
+    /// was told the net existed.
+    #[tokio::test]
+    async fn a_kicad_10_board_is_refused_rather_than_silently_edited() {
+        let board = "(kicad_pcb\n\t(version 20260206)\n\
+            \t(segment (start 0 0) (end 1 0) (net \"GND\"))\n)\n";
+        let (result, after) = add_net_to(board).await;
+        assert!(result.is_error, "must fail closed: {}", text_of(&result));
+        let msg = text_of(&result);
+        assert!(msg.contains("KiCad 10"), "{msg}");
+        assert!(msg.contains("route_trace"), "must point somewhere: {msg}");
+        assert_eq!(after, board, "the board must not be touched");
+    }
+
+    /// Even with no net named anywhere, the format version still identifies a
+    /// KiCad 10 board, and refusing is the safe direction when structure alone
+    /// cannot say.
+    #[tokio::test]
+    async fn a_blank_kicad_10_board_is_refused_on_its_version() {
+        let board = "(kicad_pcb\n\t(version 20260306)\n\t(generator \"pcbnew\")\n)\n";
+        let (result, after) = add_net_to(board).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert_eq!(after, board);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_board_still_gets_its_net() {
+        let board = "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n)\n";
+        let (result, after) = add_net_to(board).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(after.contains("(net 2 \"NEWNET\")"), "{after}");
+    }
+
+    /// The old id was `content.matches("(net ").count()`, which counted every
+    /// reference on every pad, segment and zone — so on any real board the
+    /// "next" id collided with ids already in use.
+    #[tokio::test]
+    async fn the_next_id_is_one_past_the_highest_not_a_count_of_occurrences() {
+        let board = "(kicad_pcb\n  (version 20241229)\n  (net 0 \"\")\n  (net 1 \"GND\")\n  \
+            (net 7 \"VCC\")\n  (segment (start 0 0) (end 1 0) (net 7))\n  \
+            (segment (start 1 0) (end 2 0) (net 7))\n)\n";
+        let (result, after) = add_net_to(board).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(after.contains("(net 8 \"NEWNET\")"), "{after}");
+    }
+
+    /// A 9.99 development build wrote the legacy shape with a 2025 version
+    /// number; treating it as KiCad 10 on the version alone would refuse a
+    /// board that an insert works perfectly well on.
+    #[tokio::test]
+    async fn a_9_99_development_format_is_treated_as_legacy() {
+        let board = "(kicad_pcb\n  (version 20250610)\n  (net 0 \"\")\n)\n";
+        let (result, after) = add_net_to(board).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(after.contains("(net 1 \"NEWNET\")"), "{after}");
+    }
 }
