@@ -41,6 +41,18 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "Production quantity (for BOM pricing context)",
                         "default": 5
+                    },
+                    "bom_fields": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated BOM columns, e.g. 'Reference,Value,Footprint,MPN,${QUANTITY}'. Any schematic field name works — this is how MPN/LCSC columns reach the fab. Omit for KiCAD's default Reference,Value,Footprint,QUANTITY,DNP."
+                    },
+                    "bom_labels": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated BOM column headings matching 'bom_fields'. Omit to label each column with its field name."
+                    },
+                    "bom_group_by": {
+                        "type": "string",
+                        "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
                     }
                 },
                 "required": ["board", "output_dir"]
@@ -182,13 +194,23 @@ async fn handle_export_manufacturing_package(
         // BOM
         if let Some(ref sch) = schematic {
             let bom_path = output_dir.join("bom.csv");
-            match cli::export_bom(cli_path, sch, &bom_path, "csv").await {
+            // Without bom_fields the package gets kicad-cli's fixed
+            // Reference,Value,Footprint,QUANTITY,DNP set — no MPN, no supplier
+            // part number, nothing a fab can source a part from.
+            let bom_options = cli::BomOptions {
+                fields: args["bom_fields"].as_str(),
+                labels: args["bom_labels"].as_str(),
+                group_by: args["bom_group_by"].as_str(),
+                ..Default::default()
+            };
+            match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
                 Ok(()) => {
                     info!("[BETA] BOM export succeeded");
                     files_generated.push(json!({
                         "type": "bom",
                         "path": bom_path.to_str().unwrap_or(""),
-                        "format": "csv"
+                        "format": "csv",
+                        "fields": bom_options.fields
                     }));
                 }
                 Err(e) => {
