@@ -15,7 +15,7 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
+        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
         format_net_label, format_wire, pin_endpoint, read_schematic,
     },
     writer::{
@@ -375,9 +375,7 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
 
         let pin_ep = lib_sym.and_then(|sym| {
             extract_lib_pins(sym)
@@ -1050,9 +1048,7 @@ async fn handle_validate_wire_connections(
     // Collect all valid pin endpoints
     let mut pin_points: Vec<(f64, f64)> = Vec::new();
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {
@@ -1198,9 +1194,7 @@ async fn handle_validate_component_connections(
         if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
             continue;
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins(sym) {
