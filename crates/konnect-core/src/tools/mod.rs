@@ -173,6 +173,9 @@ pub struct ServerConfig {
     /// Auto-load a tool's toolset on call instead of returning
     /// `toolset_not_loaded`. Off by default (see `konnect::Config::auto_load_toolsets`).
     pub auto_load_toolsets: bool,
+    /// Pre-load every toolset at startup so the first `tools/list` is
+    /// complete. Off by default (see `konnect::Config::eager_toolsets`).
+    pub eager_toolsets: bool,
 }
 
 /// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at
