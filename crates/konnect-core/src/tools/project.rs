@@ -570,6 +570,66 @@ mod tests {
 /// Project files that carry the project name, in the order they are renamed.
 const PROJECT_EXTS: [&str; 4] = ["kicad_pro", "kicad_sch", "kicad_pcb", "kicad_prl"];
 
+/// Rewrite the project name only where it is structurally meaningful.
+///
+/// A blind `text.replace(old, new)` corrupts unrelated content, and the blast
+/// radius scales with how ordinary the name is: a project called `led` would
+/// rewrite the footprint `LED_THT:LED_D3.0mm`, a net named `LED_LIGHT` and
+/// every value containing the substring, silently, across the whole board and
+/// schematic.
+///
+/// Every real occurrence is quoted, and the two file families need different
+/// care:
+///
+/// - `.kicad_sch` / `.kicad_pcb` hold user content, so only `(project "NAME"`
+///   is touched — the key symbol instances hang their annotation off. Getting
+///   this wrong is what makes KiCad treat the design as unannotated.
+/// - `.kicad_pro` / `.kicad_prl` are settings/metadata with no netlist in
+///   them, so quoted whole-string matches and `NAME.kicad_*` filenames are
+///   safe there.
+fn rewrite_project_references(text: &str, old: &str, new: &str, sexp: bool) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut hits = 0usize;
+
+    let swap = |out: &mut String, hits: &mut usize, from: &str, to: &str| {
+        if from != to {
+            let n = out.matches(from).count();
+            if n > 0 {
+                *hits += n;
+                *out = out.replace(from, to);
+            }
+        }
+    };
+
+    if sexp {
+        // The annotation key, and nothing else.
+        swap(
+            &mut out,
+            &mut hits,
+            &format!("(project \"{old}\""),
+            &format!("(project \"{new}\""),
+        );
+    } else {
+        for ext in PROJECT_EXTS {
+            swap(
+                &mut out,
+                &mut hits,
+                &format!("\"{old}.{ext}\""),
+                &format!("\"{new}.{ext}\""),
+            );
+        }
+        // Bare quoted name: the `name` field and the root sheet entry.
+        swap(
+            &mut out,
+            &mut hits,
+            &format!("\"{old}\""),
+            &format!("\"{new}\""),
+        );
+    }
+
+    (out, hits)
+}
+
 async fn handle_rename_project(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -647,14 +707,29 @@ async fn handle_rename_project(
     // and .kicad_prl embed their own filenames.
     let mut rewritten = Vec::new();
     if !dry_run {
+        // Rename the set, undoing what landed if one fails: a half-renamed
+        // project is one KiCad cannot open at all.
+        let mut done: Vec<(&std::path::PathBuf, &std::path::PathBuf)> = Vec::new();
         for (from, to) in &planned_files {
-            std::fs::rename(from, to)?;
+            if let Err(e) = std::fs::rename(from, to) {
+                for (undo_from, undo_to) in done.iter().rev() {
+                    let _ = std::fs::rename(undo_to, undo_from);
+                }
+                return Ok(CallToolResult::error(format!(
+                    "Rename failed on {} ({e}); rolled back, nothing was changed.",
+                    to.display()
+                )));
+            }
+            done.push((from, to));
         }
         for (_, to) in &planned_files {
+            let sexp = matches!(
+                to.extension().and_then(|s| s.to_str()),
+                Some("kicad_sch" | "kicad_pcb")
+            );
             let text = std::fs::read_to_string(to)?;
-            if text.contains(&old_name) {
-                let hits = text.matches(&old_name).count();
-                let updated = text.replace(&old_name, &new_name);
+            let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+            if hits > 0 {
                 konnect_sexp::writer::write_atomic(to, &updated)?;
                 rewritten.push(json!({
                     "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
@@ -664,10 +739,15 @@ async fn handle_rename_project(
         }
     } else {
         for (from, to) in &planned_files {
+            let sexp = matches!(
+                from.extension().and_then(|s| s.to_str()),
+                Some("kicad_sch" | "kicad_pcb")
+            );
             let text = std::fs::read_to_string(from).unwrap_or_default();
+            let (_, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
             rewritten.push(json!({
                 "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
-                "references_updated": text.matches(&old_name).count(),
+                "references_updated": hits,
             }));
         }
     }
@@ -710,4 +790,92 @@ async fn handle_rename_project(
         "backups_folder": backups,
         "directory": directory,
     })))
+}
+
+#[cfg(test)]
+mod rename_rewrite_tests {
+    use super::rewrite_project_references;
+
+    /// The corruption this guards against. A project named `led` used to have
+    /// every occurrence of that substring rewritten across the schematic —
+    /// footprints, net names, values — because the rewrite was a bare
+    /// `text.replace(old, new)`.
+    #[test]
+    fn an_ordinary_name_does_not_eat_unrelated_content() {
+        let sch = r#"(kicad_sch
+	(symbol (lib_id "Device:LED")
+		(property "Footprint" "LED_THT:LED_D3.0mm")
+		(property "Value" "led")
+	)
+	(label "LED_LIGHT" (at 10 20 0))
+	(instances
+		(project "led"
+			(path "/abc" (reference "D1") (unit 1))
+		)
+	)
+)
+"#;
+        let (out, hits) = rewrite_project_references(sch, "led", "dro", true);
+        assert_eq!(hits, 1, "only the (project …) key should match");
+        assert!(out.contains(r#"(project "dro""#));
+        // Everything else survives untouched.
+        assert!(out.contains(r#""LED_THT:LED_D3.0mm""#));
+        assert!(out.contains(r#"(property "Value" "led")"#));
+        assert!(out.contains(r#"(label "LED_LIGHT""#));
+        assert!(out.contains(r#"(lib_id "Device:LED")"#));
+    }
+
+    #[test]
+    fn sexp_files_rewrite_the_annotation_key() {
+        let sch = "(instances\n\t(project \"old name\"\n\t\t(path \"/x\")\n\t)\n)\n";
+        let (out, hits) = rewrite_project_references(sch, "old name", "new name", true);
+        assert_eq!(hits, 1);
+        assert!(out.contains("(project \"new name\""));
+        assert!(!out.contains("old name"));
+    }
+
+    /// Settings files carry the name as a bare quoted string and inside
+    /// `NAME.kicad_*` filenames; both must move or KiCad reopens the old paths.
+    #[test]
+    fn settings_files_rewrite_names_and_filenames() {
+        let pro = r#"{
+  "meta": { "filename": "old.kicad_pro" },
+  "sheets": [ [ "uuid-1", "old" ] ],
+  "schematic": { "filename": "old.kicad_sch" },
+  "board": { "filename": "old.kicad_pcb" },
+  "name": "old"
+}
+"#;
+        let (out, hits) = rewrite_project_references(pro, "old", "new", false);
+        assert!(hits >= 5, "expected every quoted form to move, got {hits}");
+        for want in [
+            "\"new.kicad_pro\"",
+            "\"new.kicad_sch\"",
+            "\"new.kicad_pcb\"",
+            "\"uuid-1\", \"new\"",
+            "\"name\": \"new\"",
+        ] {
+            assert!(out.contains(want), "missing {want} in:\n{out}");
+        }
+        assert!(!out.contains("\"old"), "an old reference survived:\n{out}");
+    }
+
+    /// A settings file must not have unrelated *unquoted* text touched, and a
+    /// schematic must not have its quoted values touched at all.
+    #[test]
+    fn no_partial_word_matches() {
+        let sch = "(property \"Value\" \"prototype\")\n(project \"proto\"\n";
+        let (out, hits) = rewrite_project_references(sch, "proto", "final", true);
+        assert_eq!(hits, 1);
+        assert!(out.contains("\"prototype\""), "substring was eaten: {out}");
+        assert!(out.contains("(project \"final\""));
+    }
+
+    #[test]
+    fn a_no_op_rename_changes_nothing() {
+        let sch = "(project \"same\"\n";
+        let (out, hits) = rewrite_project_references(sch, "same", "same", true);
+        assert_eq!(hits, 0);
+        assert_eq!(out, sch);
+    }
 }
