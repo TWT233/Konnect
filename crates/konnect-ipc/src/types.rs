@@ -94,6 +94,9 @@ pub enum IpcGraphicDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
+    /// KIID of the track, needed to delete it via delete_track. Empty only if
+    /// KiCAD returned a track without an id.
+    pub uuid: String,
     pub net_name: String,
     pub layer: String,
     pub width: f64,

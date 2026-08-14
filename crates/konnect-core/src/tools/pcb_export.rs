@@ -135,6 +135,18 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "BOM format passed to kicad-cli: 'csv' (default)",
                         "default": "csv"
                     },
+                    "fields": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated columns to export, e.g. 'Reference,Value,Footprint,MPN,${QUANTITY}'. Any schematic field name works — this is how MPN/LCSC columns reach the fab. Omit for KiCAD's default Reference,Value,Footprint,QUANTITY,DNP."
+                    },
+                    "labels": {
+                        "type": "string",
+                        "description": "Ordered, comma-separated column headings matching 'fields'. Omit to label each column with its field name."
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "description": "Comma-separated fields whose matching references collapse into one row, e.g. 'Value,Footprint'. Omit for one row per symbol."
+                    },
                     "exclude_dnp": {
                         "type": "boolean",
                         "description": "Exclude 'Do Not Place' components",
@@ -316,9 +328,13 @@ async fn handle_export_gerber(
     cli::export_gerber(cli, &board, &output_dir).await?;
 
     if drill {
-        // kicad-cli also has a dedicated drill export
-        let drill_path = output_dir.join("drill.drl");
-        let _ = cli::export_drill(cli, &board, &drill_path).await; // best-effort
+        // kicad-cli also has a dedicated drill export. Its --output is a
+        // directory: the gerber directory itself, so the PTH and NPTH files
+        // land beside the gerbers the way a fab expects them. The previous
+        // `output_dir.join("drill.drl")` made KiCad create a *directory*
+        // called drill.drl and bury the drill files inside it, where the
+        // listing below never saw them.
+        let _ = cli::export_drill(cli, &board, &output_dir).await; // best-effort
     }
 
     // List produced files
@@ -426,15 +442,24 @@ async fn handle_export_bom(
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let output = get_path(args, "output")?;
-    let format = args["format"].as_str().unwrap_or("csv");
+    let options = cli::BomOptions {
+        fields: args["fields"].as_str(),
+        labels: args["labels"].as_str(),
+        group_by: args["group_by"].as_str(),
+        // The schema has advertised this default since the tool shipped; the
+        // handler never read it, so DNP parts landed in every BOM.
+        exclude_dnp: args["exclude_dnp"].as_bool().unwrap_or(true),
+    };
 
     let cli = &ctx.config.kicad_cli;
-    cli::export_bom(cli, &schematic, &output, format).await?;
+    cli::export_bom(cli, &schematic, &output, &options).await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
-            "output": output.to_str().unwrap_or("")
+            "output": output.to_str().unwrap_or(""),
+            "fields": options.fields,
+            "exclude_dnp": options.exclude_dnp
         }))
         .unwrap(),
     ))
