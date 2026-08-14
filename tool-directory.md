@@ -44,7 +44,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `create_project` | Create a new KiCAD project at the given path. Creates the directory, a blank `.kicad_pro`, empty `.kicad_sch`, and blank `.kicad_pcb`. |
+| `create_project` | Create a new KiCAD project at the given path. Creates the directory, a blank `.kicad_pro`, empty `.kicad_sch`, and blank `.kicad_pcb`; refuses to replace any existing project file. |
 | `open_project` | Check whether a KiCAD project is currently open in the running KiCAD UI. Returns the active project path and whether KiCAD IPC is available. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
@@ -72,8 +72,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
-| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring. |
-| `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read. |
+| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring, plus each pin's `orientation_degrees` (the direction leading away from the body, 0 = east) and `length_mm`. |
+| `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
 | `group_components` | Add a group property to multiple components in the schematic. |
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
@@ -101,7 +101,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
@@ -133,12 +133,12 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint. Single read → all labels inserted → single write. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. Single read → all labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
-| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. |
+| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. |
 | `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
@@ -189,10 +189,10 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `set_board_size` | Set the PCB board outline to a rectangle on the Edge.Cuts layer. |
-| `get_board_info` | Return metadata about the PCB: title, revision, company, layer count, paper size. |
+| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size, `layer_count`, `copper_layer_count`, and `net_count` (counted from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
-| `get_layer_list` | Return all layers defined in the board with names and types. |
-| `add_layer` | Add a new inner copper or technical layer to the board stack. |
+| `get_layer_list` | Return all layers defined in the board: `id`, `name`, `type`, plus the optional `user_name` label and a `copper` flag. |
+| `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Set the active layer recorded in the board file's setup section. |
 | `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
@@ -212,7 +212,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `find_component` | Find a footprint by reference designator and return its position. |
-| `get_component_pads` | Return pad positions and net assignments for a footprint. |
+| `get_component_pads` | Return pad positions and net assignments for a footprint. A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
@@ -226,7 +226,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `add_net` | Add a new net entry to the PCB file (S-expression insert, no IPC required). |
+| `add_net` | Add a new net entry to the PCB file (S-expression insert, no IPC required). Pre-KiCad-10 boards only: KiCad 10 has no top-level net table, so this fails closed there and points at `route_trace` / `add_via` / `add_copper_pour`, which create a net by naming it on copper. |
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |

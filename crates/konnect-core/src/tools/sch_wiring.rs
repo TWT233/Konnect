@@ -13,8 +13,9 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
-        parse_at, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
+        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
+        read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -299,18 +300,25 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "connect_to_net",
-            "Connect a pin endpoint to a named net by adding a short wire stub and a net label.",
+            "Connect a pin to a named net by adding a short wire stub and a net label. \
+             Name the pin with reference + pin_number, or give its coordinates directly.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
-                    "pin_x": { "type": "number" }, "pin_y": { "type": "number" },
+                    "reference": { "type": "string",
+                        "description": "Component reference, e.g. 'U1'. Use with pin_number instead of pin_x/pin_y." },
+                    "pin_number": { "type": "string", "description": "Pin number, e.g. '3'" },
+                    "pin_x": { "type": "number", "description": "Pin X in mm; alternative to reference + pin_number" },
+                    "pin_y": { "type": "number", "description": "Pin Y in mm" },
                     "net": { "type": "string" },
                     "direction": {
                         "type": "string",
-                        "description": "Direction to route the wire stub: 'right' (default), 'left', 'up', 'down'",
-                        "enum": ["right", "left", "up", "down"],
-                        "default": "right"
+                        "description": "Direction to route the wire stub. 'auto' (default) points it \
+                                        away from the symbol body so the label text does not run back \
+                                        across the pin names; it falls back to 'right' on a bare point.",
+                        "enum": ["auto", "right", "left", "up", "down"],
+                        "default": "auto"
                     },
                     "stub_length": { "type": "number", "default": 2.54,
                         "description": "Length of the wire stub in mm" },
@@ -320,7 +328,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "default": "net_label"
                     }
                 },
-                "required": ["schematic", "pin_x", "pin_y", "net"]
+                "required": ["schematic", "net"]
             }),
             |args, ctx| async move { handle_connect_to_net(args, ctx).await }
         ),
@@ -1265,8 +1273,9 @@ async fn handle_add_power_symbol(
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
     // Build the Symbol struct
@@ -1488,31 +1497,68 @@ async fn handle_connect_to_net(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let pin_x = match require_f64(args, "pin_x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let pin_y = match require_f64(args, "pin_y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
     let net = match require_str(args, "net") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let direction = opt_str(args, "direction").unwrap_or("right");
+    let direction = opt_str(args, "direction").unwrap_or("auto");
     let stub_length = opt_f64(args, "stub_length").unwrap_or(2.54);
     let label_type = opt_str(args, "label_type").unwrap_or("net_label");
 
-    // Compute label endpoint and label rotation based on direction.
-    // Label rotation follows KiCAD convention: 0° = text reads left-to-right,
-    // label anchor is at the wire connection end.
-    let (label_x, label_y, label_rot) = match direction {
-        "left" => (pin_x - stub_length, pin_y, 180.0),
-        "up" => (pin_x, pin_y - stub_length, 90.0),
-        "down" => (pin_x, pin_y + stub_length, 270.0),
-        _ => (pin_x + stub_length, pin_y, 0.0), // "right" default
+    let (_, tree) = read_schematic(&sch_path)?;
+
+    // Name the pin, or give its coordinates. Naming it cannot miss the
+    // endpoint, and the error says which pin was wrong.
+    let (pin_x, pin_y, outward) = match (opt_str(args, "reference"), opt_str(args, "pin_number")) {
+        (Some(reference), Some(pin_number)) => {
+            let instances = extract_symbol_instances(&tree);
+            let lib_syms = tree
+                .find("lib_symbols")
+                .map(|n| n.find_all("symbol"))
+                .unwrap_or_default();
+            match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
+                Ok((pin, t)) => {
+                    let (x, y) = pin_endpoint(&pin, t);
+                    (x, y, Some(pin_outward_direction(&pin, t)))
+                }
+                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Ok(CallToolResult::error(
+                "'reference' and 'pin_number' must be given together",
+            ))
+        }
+        (None, None) => match (require_f64(args, "pin_x"), require_f64(args, "pin_y")) {
+            (Ok(x), Ok(y)) => (x, y, None),
+            // Structured, not free text: a missing coordinate is an
+            // InvalidArgument like any other, and the reason names the way in
+            // that the caller did not take.
+            (x, _) => {
+                let field = if x.is_err() { "pin_x" } else { "pin_y" };
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: field.to_string(),
+                        reason: "give either 'reference' + 'pin_number' or 'pin_x' + 'pin_y'"
+                            .into(),
+                    },
+                    format!(
+                        "Missing '{field}': give either 'reference' + 'pin_number' \
+                         or 'pin_x' + 'pin_y'"
+                    ),
+                ));
+            }
+        },
     };
+
+    // Where the stub goes, and how the label at its end must read: text
+    // running back over the symbol covers its pin names (pin_label_rotation).
+    let dir = match outward {
+        Some(d) => crate::tools::stub_direction(direction, Some(d)),
+        None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
+    };
+    let (label_x, label_y) = (pin_x + dir.dx * stub_length, pin_y + dir.dy * stub_length);
+    let label_rot = dir.label_rotation;
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
@@ -1533,9 +1579,7 @@ async fn handle_connect_to_net(
         sch.add_junction(*jx, *jy);
     }
     // Pins the stub passes over mid-segment also need junction dots.
-    let pins = read_schematic(&sch_path)
-        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
-        .unwrap_or_default();
+    let pins = crate::tools::all_pin_endpoints(&tree);
     for (px, py) in pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y) {
         if !sch
             .junctions
@@ -1546,18 +1590,19 @@ async fn handle_connect_to_net(
         }
     }
 
-    // Add label
+    // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
+    // unset, and KiCad then centres the text on the anchor (#43).
     match label_type {
         "global_label" => {
             sch.add_global_label(&net, "input", label_x, label_y);
             let idx = sch.global_labels.len() - 1;
             if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.at.rotation = Some(label_rot);
+                gl.set_rotation(label_rot);
             }
         }
         _ => {
-            let label = sch.add_label(&net, label_x, label_y);
-            label.at.rotation = Some(label_rot);
+            sch.add_label(&net, label_x, label_y)
+                .set_rotation(label_rot);
         }
     }
 
@@ -1565,7 +1610,7 @@ async fn handle_connect_to_net(
 
     Ok(CallToolResult::json(&json!({
         "connected": net,
-        "direction": direction,
+        "direction": dir.name,
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))
@@ -1628,31 +1673,69 @@ pub(crate) fn resolve_pin_endpoint(
     reference: &str,
     pin_number: &str,
 ) -> anyhow::Result<(f64, f64)> {
-    let inst = instances
-        .iter()
-        .find(|i| i.reference == reference)
-        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
+    let (pin, t) = resolve_placed_pin(instances, lib_syms, reference, pin_number)?;
+    Ok(pin_endpoint(&pin, t))
+}
 
-    // Unit-aware (#35): only this instance's unit owns the pin — asking unit 1
-    // of an LM2904 for pin 7 must fail, not wire to a superimposed phantom.
-    let pins = konnect_sexp::schematic::extract_lib_pins_for_unit(lib_sym, inst.unit);
-    let lib_pin = pins
+/// The named pin and the transform placing it, for callers that need more than
+/// its coordinates — `pin_outward_direction` and `pin_label_rotation` both take
+/// this pair, and deriving them here beats searching the sheet for the point we
+/// just computed.
+pub(crate) fn resolve_placed_pin(
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::parser::SexpNode],
+    reference: &str,
+    pin_number: &str,
+) -> anyhow::Result<(
+    konnect_sexp::schematic::LibPin,
+    konnect_sexp::geometry::PinTransform,
+)> {
+    // A multi-unit part places one instance per unit, all sharing the
+    // reference, so any of them may own the pin: an LM2904's power pins live
+    // on the unit the schematic draws separately from either amplifier.
+    let placed: Vec<_> = instances
         .iter()
-        .find(|p| p.number == pin_number)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Pin '{}' not found on '{}' (unit {})",
-                pin_number,
-                reference,
-                inst.unit
-            )
-        })?;
+        .filter(|i| i.reference == reference)
+        .collect();
+    let Some(first) = placed.first() else {
+        anyhow::bail!("Component '{}' not found", reference);
+    };
 
-    Ok(pin_endpoint(lib_pin, inst.pin_transform()))
+    let mut searched = Vec::new();
+    for inst in &placed {
+        // find_lib_symbol, not a lib_id match: an instance carrying a
+        // (lib_name …) is a sheet-local derived symbol whose pins can sit
+        // elsewhere than the base definition's, or whose base was never
+        // embedded at all (#143).
+        let Some(lib_sym) = find_lib_symbol(lib_syms, inst) else {
+            continue;
+        };
+        searched.push(inst.unit);
+        // Unit-aware (#35): only the unit that owns the pin may answer for it,
+        // or the wire lands on a superimposed phantom.
+        if let Some(lib_pin) =
+            konnect_sexp::schematic::extract_lib_pins_for_unit(lib_sym, inst.unit)
+                .into_iter()
+                .find(|p| p.number == pin_number)
+        {
+            return Ok((lib_pin, inst.pin_transform()));
+        }
+    }
+
+    if searched.is_empty() {
+        anyhow::bail!("Library symbol '{}' not found", first.lib_id);
+    }
+    anyhow::bail!(
+        "Pin '{}' not found on '{}' ({} {})",
+        pin_number,
+        reference,
+        if searched.len() == 1 { "unit" } else { "units" },
+        searched
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 async fn handle_add_schematic_connection(
@@ -1825,6 +1908,187 @@ mod unit_aware_wiring_tests {
                 .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
             "junction expected at the mid-wire pin, got {juncs:?}"
         );
+    }
+
+    // ─── connect_to_net stub orientation ───────────────────────────────────
+
+    async fn connect_to_net(path: &std::path::Path, args: serde_json::Value) -> String {
+        let mut full = json!({ "schematic": path.display().to_string() });
+        for (k, v) in args.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        let result = handle_connect_to_net(&full, &test_ctx()).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// U1's pins 1 and 2 face west, so the stub must leave westward and its
+    /// label read right-to-left, clear of the body.
+    #[tokio::test]
+    async fn auto_routes_the_stub_away_from_the_symbol_body() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN" }),
+        )
+        .await;
+        // Pin 1 tip is (92.38, 77.46); the stub runs 2.54 mm further west.
+        assert!(after.contains("(at 89.84 77.46 180)"), "{after}");
+        // An east-facing pin on the same part goes the other way.
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "3", "net": "OUT" }),
+        )
+        .await;
+        assert!(after.contains("(at 110.16 80 0)"), "{after}");
+    }
+
+    /// Labels here used to carry no `(effects)` at all, so KiCad centred the
+    /// text on the anchor — the defect #43 fixed for add_schematic_net_label.
+    #[tokio::test]
+    async fn the_label_carries_a_justify_matching_its_rotation() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN" }),
+        )
+        .await;
+        assert!(
+            after.contains("(justify right"),
+            "a 180° label must be right-justified: {after}"
+        );
+    }
+
+    /// An explicit direction still wins over the derived one.
+    #[tokio::test]
+    async fn an_explicit_direction_overrides_the_derived_one() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN",
+                    "direction": "right" }),
+        )
+        .await;
+        assert!(after.contains("(at 94.92 77.46 0)"), "{after}");
+    }
+
+    /// A vertical stub keeps its text horizontal: of 2562 wire-anchored labels
+    /// in the KiCad demos, only ~1% are rotated 90 or 270.
+    #[tokio::test]
+    async fn a_vertical_stub_keeps_its_label_horizontal() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "IN",
+                    "direction": "down" }),
+        )
+        .await;
+        assert!(after.contains("(at 92.38 80 0)"), "{after}");
+    }
+
+    /// Coordinates still work, and a bare point falls back to the old default.
+    #[tokio::test]
+    async fn coordinates_still_work_and_a_bare_point_goes_right() {
+        let (_d, path) = dual_opamp_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "pin_x": 50.0, "pin_y": 50.0, "net": "FREE" }),
+        )
+        .await;
+        assert!(after.contains("(at 52.54 50 0)"), "{after}");
+    }
+
+    /// [`single_pin_schematic`] with a second part butted onto U1's pin: both
+    /// tips sit at (101.6, 76.2) and face opposite ways.
+    fn butted_pins_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = single_pin_schematic();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let u2 = "\t(symbol\n\t\t(lib_id \"Test:P1\")\n\t\t(at 101.6 76.2 180)\n\t\t(unit 1)\n\t\t(uuid \"u2\")\n\t\t(property \"Reference\" \"U2\"\n\t\t\t(at 101.6 71.12 0)\n\t\t)\n\t)\n";
+        let at = content.find("\t(sheet_instances").unwrap();
+        std::fs::write(&path, format!("{}{u2}{}", &content[..at], &content[at..])).unwrap();
+        (dir, path)
+    }
+
+    /// Naming a pin carries its own direction. Deriving one from a coordinate
+    /// cannot: two pins share this point and disagree about which way is out,
+    /// so that path has to fall back to "right".
+    #[tokio::test]
+    async fn a_named_pin_outranks_the_coordinate_lookup_where_pins_stack() {
+        let (_d, path) = butted_pins_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "1", "net": "SHARED" }),
+        )
+        .await;
+        assert!(after.contains("(at 99.06 76.2 180)"), "{after}");
+
+        let (_d, path) = butted_pins_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "pin_x": 101.6, "pin_y": 76.2, "net": "SHARED" }),
+        )
+        .await;
+        assert!(after.contains("(at 104.14 76.2 0)"), "{after}");
+    }
+
+    /// [`dual_opamp_schematic`] with both units placed under one reference.
+    /// KiCad gives every unit its own `(symbol …)` node sharing the Reference
+    /// property — 26 of the KiCad 10 demo schematics do this.
+    fn multi_unit_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = dual_opamp_schematic();
+        let content = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"U2\"", "\"U1\"");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    /// Pin 5 belongs to unit 2, so resolving it means searching every unit
+    /// placed under the reference. Stopping at the first would make an
+    /// op-amp's power pins unreachable by name.
+    #[tokio::test]
+    async fn a_pin_on_another_unit_of_the_same_reference_resolves() {
+        let (_d, path) = multi_unit_schematic();
+        let after = connect_to_net(
+            &path,
+            json!({ "reference": "U1", "pin_number": "5", "net": "PWR" }),
+        )
+        .await;
+        // Unit 2 sits at x=150, putting pin 5's tip at (142.38, 77.46).
+        assert!(after.contains("(at 139.84 77.46 180)"), "{after}");
+    }
+
+    /// A pin on no placed unit still fails, and the error names every unit
+    /// that was searched rather than only the first.
+    #[tokio::test]
+    async fn a_pin_on_no_placed_unit_names_the_units_searched() {
+        let (_d, path) = multi_unit_schematic();
+        let result = handle_connect_to_net(
+            &json!({ "schematic": path.display().to_string(),
+                     "reference": "U1", "pin_number": "99", "net": "NOPE" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("units 1, 2"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn naming_only_half_a_pin_is_an_error() {
+        let (_d, path) = dual_opamp_schematic();
+        let result = handle_connect_to_net(
+            &json!({ "schematic": path.display().to_string(),
+                     "reference": "U1", "net": "IN" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
     }
 }
 
