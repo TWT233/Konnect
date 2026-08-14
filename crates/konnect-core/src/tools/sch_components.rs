@@ -17,7 +17,7 @@ use konnect_sexp::{
     parse_sexp,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
-        read_schematic,
+        pin_outward_direction, read_schematic,
     },
     writer::{
         apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
@@ -198,7 +198,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_schematic_pin_locations",
             "Get the exact schematic-space (X,Y) coordinates of every pin on a symbol, \
-             accounting for rotation and mirroring. Uses the canonical pin transform.",
+             accounting for rotation and mirroring. Uses the canonical pin transform. \
+             Each pin also reports 'orientation_degrees', the direction leading away \
+             from the symbol body (0 = east) — a net label at the pin must read that \
+             way or its text runs back over the symbol's pin names — and 'length_mm'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -211,7 +214,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_get_schematic_pin_locations",
-            "Get pin locations for multiple components in a single file read.",
+            "Get pin locations for multiple components in a single file read. Reports the \
+             same per-pin fields as get_schematic_pin_locations, including \
+             'orientation_degrees' and 'length_mm'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -853,7 +858,12 @@ async fn handle_get_schematic_pin_locations(
                 "number": p.number,
                 "name": p.name,
                 "x": sx,
-                "y": sy
+                "y": sy,
+                // Which way the pin faces away from the body (0 = east). A
+                // label here should read that way, or it runs back over the
+                // symbol's pin names.
+                "orientation_degrees": pin_outward_direction(p, t),
+                "length_mm": p.length
             })
         })
         .collect();
@@ -928,7 +938,14 @@ async fn handle_batch_get_pin_locations(
                 .iter()
                 .map(|p| {
                     let (sx, sy) = pin_endpoint(p, t);
-                    json!({ "number": p.number, "name": p.name, "x": sx, "y": sy })
+                    json!({
+                        "number": p.number,
+                        "name": p.name,
+                        "x": sx,
+                        "y": sy,
+                        "orientation_degrees": pin_outward_direction(p, t),
+                        "length_mm": p.length
+                    })
                 })
                 .collect();
             json!({ "reference": reference, "x": inst.x, "y": inst.y, "pins": pins })

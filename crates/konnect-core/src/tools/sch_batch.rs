@@ -15,9 +15,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
-        read_schematic,
+        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
+        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -31,7 +30,7 @@ use std::collections::HashSet;
 use super::sch_analysis::build_net_graph;
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::place_one_component;
-use super::sch_wiring::{resolve_pin_endpoint, route_between};
+use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -218,8 +217,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position of the stub root in mm" },
                     "direction": {
                         "type": "string",
-                        "description": "Stub direction: 'left', 'right', 'up', 'down'",
-                        "default": "right"
+                        "description": "Stub direction. 'auto' (default) points it away from \
+                                        the symbol body when a pin sits at (x, y), so the label \
+                                        text does not run back across the symbol; it falls back \
+                                        to 'right' on a bare point.",
+                        "enum": ["auto", "right", "left", "up", "down"],
+                        "default": "auto"
                     }
                 },
                 "required": ["schematic", "net_name", "x", "y"]
@@ -362,6 +365,13 @@ async fn handle_batch_connect_to_net(
     let mut inserts = String::new();
     let mut added: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    // Endpoints already carrying this net's label, so a second never lands
+    // on the first. Seeded from the file, extended as we go.
+    let mut labelled: Vec<(f64, f64)> = extract_labels(&tree)
+        .iter()
+        .filter(|l| l.net == net_name)
+        .map(|l| (l.x, l.y))
+        .collect();
 
     for pin_spec in &pins {
         let reference = match pin_spec["reference"].as_str() {
@@ -379,46 +389,36 @@ async fn handle_batch_connect_to_net(
             }
         };
 
-        // A multi-unit symbol is placed as one instance PER UNIT, all sharing
-        // the reference. The requested pin lives in exactly one of them and
-        // must be transformed by *that* instance's placement. Taking the first
-        // instance and transforming every pin by it puts the label on unit 1's
-        // pin instead — silently shorting two nets together, with no error.
-        let candidates: Vec<_> = instances
-            .iter()
-            .filter(|i| i.reference == reference)
-            .collect();
-        if candidates.is_empty() {
-            errors.push(format!("Component '{}' not found", reference));
-            continue;
-        }
-
-        // find_lib_symbol, not a lib_id match: an instance carrying a
-        // (lib_name …) is a sheet-local derived symbol whose pins can sit at
-        // different coordinates than the base definition, and matching on
-        // lib_id returns the wrong one — or nothing, when the base was never
-        // embedded (#143). Every unit of a multi-unit part is resolved this
-        // way, so the two fixes compose rather than one undoing the other.
-        let pin_ep = candidates.iter().find_map(|inst| {
-            let sym = find_lib_symbol(&lib_syms, inst)?;
-            extract_lib_pins_for_unit(sym, inst.unit)
-                .into_iter()
-                .find(|p| p.number == pin_number)
-                .map(|p| pin_endpoint(&p, inst.pin_transform()))
-        });
-
-        match pin_ep {
-            Some((px, py)) => {
-                inserts.push_str(&format_net_label(&net_name, px, py, 0.0));
-                added.push(json!({
-                    "reference": reference,
-                    "pin": pin_number,
-                    "x": px,
-                    "y": py
-                }));
+        let (pin, t) = match resolve_placed_pin(&instances, &lib_syms, reference, pin_number) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
             }
-            None => errors.push(format!("Pin '{}' not found on '{}'", pin_number, reference)),
+        };
+        let (px, py) = pin_endpoint(&pin, t);
+        let rotation = pin_label_rotation(&pin, t);
+
+        // Symbols stack several pins on one endpoint; a label each renders as
+        // a smear. They stay connected by that endpoint.
+        let duplicate = labelled
+            .iter()
+            .any(|(lx, ly)| points_coincident(*lx, *ly, px, py, 0.01));
+        if !duplicate {
+            inserts.push_str(&format_net_label(&net_name, px, py, rotation));
+            labelled.push((px, py));
         }
+        let mut entry = json!({
+            "reference": reference,
+            "pin": pin_number,
+            "x": px,
+            "y": py,
+            "rotation": rotation
+        });
+        if duplicate {
+            entry["deduplicated"] = json!(true);
+        }
+        added.push(entry);
     }
 
     if !inserts.is_empty() {
@@ -923,21 +923,18 @@ async fn handle_connect_passthrough(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let direction = opt_str(args, "direction").unwrap_or("right");
+    let direction = opt_str(args, "direction").unwrap_or("auto");
+
+    let (content, tree) = read_schematic(&sch_path)?;
+    let dir = crate::tools::resolve_stub_direction(direction, (x, y), &tree);
 
     // Stub is 2.54mm (2×1.27 grid units)
     let stub = 2.54_f64;
-    let (wire_end_x, wire_end_y, label_rot) = match direction {
-        "left" => (x - stub, y, 180.0),
-        "up" => (x, y - stub, 90.0),
-        "down" => (x, y + stub, 270.0),
-        _ => (x + stub, y, 0.0), // "right" default
-    };
+    let (wire_end_x, wire_end_y) = (x + dir.dx * stub, y + dir.dy * stub);
 
     let wire_sexp = format_wire(x, y, wire_end_x, wire_end_y);
-    let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, label_rot);
+    let label_sexp = format_net_label(&net_name, wire_end_x, wire_end_y, dir.label_rotation);
 
-    let content = read_consistent(&sch_path)?;
     let expected = content.clone();
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let edits = vec![SexpEdit::insert(
@@ -951,8 +948,8 @@ async fn handle_connect_passthrough(
         "net": net_name,
         "stub_root": { "x": x, "y": y },
         "label_position": { "x": wire_end_x, "y": wire_end_y },
-        "direction": direction,
-        "label_rotation": label_rot
+        "direction": dir.name,
+        "label_rotation": dir.label_rotation
     })))
 }
 
@@ -1603,6 +1600,180 @@ mod midwire_pin_tests {
                 "with_junction={with_junction}: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_to_net_orientation_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// One pin per edge, plus two pins stacked on one endpoint. Placed at
+    /// (100, 100): west tip (89.84, 100), east (110.16, 100), north
+    /// (100, 89.84), south (100, 110.16), stack (89.84, 94.92).
+    fn quad_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin = |x: f64, y: f64, angle: f64, name: &str, number: &str| {
+            format!(
+                "        (pin passive line (at {x} {y} {angle}) (length 2.54)\n\
+                 \x20         (name \"{name}\") (number \"{number}\"))\n"
+            )
+        };
+        let body = format!(
+            "{}{}{}{}{}{}",
+            pin(-10.16, 0.0, 0.0, "WEST", "1"),
+            pin(10.16, 0.0, 180.0, "EAST", "2"),
+            pin(0.0, 10.16, 270.0, "NORTH", "3"),
+            pin(0.0, -10.16, 90.0, "SOUTH", "4"),
+            pin(-10.16, 5.08, 0.0, "GND", "5"),
+            pin(-10.16, 5.08, 0.0, "GND", "6"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quad.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  \
+                 (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  \
+                 (lib_symbols\n    (symbol \"Test:QUAD\"\n      (symbol \"QUAD_1_1\"\n\
+                 {body}      )\n    )\n  )\n  (symbol\n    (lib_id \"Test:QUAD\")\n    \
+                 (at 100 100 0)\n    (unit 1)\n    \
+                 (property \"Reference\" \"U1\" (at 100 90 0))\n    \
+                 (property \"Value\" \"QUAD\" (at 100 110 0))\n  )\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// The `(at x y ROT)` and justify of the label for `net`.
+    fn label_of(body: &str, net: &str) -> (String, String) {
+        let start = body
+            .find(&format!("(label \"{net}\""))
+            .expect("label present");
+        let block = &body[start..];
+        let end = block.find("(uuid").unwrap_or(block.len());
+        let block = &block[..end];
+        let at = {
+            let i = block.find("(at ").expect("at present") + 4;
+            block[i..][..block[i..].find(')').unwrap()]
+                .trim()
+                .to_string()
+        };
+        let justify = match block.find("(justify ") {
+            Some(j) => {
+                let rest = &block[j + "(justify ".len()..];
+                rest[..rest.find(')').unwrap()].trim().to_string()
+            }
+            None => "<none>".to_string(),
+        };
+        (at, justify)
+    }
+
+    async fn connect(path: &std::path::Path, net: &str, pin_number: &str) -> String {
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": net,
+                "pins": [{ "reference": "U1", "pin_number": pin_number }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The reported bug: a left-edge pin's label was written at rotation 0,
+    /// so its text ran east across the body, over the pin names.
+    #[tokio::test]
+    async fn a_left_edge_pin_gets_a_label_reading_away_from_the_body() {
+        let (_d, path) = quad_schematic();
+        let after = connect(&path, "SWDIO", "1").await;
+        assert_eq!(
+            label_of(&after, "SWDIO"),
+            ("89.84 100 180".into(), "right bottom".into())
+        );
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    #[tokio::test]
+    async fn a_right_edge_pin_keeps_reading_east() {
+        let (_d, path) = quad_schematic();
+        let after = connect(&path, "XTAL", "2").await;
+        assert_eq!(
+            label_of(&after, "XTAL"),
+            ("110.16 100 0".into(), "left bottom".into())
+        );
+    }
+
+    /// eeschema never turns a pin-anchored label sideways, whichever way a
+    /// vertical pin faces — see `pin_label_rotation`.
+    #[tokio::test]
+    async fn vertical_pins_keep_their_label_horizontal() {
+        let (_d, path) = quad_schematic();
+        let after = connect(&path, "TOP", "3").await;
+        assert_eq!(label_of(&after, "TOP").0, "100 89.84 0");
+        let after = connect(&path, "BOTTOM", "4").await;
+        assert_eq!(label_of(&after, "BOTTOM").0, "100 110.16 0");
+    }
+
+    /// Pins on one endpoint are already connected, so one label serves them
+    /// all; superimposed copies render as a smear.
+    #[tokio::test]
+    async fn stacked_pins_share_a_single_label() {
+        let (_d, path) = quad_schematic();
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "GND",
+                "pins": [
+                    { "reference": "U1", "pin_number": "5" },
+                    { "reference": "U1", "pin_number": "6" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        // Both pins are reported connected — the second is not an error.
+        assert_eq!(parsed["added_count"], 2);
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["added"][1]["deduplicated"], json!(true));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(label \"GND\"").count(), 1, "{after}");
+    }
+
+    /// Re-running must not stack a second label on the first.
+    #[tokio::test]
+    async fn re_connecting_the_same_pin_adds_no_second_label() {
+        let (_d, path) = quad_schematic();
+        connect(&path, "SWDIO", "1").await;
+        let after = connect(&path, "SWDIO", "1").await;
+        assert_eq!(after.matches("(label \"SWDIO\"").count(), 1, "{after}");
     }
 }
 

@@ -72,8 +72,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
 | `move_region` | Move all symbols within a bounding box by a given offset. |
 | `annotate_schematic` | Run kicad-cli to auto-assign reference designators (`R?` → `R1`, `U?` → `U1`, etc.). |
-| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring. |
-| `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read. |
+| `get_schematic_pin_locations` | Get exact (X,Y) coordinates of every pin on a symbol, accounting for rotation/mirroring, plus each pin's `orientation_degrees` (the direction leading away from the body, 0 = east) and `length_mm`. |
+| `batch_get_schematic_pin_locations` | Get pin locations for multiple components in a single file read, with the same per-pin fields. |
 | `add_component_annotation` | Add a custom property (annotation) to a symbol instance. |
 | `group_components` | Add a group property to multiple components in the schematic. |
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
@@ -101,7 +101,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_delete_no_connect` | Delete multiple no-connect flags in a single file read/write cycle. |
 | `add_junction` | Add a junction dot at a point where wires cross or T-intersect. |
 | `batch_add_junction` | Add multiple junction dots in a single file read/write cycle. |
-| `connect_to_net` | Connect a pin endpoint to a named net by adding a short wire stub + net label. |
+| `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
@@ -133,12 +133,12 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint. Single read → all labels inserted → single write. |
+| `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. Single read → all labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
-| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. |
+| `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. |
 | `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |

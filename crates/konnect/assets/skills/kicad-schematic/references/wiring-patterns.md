@@ -23,7 +23,7 @@
      |
     IC pin
 ```
-**Tools**: `add_schematic_component` (R, value 4.7k) → `add_power_symbol` (+3V3) → `connect_to_net` (resistor pin 2, net "SDA", direction down)
+**Tools**: `add_schematic_component` (R, value 4.7k) → `add_power_symbol` (+3V3) → `connect_to_net` (resistor pin 2, net "SDA")
 
 ## Pattern 3: Voltage Divider
 ```

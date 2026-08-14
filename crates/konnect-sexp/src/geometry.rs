@@ -85,6 +85,39 @@ pub fn transform_pin(pin_x: f64, pin_y: f64, t: PinTransform) -> (f64, f64) {
     (t.comp_x + rx, t.comp_y + ry)
 }
 
+/// Map a library-space (Y-up) direction through a placement, returning the
+/// on-screen angle in degrees, snapped to 0/90/180/270.
+///
+/// A direction needs the same rotation and mirror as a point but no
+/// translation, so this pushes a unit vector through [`transform_pin`] with
+/// the origin zeroed. Deriving the angle arithmetically (`angle +
+/// t.rotation_deg`) would silently drop the mirror.
+///
+/// # Examples
+/// ```
+/// use konnect_sexp::geometry::{transform_direction, PinTransform};
+///
+/// // East in library space stays east when the symbol is unrotated…
+/// let t = PinTransform { comp_x: 50.0, comp_y: 50.0, rotation_deg: 0.0,
+///                        mirror_x: false, mirror_y: false };
+/// assert_eq!(transform_direction(0.0, t), 0.0);
+/// // …and flips to west when the symbol is mirrored about Y.
+/// assert_eq!(transform_direction(0.0, PinTransform { mirror_y: true, ..t }), 180.0);
+/// ```
+pub fn transform_direction(angle_deg: f64, t: PinTransform) -> f64 {
+    let rad = angle_deg * PI / 180.0;
+    let origin = PinTransform {
+        comp_x: 0.0,
+        comp_y: 0.0,
+        ..t
+    };
+    let (dx, dy) = transform_pin(rad.cos(), rad.sin(), origin);
+    // Back to a Y-up angle: transform_pin returns screen coords, where Y grows
+    // downward, but KiCad's `(at x y ANGLE)` counts counter-clockwise as drawn.
+    let deg = (-dy).atan2(dx).to_degrees().rem_euclid(360.0);
+    ((deg / 90.0).round() * 90.0).rem_euclid(360.0)
+}
+
 /// Transform a **pad** from footprint-local space to board space.
 ///
 /// This is the PCB counterpart of [`transform_pin`]. Unlike symbol pins,
@@ -223,6 +256,85 @@ mod tests {
             (103.81, 100.0),
             "rot270",
         );
+    }
+
+    /// A library direction rotates with the symbol and flips with its mirror.
+    /// Table read as: library angle × placement → on-screen angle.
+    #[test]
+    fn direction_follows_rotation_and_mirror() {
+        let cases: &[(f64, PinTransform, f64)] = &[
+            // Unrotated: library east/north/west/south survive unchanged.
+            (0.0, t(0.0, 0.0, 0.0, false, false), 0.0),
+            (90.0, t(0.0, 0.0, 0.0, false, false), 90.0),
+            (180.0, t(0.0, 0.0, 0.0, false, false), 180.0),
+            (270.0, t(0.0, 0.0, 0.0, false, false), 270.0),
+            // Instance rotation is screen-CCW, matching transform_pin.
+            (0.0, t(0.0, 0.0, 90.0, false, false), 90.0),
+            (0.0, t(0.0, 0.0, 180.0, false, false), 180.0),
+            (0.0, t(0.0, 0.0, 270.0, false, false), 270.0),
+            (90.0, t(0.0, 0.0, 90.0, false, false), 180.0),
+            (180.0, t(0.0, 0.0, 270.0, false, false), 90.0),
+            // (mirror y) negates screen-X: east ↔ west, north/south fixed.
+            (0.0, t(0.0, 0.0, 0.0, false, true), 180.0),
+            (180.0, t(0.0, 0.0, 0.0, false, true), 0.0),
+            (90.0, t(0.0, 0.0, 0.0, false, true), 90.0),
+            // (mirror x) negates screen-Y: north ↔ south, east/west fixed.
+            (90.0, t(0.0, 0.0, 0.0, true, false), 270.0),
+            (270.0, t(0.0, 0.0, 0.0, true, false), 90.0),
+            (0.0, t(0.0, 0.0, 0.0, true, false), 0.0),
+            // Mirror applies after rotation, as in transform_pin.
+            (0.0, t(0.0, 0.0, 90.0, true, false), 270.0),
+            // Translation must not matter.
+            (0.0, t(123.4, 56.7, 0.0, false, false), 0.0),
+        ];
+        for &(angle, tr, expected) in cases {
+            let got = transform_direction(angle, tr);
+            assert_eq!(
+                got, expected,
+                "lib angle {} through rot {} mirror({},{})",
+                angle, tr.rotation_deg, tr.mirror_x, tr.mirror_y
+            );
+        }
+    }
+
+    /// Guard against "simplifying" the direction transform into plain angle
+    /// arithmetic, which agrees on unmirrored symbols and silently drops the
+    /// mirror — the same class of bug as `pad_transform_rejects_textbook_rotation`.
+    #[test]
+    fn direction_rejects_angle_arithmetic() {
+        let tr = t(0.0, 0.0, 0.0, false, true);
+        let naive = (0.0_f64 + tr.rotation_deg).rem_euclid(360.0);
+        assert_ne!(
+            transform_direction(0.0, tr),
+            naive,
+            "a (mirror y) instance must not report the unmirrored direction"
+        );
+    }
+
+    /// Callers match the result against 0/90/180/270, so every input must land
+    /// on one of those — including negatives and a full turn, which must give
+    /// 0 rather than 360.
+    ///
+    /// An exact 45° tie is deliberately *not* pinned: `cos`/`sin`/`atan2` land
+    /// either side of 45.0 depending on the platform's libm, so `round`'s
+    /// half-away-from-zero rule picks differently on macOS than on Linux. KiCad
+    /// pins are only ever axis-aligned, so the tie has no real caller.
+    #[test]
+    fn direction_snaps_to_quadrants() {
+        let tr = t(0.0, 0.0, 0.0, false, false);
+        assert_eq!(transform_direction(44.0, tr), 0.0);
+        assert_eq!(transform_direction(46.0, tr), 90.0);
+        assert_eq!(transform_direction(-90.0, tr), 270.0);
+        assert_eq!(transform_direction(360.0, tr), 0.0);
+        // 315° must land on 0, not 360.
+        assert_eq!(transform_direction(315.0, tr), 0.0);
+        for angle in [-720.0, -45.0, 0.0, 45.0, 123.4, 359.9, 1000.0] {
+            let got = transform_direction(angle, tr);
+            assert!(
+                [0.0, 90.0, 180.0, 270.0].contains(&got),
+                "{angle}° snapped to {got}, which is not a quadrant"
+            );
+        }
     }
 
     fn assert_pad(local: (f64, f64), fp: (f64, f64, f64), expected: (f64, f64), label: &str) {

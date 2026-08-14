@@ -173,3 +173,109 @@ fn demo_files_survive_edit_cycle() {
         );
     }
 }
+
+/// Oracle for [`pin_label_rotation`]: labels eeschema itself anchored on a pin.
+///
+/// A net label whose text runs *into* the symbol body covers the pin names
+/// KiCad draws there. The demos say how eeschema orients them — for every
+/// label sitting exactly on one pin endpoint, compare its rotation against the
+/// direction leading away from that body.
+#[test]
+fn pin_anchored_labels_match_eeschema_orientation() {
+    let Some(root) = demo_dirs() else {
+        eprintln!("SKIP: no KiCad demos found");
+        return;
+    };
+    use konnect_sexp::geometry::points_coincident;
+    use konnect_sexp::schematic::{
+        extract_labels, extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint,
+        pin_outward_direction,
+    };
+
+    let (mut horizontal, mut vertical) = (0usize, 0usize);
+    let (mut disagreements, mut sideways) = (Vec::new(), Vec::new());
+    for sch in collect_schematics(&root) {
+        let content = std::fs::read_to_string(&sch).unwrap_or_default();
+        let Ok(tree) = parse_sexp(&content) else {
+            continue;
+        };
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+
+        // Every pin endpoint on the sheet, with the way it faces.
+        let mut pins: Vec<((f64, f64), f64)> = Vec::new();
+        for inst in extract_symbol_instances(&tree) {
+            let Some(sym) = lib_syms
+                .iter()
+                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
+            else {
+                continue;
+            };
+            let t = inst.pin_transform();
+            // Unit-aware: superimposing another unit's pins would invent
+            // endpoints that no label can legitimately sit on (#35).
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                pins.push((pin_endpoint(&pin, t), pin_outward_direction(&pin, t)));
+            }
+        }
+
+        for label in extract_labels(&tree) {
+            let mut hits = pins
+                .iter()
+                .filter(|(p, _)| points_coincident(p.0, p.1, label.x, label.y, 0.01));
+            let Some((_, outward)) = hits.next() else {
+                continue; // label on a wire, or free-floating
+            };
+            if hits.next().is_some() {
+                continue; // stacked pins: no single pin owns this anchor
+            }
+            let rotation = label.rotation.rem_euclid(360.0);
+            if *outward == 90.0 || *outward == 270.0 {
+                vertical += 1;
+            } else {
+                horizontal += 1;
+                if rotation != *outward {
+                    disagreements.push(format!(
+                        "{}: '{}' at ({}, {}) is {rotation}°, pin faces {outward}°",
+                        sch.display(),
+                        label.net,
+                        label.x,
+                        label.y
+                    ));
+                }
+            }
+            // Whichever way the pin faces, eeschema never turns the text
+            // sideways — the invariant `horizontal_label_rotation` encodes.
+            // Collected, not asserted here: one violation must not abort the
+            // sweep before it can report what else disagrees.
+            if rotation != 0.0 && rotation != 180.0 {
+                sideways.push(format!(
+                    "{}: '{}' at ({}, {}) is rotated {rotation}°",
+                    sch.display(),
+                    label.net,
+                    label.x,
+                    label.y
+                ));
+            }
+        }
+    }
+
+    eprintln!("pin-anchored labels: {horizontal} horizontal, {vertical} vertical");
+    // Guard against a matcher that quietly stops matching and passes vacuously.
+    assert!(
+        horizontal >= 200,
+        "suspiciously few pin-anchored labels matched ({horizontal})"
+    );
+    assert!(
+        sideways.is_empty(),
+        "no pin-anchored label in the demo corpus should be vertical:\n{}",
+        sideways.join("\n")
+    );
+    assert!(
+        disagreements.is_empty(),
+        "labels disagree with pin_outward_direction:\n{}",
+        disagreements.join("\n")
+    );
+}
