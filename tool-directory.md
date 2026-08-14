@@ -355,7 +355,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. |
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
-| `run_design_review` | Run all available audit checks and produce a consolidated report. Call this when the user asks "is my board ready?" |
+| `run_design_review` | Run all available audit checks across every reachable schematic sheet and produce a consolidated report with status, coverage, and diagnostics. Returns `INCOMPLETE` rather than approval when coverage is partial or failed. |
 | `check_bom_health` | Analyze the BOM for supply-chain risks: parts with no MPN, lifecycle warnings, low stock, unavailable from preferred distributors. |
 
 ---

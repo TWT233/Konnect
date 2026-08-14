@@ -806,7 +806,7 @@ async fn handle_get_sheet_hierarchy(
     Ok(CallToolResult::json(&tree))
 }
 
-fn build_hierarchy_node(
+pub(crate) fn build_hierarchy_node(
     path: &Path,
     project_name: &str,
     depth: usize,
