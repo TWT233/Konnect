@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-schematic-editor"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "konnect-sexp",
  "thiserror 1.0.69",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "konnect-sexp"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "schematic-viewer"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "konnect-schematic-editor",
  "notify",
