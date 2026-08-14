@@ -52,6 +52,64 @@ where
     }
 }
 
+/// What a board-mutating tool should do after its IPC attempt.
+pub(crate) enum BoardWrite<T = ()> {
+    /// KiCAD applied the change; report `"source": "ipc"`. Carries whatever the
+    /// IPC call returned, for tools that echo it back — the placed footprint,
+    /// for instance.
+    Ipc(T),
+    /// No live KiCAD on this transport, so a direct file edit cannot race an
+    /// editor; proceed with the S-expression path.
+    File,
+    /// KiCAD answered and refused. The caller must return this result and must
+    /// NOT touch the file.
+    Refused(CallToolResult),
+}
+
+/// Run `f` over IPC against the board named by `board_path`, deciding what the
+/// caller may do next.
+///
+/// Two failure modes that used to look alike are kept apart here, both of which
+/// silently corrupted work before:
+///
+/// * The board reached over IPC is whichever one KiCAD has open, so a request
+///   naming a *different* board would edit the wrong one — `ensure_board_is_active`
+///   rejects that up front (issue: `add_board_outline` writing into the open board).
+/// * A file-only edit is invisible to a KiCAD holding this board open and is
+///   discarded by its next save. So the fallback gate is the typed transport
+///   classification, never a text match: only a request that never reached a live
+///   KiCAD may edit the file; a KiCAD that answered — even with an error — fails
+///   closed. `handle_add_mounting_hole` established that rule; this is it made
+///   reusable, so every board-mutating tool decides the same way.
+pub(crate) async fn attempt_ipc_write<T, F>(
+    addr: String,
+    board_path: &std::path::Path,
+    what: &str,
+    f: F,
+) -> anyhow::Result<BoardWrite<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+{
+    let requested = board_path.to_path_buf();
+    match crate::tools::pcb_components::with_ipc_classified(addr, move |c| {
+        c.ensure_board_is_active(&requested)?;
+        f(c)
+    })
+    .await?
+    {
+        Ok(value) => Ok(BoardWrite::Ipc(value)),
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            Ok(BoardWrite::Refused(CallToolResult::error(format!(
+                "KiCAD rejected the {what} over IPC: {message}. \
+                 The board file was not modified — KiCAD is reachable and may hold this \
+                 board open, so editing the file directly could be silently overwritten."
+            ))))
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => Ok(BoardWrite::File),
+    }
+}
+
 // ─── S-expression format helpers ──────────────────────────────────────────────
 
 fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
@@ -430,17 +488,23 @@ async fn handle_set_board_size(
     // ponytail: 4 segments over a single BoardRectangle keeps one builder path;
     // switch to board_rectangle if a native rect proves less flaky.
     let items = rect_outline_items(ox, oy, x2, y2, w);
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.create_items(items)
-    })
+    match attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "board size",
+        move |c| c.create_items(items).map(|_| ()),
+    )
     .await?
-    .is_ok()
     {
-        return Ok(CallToolResult::json(&json!({
-            "width": width, "height": height,
-            "x1": ox, "y1": oy, "x2": x2, "y2": y2,
-            "source": "ipc"
-        })));
+        BoardWrite::Ipc(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "width": width, "height": height,
+                "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+                "source": "ipc"
+            })))
+        }
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::File => {}
     }
 
     // Append 4 Edge.Cuts lines (top, right, bottom, left)
@@ -534,7 +598,13 @@ async fn handle_get_board_extents(
     let board_path = get_path(args, "board")?;
 
     // Try IPC first; fall through to file-based computation on error
-    if let Ok(ext) = with_ipc(ctx.config.ipc_address.clone(), |c| c.get_board_extents()).await? {
+    let requested = board_path.clone();
+    if let Ok(ext) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        c.ensure_board_is_active(&requested)?;
+        c.get_board_extents()
+    })
+    .await?
+    {
         return Ok(CallToolResult::json(&json!({
             "x_min": ext.min.x, "y_min": ext.min.y,
             "x_max": ext.max.x, "y_max": ext.max.y,
@@ -767,19 +837,24 @@ async fn handle_add_board_outline(
     };
     let w = 0.05_f64;
 
-    // Try IPC first; fall through to file edit if KiCAD is not reachable.
     let items = rect_outline_items(x1, y1, x2, y2, w);
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.create_items(items)
-    })
+    match attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "board outline",
+        move |c| c.create_items(items).map(|_| ()),
+    )
     .await?
-    .is_ok()
     {
-        return Ok(CallToolResult::json(&json!({
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "width": (x2-x1).abs(), "height": (y2-y1).abs(),
-            "source": "ipc"
-        })));
+        BoardWrite::Ipc(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+                "source": "ipc"
+            })))
+        }
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::File => {}
     }
 
     let lines = format!(
@@ -818,19 +893,19 @@ async fn handle_add_mounting_hole(
     let drill_d = args["drill_diameter"].as_f64().unwrap_or(3.2);
     let reference = args["reference"].as_str().unwrap_or("H1").to_string();
 
-    // Try IPC first, exactly as `place_component` does. A mounting hole is a
-    // footprint, so a file-only edit is invisible to a KiCAD that holds this
-    // board open and is discarded by its next save — the tool reported success
-    // while nothing was ever created. The fallback gate is the typed transport
-    // classification: only a request that never reached a live KiCAD may edit
-    // the board file; a KiCAD that answered — even with an error — fails closed.
+    // A mounting hole is a footprint, so the same rule as every other
+    // board-mutating tool applies (see `attempt_ipc_write`): the request must
+    // name the board KiCAD has open, and only an IPC transport that was never
+    // reached may fall back to editing the file.
     let requested_board = board_path.clone();
     let lib_id = mounting_hole_lib_id(drill_d);
     let lib_id_ipc = lib_id.clone();
     let reference_ipc = reference.clone();
     let text_offset = mounting_hole_text_offset(drill_d);
-    let attempt = crate::tools::pcb_components::with_ipc_classified(
+    let attempt = attempt_ipc_write(
         ctx.config.ipc_address.clone(),
+        &board_path,
+        "mounting hole",
         move |c| {
             c.place_footprint(
                 &requested_board,
@@ -853,17 +928,13 @@ async fn handle_add_mounting_hole(
     .await?;
 
     match attempt {
-        Ok(fp) => Ok(CallToolResult::json(&json!({
+        BoardWrite::Ipc(fp) => Ok(CallToolResult::json(&json!({
             "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
             "drill_diameter": drill_d, "footprint": fp.footprint,
             "source": "ipc"
         }))),
-        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
-            "KiCAD rejected the mounting hole over IPC: {message}. \
-             The board file was not modified — KiCAD is reachable and may hold this \
-             board open, so editing the file directly could be silently overwritten."
-        ))),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+        BoardWrite::Refused(err) => Ok(err),
+        BoardWrite::File => {
             // No live KiCad on the other end of this transport: editing the
             // board file directly cannot race an editor.
             let fp_sexp = format_npth_footprint(x, y, drill_d, &reference);
@@ -905,21 +976,28 @@ async fn handle_add_board_text(
     let size = args["size"].as_f64().unwrap_or(1.0);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
-    // Try IPC first; fall through to file edit if KiCAD isn't reachable.
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
-        let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
-        c.create_items(vec![any])
-    })
+    match attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "board text",
+        move |c| {
+            let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
+            let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
+            c.create_items(vec![any]).map(|_| ())
+        },
+    )
     .await?
-    .is_ok()
     {
-        return Ok(CallToolResult::json(&json!({
-            "text": text, "x": x, "y": y, "layer": layer, "size": size,
-            "source": "ipc"
-        })));
+        BoardWrite::Ipc(()) => {
+            return Ok(CallToolResult::json(&json!({
+                "text": text, "x": x, "y": y, "layer": layer, "size": size,
+                "source": "ipc"
+            })))
+        }
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::File => {}
     }
 
     let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
@@ -1003,17 +1081,23 @@ async fn handle_import_svg_logo(
     let placed =
         crate::tools::svg_import::scale_and_place(&logo.polygons, logo.width, width_mm, x, y);
 
-    // Try IPC first; fall through to a direct file edit if KiCAD isn't reachable.
     let layer_ipc = layer.clone();
     let placed_ipc = placed.clone();
-    if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc);
-        let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
-        c.create_items(vec![any])
-    })
-    .await?
-    .is_ok()
-    {
+    let ipc_attempt = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "SVG logo",
+        move |c| {
+            let shape = builders::board_polygon(&layer_ipc, 0.0, true, &placed_ipc);
+            let any = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+            c.create_items(vec![any]).map(|_| ())
+        },
+    )
+    .await?;
+    if let BoardWrite::Refused(err) = ipc_attempt {
+        return Ok(err);
+    }
+    if matches!(ipc_attempt, BoardWrite::Ipc(())) {
         return Ok(CallToolResult::json(&json!({
             "polygon_count": placed.len(),
             "layer": layer,
@@ -1345,7 +1429,7 @@ mod mounting_hole_tests {
     use crate::tools::ServerConfig;
     use std::sync::Arc;
 
-    fn ctx_with_ipc(ipc_address: String) -> ToolContext {
+    pub(super) fn ctx_with_ipc(ipc_address: String) -> ToolContext {
         ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
@@ -1360,7 +1444,7 @@ mod mounting_hole_tests {
         )
     }
 
-    fn blank_board(dir: &std::path::Path) -> std::path::PathBuf {
+    pub(super) fn blank_board(dir: &std::path::Path) -> std::path::PathBuf {
         let board = dir.join("board.kicad_pcb");
         std::fs::write(
             &board,
@@ -1370,7 +1454,7 @@ mod mounting_hole_tests {
         board
     }
 
-    fn result_text(res: &CallToolResult) -> String {
+    pub(super) fn result_text(res: &CallToolResult) -> String {
         match res.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             other => panic!("expected text content, got {other:?}"),
@@ -1380,7 +1464,7 @@ mod mounting_hole_tests {
     /// A rep0 endpoint that completes every round-trip with an error status —
     /// a live KiCAD saying no. Mirrors the helper of the same name in
     /// `pcb_components`, which guards `place_component`'s fallback.
-    fn spawn_rejecting_kicad() -> String {
+    pub(super) fn spawn_rejecting_kicad() -> String {
         use nng::options::Options;
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1485,5 +1569,108 @@ mod mounting_hole_tests {
         );
         assert!(updated.contains("(drill 3.45)"), "{updated}");
         assert!(updated.contains("\"H1\""), "{updated}");
+    }
+}
+
+/// The board-graphics tools (`set_board_size`, `add_board_outline`,
+/// `add_board_text`, `import_svg_logo`) went to IPC on `with_ipc(..).is_ok()`,
+/// which conflated "no KiCAD there" with "KiCAD said no" and ignored the
+/// `board` argument entirely. Both halves are covered here: a reachable KiCAD
+/// that refuses must leave the file alone, and an unreachable one must still
+/// produce the file edit.
+#[cfg(test)]
+mod board_write_gate_tests {
+    use super::mounting_hole_tests::{
+        blank_board, ctx_with_ipc, result_text, spawn_rejecting_kicad,
+    };
+    use super::*;
+
+    fn board_args(board: &std::path::Path) -> serde_json::Value {
+        json!({
+            "board": board.to_str().unwrap(),
+            "x1": 10.0, "y1": 10.0, "x2": 30.0, "y2": 25.0
+        })
+    }
+
+    #[tokio::test]
+    async fn outline_on_a_rejecting_kicad_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(spawn_rejecting_kicad());
+        let res = handle_add_board_outline(&board_args(&board), &ctx)
+            .await
+            .unwrap();
+
+        assert!(res.is_error, "a rejection must not be reported as success");
+        assert!(
+            result_text(&res).contains("board file was not modified"),
+            "{}",
+            result_text(&res)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "a reachable KiCAD refused, so the file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn outline_on_an_unreachable_kicad_edits_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+
+        // Empty ipc_address classifies as TransportUnreachable: no live KiCAD
+        // can be holding this board, so the file edit is safe.
+        let ctx = ctx_with_ipc(String::new());
+        let res = handle_add_board_outline(&board_args(&board), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(parsed["source"], json!("file"));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(
+            updated.matches("Edge.Cuts").count(),
+            4,
+            "expected four outline segments: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn board_text_on_a_rejecting_kicad_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(spawn_rejecting_kicad());
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "text": "REV A", "x": 5.0, "y": 5.0
+        });
+        let res = handle_add_board_text(&args, &ctx).await.unwrap();
+
+        assert!(res.is_error, "a rejection must not be reported as success");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_board_size_on_a_rejecting_kicad_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(spawn_rejecting_kicad());
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "width": 20.0, "height": 15.0
+        });
+        let res = handle_set_board_size(&args, &ctx).await.unwrap();
+
+        assert!(res.is_error, "a rejection must not be reported as success");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
     }
 }
