@@ -7,8 +7,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, require_f64,
-    require_str, ToolContext, ToolDef,
+    find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
+    project_name_for, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -481,6 +481,124 @@ async fn handle_delete_schematic_component(
     }
 }
 
+/// Properties this tool exposes as first-class parameters. Routing one of them
+/// through `fields` too would let a single call set the same property twice
+/// with different values, and for Reference it would skip the instances-path
+/// rewrite entirely — a rename that the netlist ignores (#157).
+fn is_reserved_property(name: &str) -> bool {
+    matches!(name, "Reference" | "Value" | "Footprint" | "Datasheet")
+}
+
+/// Does `reference`'s symbol block already carry a `name` property?
+fn property_exists(content: &str, reference: &str, name: &str) -> bool {
+    find_symbol_instance_block(content, reference).is_some_and(|(start, end)| {
+        content[start..end].contains(&format!(r#"(property "{name}" ""#))
+    })
+}
+
+/// Append a new `(property …)` to `reference`'s symbol block.
+///
+/// Anchored at the symbol's own `(at …)` and written hidden: a custom field is
+/// data, not something to draw over the sheet, and KiCad 10's canonical
+/// instance form puts `(hide yes)` as a sibling before `(effects …)` (#96).
+/// The `(at …)` is mandatory — a property written without one is defaulted to
+/// the sheet origin, which is how every `#PWR` reference once piled up in the
+/// top-left corner (#95).
+fn append_property(
+    content: &str,
+    reference: &str,
+    name: &str,
+    value: &str,
+) -> Result<String, String> {
+    let (start, end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+    let block = &content[start..end];
+
+    // The symbol's placement, to anchor the new property on.
+    let (x, y) = block
+        .find("(at ")
+        .and_then(|at| {
+            let rest = &block[at + 4..];
+            let close = rest.find(')')?;
+            let mut parts = rest[..close].split_whitespace();
+            Some((
+                parts.next()?.parse::<f64>().ok()?,
+                parts.next()?.parse::<f64>().ok()?,
+            ))
+        })
+        .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
+
+    // Match the block's own indentation rather than assuming: eeschema saves
+    // with tabs, this crate's writer uses two spaces.
+    let indent = block
+        .find("(property ")
+        .map(|p| {
+            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
+            block[line_start..p].to_string()
+        })
+        .unwrap_or_else(|| "\t\t".to_string());
+
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let prop = format!(
+        "\n{indent}(property \"{name}\" \"{escaped}\"\n{indent}\t(at {x} {y} 0)\n\
+         {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
+         (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
+    );
+
+    // Insert before the block's closing paren so the property stays inside it.
+    let close = content[..end]
+        .rfind(')')
+        .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
+    Ok(format!(
+        "{}{}{}",
+        &content[..close],
+        prop,
+        &content[close..]
+    ))
+}
+
+/// Rewrite the `(reference "…")` inside every unit's `(instances …)` block.
+///
+/// Returns the updated content and how many were rewritten. A multi-unit part
+/// is placed once per unit and each placement carries its own instances block,
+/// so a rename has to reach all of them or the units disagree about their own
+/// designator.
+fn rewrite_instance_references(
+    content: &str,
+    old_ref: &str,
+    new_ref: &str,
+) -> Result<(String, usize), String> {
+    let blocks = find_all_symbol_instance_blocks(content, new_ref);
+    if blocks.is_empty() {
+        return Err(format!("symbol '{old_ref}' not found after the rename"));
+    }
+
+    let search = format!(r#"(reference "{old_ref}")"#);
+    let replacement = format!(r#"(reference "{new_ref}")"#);
+    let mut edits = Vec::new();
+    for (start, end) in &blocks {
+        let block = &content[*start..*end];
+        let mut from = 0usize;
+        while let Some(rel) = block[from..].find(&search) {
+            let at = *start + from + rel;
+            edits.push(SexpEdit::replace(
+                at,
+                at + search.len(),
+                replacement.clone(),
+            ));
+            from += rel + search.len();
+        }
+    }
+    if edits.is_empty() {
+        return Err(format!(
+            "'{new_ref}' has no (reference \"{old_ref}\") in its instances path — \
+             the property was renamed but the netlist still reads the old designator"
+        ));
+    }
+    let count = edits.len();
+    Ok((apply_edits(content.to_string(), edits), count))
+}
+
 async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -522,31 +640,88 @@ async fn handle_edit_schematic_component(
         };
 
     let mut errors: Vec<String> = Vec::new();
-    let mut apply = |content: &mut String, field: &str, new_val: &str| match update_field(
-        content, &reference, field, new_val,
-    ) {
-        Ok(updated) => {
-            *content = updated;
-            changed.push(format!("{} → {}", field, new_val));
-        }
-        Err(why) => errors.push(format!("{field}: {why}")),
-    };
+    // A macro rather than a closure: the body also needs `changed`/`errors`
+    // between calls (the instances rewrite below, and the custom-field loop),
+    // and a closure capturing them mutably would lock both for its lifetime.
+    macro_rules! apply {
+        ($field:expr, $new_val:expr) => {
+            match update_field(&content, &reference, $field, $new_val) {
+                Ok(updated) => {
+                    content = updated;
+                    changed.push(format!("{} → {}", $field, $new_val));
+                }
+                Err(why) => errors.push(format!("{}: {}", $field, why)),
+            }
+        };
+    }
 
     if let Some(new_ref) = opt_str(args, "new_reference") {
-        apply(&mut content, "Reference", new_ref);
+        apply!("Reference", new_ref);
+        // A designator lives in TWO places. The (property "Reference" …) is
+        // what renders; the (reference …) inside (instances …) is what KiCad
+        // reads when it builds the netlist. Rewriting only the property leaves
+        // the netlist on the old designator, so the rename appears to work in
+        // eeschema and is ignored everywhere it matters (#157).
+        match rewrite_instance_references(&content, &reference, new_ref) {
+            Ok((updated, count)) => {
+                content = updated;
+                changed.push(format!("instances reference → {new_ref} ({count})"));
+            }
+            Err(why) => errors.push(format!("instances reference: {why}")),
+        }
     }
     if let Some(val) = opt_str(args, "value") {
-        apply(&mut content, "Value", val);
+        apply!("Value", val);
     }
     if let Some(fp) = opt_str(args, "footprint") {
-        apply(&mut content, "Footprint", fp);
+        apply!("Footprint", fp);
     }
     if let Some(ds) = opt_str(args, "datasheet") {
-        apply(&mut content, "Datasheet", ds);
+        apply!("Datasheet", ds);
+    }
+
+    // `fields` has been in this tool's schema since it shipped and the handler
+    // never read it, so custom properties were dropped and the call still
+    // reported success (#158). An existing property is updated in place; a new
+    // one is appended to the symbol block.
+    let custom_fields = args["fields"].as_object();
+    if let Some(fields) = custom_fields {
+        for (name, value) in fields {
+            let Some(value) = value.as_str() else {
+                errors.push(format!("{name}: field values must be strings"));
+                continue;
+            };
+            if is_reserved_property(name) {
+                errors.push(format!(
+                    "{name}: set this through the '{}' parameter, not 'fields'",
+                    name.to_ascii_lowercase()
+                ));
+                continue;
+            }
+            if property_exists(&content, &reference, name) {
+                apply!(name.as_str(), value);
+            } else {
+                match append_property(&content, &reference, name, value) {
+                    Ok(updated) => {
+                        content = updated;
+                        changed.push(format!("{name} → {value} (added)"));
+                    }
+                    Err(why) => errors.push(format!("{name}: {why}")),
+                }
+            }
+        }
     }
 
     // A request that changed nothing is a failure, not a success — silently
-    // reporting `"changes": []` is what let the tab-indentation bug hide.
+    // reporting `"changes": []` is what let the tab-indentation bug hide, and
+    // what made a fields-only call report success while dropping every field
+    // (#158): with `fields` unread, both `changed` and `errors` came back
+    // empty and this guard never fired.
+    if changed.is_empty() && custom_fields.is_some_and(|f| !f.is_empty()) && errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields were updated on '{reference}'"
+        )));
+    }
     if changed.is_empty() && !errors.is_empty() {
         return Ok(CallToolResult::error(format!(
             "No fields were updated on '{}': {}",
@@ -1899,6 +2074,146 @@ mod tests {
         assert!(
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
+        );
+    }
+}
+
+/// `edit_schematic_component` had two independent defects, both of which
+/// reported success: `fields` was declared in the schema and never read
+/// (#158), and `new_reference` rewrote only the rendered property, leaving the
+/// instances path — which is where KiCad reads the designator for the netlist
+/// — on the old value (#157).
+#[cfg(test)]
+mod edit_component_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// One R1, with an instances path, as eeschema writes it.
+    const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 50 60 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 52 58 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 52 62 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"proj\"\n\t\t\t\t(path \"/root\"\n\t\t\t\t\t(reference \"R1\") (unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
+
+    async fn edit(args: serde_json::Value) -> (String, String) {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let mut args = args;
+        args["schematic"] = json!(f.path().to_str().unwrap());
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "edit_schematic_component")
+            .unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let res = (def.handler)(&args, ctx).await.unwrap();
+        let reply = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        (std::fs::read_to_string(f.path()).unwrap(), reply)
+    }
+
+    /// #157: the rename must reach the instances path, not just the property.
+    #[tokio::test]
+    async fn renaming_a_reference_rewrites_the_instances_path() {
+        let (out, _) = edit(json!({ "reference": "R1", "new_reference": "R7" })).await;
+        assert!(
+            out.contains("(property \"Reference\" \"R7\""),
+            "property renamed:\n{out}"
+        );
+        assert!(
+            out.contains("(reference \"R7\")"),
+            "instances path must carry the new designator, or the netlist \
+             ignores the rename:\n{out}"
+        );
+        assert!(
+            !out.contains("(reference \"R1\")"),
+            "no instances entry may keep the old designator:\n{out}"
+        );
+    }
+
+    /// #158: a custom field that does not exist yet must be created.
+    #[tokio::test]
+    async fn a_new_custom_field_is_written_into_the_symbol() {
+        let (out, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "MPN": "RC0402FR-0710KL" }
+        }))
+        .await;
+        assert!(
+            out.contains("(property \"MPN\" \"RC0402FR-0710KL\""),
+            "custom field must land in the file:\n{out}"
+        );
+        assert!(
+            out.contains("(hide yes)"),
+            "a custom field is data, not sheet artwork:\n{out}"
+        );
+        assert!(reply.contains("MPN"), "the reply must report it: {reply}");
+        // Anchored on the symbol, not defaulted to the sheet origin (#95).
+        assert!(
+            !out.contains("(property \"MPN\" \"RC0402FR-0710KL\"\n\t\t\t(at 0 0 0)"),
+            "must not land at the sheet origin:\n{out}"
+        );
+    }
+
+    /// #158: an existing custom field is updated rather than duplicated.
+    #[tokio::test]
+    async fn an_existing_custom_field_is_updated_not_duplicated() {
+        let (out, _) = edit(json!({ "reference": "R1", "fields": { "MPN": "first" } })).await;
+        assert_eq!(out.matches("(property \"MPN\"").count(), 1);
+
+        // Value is a first-class parameter, so it must be updated in place.
+        let (out2, _) = edit(json!({ "reference": "R1", "value": "22k" })).await;
+        assert_eq!(out2.matches("(property \"Value\"").count(), 1, "{out2}");
+        assert!(out2.contains("(property \"Value\" \"22k\""), "{out2}");
+    }
+
+    /// The defect that made #158 invisible: with `fields` unread, both
+    /// `changed` and `errors` came back empty, so the no-op guard never fired
+    /// and the call reported success having done nothing.
+    #[tokio::test]
+    async fn a_fields_only_call_no_longer_reports_an_empty_success() {
+        let (_, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "MPN": "RC0402FR-0710KL" }
+        }))
+        .await;
+        assert!(
+            !reply.contains("\"changes\":[]"),
+            "a fields-only call must not report an empty change set: {reply}"
+        );
+    }
+
+    /// Reserved names belong to their own parameters — routing Reference
+    /// through `fields` would skip the instances rewrite and silently
+    /// reintroduce #157.
+    #[tokio::test]
+    async fn reserved_names_are_refused_inside_fields() {
+        let (out, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "Reference": "R9" }
+        }))
+        .await;
+        assert!(
+            out.contains("(property \"Reference\" \"R1\""),
+            "the designator must be untouched:\n{out}"
+        );
+        assert!(
+            reply.contains("Reference"),
+            "the refusal is reported: {reply}"
         );
     }
 }
