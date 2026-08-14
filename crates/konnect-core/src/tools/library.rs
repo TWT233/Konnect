@@ -5382,3 +5382,91 @@ mod symbol_source_tests {
         );
     }
 }
+
+/// A missing argument must stay a structured `invalid_argument` naming the
+/// field, rather than collapsing into a generic `handler_error`.
+///
+/// Seven handlers here did `map_err(|e| anyhow!("{:?}", e))?` on the
+/// `CallToolResult` that `require_str` returns, debug-formatting a typed error
+/// into a string and losing the taxonomy on the way out. `pcb_components`
+/// already returned the result directly. This is what lets a caller tell "you
+/// forgot an argument" from "the tool tried and failed".
+#[cfg(test)]
+mod argument_error_kind_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn missing_required_arguments_report_invalid_argument_with_the_field() {
+        // (tool, args that satisfy everything *except* the field under test,
+        //  the field it should name)
+        //
+        // The args matter: several of these read a path through `get_path`
+        // first, which still returns an `anyhow::Error` and would fail the
+        // call before the `require_str` this test is about is ever reached.
+        let cases = [
+            ("get_symbol_info", json!({}), "lib_id"),
+            ("get_footprint_info", json!({}), "footprint_path"),
+            (
+                "register_footprint_library",
+                json!({ "library_path": "/tmp/x.pretty", "scope": "global" }),
+                "nickname",
+            ),
+            (
+                "register_symbol_library",
+                json!({ "library_path": "/tmp/x.kicad_sym", "scope": "global" }),
+                "nickname",
+            ),
+        ];
+
+        for (tool_name, args, field) in cases {
+            let def = tools()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is registered"));
+
+            // The old pattern turned this into an Err, so the unwrap itself is
+            // part of the assertion.
+            let result = (def.handler)(&args, ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{tool_name} must not bubble an anyhow error: {e}"));
+
+            assert!(result.is_error, "{tool_name}: missing argument must fail");
+
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool_name}: expected text, got {other:?}"),
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool_name}: {e}: {text}"));
+
+            assert_eq!(
+                parsed["error"]["kind"], "invalid_argument",
+                "{tool_name} must report a typed argument error, not a \
+                 debug-formatted handler_error: {text}"
+            );
+            assert_eq!(
+                parsed["error"]["field"], field,
+                "{tool_name} must name the missing field: {text}"
+            );
+        }
+    }
+}
