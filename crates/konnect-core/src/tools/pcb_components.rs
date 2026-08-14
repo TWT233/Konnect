@@ -35,7 +35,7 @@ where
 /// As [`with_ipc`], but classifying a failure as transport-unreachable vs
 /// KiCad-rejected via [`konnect_ipc::IpcFailure`] — the typed gate for the
 /// file-editing fallback (never a text match on the error message).
-async fn with_ipc_classified<T, F>(
+pub(crate) async fn with_ipc_classified<T, F>(
     addr: String,
     f: F,
 ) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>

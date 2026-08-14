@@ -71,14 +71,53 @@ fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) 
     )
 }
 
+/// Library identifier a mounting hole is placed under. Shared by the IPC and
+/// file paths so the two cannot drift.
+fn mounting_hole_lib_id(drill_d: f64) -> String {
+    format!("MountingHole:MountingHole_{drill_d:.1}mm")
+}
+
+/// Copper/mask annulus diameter around a `drill_d` mounting hole.
+fn mounting_hole_pad_size(drill_d: f64) -> f64 {
+    drill_d + 0.5
+}
+
+/// Footprint-local Y offset of the Reference/Value text of a mounting hole.
+fn mounting_hole_text_offset(drill_d: f64) -> f64 {
+    drill_d + 1.5
+}
+
+/// The single NPTH pad of a mounting hole, in footprint-local coordinates —
+/// the IPC-path equivalent of the `(pad "" np_thru_hole …)` node that
+/// [`format_npth_footprint`] writes.
+fn mounting_hole_pad(drill_d: f64) -> konnect_ipc::IpcPadDefinition {
+    let pad_size = mounting_hole_pad_size(drill_d);
+    konnect_ipc::IpcPadDefinition {
+        number: String::new(),
+        pad_type: "np_thru_hole".to_string(),
+        shape: "circle".to_string(),
+        x: 0.0,
+        y: 0.0,
+        rotation: 0.0,
+        size_x: pad_size,
+        size_y: pad_size,
+        drill_x: Some(drill_d),
+        drill_y: Some(drill_d),
+        drill_oval: false,
+        layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
+        roundrect_ratio: 0.0,
+    }
+}
+
 fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> String {
     let fp_uuid = new_uuid();
     let ref_uuid = new_uuid();
     let val_uuid = new_uuid();
     let pad_uuid = new_uuid();
-    let pad_size = drill_d + 0.5;
+    let pad_size = mounting_hole_pad_size(drill_d);
+    let lib_id = mounting_hole_lib_id(drill_d);
     format!(
-        "\n  (footprint \"MountingHole:MountingHole_{drill_d:.1}mm\"\n    \
+        "\n  (footprint \"{lib_id}\"\n    \
          (layer \"F.Cu\")\n    (at {x} {y})\n    \
          (attr exclude_from_pos_files)\n    \
          (property \"Reference\" \"{reference}\"\n      (at 0 {offset} 0)\n      (layer \"F.SilkS\")\n      (uuid \"{ref_uuid}\")\n    )\n    \
@@ -86,7 +125,7 @@ fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> Strin
          (pad \"\" np_thru_hole circle (at 0 0) (size {pad_size} {pad_size})\n      \
          (drill {drill_d})\n      (layers \"*.Cu\" \"*.Mask\")\n      (uuid \"{pad_uuid}\")\n    )\n    \
          (uuid \"{fp_uuid}\")\n  )",
-        offset = drill_d + 1.5
+        offset = mounting_hole_text_offset(drill_d)
     )
 }
 
@@ -765,7 +804,7 @@ async fn handle_add_board_outline(
 
 async fn handle_add_mounting_hole(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let x = match require_f64(args, "x") {
@@ -777,17 +816,72 @@ async fn handle_add_mounting_hole(
         Err(e) => return Ok(e),
     };
     let drill_d = args["drill_diameter"].as_f64().unwrap_or(3.2);
-    let reference = args["reference"].as_str().unwrap_or("H1");
+    let reference = args["reference"].as_str().unwrap_or("H1").to_string();
 
-    let fp_sexp = format_npth_footprint(x, y, drill_d, reference);
-    let content = std::fs::read_to_string(&board_path)?;
-    let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
-    write_atomic(&board_path, &new_content)?;
+    // Try IPC first, exactly as `place_component` does. A mounting hole is a
+    // footprint, so a file-only edit is invisible to a KiCAD that holds this
+    // board open and is discarded by its next save — the tool reported success
+    // while nothing was ever created. The fallback gate is the typed transport
+    // classification: only a request that never reached a live KiCAD may edit
+    // the board file; a KiCAD that answered — even with an error — fails closed.
+    let requested_board = board_path.clone();
+    let lib_id = mounting_hole_lib_id(drill_d);
+    let lib_id_ipc = lib_id.clone();
+    let reference_ipc = reference.clone();
+    let text_offset = mounting_hole_text_offset(drill_d);
+    let attempt = crate::tools::pcb_components::with_ipc_classified(
+        ctx.config.ipc_address.clone(),
+        move |c| {
+            c.place_footprint(
+                &requested_board,
+                &lib_id_ipc,
+                &reference_ipc,
+                "MountingHole",
+                std::slice::from_ref(&mounting_hole_pad(drill_d)),
+                &[],
+                &konnect_ipc::IpcFieldPlacement {
+                    reference_at: Some((0.0, text_offset, 0.0)),
+                    value_at: Some((0.0, -text_offset, 0.0)),
+                },
+                x,
+                y,
+                0.0,
+                "F.Cu",
+            )
+        },
+    )
+    .await?;
 
-    Ok(CallToolResult::json(&json!({
-        "reference": reference, "x": x, "y": y, "drill_diameter": drill_d
-    })))
+    match attempt {
+        Ok(fp) => Ok(CallToolResult::json(&json!({
+            "reference": fp.reference, "x": fp.position.x, "y": fp.position.y,
+            "drill_diameter": drill_d, "footprint": fp.footprint,
+            "source": "ipc"
+        }))),
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
+            "KiCAD rejected the mounting hole over IPC: {message}. \
+             The board file was not modified — KiCAD is reachable and may hold this \
+             board open, so editing the file directly could be silently overwritten."
+        ))),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            // No live KiCad on the other end of this transport: editing the
+            // board file directly cannot race an editor.
+            let fp_sexp = format_npth_footprint(x, y, drill_d, &reference);
+            let content = std::fs::read_to_string(&board_path)?;
+            let close_pos = content.rfind(')').unwrap_or(content.len());
+            let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, fp_sexp)]);
+            write_atomic(&board_path, &new_content)?;
+
+            Ok(CallToolResult::json(&json!({
+                "reference": reference, "x": x, "y": y, "drill_diameter": drill_d,
+                "footprint": lib_id,
+                "source": "file",
+                "warning": "KiCAD IPC was not reachable, so the board file was edited \
+                            directly. KiCAD will show this mounting hole when it next \
+                            loads the board."
+            })))
+        }
+    }
 }
 
 async fn handle_add_board_text(
@@ -1239,5 +1333,154 @@ mod net_count_tests {
             net_count_of("(kicad_pcb\n  (version 20250610)\n  (net 0 \"\")\n)\n").await,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod mounting_hole_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn ctx_with_ipc(ipc_address: String) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn blank_board(dir: &std::path::Path) -> std::path::PathBuf {
+        let board = dir.join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n  (version 20250610)\n  (generator \"konnect\")\n  (paper \"A4\")\n  (net 0 \"\")\n)\n",
+        )
+        .unwrap();
+        board
+    }
+
+    fn result_text(res: &CallToolResult) -> String {
+        match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A rep0 endpoint that completes every round-trip with an error status —
+    /// a live KiCAD saying no. Mirrors the helper of the same name in
+    /// `pcb_components`, which guards `place_component`'s fallback.
+    fn spawn_rejecting_kicad() -> String {
+        use nng::options::Options;
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        std::thread::spawn(move || {
+            use prost::Message;
+            while socket.recv().is_ok() {
+                let response = konnect_ipc::gen::kiapi::common::ApiResponse {
+                    status: Some(konnect_ipc::gen::kiapi::common::ApiResponseStatus {
+                        status: konnect_ipc::gen::kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                        error_message: "mock rejects everything".to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn mounting_hole_pad_is_an_unplated_hole_with_drill_and_annulus() {
+        let pad = mounting_hole_pad(3.45);
+        assert_eq!(pad.pad_type, "np_thru_hole");
+        assert_eq!(pad.shape, "circle");
+        assert_eq!(pad.drill_x, Some(3.45));
+        assert_eq!(pad.drill_y, Some(3.45));
+        assert!(!pad.drill_oval);
+        // Annulus matches the (size …) the file path writes, so a hole placed
+        // over IPC and one written to the file are the same hole.
+        assert_eq!(pad.size_x, 3.95);
+        assert_eq!(pad.size_y, 3.95);
+        assert_eq!(pad.layers, ["*.Cu", "*.Mask"]);
+        assert_eq!(pad.x, 0.0);
+        assert_eq!(pad.y, 0.0);
+    }
+
+    /// The bug: `add_mounting_hole` only ever edited the board file. Against a
+    /// KiCAD holding the board open, the hole never appeared in the session and
+    /// the next save discarded it — three calls, a success JSON each time, zero
+    /// footprints on the board. A reachable KiCAD must now fail closed.
+    #[tokio::test]
+    async fn a_reachable_kicad_that_rejects_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let ctx = ctx_with_ipc(spawn_rejecting_kicad());
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+        });
+        let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
+
+        assert!(res.is_error, "a rejection must not be reported as success");
+        let text = result_text(&res);
+        assert!(
+            text.contains("rejected the mounting hole") && text.contains("not modified"),
+            "the error must say the file was left alone: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&board).unwrap(),
+            before,
+            "a reachable KiCAD that says no must never trigger the file fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_kicad_still_falls_back_to_the_board_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+
+        // Empty ipc_address is classified TransportUnreachable, so no live
+        // KiCAD can be holding this board.
+        let ctx = ctx_with_ipc(String::new());
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "x": 5.0, "y": 6.0, "drill_diameter": 3.45, "reference": "H1"
+        });
+        let res = handle_add_mounting_hole(&args, &ctx).await.unwrap();
+        assert!(!res.is_error, "handler errored: {:?}", res.content);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(parsed["source"], json!("file"));
+        assert_eq!(parsed["reference"], json!("H1"));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(pad \"\" np_thru_hole circle"),
+            "{updated}"
+        );
+        assert!(updated.contains("(drill 3.45)"), "{updated}");
+        assert!(updated.contains("\"H1\""), "{updated}");
     }
 }
