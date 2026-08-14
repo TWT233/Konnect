@@ -971,6 +971,33 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
 /// `${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty`. An exported environment
 /// variable wins; otherwise the variable's kind is inferred from its name and
 /// the known install locations are searched.
+/// User path variables from `kicad_common.json` (Preferences → Configure
+/// Paths).
+///
+/// These are KiCad's own variables, not process environment variables — KiCad
+/// stores them in its config and substitutes them itself when reading a
+/// lib-table, so `std::env::var` never finds them. A table written against one
+/// is perfectly normal and is the recommended way to keep a table portable
+/// across machines.
+fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(super::kicad_config_dir().join("kicad_common.json"))
+    else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return std::collections::HashMap::new();
+    };
+    json.get("environment")
+        .and_then(|e| e.get("vars"))
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
@@ -993,6 +1020,19 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     // var_os, not var: `var` treats a non-Unicode value as absent, which would
     // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
     if let Some(base) = std::env::var_os(var) {
+        let p = PathBuf::from(base).join(tail);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // User path variables (Preferences → Configure Paths) are stored in
+    // kicad_common.json and are NOT process environment variables, so the
+    // var_os lookup above can never see them. They are the normal way to write
+    // a portable lib-table — `${MY_PARTS}/house.kicad_sym` — and without this
+    // every such entry resolved to None and the library was invisible.
+    // Credit to @JYPochez (#172) for finding this.
+    if let Some(base) = kicad_user_path_vars().get(var) {
         let p = PathBuf::from(base).join(tail);
         if p.exists() {
             return Some(p);
@@ -1349,23 +1389,54 @@ async fn handle_list_footprint_libraries(
     ))
 }
 
+/// A lib-table path written the way KiCad writes one: forward slashes on every
+/// platform, and without the Windows verbatim prefix.
+///
+/// `canonicalize` on Windows returns `\\?\C:\…`. That prefix is an OS-level
+/// escape for the 260-character limit, not part of the path — KiCad neither
+/// writes nor expects it, and a table carrying one is not portable. Backslashes
+/// are normalised for the same reason: a URI written on Windows has to still
+/// resolve when the project is opened on Linux or macOS.
+/// Credit to @anyn99 (#163), whose PR carried this and the lexical fallback
+/// below.
+fn portable_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    stripped.replace('\\', "/")
+}
+
 /// A lib-table URI for `lib_path`: `${KIPRJMOD}/…` when it lives inside the
 /// project, so the project survives being moved or cloned. Anything outside
 /// keeps its absolute path.
 fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
-    let absolute_uri = || lib_path.to_string_lossy().into_owned();
-    // Both must canonicalise: `strip_prefix("")` succeeds and returns the whole
-    // path, which would emit a `${KIPRJMOD}//abs/path` that resolves nowhere.
-    let (Ok(lib), Ok(dir)) = (
+    // An empty table dir must never reach `strip_prefix`: it succeeds and
+    // returns the whole path, which would emit a `${KIPRJMOD}//abs/path` that
+    // resolves nowhere on read.
+    if table_dir.as_os_str().is_empty() {
+        return portable_uri(lib_path);
+    }
+
+    let relative = |rel: &Path| format!("${{KIPRJMOD}}/{}", portable_uri(rel));
+
+    // Canonicalising both sides is the accurate comparison — it resolves
+    // symlinks, `..` and case differences — but it only works for paths that
+    // already exist. Registering a library before creating it is normal, so a
+    // failure here falls through to a lexical compare rather than giving up on
+    // portability.
+    if let (Ok(lib), Ok(dir)) = (
         std::fs::canonicalize(lib_path),
         std::fs::canonicalize(table_dir),
-    ) else {
-        return absolute_uri();
-    };
-    match lib.strip_prefix(dir) {
-        // Forward slashes: KiCad writes URIs this way on Windows too.
-        Ok(rel) => format!("${{KIPRJMOD}}/{}", rel.to_string_lossy().replace('\\', "/")),
-        Err(_) => absolute_uri(),
+    ) {
+        if let Ok(rel) = lib.strip_prefix(&dir) {
+            return relative(rel);
+        }
+        // Canonicalised and genuinely outside the project.
+        return portable_uri(&lib);
+    }
+
+    match lib_path.strip_prefix(table_dir) {
+        Ok(rel) => relative(rel),
+        Err(_) => portable_uri(lib_path),
     }
 }
 
@@ -1381,7 +1452,7 @@ fn lib_table_target(
     table_filename: &str,
 ) -> Result<(PathBuf, String), CallToolResult> {
     if scope == "global" {
-        return Ok((global_table, lib_path.to_string_lossy().into_owned()));
+        return Ok((global_table, portable_uri(lib_path)));
     }
     let Some(proj) = project else {
         return Err(CallToolResult::error(
@@ -4711,7 +4782,60 @@ mod symbol_source_tests {
             !uri.contains("KIPRJMOD"),
             "empty project dir must fall back to an absolute uri: {uri}"
         );
-        assert_eq!(uri, file.to_string_lossy());
+        assert_eq!(uri, portable_uri(&file));
+    }
+
+    /// A library outside the project keeps an absolute URI, but still written
+    /// with forward slashes — a backslash URI does not survive the project
+    /// being opened on Linux or macOS.
+    #[test]
+    fn a_library_outside_the_project_stays_absolute_with_forward_slashes() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, proj.path());
+        assert!(!uri.contains("KIPRJMOD"), "outside the project: {uri}");
+        assert!(!uri.contains('\\'), "uri must be slash-separated: {uri}");
+    }
+
+    /// Global scope is never relativized, and never carries the Windows
+    /// verbatim prefix or backslashes.
+    #[test]
+    fn global_scope_writes_a_plain_forward_slash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table, uri) = lib_table_target(
+            "global",
+            None,
+            &file,
+            PathBuf::from("/cfg/sym-lib-table"),
+            "sym-lib-table",
+        )
+        .expect("global scope needs no project");
+
+        assert_eq!(table, PathBuf::from("/cfg/sym-lib-table"));
+        assert!(!uri.contains("KIPRJMOD"), "global is never relative: {uri}");
+        assert!(!uri.starts_with(r"\\?\"), "verbatim prefix leaked: {uri}");
+        assert!(!uri.contains('\\'), "uri must be slash-separated: {uri}");
+    }
+
+    /// Registering a library before it exists on disk is normal — the file is
+    /// often created by the very next call. `canonicalize` fails for a path
+    /// that is not there yet, so without a lexical fallback the URI silently
+    /// came out absolute and the project stopped being portable.
+    #[test]
+    fn a_library_not_yet_on_disk_still_gets_a_portable_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let file = proj.path().join("lib").join("not-created-yet.kicad_sym");
+
+        assert_eq!(
+            project_relative_uri(&file, proj.path()),
+            "${KIPRJMOD}/lib/not-created-yet.kicad_sym"
+        );
     }
 
     /// Both registrars share one target helper, so footprints get the same
