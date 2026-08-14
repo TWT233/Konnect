@@ -877,7 +877,13 @@ impl KiCadIpcClient {
 
                 let start = track.start.as_ref();
                 let end = track.end.as_ref();
+                let uuid = track
+                    .id
+                    .as_ref()
+                    .map(|id| id.value.clone())
+                    .unwrap_or_default();
                 tracks.push(IpcTrack {
+                    uuid,
                     net_name: net_name.to_string(),
                     layer: layer_name.to_string(),
                     width: track
