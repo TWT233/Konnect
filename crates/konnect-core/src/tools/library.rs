@@ -1333,14 +1333,15 @@ async fn handle_register_footprint_library(
         Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
+    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
-            "table": table_path.to_str().unwrap_or("")
+            "table": table_path.to_str().unwrap_or(""),
+            "repaired_table_root": repaired_root
         }))
         .unwrap(),
     ))
@@ -1489,7 +1490,7 @@ async fn handle_register_symbol_library(
         Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
+    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1497,7 +1498,8 @@ async fn handle_register_symbol_library(
             "nickname": nickname,
             "scope": scope,
             "table": table_path.to_str().unwrap_or(""),
-            "uri": uri
+            "uri": uri,
+            "repaired_table_root": repaired_root
         }))
         .unwrap(),
     ))
@@ -1564,26 +1566,73 @@ fn table_root_element(table_path: &Path) -> &'static str {
     }
 }
 
+/// Correct a lib-table whose root element is the wrong kind, returning the
+/// content and whether anything changed.
+///
+/// A `sym-lib-table` whose root says `(fp_lib_table` — or the reverse — is
+/// rejected outright: *"Library table … has type FOOTPRINT but expected SYMBOL;
+/// skipping"*. #54 stopped Konnect from **creating** such a file, but a table
+/// an older build already wrote stays broken forever, because every later
+/// registration appends into whatever root it finds. Repairing on write is what
+/// makes the earlier fix reach existing projects.
+///
+/// Only a root element is rewritten: the wrong token has to be the first thing
+/// in the file, so the same words appearing inside a `(descr …)` are left alone.
+fn repair_table_root(content: String, expected_root: &str) -> (String, bool) {
+    let wrong_root = if expected_root == "sym_lib_table" {
+        "fp_lib_table"
+    } else {
+        "sym_lib_table"
+    };
+    let opening = format!("({wrong_root}");
+    match content.find(&opening) {
+        Some(pos) if content[..pos].trim().is_empty() => {
+            let repaired = format!(
+                "{}({expected_root}{}",
+                &content[..pos],
+                &content[pos + opening.len()..]
+            );
+            (repaired, true)
+        }
+        _ => (content, false),
+    }
+}
+
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
-/// Creates the file with minimal scaffolding if it doesn't exist.
+/// Creates the file with minimal scaffolding if it doesn't exist, and repairs a
+/// mismatched root element on an existing one.
+///
+/// Returns whether the root element had to be repaired.
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
     uri: &str,
     lib_type: &str,
-) -> anyhow::Result<()> {
-    let content = if table_path.exists() {
-        tokio::fs::read_to_string(table_path).await?
+) -> anyhow::Result<bool> {
+    // The root element must match the table kind: a sym-lib-table with an
+    // (fp_lib_table root is rejected by KiCad. Decide from the filename, which
+    // is fixed by convention.
+    let root = table_root_element(table_path);
+    let (content, repaired_root) = if table_path.exists() {
+        repair_table_root(tokio::fs::read_to_string(table_path).await?, root)
     } else {
-        // The scaffold's root element must match the table kind: a
-        // sym-lib-table created with an (fp_lib_table root is rejected by
-        // KiCad. Decide from the filename, which is fixed by convention.
-        format!("({}\n  (version 7)\n)\n", table_root_element(table_path))
+        (format!("({root}\n  (version 7)\n)\n"), false)
     };
+    if repaired_root {
+        tracing::warn!(
+            "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
+            table_path.display()
+        );
+    }
 
     // Check if nickname already registered
     if content.contains(&format!("(name \"{}\")", nickname)) {
-        return Ok(()); // already registered, idempotent
+        // Idempotent — but a repaired root still has to reach disk, or a table
+        // that already lists this nickname stays rejected forever.
+        if repaired_root {
+            write_atomic(table_path, &content)?;
+        }
+        return Ok(repaired_root);
     }
 
     // Find closing paren of the root expression
@@ -1599,7 +1648,7 @@ async fn register_in_lib_table(
         tokio::fs::create_dir_all(parent).await?;
     }
     write_atomic(table_path, &new_content)?;
-    Ok(())
+    Ok(repaired_root)
 }
 
 // ─── Symbol library tools ─────────────────────────────────────────────────────
@@ -3474,15 +3523,91 @@ mod tests {
     async fn registering_a_symbol_library_scaffolds_a_sym_root() {
         let tmp = tempfile::tempdir().unwrap();
         let table = tmp.path().join("sym-lib-table");
-        register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
+        let repaired = register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
             .await
             .unwrap();
+        assert!(!repaired, "a fresh scaffold has nothing to repair");
         let content = std::fs::read_to_string(&table).unwrap();
         assert!(
             content.starts_with("(sym_lib_table"),
             "scaffold root must match the table kind, got: {content}"
         );
         assert!(content.contains("\"MySyms\""));
+    }
+
+    /// A sym-lib-table an older build wrote with an `(fp_lib_table` root is
+    /// rejected wholesale by KiCad ("has type FOOTPRINT but expected SYMBOL;
+    /// skipping"). #54 stopped new files being written that way; without a
+    /// repair the existing ones stay broken through every later registration.
+    const BROKEN_SYM_TABLE: &str = "(fp_lib_table\n  (version 7)\n  (lib (name \"Old\") (type \"KiCad\") (uri \"/abs/old.kicad_sym\") (options \"\") (descr \"\"))\n)\n";
+
+    #[tokio::test]
+    async fn an_existing_sym_table_with_an_fp_root_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        std::fs::write(&table, BROKEN_SYM_TABLE).unwrap();
+
+        let repaired = register_in_lib_table(&table, "MySyms", "/abs/my.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+
+        assert!(
+            repaired,
+            "the wrong root must be reported, not fixed mutely"
+        );
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            content.starts_with("(sym_lib_table"),
+            "root must be repaired, got: {content}"
+        );
+        assert!(!content.contains("fp_lib_table"), "{content}");
+        assert!(
+            content.contains("\"Old\""),
+            "existing entry lost: {content}"
+        );
+        assert!(content.contains("\"MySyms\""), "{content}");
+    }
+
+    /// The idempotent "already registered" early return used to skip the write
+    /// entirely, so re-registering the same nickname left the bad root in place.
+    #[tokio::test]
+    async fn a_repair_still_lands_when_the_nickname_is_already_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        std::fs::write(&table, BROKEN_SYM_TABLE).unwrap();
+
+        let repaired = register_in_lib_table(&table, "Old", "/abs/old.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+
+        assert!(repaired);
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(content.starts_with("(sym_lib_table"), "{content}");
+        assert_eq!(
+            content.matches("(lib ").count(),
+            1,
+            "an already-registered nickname must not be duplicated: {content}"
+        );
+    }
+
+    #[test]
+    fn a_correct_root_and_a_mention_inside_a_descr_are_left_alone() {
+        let ok = "(fp_lib_table\n  (version 7)\n)\n".to_string();
+        assert_eq!(
+            repair_table_root(ok.clone(), "fp_lib_table"),
+            (ok, false),
+            "a correct table must not be rewritten"
+        );
+
+        // The wrong token appears, but not as the root element.
+        let nested =
+            "(sym_lib_table\n  (lib (name \"X\") (descr \"copied from fp_lib_table\"))\n)\n"
+                .to_string();
+        assert_eq!(
+            repair_table_root(nested.clone(), "sym_lib_table"),
+            (nested, false),
+            "only the root element may be rewritten"
+        );
     }
 
     fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {
