@@ -81,7 +81,7 @@ macro_rules! ipc {
 /// through the project's fp-lib-table (the board's directory), then the global
 /// table, then the conventional KiCad library directories — the lookup that
 /// `library::resolve_footprint_path` owns.
-fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String> {
+pub(crate) fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Result<String> {
     let (nickname, entry) = lib_id.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("footprint must use Library:Footprint syntax, got '{lib_id}'")
     })?;
@@ -197,7 +197,9 @@ fn prepare_footprint_source(
     Ok(prepared)
 }
 
-fn extract_pad_definitions(source: &str) -> anyhow::Result<Vec<konnect_ipc::IpcPadDefinition>> {
+pub(crate) fn extract_pad_definitions(
+    source: &str,
+) -> anyhow::Result<Vec<konnect_ipc::IpcPadDefinition>> {
     let footprint = konnect_sexp::parse_sexp(source)?;
     footprint
         .find_all("pad")
@@ -363,7 +365,7 @@ fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f
 /// Footprint-local Reference/Value text anchors from the library source, so
 /// placed parts keep the library's text layout (a synthesized offset put the
 /// Reference on the part's own silkscreen — silk_overlap in live DRC).
-fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
+pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
     let mut placement = konnect_ipc::IpcFieldPlacement::default();
     let Ok(footprint) = konnect_sexp::parse_sexp(source) else {
         return placement;
@@ -393,7 +395,7 @@ fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlacement {
     placement
 }
 
-fn extract_graphic_definitions(
+pub(crate) fn extract_graphic_definitions(
     source: &str,
 ) -> anyhow::Result<Vec<konnect_ipc::IpcGraphicDefinition>> {
     use konnect_ipc::IpcGraphicDefinition as Graphic;

@@ -191,6 +191,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "exclude_dnp",
         "allow_pin_moves",
         "dry_run",
+        "expected_plan_revision",
         "net_name",
         "pin_number",
         "new_reference",

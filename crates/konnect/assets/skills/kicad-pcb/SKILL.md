@@ -40,6 +40,7 @@ Before any PCB work, load the required toolsets:
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
 load_toolset('pcb_components')   # place, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
+load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
 Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
@@ -60,12 +61,13 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 Follow this sequence for a clean PCB workflow:
 
 1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry
-2. **Import netlist** — there is no Konnect tool for this. KiCad 10 removed
-   `kicad-cli pcb sync`, so the user must open the board in KiCAD and run
-   **Tools > Update PCB from Schematic** themselves. Say so and wait; do not
-   substitute another tool, and do not proceed as though the netlist arrived.
-   `validate_for_manufacturing` reports "No footprints found on the board" when
-   this step has been skipped.
+2. **Update from schematic** — call `update_pcb_from_schematic` first with
+   `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
+   Apply only with `dry_run: false` and the exact returned
+   `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
+   schematic editor, and the target board must be open in KiCad. A conflict is
+   non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
+   undo entry, so Ctrl-Z reverses the whole update.
 3. **Place components** — position all footprints
 4. **Route traces** — connect all nets
 5. **Copper pour** — add ground/power zones last
