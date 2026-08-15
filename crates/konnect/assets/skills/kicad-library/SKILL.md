@@ -273,13 +273,13 @@ set_footprint_models(
 ### Register a Symbol Library
 
 ```
-register_symbol_library(name, path, scope)
+register_symbol_library(nickname, library_path, scope?, project?, replace_existing?)
 ```
 
 ### Register a Footprint Library
 
 ```
-register_footprint_library(name, path, scope)
+register_footprint_library(nickname, library_path, scope?, project?, replace_existing?)
 ```
 
 - Registration is idempotent by default: an existing nickname is left unchanged.
@@ -329,8 +329,9 @@ Dimension format: `LxW` in mm (body dimensions, not pad-to-pad).
 
 ### Create a New IC Symbol + Footprint
 
-1. `search_symbols(part_name)` — confirm it does not exist
-2. `search_footprints(package_name)` — check if footprint exists (often it does)
+1. `search_symbols(query)` — pass the part name; confirm it does not exist
+2. `search_footprints(query)` — pass the package name; check if the footprint
+   exists (often it does)
 3. Create symbol with correct pin count, names, numbers, and types
 4. Assign existing footprint OR create custom footprint from datasheet
 5. Register library if new

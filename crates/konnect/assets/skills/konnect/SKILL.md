@@ -72,7 +72,7 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 
 ## Discovery — Finding Available Tools
 
-Konnect uses a meta-tool router pattern with 187 tools across 18 toolsets. Tools are loaded on demand to keep the context focused.
+Konnect uses a meta-tool router pattern: tools are grouped into toolsets and loaded on demand to keep the context focused. Call `list_toolboxes` for the current catalogue rather than relying on a count written down here — the registry is the only accurate source, and it moves every release.
 
 ```
 list_toolboxes          → See all available toolsets with descriptions

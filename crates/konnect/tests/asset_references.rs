@@ -109,6 +109,125 @@ fn tools_listed_beside_a_toolset_belong_to_it() {
     );
 }
 
+/// A signature-shaped example — `tool(arg, arg, …)` — names real schema
+/// properties, and names every required one.
+///
+/// The two checks above validate *tool* and *toolset* names, so an example
+/// could pass them while every argument in it was invented. That is what
+/// shipped: `route_pad_to_pad(from_reference, from_pad, to_reference, to_pad,
+/// width, layer)` matches the schema on `width` and `layer` alone — the four
+/// that identify the pads are all wrong, and the required `board` and
+/// `net_name` are missing. An agent following it fails the call six ways and
+/// has nothing in the error to tell it the doc was the problem (#217).
+///
+/// Worse, `from_reference` and friends had been added to `NOT_TOOLS` to quiet
+/// the phantom-tool check — an allowlist entry asserting "this is a parameter,
+/// not a tool" with nothing checking the first half of that claim (#183).
+#[test]
+fn call_examples_name_real_parameters() {
+    let mut bad = Vec::new();
+
+    for path in asset_files() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (lineno, line) in text.lines().enumerate() {
+            for (tool, args) in signature_examples(line) {
+                let Some(schema) = schema_for(&tool) else {
+                    continue; // not a tool, or reported by the phantom check
+                };
+                let props: BTreeSet<&str> = schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let required: BTreeSet<&str> = schema
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+
+                let named: BTreeSet<&str> = args.iter().map(String::as_str).collect();
+                for arg in &args {
+                    if !props.contains(arg.as_str()) {
+                        bad.push(format!(
+                            "{}:{}: {tool}(…) names `{arg}`, which is not in its schema. Has: {props:?}",
+                            display(&path),
+                            lineno + 1
+                        ));
+                    }
+                }
+                for missing in required.difference(&named) {
+                    bad.push(format!(
+                        "{}:{}: {tool}(…) omits required `{missing}`",
+                        display(&path),
+                        lineno + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "shipped call examples do not match the tool schemas:\n  {}\n\n\
+         An agent copying one of these gets an invalid_argument error it cannot \
+         diagnose. Fix the example to the real property names.",
+        bad.join("\n  ")
+    );
+}
+
+/// Every registered tool's input schema, by name.
+fn schema_for(tool: &str) -> Option<serde_json::Value> {
+    registry::ALL_TOOLSETS
+        .iter()
+        .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
+        .find(|d| d.name == tool)
+        .map(|d| d.input_schema)
+}
+
+/// `tool(a, b, c)` where every argument is a bare identifier — the form the
+/// skills use to write a signature.
+///
+/// Anything else is left alone: a call with literal values (`load_toolset('x')`,
+/// `add_via(board, "GND", 10, 20)`) is illustrating a value, not claiming a
+/// parameter list, and `tool_name(params)` is the syntax itself being written
+/// up. A trailing `?` marks an optional argument in the schematic skill and is
+/// not part of the name.
+fn signature_examples(line: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    for (open, _) in line.match_indices('(') {
+        let Some(close) = line[open..].find(')').map(|i| open + i) else {
+            continue;
+        };
+        // Walk back over the identifier that opens the call.
+        let start = bytes[..open]
+            .iter()
+            .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .map_or(0, |i| i + 1);
+        let tool = &line[start..open];
+        if tool.is_empty() || !tool.starts_with(|c: char| c.is_ascii_lowercase()) {
+            continue;
+        }
+        let inner = &line[open + 1..close];
+        if inner.trim().is_empty() {
+            continue;
+        }
+        let args: Vec<String> = inner
+            .split(',')
+            .map(|a| a.trim().trim_end_matches('?').to_string())
+            .collect();
+        let bare = args.iter().all(|a| {
+            !a.is_empty()
+                && a.starts_with(|c: char| c.is_ascii_lowercase())
+                && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if bare {
+            out.push((tool.to_string(), args));
+        }
+    }
+    out
+}
+
 fn toolset_names_in(line: &str) -> impl Iterator<Item = String> + '_ {
     line.match_indices("load_toolset(").filter_map(|(at, _)| {
         let rest = &line[at + "load_toolset(".len()..];
@@ -145,6 +264,13 @@ fn display(path: &Path) -> String {
 /// shape, and an explicit allowlist for the non-tool identifiers the prose
 /// legitimately uses. A broad heuristic here would fail on every future doc
 /// edit and get deleted; this one should only fire on a real phantom.
+///
+/// Parameter names are exempted *from the schemas*, not by hand. The manual
+/// list used to carry `from_reference`, `net_positive`, `fab_options` and
+/// friends — names that are not parameters of anything, allowlisted here on the
+/// strength of appearing in an example that was itself wrong. Deriving the
+/// exemption from the registry means a name only escapes this check by being a
+/// real property of a real tool (#183).
 #[test]
 fn backticked_tool_names_in_prose_exist_in_the_registry() {
     let known: BTreeSet<String> = registry::ALL_TOOLSETS
@@ -157,6 +283,18 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
                 .iter()
                 .map(|t| t.name.to_string()),
         )
+        .collect();
+
+    let parameters: BTreeSet<String> = registry::ALL_TOOLSETS
+        .iter()
+        .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
+        .filter_map(|d| {
+            d.input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        })
+        .flatten()
         .collect();
 
     // Identifiers the prose uses that are not tools: meta-tools, config keys,
@@ -188,32 +326,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "open_collector",
         "open_emitter",
         "tri_state",
-        "exclude_dnp",
-        "allow_pin_moves",
-        "dry_run",
-        "expected_plan_revision",
-        "net_name",
-        "pin_number",
-        "new_reference",
-        // Tool *parameters* and values named in prose and examples.
-        "from_pad",
-        "from_reference",
-        "to_pad",
-        "to_reference",
-        "net_positive",
-        "net_negative",
-        "outline_points",
-        "output_dir",
-        "output_path",
-        "package_name",
-        "part_name",
-        "power_net",
-        "trace_width",
-        "track_width",
-        "via_diameter",
-        "via_drill",
-        "fab_options",
-        "lcsc_no",
+        // Tool parameters are exempted from the schemas, not from this list —
+        // see the doc comment. Only values and vocabulary belong here.
         "usb_c_5v_sink",
         // File extensions and other tooling vocabulary.
         "kicad_mod",
@@ -245,7 +359,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         };
         for (lineno, line) in text.lines().enumerate() {
             for word in snake_words(line) {
-                if known.contains(&word) || NOT_TOOLS.contains(&word.as_str()) {
+                if known.contains(&word)
+                    || parameters.contains(&word)
+                    || NOT_TOOLS.contains(&word.as_str())
+                {
                     continue;
                 }
                 phantom.push(format!(

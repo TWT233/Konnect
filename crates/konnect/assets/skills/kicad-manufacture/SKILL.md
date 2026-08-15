@@ -74,8 +74,11 @@ Every schematic symbol must have a footprint assigned. Check for:
 ### One-Shot Export (Recommended)
 
 ```
-export_manufacturing_package(output_dir, format)
+export_manufacturing_package(board, output_dir, fab_house?, schematic?, quantity?)
 ```
+
+`fab_house` selects the house profile (there is no `format` argument). Pass
+`schematic` when you want the BOM generated as part of the package.
 
 Generates all manufacturing files in one call:
 - Gerbers (all copper layers + mask + silkscreen + edge cuts)
@@ -91,7 +94,7 @@ Use individual tools when you need specific settings per file:
 #### Step 1: Gerbers
 
 ```
-export_gerber(output_dir, layers, options)
+export_gerber(board, output_dir, layers?, drill_file?)
 ```
 
 Standard layers to export:
@@ -104,7 +107,7 @@ Standard layers to export:
 #### Step 2: Bill of Materials
 
 ```
-export_bom(output_path, format, fields)
+export_bom(schematic, output, format?, fields?, group_by?, labels?, exclude_dnp?)
 ```
 
 Include fields: Reference, Value, Footprint, LCSC (if targeting JLCPCB).
@@ -112,7 +115,7 @@ Include fields: Reference, Value, Footprint, LCSC (if targeting JLCPCB).
 #### Step 3: Component Position File
 
 ```
-export_position_file(output_path, format, side)
+export_position_file(board, output, format?, side?, units?)
 ```
 
 Required for SMT assembly. Contains X/Y/Rotation for each component.
@@ -125,8 +128,8 @@ Export separately for top and bottom if double-sided assembly.
 ### Part Sourcing
 
 ```
-search_jlcpcb_parts(query)           # Find LCSC part numbers
-suggest_jlcpcb_alternatives(lcsc_no) # Find alternatives for OOS parts
+search_jlcpcb_parts(query)                     # Find LCSC part numbers
+suggest_jlcpcb_alternatives(value, footprint)  # Find alternatives for OOS parts
 ```
 
 ### Part Categories
@@ -174,7 +177,7 @@ Use `add_design_rule` or `list_design_rules` to configure project rules to match
 ## Cost Estimation
 
 ```
-estimate_cost(quantity, fab_options)
+estimate_cost(board, quantity?, layers?, fab_house?, schematic?)
 ```
 
 Factors that increase cost:
@@ -193,7 +196,7 @@ Factors that increase cost:
 Before submitting to fab, always generate a 3D view:
 
 ```
-export_3d(output_path, format)
+export_3d(board, output, format?, include_unspecified?)
 ```
 
 Visual checks:

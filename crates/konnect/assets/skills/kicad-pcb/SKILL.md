@@ -122,38 +122,45 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 
 ### route_pad_to_pad
 
-The primary routing tool. Automatically creates an L-shaped trace between two pads.
+The primary routing tool. Looks up both pad positions on the board and lays an
+L-shaped trace between them.
 
 ```
-route_pad_to_pad(from_reference, from_pad, to_reference, to_pad, width, layer)
+route_pad_to_pad(board, net_name, ref1, pad1, ref2, pad2, layer?, width?)
 ```
 
-- Handles 90-degree bends automatically
+- Emits one segment when the pads already share an X or Y, two otherwise
 - Specify width in mm (e.g., 0.25 for signal, 0.5 for power)
-- Will use vias if pads are on different layers
+- Routes entirely on `layer` (default `F.Cu`) — it does not add a via. To
+  change layer mid-route, place the via yourself with `add_via` and route each
+  side separately
 
 ### route_trace
 
-For manual control over trace path. Specify waypoints.
+One straight segment between two explicit points, for when you want to control
+the path yourself.
 
 ```
-route_trace(net_name, points, width, layer)
+route_trace(board, net_name, layer, x1, y1, x2, y2, width?)
 ```
 
 - Use when auto-routing creates suboptimal paths
-- Provide intermediate points for complex routes
-- Each segment is a straight line between points
+- There is no waypoint list: call it once per segment to build a polyline
+- Coordinates are board-space mm
 
 ### route_differential_pair
 
-For high-speed differential signals (USB, HDMI, Ethernet, LVDS).
+For differential signals (USB, HDMI, Ethernet, LVDS).
 
 ```
-route_differential_pair(net_positive, net_negative, width, spacing)
+route_differential_pair(board, net_pos, net_neg, x1, y1, x2, y2, gap?, layer?, width?)
 ```
 
-- Maintains constant spacing between P and N traces
-- Matches trace lengths automatically
+- Lays two straight traces parallel to the given line, offset `(gap + width)/2`
+  either side, so spacing is constant along the segment
+- Not a length-matching router: it adds no serpentine tuning, and equal length
+  only follows from the two traces being parallel segments. Skew introduced
+  before or after this call is yours to correct
 - Common pairs: USB_D+/USB_D-, LVDS_P/LVDS_N
 
 ### Netclasses
@@ -161,8 +168,11 @@ route_differential_pair(net_positive, net_negative, width, spacing)
 Define routing rules for groups of nets:
 
 ```
-create_netclass(name, track_width, clearance, via_drill, via_diameter)
+create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?)
 ```
+
+The class is written to the project's `.kicad_pro` file, which is where KiCad
+has kept netclasses since v7 — the board file is not modified.
 
 Common netclass configurations:
 - Signal: 0.25mm track, 0.2mm clearance
@@ -186,13 +196,14 @@ Zone tools live in the `pcb_board` toolset.
 Creates a copper pour area (polygon fill).
 
 ```
-add_zone(net_name, layer, outline_points, priority)
+add_zone(board, net_name, layer, points, clearance?, min_width?)
 ```
 
 - Almost always GND net on both F.Cu and B.Cu
-- Define outline slightly inside board edge (0.5mm inset)
-- Priority: higher number fills on top of lower
-- Add thermal relief to pads (default behavior)
+- `points` is the outline polygon; define it slightly inside the board edge
+  (0.5mm inset)
+- There is no priority argument, and no `(priority …)` is written, so every
+  zone takes KiCad's default. Set priority in KiCad if two pours overlap
 
 ### refill_zones
 
