@@ -10,3 +10,9 @@ crates/schematic-viewer/target/
 .konnect-transaction-*.json
 .konnect-transaction-*.abandoned.json
 dist/
+
+# Python bytecode. The plugin and packaging scripts are Python; running
+# them (or the plugin tests) writes caches next to the sources, and three
+# .pyc files had been committed.
+__pycache__/
+*.py[cod]
