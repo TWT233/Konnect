@@ -1169,3 +1169,116 @@ fn kicad_env_suffix(kind: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Where a sheet sits in its project's hierarchy: the project name and the
+/// instance path eeschema would key its symbols to.
+///
+/// A symbol's `(instances (project "NAME" (path "/…")))` entry is what KiCad
+/// reads the designator from, and both halves are properties of the **root**
+/// sheet, not of the file the symbol happens to live in. Deriving them from
+/// the child file — its own stem as the project name, its own uuid as the
+/// whole path — produces an entry KiCad matches against nothing, so the
+/// symbol reads as unannotated on that sheet (#204).
+pub struct SheetInstanceContext {
+    /// Project name: the `.kicad_pro` stem, falling back to the root sheet's.
+    pub project_name: String,
+    /// `/root-uuid[/sheet-uuid…]`, the path from the root down to this sheet.
+    pub instance_path: String,
+    /// Whether this sheet was reached from a root other than itself.
+    pub is_child_sheet: bool,
+}
+
+/// Resolve `sch_path`'s place in its project.
+///
+/// Falls back to treating the file as its own root — the standalone-sheet
+/// behaviour — whenever no project can be found, the root sheet cannot be
+/// read, or the file is not reachable from it. That keeps a loose `.kicad_sch`
+/// working exactly as before.
+pub fn sheet_instance_context(
+    sch_path: &std::path::Path,
+    sch: &mut konnect_schematic_editor::Schematic,
+) -> SheetInstanceContext {
+    let own_root = ensure_root_uuid(sch);
+    let standalone = SheetInstanceContext {
+        project_name: project_name_for(sch_path),
+        instance_path: format!("/{own_root}"),
+        is_child_sheet: false,
+    };
+
+    let Some(project) = nearest_kicad_pro(sch_path) else {
+        return standalone;
+    };
+    let root_sheet = project.with_extension("kicad_sch");
+    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canonical(&root_sheet) == canonical(sch_path) {
+        // This IS the root sheet; only the project name may differ from the
+        // file stem, and here it cannot.
+        return standalone;
+    }
+    let Ok(root) = konnect_schematic_editor::Schematic::load(&root_sheet) else {
+        return standalone;
+    };
+    let Some(root_uuid) = root.uuid.clone() else {
+        return standalone;
+    };
+    let mut sheet_uuids = Vec::new();
+    if !find_sheet_path(&root_sheet, sch_path, &mut sheet_uuids, 0) {
+        return standalone;
+    }
+
+    let mut instance_path = format!("/{root_uuid}");
+    for uuid in &sheet_uuids {
+        instance_path.push('/');
+        instance_path.push_str(uuid);
+    }
+    SheetInstanceContext {
+        project_name: project
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        instance_path,
+        is_child_sheet: true,
+    }
+}
+
+/// The `.kicad_pro` governing `file`, from its own directory upwards.
+fn nearest_kicad_pro(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    file.parent()?.ancestors().find_map(|dir| {
+        std::fs::read_dir(dir).ok()?.find_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().and_then(|e| e.to_str()) == Some("kicad_pro")).then_some(path)
+        })
+    })
+}
+
+/// Depth-first walk from `from` looking for `target`, recording the uuid of
+/// each `(sheet …)` node stepped through. Bounded like the hierarchy tools:
+/// a `Sheetfile` cycle would otherwise recurse forever.
+fn find_sheet_path(
+    from: &std::path::Path,
+    target: &std::path::Path,
+    acc: &mut Vec<String>,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    let Ok(sch) = konnect_schematic_editor::Schematic::load(from) else {
+        return false;
+    };
+    let dir = from.parent().unwrap_or(std::path::Path::new("."));
+    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    for sheet in sch.sheets.iter() {
+        let child = dir.join(sheet.file());
+        acc.push(sheet.uuid.clone());
+        if canonical(&child) == canonical(target) {
+            return true;
+        }
+        if child.exists() && find_sheet_path(&child, target, acc, depth + 1) {
+            return true;
+        }
+        acc.pop();
+    }
+    false
+}

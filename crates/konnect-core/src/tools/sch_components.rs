@@ -8,8 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
-    project_name_for, reembed_lib_symbols, require_f64, require_str, ReembedOutcome, ToolContext,
-    ToolDef,
+    reembed_lib_symbols, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -503,15 +502,18 @@ async fn handle_add_schematic_component(
     // Load via konnect-schematic-editor
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // The instance path below must be "/<root-uuid>" — KiCAD's netlister
-    // resolves instances against the root sheet UUID and silently forms no
-    // wire-only nets for symbols whose path doesn't resolve.
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
-    let project_name = project_name_for(&sch_path);
+    // KiCAD's netlister resolves instances against the ROOT sheet's uuid and
+    // the project's name, and silently forms no wire-only nets for symbols
+    // whose path doesn't resolve. On a child sheet both differ from this
+    // file's own stem and uuid, which is what left hierarchical designs
+    // unannotated (#204).
+    let context = crate::tools::sheet_instance_context(&sch_path, &mut sch);
+    let instance_path = context.instance_path.clone();
+    let project_name = context.project_name.clone();
 
     let result = match place_one_component(
         &mut sch,
-        &root_uuid,
+        &instance_path,
         &project_name,
         &lib_id,
         x,
@@ -548,7 +550,7 @@ async fn handle_add_schematic_component(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_one_component(
     sch: &mut cse::Schematic,
-    root_uuid: &str,
+    instance_path: &str,
     project_name: &str,
     lib_id: &str,
     x: f64,
@@ -629,7 +631,7 @@ pub(crate) fn place_one_component(
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
-    sym.set_instance_path(project_name, &format!("/{}", root_uuid), reference, unit);
+    sym.set_instance_path(project_name, instance_path, reference, unit);
 
     let uuid = sym.uuid.clone();
     sch.add_symbol(sym);
@@ -1943,6 +1945,82 @@ mod tests {
             sch.uuid.is_some(),
             "root (uuid ...) is required for KiCAD's netlister to resolve instance paths"
         );
+    }
+
+    /// #204: on a child sheet both halves of the instance key came from the
+    /// child file — its own stem as the project name, its own uuid as the
+    /// whole path. KiCad matches that against nothing, so every symbol placed
+    /// on a sub-sheet read as unannotated.
+    #[tokio::test]
+    async fn a_child_sheet_keys_instances_to_the_root_not_itself() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        std::fs::write(dir.path().join("board.kicad_pro"), "{}").unwrap();
+        let root = dir.path().join("board.kicad_sch");
+        let child = dir.path().join("amp.kicad_sch");
+        std::fs::write(
+            &root,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"ROOTUUID\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet\n\t\t(at 50 50)\n\t\t(size 20 20)\n\t\t(uuid \"SHEETUUID\")\n\t\t(property \"Sheetname\" \"amp\")\n\t\t(property \"Sheetfile\" \"amp.kicad_sch\")\n\t)\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"CHILDUUID\")\n\t(paper \"A4\")\n\t(lib_symbols)\n)\n",
+        )
+        .unwrap();
+
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": child.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+
+        let written = std::fs::read_to_string(&child).unwrap();
+        assert!(
+            written.contains("(project \"board\""),
+            "the project name is the .kicad_pro stem, not the child file stem:\n{written}"
+        );
+        assert!(
+            written.contains("/ROOTUUID/SHEETUUID"),
+            "the path must run root -> sheet:\n{written}"
+        );
+        assert!(
+            !written.contains("(path \"/CHILDUUID\""),
+            "the child's own uuid must not be the whole path:\n{written}"
+        );
+    }
+
+    /// A standalone sheet — no project file, no parent — keeps the old
+    /// behaviour: it is its own root.
+    #[tokio::test]
+    async fn a_standalone_sheet_still_keys_instances_to_itself() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let path = dir.path().join("loose.kicad_sch");
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let own = sch.uuid.clone().unwrap();
+        assert!(
+            written.contains(&format!("(path \"/{own}\"")),
+            "a loose sheet is its own root:\n{written}"
+        );
+        assert!(written.contains("(project \"loose\""), "{written}");
     }
 
     #[tokio::test]
