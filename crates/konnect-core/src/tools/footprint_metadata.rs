@@ -224,7 +224,9 @@ fn prepare_mutation(
         let Some(tag) = node.head() else {
             continue;
         };
-        child_indent.get_or_insert_with(|| indent_before(source, start));
+        if child_indent.is_none() {
+            child_indent = indent_before(source, start);
+        }
         let target = match tag {
             "descr" => Some(&mut description),
             "tags" => Some(&mut tags),
@@ -358,12 +360,16 @@ fn is_footprint_item(tag: &str) -> bool {
         )
 }
 
-fn indent_before(source: &str, offset: usize) -> String {
+fn indent_before(source: &str, offset: usize) -> Option<String> {
     let line_start = source[..offset]
         .rfind('\n')
         .map(|index| index + 1)
         .unwrap_or(0);
-    source[line_start..offset].to_string()
+    let indent = &source[line_start..offset];
+    indent
+        .chars()
+        .all(|character| matches!(character, ' ' | '\t'))
+        .then(|| indent.to_string())
 }
 
 fn quote_string(value: &str) -> String {
@@ -605,6 +611,32 @@ mod tests {
             assert!(prepared.replacement.contains("(descr \"new\")"));
             konnect_sexp::parse_sexp(&prepared.replacement).unwrap();
         }
+    }
+
+    #[test]
+    fn old_inline_header_accepts_replacements_plus_an_inserted_attribute() {
+        let source = r#"(footprint "Socket" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (descr "old description")
+  (tags "old tags")
+  (fp_text reference "REF**" (at 0 0) (layer "F.SilkS"))
+  (pad "1" thru_hole circle (at 0 0) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+)
+"#;
+        let update = parse_update(&json!({
+            "description": "new description",
+            "tags": ["keyboard", "hot_swap"],
+            "attributes": ["exclude_from_pos_files"]
+        }))
+        .unwrap();
+
+        let prepared = prepare_mutation(source, &update).unwrap();
+
+        assert_eq!(prepared.replacement.matches("(footprint ").count(), 1);
+        assert!(prepared
+            .replacement
+            .contains("(attr exclude_from_pos_files)"));
+        konnect_sexp::parse_sexp(&prepared.replacement).unwrap();
     }
 
     #[tokio::test]
