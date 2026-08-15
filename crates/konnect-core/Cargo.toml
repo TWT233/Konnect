@@ -24,6 +24,7 @@ base64.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 usvg.workspace = true
+zip.workspace = true
 tempfile = "3"
 
 [dev-dependencies]

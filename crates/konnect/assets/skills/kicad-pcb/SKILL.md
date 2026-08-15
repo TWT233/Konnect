@@ -16,8 +16,14 @@ ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 
 ## Prerequisites
 
-PCB layout operations require KiCAD to be running with the board file open. The IPC
+Most PCB layout operations require KiCAD to be running with the board file open. The IPC
 connection communicates with the running KiCAD instance in real-time.
+
+`place_component` is the narrow exception: when IPC is unreachable, it can place one
+front-side footprint into a closed `.kicad_pcb` file through a revision-aware atomic
+fallback. It preserves pads, graphics, attributes, and models, and rejects duplicate
+references. If KiCAD is reachable but rejects the request, the fallback stays disabled
+to avoid racing a live editor.
 
 If connection fails:
 - Tell the user to open KiCAD and load the project
@@ -54,7 +60,12 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 Follow this sequence for a clean PCB workflow:
 
 1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry
-2. **Import netlist** — sync with schematic (update_pcb_from_schematic)
+2. **Import netlist** — there is no Konnect tool for this. KiCad 10 removed
+   `kicad-cli pcb sync`, so the user must open the board in KiCAD and run
+   **Tools > Update PCB from Schematic** themselves. Say so and wait; do not
+   substitute another tool, and do not proceed as though the netlist arrived.
+   `validate_for_manufacturing` reports "No footprints found on the board" when
+   this step has been skipped.
 3. **Place components** — position all footprints
 4. **Route traces** — connect all nets
 5. **Copper pour** — add ground/power zones last
@@ -80,7 +91,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 
 | Tool                      | Use Case                                    |
 |---------------------------|---------------------------------------------|
-| `place_component`         | Position a single footprint at x,y          |
+| `place_component`         | Position one footprint via IPC or safe file fallback |
 | `move_component`          | Relocate an existing footprint              |
 | `rotate_component`        | Rotate footprint (0/90/180/270)             |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
@@ -253,7 +264,8 @@ Common DRC errors and fixes:
 4. **Refill zones after changes** — stale zone fills cause phantom DRC errors
 5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
-7. **KiCAD must be running** — PCB tools require the live IPC connection
+7. **KiCAD normally must be running** — only `place_component` has a safe
+   IPC-unreachable file fallback; other PCB edits still require the live IPC connection
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete

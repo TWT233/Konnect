@@ -113,6 +113,31 @@ re-fetch `tools/list` in response. If newly loaded tools never show up:
 3. Re-issue `tools/list` (e.g. restart the client session) — the loaded toolset
    state lives in the server process and survives a list refresh.
 
+If your client caches the initial tool list and never re-fetches it, none of the
+above helps: the tools are loaded server-side, but the client has no schema to
+invoke them with. `load_toolset` reports the names it loaded and *not* their
+schemas, so a model can see a tool named in the reply and still be unable to
+call it. That is the symptom in
+[#134](https://github.com/mixelpixx/Konnect/issues/134) and
+[#169](https://github.com/mixelpixx/Konnect/issues/169) — reported against
+Claude Desktop.
+
+The fix for those clients is to make the *first* listing complete:
+
+```json
+{ "eager_toolsets": true }
+```
+
+in `konnect-settings.json` (or `konnect.toml`). Every toolset is then loaded at
+startup, so `tools/list` carries all 187 tools from the first call.
+
+It is off by default because it costs what the router exists to save: roughly
+25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
+
+Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
+a tool from it is *called*, which helps only a client that already knows the
+tool name — so it does nothing for a client whose tool list is stale.
+
 ## Plugin doesn't appear in KiCAD
 
 Install via **Plugin and Content Manager → Install from File** with the

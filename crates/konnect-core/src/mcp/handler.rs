@@ -36,7 +36,16 @@ impl McpHandler {
 
         // Load only the starter kit at startup so baseline `tools/list` stays small
         // (~2K tokens, not ~23K). The LLM expands on demand via `load_toolset`.
-        router.load_starter_kit().await;
+        //
+        // `eager_toolsets` opts out of that for clients that cache the initial
+        // tool list and ignore `notifications/tools/list_changed` — for those,
+        // a tool missing from the first listing is permanently uncallable
+        // (#134, #169). Costs ~25K tokens per listing, hence off by default.
+        if config.eager_toolsets {
+            router.load_all().await;
+        } else {
+            router.load_starter_kit().await;
+        }
 
         let observer = CallObserver::new(Some(default_calls_log_path()));
         let ctx = Arc::new(crate::tools::ToolContext::new_with_observer(

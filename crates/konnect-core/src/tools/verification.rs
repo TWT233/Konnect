@@ -8,6 +8,7 @@ use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use tokio::task;
 
 use super::cli;
@@ -49,7 +50,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the PCB file.",
+            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD project file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -66,7 +67,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_design_rules",
-            "Return the current design rule constraints defined in the PCB file.",
+            "Return the current design rule constraints defined in the sibling KiCAD project file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -138,7 +139,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_layer_constraints",
-            "Set per-layer design constraints (e.g. min trace width, clearance) in the board setup section.",
+            "Set per-layer design constraints (e.g. min trace width, clearance) in the sibling .kicad_dru custom rules file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -225,76 +226,104 @@ async fn handle_run_drc(
     ))
 }
 
-// ─── Design rules S-expression helpers ───────────────────────────────────────
+// ─── Design rules helpers ────────────────────────────────────────────────────
 
-/// Read a rule value from `(setup (rules (rule_severity key val) ...))`.
-/// KiCAD stores rules in: `(setup ... (rules (rule_severity "..." ...) ...))`
-/// But simple constraints are in `(setup (constraints ...))`.
-fn read_constraint(content: &str, key: &str) -> Option<f64> {
-    // Pattern: `(constraint clearance (min VAL))` or `(min_clearance VAL)` in setup
-    // Try legacy format first: `(key VAL)` inside setup section
-    let pat = format!("({} ", key);
-    if let Some(pos) = content.find(&pat) {
-        let after = &content[pos + pat.len()..];
-        if let Some(end) = after.find(')') {
-            return after[..end].trim().parse::<f64>().ok();
+fn sibling_project_path(board: &Path) -> PathBuf {
+    board.with_extension("kicad_pro")
+}
+
+fn sibling_custom_rules_path(board: &Path) -> PathBuf {
+    board.with_extension("kicad_dru")
+}
+
+fn project_rules_mut(
+    project: &mut serde_json::Value,
+) -> anyhow::Result<&mut serde_json::Map<String, serde_json::Value>> {
+    let project = project
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("KiCAD project root must be a JSON object"))?;
+    let board = project
+        .entry("board")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("KiCAD project 'board' must be a JSON object"))?;
+    let design_settings = board
+        .entry("design_settings")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("KiCAD project 'board.design_settings' must be a JSON object")
+        })?;
+    design_settings
+        .entry("rules")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("KiCAD project 'board.design_settings.rules' must be a JSON object")
+        })
+}
+
+fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
+    project["board"]["design_settings"]["rules"][key].as_f64()
+}
+
+fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
+    let needle = format!("(rule \"{name}\"");
+    let start = content.find(&needle)?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+
+    for (offset, character) in content[start..].char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
         }
-    }
-    // Try constraint format: `(constraint min_clearance (min VAL))`
-    let cpat = format!("(constraint {} (min ", key);
-    if let Some(pos) = content.find(&cpat) {
-        let after = &content[pos + cpat.len()..];
-        if let Some(end) = after.find(')') {
-            return after[..end].trim().parse::<f64>().ok();
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '#' => in_comment = true,
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, start + offset + character.len_utf8()));
+                }
+            }
+            _ => {}
         }
     }
     None
 }
 
-/// Set or insert a rule inside the `(setup ...)` section.
-fn set_constraint(content: &str, key: &str, value: f64) -> String {
-    let pat = format!("({} ", key);
-
-    if let Some(pos) = content.find(&pat) {
-        // Replace existing value
-        let end = content[pos..]
-            .find(')')
-            .map(|i| pos + i + 1)
-            .unwrap_or(content.len());
-        let new_entry = format!("({} {})", key, value);
-        format!("{}{}{}", &content[..pos], new_entry, &content[end..])
-    } else {
-        // Insert into setup section before its closing paren
-        if let Some(setup_pos) = content.find("(setup") {
-            let setup_end = {
-                let mut depth = 0i32;
-                let mut end = setup_pos;
-                for (i, ch) in content[setup_pos..].char_indices() {
-                    match ch {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = setup_pos + i;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                end
-            };
-            let new_entry = format!("\n  ({} {})", key, value);
-            format!(
-                "{}{}{}",
-                &content[..setup_end],
-                new_entry,
-                &content[setup_end..]
-            )
-        } else {
-            content.to_string()
-        }
+fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
+    if let Some((start, end)) = named_rule_range(content, name) {
+        return format!("{}{}{}", &content[..start], rule, &content[end..]);
     }
+
+    let mut result = content.trim_end().to_string();
+    if !result.is_empty() {
+        result.push_str("\n\n");
+    }
+    result.push_str(rule);
+    result.push('\n');
+    result
+}
+
+fn layer_rule(name: &str, constraint: &str, value: f64, layer: &str) -> String {
+    format!("(rule \"{name}\"\n  (constraint {constraint} (min {value}mm))\n  (layer \"{layer}\"))")
 }
 
 async fn handle_set_design_rules(
@@ -302,32 +331,43 @@ async fn handle_set_design_rules(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let mut content = tokio::fs::read_to_string(&board).await?;
+    let project_path = sibling_project_path(&board);
+    let project_content = tokio::fs::read_to_string(&project_path).await?;
+    let mut project: serde_json::Value = serde_json::from_str(&project_content)?;
 
     let mut changed = Vec::new();
 
     let rules: &[(&str, &str)] = &[
         ("min_clearance", "min_clearance"),
         ("min_track_width", "min_trace_width"),
-        ("min_via_drill", "min_via_drill"),
+        ("min_through_hole_diameter", "min_via_drill"),
         ("min_via_size", "min_via_size"),
         ("min_hole_to_hole", "min_hole_to_hole"),
     ];
 
-    for (sexp_key, arg_key) in rules {
+    let project_rules = project_rules_mut(&mut project)?;
+    for (project_key, arg_key) in rules {
         if let Some(val) = args[arg_key].as_f64() {
-            content = set_constraint(&content, sexp_key, val);
-            changed.push(format!("{} = {}", sexp_key, val));
+            let storage_key = if *project_key == "min_via_size" {
+                "min_via_diameter"
+            } else {
+                project_key
+            };
+            project_rules.insert(storage_key.to_string(), json!(val));
+            changed.push(format!("{} = {}", storage_key, val));
         }
     }
 
     if !changed.is_empty() {
-        write_atomic(&board, &content)?;
+        let mut content = serde_json::to_string_pretty(&project)?;
+        content.push('\n');
+        write_atomic(&project_path, &content)?;
     }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
+            "project": project_path,
             "changed": changed
         }))
         .unwrap(),
@@ -339,17 +379,20 @@ async fn handle_get_design_rules(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let content = tokio::fs::read_to_string(&board).await?;
+    let project_path = sibling_project_path(&board);
+    let content = tokio::fs::read_to_string(&project_path).await?;
+    let project: serde_json::Value = serde_json::from_str(&content)?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "board": board.to_str().unwrap_or(""),
+            "project": project_path.to_str().unwrap_or(""),
             "rules": {
-                "min_clearance": read_constraint(&content, "min_clearance"),
-                "min_trace_width": read_constraint(&content, "min_track_width"),
-                "min_via_drill": read_constraint(&content, "min_via_drill"),
-                "min_via_size": read_constraint(&content, "min_via_size"),
-                "min_hole_to_hole": read_constraint(&content, "min_hole_to_hole")
+                "min_clearance": project_rule_value(&project, "min_clearance"),
+                "min_trace_width": project_rule_value(&project, "min_track_width"),
+                "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
+                "min_via_size": project_rule_value(&project, "min_via_diameter"),
+                "min_hole_to_hole": project_rule_value(&project, "min_hole_to_hole")
             }
         }))
         .unwrap(),
@@ -737,82 +780,52 @@ async fn handle_set_layer_constraints(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let mut content = tokio::fs::read_to_string(&board).await?;
+    anyhow::ensure!(
+        !layer.is_empty()
+            && layer
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || character == '.'
+                    || character == '_'),
+        "Layer name contains unsupported characters"
+    );
+    let rules_path = sibling_custom_rules_path(&board);
+    let mut content = match tokio::fs::read_to_string(&rules_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "(version 1)\n".to_string(),
+        Err(error) => return Err(error.into()),
+    };
     let mut changed = Vec::new();
 
-    // Build a layer constraint rule block to insert into (setup ...)
-    // KiCAD uses `(rule "name" (constraint ...) (condition "A.Layer == 'LAYER'"))` inside setup
-    let rule_name = format!("{}_constraints", layer.replace('.', "_"));
-
     if let Some(clearance) = args["min_clearance"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_clearance\"\n      (constraint clearance (min {clearance}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
+        let rule_name = format!("konnect:{layer}:clearance");
+        content = upsert_named_rule(
+            &content,
+            &rule_name,
+            &layer_rule(&rule_name, "clearance", clearance, &layer),
         );
-        // Insert into setup block
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("clearance = {} on {}", clearance, layer));
-        }
+        changed.push(format!("clearance = {} on {}", clearance, layer));
     }
 
     if let Some(trace_width) = args["min_trace_width"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_trace_width\"\n      (constraint track_width (min {trace_width}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
+        let rule_name = format!("konnect:{layer}:track_width");
+        content = upsert_named_rule(
+            &content,
+            &rule_name,
+            &layer_rule(&rule_name, "track_width", trace_width, &layer),
         );
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
-        }
+        changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
     }
 
     if !changed.is_empty() {
-        write_atomic(&board, &content)?;
+        write_atomic(&rules_path, &content)?;
     }
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "layer": layer,
+            "rules_file": rules_path,
             "changed": changed
         }))
         .unwrap(),
@@ -875,4 +888,101 @@ fn find_footprint_position(
     let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
 
     Ok((fp_x, fp_y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn blank_board() -> &'static str {
+        "(kicad_pcb\n  (version 20250610)\n  (generator \"test\")\n  (general (thickness 1.6))\n  (paper \"A4\")\n  (layers\n    (0 \"F.Cu\" signal)\n    (31 \"B.Cu\" signal)\n    (44 \"Edge.Cuts\" user)\n  )\n  (setup (pad_to_mask_clearance 0))\n  (net 0 \"\")\n)\n"
+    }
+
+    fn blank_project() -> &'static str {
+        "{\n  \"meta\": {\"filename\": \"board.kicad_pro\", \"version\": 1},\n  \"board\": {\"design_settings\": {}},\n  \"schematic\": {}\n}\n"
+    }
+
+    #[tokio::test]
+    async fn set_design_rules_updates_project_json_without_touching_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(&project, blank_project()).await.unwrap();
+        let original_board = tokio::fs::read(&board).await.unwrap();
+
+        let args = json!({
+            "board": board,
+            "min_clearance": 0.25,
+            "min_trace_width": 0.25,
+            "min_via_drill": 0.30,
+            "min_via_size": 0.70,
+            "min_hole_to_hole": 0.45
+        });
+        let result = handle_set_design_rules(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(tokio::fs::read(&board).await.unwrap(), original_board);
+        let project_json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&project).await.unwrap()).unwrap();
+        let rules = &project_json["board"]["design_settings"]["rules"];
+        assert_eq!(rules["min_clearance"], 0.25);
+        assert_eq!(rules["min_track_width"], 0.25);
+        assert_eq!(rules["min_through_hole_diameter"], 0.30);
+        assert_eq!(rules["min_via_diameter"], 0.70);
+        assert_eq!(rules["min_hole_to_hole"], 0.45);
+    }
+
+    #[tokio::test]
+    async fn set_layer_constraints_writes_idempotent_custom_rules_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let original_board = tokio::fs::read(&board).await.unwrap();
+        let args = json!({
+            "board": board,
+            "layer": "F.Cu",
+            "min_clearance": 0.25,
+            "min_trace_width": 0.25
+        });
+
+        for _ in 0..2 {
+            let result = handle_set_layer_constraints(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+        }
+
+        assert_eq!(tokio::fs::read(&board).await.unwrap(), original_board);
+        let rules = tokio::fs::read_to_string(dir.path().join("board.kicad_dru"))
+            .await
+            .unwrap();
+        assert!(rules.starts_with("(version 1)"));
+        assert_eq!(rules.matches("(rule \"konnect:F.Cu:clearance\"").count(), 1);
+        assert_eq!(
+            rules.matches("(rule \"konnect:F.Cu:track_width\"").count(),
+            1
+        );
+        assert!(rules.contains("(constraint clearance (min 0.25mm))"));
+        assert!(rules.contains("(constraint track_width (min 0.25mm))"));
+        assert!(rules.contains("(layer \"F.Cu\")"));
+    }
 }
