@@ -307,6 +307,30 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
         ),
         tool!(
+            "reset_schematic_field_positions",
+            "Move each placed symbol's Reference and Value text back to the position its \
+             library definition anchors them at, carried through the symbol's own rotation \
+             — KiCad's 'Reset field text positions'. Use it on a sheet whose fields sit at \
+             a uniform offset instead of where the library puts them (labels inside a \
+             connector body, a rail's name below an up-pointing arrow). Fields a symbol's \
+             definition gives no anchor for are left alone.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "references": {
+                        "type": "array",
+                        "description": "Component references to reset (e.g. ['U1']). Omit to reset every symbol in the schematic.",
+                        "items": { "type": "string" }
+                    },
+                    "dry_run": { "type": "boolean", "default": false,
+                        "description": "Report what would move without writing." }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_reset_schematic_field_positions(args, ctx).await }
+        ),
+        tool!(
             "get_schematic_view",
             "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
             json!({
@@ -1447,6 +1471,140 @@ async fn handle_update_symbols_from_library(
     Ok(CallToolResult::json(&body))
 }
 
+/// Put every instance field back on its library anchor.
+///
+/// `add_schematic_component` places new symbols there already; this repairs
+/// sheets written before it did, where every field sat at a fixed ±3.81mm
+/// offset regardless of what the symbol's definition asked for (#101).
+async fn handle_reset_schematic_field_positions(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only: Option<std::collections::HashSet<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+
+    // Anchors first: reading them borrows the schematic, mutating the symbols
+    // borrows it again, so the lookup cannot be inlined into the loop.
+    let lib_ids: Vec<String> = {
+        let mut ids: Vec<String> = Vec::new();
+        for sym in sch.symbols.iter() {
+            if !ids.contains(&sym.lib_id) {
+                ids.push(sym.lib_id.clone());
+            }
+        }
+        ids
+    };
+    let anchors: std::collections::HashMap<String, cse::library::FieldAnchors> = lib_ids
+        .into_iter()
+        .map(|id| {
+            let a = cse::library::field_anchors(&sch, &id);
+            (id, a)
+        })
+        .collect();
+
+    let mut moved = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut no_anchor = Vec::new();
+    let mut no_property = Vec::new();
+    let mut missing: Vec<String> = only
+        .clone()
+        .map(|r| r.into_iter().collect())
+        .unwrap_or_default();
+
+    for sym in sch.symbols.iter_mut() {
+        let Some(reference) = sym.reference().map(String::from) else {
+            continue;
+        };
+        if only.as_ref().is_some_and(|r| !r.contains(&reference)) {
+            continue;
+        }
+        missing.retain(|r| r != &reference);
+
+        let anchor = anchors.get(&sym.lib_id).copied().unwrap_or_default();
+        let mirror = sym.mirror.as_deref().unwrap_or("");
+        let t = konnect_sexp::geometry::PinTransform {
+            comp_x: sym.at.x,
+            comp_y: sym.at.y,
+            rotation_deg: sym.at.rotation.unwrap_or(0.0),
+            mirror_x: mirror.contains('x'),
+            mirror_y: mirror.contains('y'),
+        };
+
+        for (name, anchor) in [
+            ("Reference", anchor.reference_at),
+            ("Value", anchor.value_at),
+        ] {
+            let Some(anchor) = anchor else {
+                no_anchor.push(format!("{}.{}", reference, name));
+                continue;
+            };
+            let (x, y, rot) = crate::tools::field_at(Some(anchor), (0.0, 0.0, 0.0), t);
+            // The library anchors this field but the placed symbol carries no
+            // such property. Report it rather than dropping it in silence —
+            // an unreported skip reads as "reset" to the caller.
+            let Some(prop) = sym.properties.iter_mut().find(|p| p.name == name) else {
+                no_property.push(format!("{}.{}", reference, name));
+                continue;
+            };
+            if set_property_at(prop, x, y, rot) {
+                moved.push(format!("{}.{}", reference, name));
+            } else {
+                unchanged.push(format!("{}.{}", reference, name));
+            }
+        }
+    }
+
+    if !moved.is_empty() && !dry_run {
+        sch.overwrite()?;
+    }
+    // `missing` starts life as a HashSet, whose iteration order varies run to
+    // run; a caller asking about several unknown references would get them
+    // back in a different order each time.
+    missing.sort_unstable();
+
+    Ok(CallToolResult::json(&json!({
+        "moved": moved,
+        "moved_count": moved.len(),
+        "unchanged": unchanged,
+        "no_library_anchor": no_anchor,
+        "no_property": no_property,
+        "not_found": missing,
+        "dry_run": dry_run
+    })))
+}
+
+/// Rewrite a property's `(at …)` in place. Returns whether anything changed,
+/// so an already-correct field is not reported as moved.
+fn set_property_at(prop: &mut cse::types::Property, x: f64, y: f64, rotation: f64) -> bool {
+    use cse::sexp::{atom, SexpNode};
+    use cse::types::fmt_f64;
+
+    let at = SexpNode::List(vec![
+        atom("at"),
+        atom(fmt_f64(x)),
+        atom(fmt_f64(y)),
+        atom(fmt_f64(rotation)),
+    ]);
+    match prop.sub_nodes.iter_mut().find(|n| n.tag() == Some("at")) {
+        Some(existing) => {
+            if *existing == at {
+                return false;
+            }
+            *existing = at;
+        }
+        // A field with no (at) is drawn at the sheet origin — always a move.
+        None => prop.sub_nodes.insert(0, at),
+    }
+    true
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2323,6 +2481,172 @@ mod tests {
         assert!(
             value.contains("(at 101.6 50.8 90)"),
             "Value must follow the rotated body: {value}"
+        );
+    }
+
+    /// The repair path for sheets written before fields followed the library
+    /// (#101): an instance whose fields sit at the old fixed offset is put
+    /// back on its anchors, and a second run reports nothing left to move.
+    #[tokio::test]
+    async fn reset_field_positions_puts_stale_fields_back_on_their_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-fields.kicad_sch");
+        // A sheet as the old code wrote it: Reference at y-3.81 and Value at
+        // y+3.81, while the library anchors them beside the body at 90.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let args = json!({ "schematic": path.display().to_string() });
+        let dry = handle_reset_schematic_field_positions(
+            &json!({
+                "schematic": path.display().to_string(), "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &dry.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved"], json!(["R1.Reference", "R1.Value"]));
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("46.99"),
+            "dry_run must not write"
+        );
+
+        let done = handle_reset_schematic_field_positions(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!done.is_error, "{done:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch.symbols.by_reference("R1").expect("R1");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        assert!(
+            field("Reference").contains("(at 103.632 50.8 90)"),
+            "{}",
+            field("Reference")
+        );
+        assert!(
+            field("Value").contains("(at 101.6 50.8 90)"),
+            "{}",
+            field("Value")
+        );
+
+        // Idempotent: nothing left to move on a second pass.
+        let again = handle_reset_schematic_field_positions(&args, &test_ctx())
+            .await
+            .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &again.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved"], json!([]));
+        assert_eq!(body["unchanged"], json!(["R1.Reference", "R1.Value"]));
+    }
+
+    /// A reference that is not in the sheet is reported rather than silently
+    /// doing nothing.
+    #[tokio::test]
+    async fn reset_field_positions_reports_an_unknown_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_reset_schematic_field_positions(
+            &json!({
+                "schematic": path.display().to_string(), "references": ["R9"]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["not_found"], json!(["R9"]));
+        assert_eq!(body["moved"], json!([]));
+    }
+
+    /// `not_found` is built from a HashSet, whose iteration order varies run
+    /// to run — several unknown references would come back in a different
+    /// order each call unless it is sorted.
+    #[tokio::test]
+    async fn reset_field_positions_reports_unknown_references_in_a_stable_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stable.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        // Repeated because a HashSet of this size reorders between runs; an
+        // unsorted list passes once and then does not.
+        for _ in 0..8 {
+            let result = handle_reset_schematic_field_positions(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "references": ["R9", "R2", "U7", "C3"]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["not_found"], json!(["C3", "R2", "R9", "U7"]));
+        }
+    }
+
+    /// A field the library anchors but the placed symbol does not carry is
+    /// reported, not skipped in silence — an unreported skip reads as "reset".
+    #[tokio::test]
+    async fn reset_field_positions_reports_a_field_the_symbol_does_not_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-value.kicad_sch");
+        // The library anchors Reference and Value; the instance has only
+        // Reference.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_reset_schematic_field_positions(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved"], json!(["R1.Reference"]));
+        assert_eq!(
+            body["no_property"],
+            json!(["R1.Value"]),
+            "the skipped field must be accounted for: {body}"
         );
     }
 

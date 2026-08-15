@@ -368,9 +368,25 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
     ];
-    tools.insert(2, super::footprint_graphics::tool());
-    tools.insert(3, super::footprint_metadata::tool());
-    tools.insert(4, super::footprint_models::tool());
+    // Grouped after `create_footprint` so the footprint-editing tools read as
+    // one family in `tools/list`. Anchored on that tool's name rather than a
+    // literal index: the list above is edited often, and a positional insert
+    // silently reorders the catalogue the first time a tool moves.
+    let after_create_footprint = tools
+        .iter()
+        .position(|t| t.name == "create_footprint")
+        .map(|i| i + 1)
+        .unwrap_or(tools.len());
+    for (offset, tool) in [
+        super::footprint_graphics::tool(),
+        super::footprint_metadata::tool(),
+        super::footprint_models::tool(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        tools.insert(after_create_footprint + offset, tool);
+    }
     tools
 }
 
