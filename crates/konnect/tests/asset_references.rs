@@ -227,6 +227,13 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "pin_y",
         "orientation_degrees",
         "tool_name",
+        "footprint_path",
+        "hot_swap",
+        "exclude_from_pos_files",
+        "exclude_from_bom",
+        "new_number",
+        "match_all",
+        "replace_existing",
     ];
 
     let mut phantom = Vec::new();
