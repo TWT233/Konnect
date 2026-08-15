@@ -102,6 +102,104 @@ fn tool_directory_lists_every_registered_tool() {
     );
 }
 
+/// No file anywhere quotes a catalogue total that is not the current one.
+///
+/// The checks above name the four files CONTRIBUTING lists, which is why
+/// `packaging/metadata.json` and `plugin/plugin.json` sat at "185 tools" while
+/// the guarded documents said 200 — and those two are the ones users read, in
+/// the PCM package description. `docs/TROUBLESHOOTING.md` said 189.
+///
+/// Sweeping instead of listing means a new document is covered the day it is
+/// written rather than the day someone remembers to add it here. Only
+/// three-digit counts are checked: a per-toolset count cannot reach 100 with
+/// `MAX_TOOLS_PER_TOOLSET` at 20, so DEV.md's per-toolset tables are
+/// unambiguously not catalogue totals and are left alone.
+#[test]
+fn no_file_quotes_a_stale_catalogue_total() {
+    let (_, registered, meta) = counts();
+    let total = registered + meta;
+
+    let mut stale = Vec::new();
+    for path in text_files(&repo_root()) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            for n in counts_in(line) {
+                if n >= 100 && n != registered && n != total {
+                    let rel = path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string()
+                        .replace('\\', "/");
+                    stale.push(format!(
+                        "{rel}:{}: says \"{n} tools\" — the registry has {registered} \
+                         registered, {total} with meta-tools",
+                        lineno + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        stale.is_empty(),
+        "a document quotes a tool count the registry does not support:\n  {}",
+        stale.join("\n  ")
+    );
+}
+
+/// Markdown and JSON under the repo, skipping build output and vendored trees.
+fn text_files(root: &Path) -> Vec<PathBuf> {
+    const SKIP: &[&str] = &["target", "node_modules", ".git", "dist", "build"];
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !SKIP.contains(&name.as_ref()) {
+                    stack.push(path);
+                }
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("md") | Some("json")
+            ) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Numbers written immediately before the word "tools", ignoring any `~`.
+fn counts_in(line: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (at, _) in line.match_indices("tools") {
+        let before = line[..at].trim_end();
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            continue;
+        }
+        // Only a bare number counts: "20250610 tools" would be a version.
+        if let Ok(n) = digits.chars().rev().collect::<String>().parse::<usize>() {
+            out.push(n);
+        }
+    }
+    out
+}
+
 /// The meta-tool count is quoted in prose too, and it moves far less often —
 /// which is exactly why a change to it is easy to forget. PR #176 proposes
 /// taking it from 6 to 7.
