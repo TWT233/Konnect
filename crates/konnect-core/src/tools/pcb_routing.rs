@@ -5,7 +5,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{apply_edits, new_uuid, write_atomic, SexpEdit};
 use serde_json::json;
@@ -726,10 +726,16 @@ async fn handle_create_netclass(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let clearance = args["clearance"].as_f64().unwrap_or(0.2);
-    let trace_width = args["trace_width"].as_f64().unwrap_or(0.25);
-    let via_drill = args["via_drill"].as_f64().unwrap_or(0.4);
-    let via_dia = args["via_diameter"].as_f64().unwrap_or(0.8);
+    // KiCad's key, this tool's argument name, and the value a *new* class
+    // takes when the caller says nothing. The defaults belong to creation
+    // only: folding them in before an update turned "widen HV's track" into a
+    // silent reset of the clearance, drill and via size the caller had tuned.
+    const FIELDS: [(&str, &str, f64); 4] = [
+        ("clearance", "clearance", 0.2),
+        ("track_width", "trace_width", 0.25),
+        ("via_drill", "via_drill", 0.4),
+        ("via_diameter", "via_diameter", 0.8),
+    ];
 
     let (pro, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
@@ -754,30 +760,44 @@ async fn handle_create_netclass(
 
     // KiCad keys classes by name; a second entry with the same name is
     // undefined in its dialog, so an existing class is updated in place.
+    let mut changed = true;
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
-        class["clearance"] = json!(clearance);
-        class["track_width"] = json!(trace_width);
-        class["via_diameter"] = json!(via_dia);
-        class["via_drill"] = json!(via_drill);
+        let before = class.clone();
+        for (key, arg, _) in FIELDS {
+            if let Some(value) = opt_f64(args, arg) {
+                class[key] = json!(value);
+            }
+        }
+        changed = *class != before;
         true
     } else {
-        classes.push(json!({
-            "clearance": clearance,
-            "name": name,
-            "priority": 0,
-            "track_width": trace_width,
-            "via_diameter": via_dia,
-            "via_drill": via_drill
-        }));
+        let mut class = json!({ "name": name, "priority": 0 });
+        for (key, arg, default) in FIELDS {
+            class[key] = json!(opt_f64(args, arg).unwrap_or(default));
+        }
+        classes.push(class);
         false
     };
-    save_project_settings(&pro, &settings)?;
+    // Report the class as it now stands rather than the arguments that came
+    // in: on an update most of it was never named by the caller.
+    let stored = classes
+        .iter()
+        .find(|c| c["name"] == json!(name))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    // Naming no value at all leaves the class exactly as it was, and so does
+    // passing the values it already holds. Saving anyway would rewrite the
+    // whole project file — the serialiser re-emits the document rather than
+    // patching it — for a call that decided nothing.
+    if changed {
+        save_project_settings(&pro, &settings)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "created_netclass": name,
         "updated_existing": updated,
-        "clearance": clearance, "trace_width": trace_width,
-        "via_drill": via_drill, "via_diameter": via_dia,
+        "clearance": stored["clearance"], "trace_width": stored["track_width"],
+        "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
         "file": pro.display().to_string(),
         "note": "Netclasses live in the project file; assign nets with assign_net_to_class. \
                  KiCad reads the change on next project open."
@@ -1181,6 +1201,88 @@ mod netclass_tests {
             "{classes:?}"
         );
         assert_eq!(classes[0]["clearance"], json!(0.6));
+    }
+
+    /// Re-running the tool is how a caller adjusts one setting of a class it
+    /// already tuned. Every argument carries a schema default, so applying
+    /// those defaults on an update silently reset the three settings the
+    /// caller did not name — the clearance a board was routed to, gone on a
+    /// call that only meant to widen a track.
+    #[tokio::test]
+    async fn create_netclass_leaves_settings_the_caller_did_not_name_alone() {
+        let (_dir, board) = fixture(true);
+        create(
+            &board,
+            json!({ "name": "HV", "clearance": 1.5, "trace_width": 0.5,
+                    "via_drill": 0.45, "via_diameter": 0.85 }),
+        )
+        .await;
+        let second = create(&board, json!({ "name": "HV", "trace_width": 0.9 })).await;
+        assert!(!second.is_error, "{}", text_of(&second));
+
+        let pro = project_json(&board);
+        let hv = pro["net_settings"]["classes"][0].clone();
+        assert_eq!(hv["track_width"], json!(0.9), "the named value changes");
+        assert_eq!(hv["clearance"], json!(1.5), "{hv}");
+        assert_eq!(hv["via_drill"], json!(0.45), "{hv}");
+        assert_eq!(hv["via_diameter"], json!(0.85), "{hv}");
+
+        // The result echoes the stored class, not the one argument passed.
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&second)).unwrap();
+        assert_eq!(echoed["clearance"], json!(1.5));
+        assert_eq!(echoed["trace_width"], json!(0.9));
+    }
+
+    /// With the defaults gone from the update path, a call that names no value
+    /// decides nothing — so it must not write. `save_project_settings`
+    /// re-serialises the whole document rather than patching it, so saving
+    /// anyway rewrites every line of the project file for a call that is, in
+    /// effect, a read.
+    #[tokio::test]
+    async fn a_call_that_changes_nothing_leaves_the_project_file_untouched() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+
+        // Re-written by hand in a shape the serialiser would not produce, so
+        // any save at all is visible in the bytes.
+        let pro = board.with_extension("kicad_pro");
+        let compact = serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&pro).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&pro, &compact).unwrap();
+
+        // Naming no value at all: a read.
+        let result = create(&board, json!({ "name": "HV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(std::fs::read_to_string(&pro).unwrap(), compact);
+        // It still reports what the class holds.
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(echoed["clearance"], json!(1.5));
+        assert_eq!(echoed["updated_existing"], json!(true));
+
+        // Naming the values it already holds: also nothing to decide.
+        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+        assert_eq!(std::fs::read_to_string(&pro).unwrap(), compact);
+
+        // A real change still writes.
+        create(&board, json!({ "name": "HV", "clearance": 0.9 })).await;
+        assert_ne!(std::fs::read_to_string(&pro).unwrap(), compact);
+    }
+
+    /// A new class still gets the documented defaults for whatever the caller
+    /// leaves out — the fix above must not turn creation into a partial class.
+    #[tokio::test]
+    async fn a_new_class_is_still_created_with_the_documented_defaults() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+
+        let hv = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(hv["clearance"], json!(0.2), "{hv}");
+        assert_eq!(hv["track_width"], json!(0.25), "{hv}");
+        assert_eq!(hv["via_drill"], json!(0.4), "{hv}");
+        assert_eq!(hv["via_diameter"], json!(0.8), "{hv}");
     }
 
     /// Membership is a netclass_patterns entry keyed by the exact net name.
