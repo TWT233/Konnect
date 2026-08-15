@@ -21,9 +21,10 @@ struct McpProcess {
 impl McpProcess {
     fn spawn(socket: &str) -> Self {
         let config = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        let kicad_cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
         std::fs::write(
             config.path(),
-            serde_json::to_vec(&json!({"ipc_address": socket})).unwrap(),
+            serde_json::to_vec(&json!({"ipc_address": socket, "kicad_cli": kicad_cli})).unwrap(),
         )
         .unwrap();
         let (_, config_path) = config.keep().unwrap();
@@ -235,4 +236,50 @@ fn place_component_loads_real_library_geometry() {
             .expect("array footprint has no board position");
         assert!((at.get_f64(2).unwrap() - 55.0).abs() < 1e-6);
     }
+}
+
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, saved schematic, and matching open board"]
+fn schematic_sync_apply_then_dry_run_is_noop() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let schematic = std::env::var("KONNECT_LIVE_KICAD_SCHEMATIC")
+        .expect("KONNECT_LIVE_KICAD_SCHEMATIC must name the saved, closed root schematic");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "sch_export"}));
+
+    let dry_run = mcp.tool(
+        "update_pcb_from_schematic",
+        json!({"schematic": schematic, "board": board, "dry_run": true}),
+    );
+    let dry_run: Value =
+        serde_json::from_str(dry_run["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        dry_run["status"], "ready",
+        "fixture must require a sync: {dry_run}"
+    );
+    let revision = dry_run["plan_revision"]
+        .as_str()
+        .expect("dry run returned no plan revision");
+
+    let applied = mcp.tool(
+        "update_pcb_from_schematic",
+        json!({
+            "schematic": schematic,
+            "board": board,
+            "dry_run": false,
+            "expected_plan_revision": revision
+        }),
+    );
+    let applied: Value =
+        serde_json::from_str(applied["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(applied["status"], "applied", "{applied}");
+
+    let after = mcp.tool(
+        "update_pcb_from_schematic",
+        json!({"schematic": schematic, "board": board, "dry_run": true}),
+    );
+    let after: Value = serde_json::from_str(after["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(after["status"], "noop", "apply did not converge: {after}");
 }

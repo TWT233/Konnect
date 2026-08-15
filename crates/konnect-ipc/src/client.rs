@@ -360,7 +360,11 @@ impl KiCadIpcClient {
 
     /// Get all nets on the board.
     pub fn get_nets(&self) -> Result<Vec<IpcNet>> {
-        let doc = self.get_board_document()?;
+        self.get_nets_in(self.get_board_document()?)
+    }
+
+    /// As [`Self::get_nets`], targeting a specific open document.
+    pub fn get_nets_in(&self, doc: kiapi::common::types::DocumentSpecifier) -> Result<Vec<IpcNet>> {
         let cmd = kiapi::board::commands::GetNets {
             board: Some(doc),
             netclass_filter: vec![],
@@ -552,11 +556,20 @@ impl KiCadIpcClient {
     /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;
     /// each `Any` must be a fully-formed board item with an existing `id` populated.
     pub fn update_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        self.update_items_in(self.get_board_document()?, items)
+    }
+
+    /// As [`Self::update_items`], targeting a specific open document.
+    pub fn update_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        items: Vec<prost_types::Any>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         let expected_count = items.len();
-        let header = self.make_header()?;
+        let header = header_for(document);
         let cmd = kiapi::common::commands::UpdateItems {
             header: Some(header),
             items,
@@ -1306,8 +1319,26 @@ impl KiCadIpcClient {
 
     /// Get board extents (bounding box of all items).
     pub fn get_board_extents(&self) -> Result<IpcBoardExtents> {
+        self.get_board_extents_in(self.get_board_document()?)
+    }
+
+    /// As [`Self::get_board_extents`], targeting a specific open document.
+    pub fn get_board_extents_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcBoardExtents> {
+        self.get_optional_board_extents_in(document)?
+            .context("No bounding box returned from KiCAD")
+    }
+
+    /// Return no bounds for a completely empty board instead of treating the
+    /// valid empty `GetBoundingBox` response as an IPC failure.
+    pub fn get_optional_board_extents_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Option<IpcBoardExtents>> {
         // Use GetBoundingBox with no specific items = board extents
-        let header = self.make_header()?;
+        let header = header_for(document);
         let cmd = kiapi::common::commands::GetBoundingBox {
             header: Some(header),
             items: vec![], // empty = all items
@@ -1319,7 +1350,7 @@ impl KiCadIpcClient {
             if let Some(bbox) = resp.boxes.first() {
                 let pos = bbox.position.as_ref();
                 let size = bbox.size.as_ref();
-                return Ok(IpcBoardExtents {
+                return Ok(Some(IpcBoardExtents {
                     min: IpcVector2 {
                         x: pos
                             .map(|p| crate::builders::nm_to_mm(p.x_nm))
@@ -1342,10 +1373,10 @@ impl KiCadIpcClient {
                                 .map(|s| crate::builders::nm_to_mm(s.y_nm))
                                 .unwrap_or(0.0),
                     },
-                });
+                }));
             }
         }
-        anyhow::bail!("No bounding box returned from KiCAD")
+        Ok(None)
     }
 
     /// Get enabled layers.
