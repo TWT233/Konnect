@@ -38,6 +38,26 @@ jobs:
       - name: Doctests
         run: cargo test --workspace --locked --doc
 
+  # flake.nix pins its own toolchain, dependency set and build flags, so
+  # nothing else in CI would notice it going stale — and it names things
+  # that move: `-p konnect --bin konnect`, rust-toolchain.toml, and a
+  # preCheck that supplies KONNECT_STATE_DIR for the tests that need a
+  # writable state dir. Without this job it is broken-on-arrival the first
+  # time any of those changes, and only Nix users find out.
+  nix:
+    name: Nix flake
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: Check flake metadata
+        run: nix flake check --no-build
+      - name: Build the package
+        run: nix build .#konnect --print-build-logs
+
   # schematic-viewer is intentionally outside the workspace (Tauri app), so
   # --workspace never touches it. Without this job a viewer break ships
   # silently: release builds it with continue-on-error and the PCM scripts
