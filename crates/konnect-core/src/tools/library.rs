@@ -77,7 +77,22 @@ pub fn tools() -> Vec<ToolDef> {
                                 "y": { "type": "number" },
                                 "width": { "type": "number" },
                                 "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" }
+                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "layers": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Explicit canonical KiCAD pad layers. Defaults to F.Cu/F.Paste/F.Mask for SMD and *.Cu/*.Mask otherwise."
+                                },
+                                "rotation": {
+                                    "type": "number",
+                                    "description": "Pad rotation in degrees (default 0)"
+                                },
+                                "roundrect_rratio": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 0.5,
+                                    "description": "Rounded-rectangle corner radius ratio (0..0.5)"
+                                }
                             },
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
                         }
@@ -654,10 +669,59 @@ async fn handle_create_footprint(
         let w = pad["width"].as_f64().unwrap_or(1.0);
         let h = pad["height"].as_f64().unwrap_or(1.0);
 
-        let layers = if pad_type == "smd" {
-            r#"(layers "F.Cu" "F.Paste" "F.Mask")"#
+        let layer_names = if let Some(layers) = pad["layers"].as_array() {
+            let mut names = Vec::with_capacity(layers.len());
+            for layer in layers {
+                let layer = layer
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("pad layers must contain strings"))?;
+                if !matches!(
+                    layer,
+                    "F.Cu"
+                        | "B.Cu"
+                        | "F.Paste"
+                        | "B.Paste"
+                        | "F.Mask"
+                        | "B.Mask"
+                        | "*.Cu"
+                        | "*.Mask"
+                ) {
+                    anyhow::bail!("invalid pad layer: {layer}");
+                }
+                names.push(layer);
+            }
+            if names.is_empty() {
+                anyhow::bail!("pad layers must not be empty");
+            }
+            names
+        } else if pad_type == "smd" {
+            vec!["F.Cu", "F.Paste", "F.Mask"]
         } else {
-            r#"(layers "*.Cu" "*.Mask")"#
+            vec!["*.Cu", "*.Mask"]
+        };
+        let layers = format!(
+            "(layers {})",
+            layer_names
+                .iter()
+                .map(|layer| format!("\"{layer}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        let rotation = pad["rotation"].as_f64().unwrap_or(0.0);
+        let at = if rotation == 0.0 {
+            format!("(at {x} {y})")
+        } else {
+            format!("(at {x} {y} {rotation})")
+        };
+
+        let roundrect_ratio = if let Some(ratio) = pad["roundrect_rratio"].as_f64() {
+            if !(0.0..=0.5).contains(&ratio) {
+                anyhow::bail!("roundrect_rratio must be between 0 and 0.5");
+            }
+            format!("(roundrect_rratio {ratio})")
+        } else {
+            String::new()
         };
 
         let drill_sexp = if let Some(drill) = pad["drill"].as_f64() {
@@ -667,8 +731,8 @@ async fn handle_create_footprint(
         };
 
         pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} (at {} {}) (size {} {}) {} {})",
-            number, pad_type, shape, x, y, w, h, layers, drill_sexp
+            "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
+            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -4756,6 +4820,137 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated footprint doesn't parse"
         );
+    }
+
+    #[test]
+    fn create_footprint_schema_exposes_pad_layers_rotation_and_roundrect_ratio() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_footprint")
+            .expect("library must expose create_footprint");
+        let pad_properties = &tool.input_schema["properties"]["pads"]["items"]["properties"];
+        assert_eq!(pad_properties["layers"]["items"]["type"], json!("string"));
+        assert_eq!(pad_properties["rotation"]["type"], json!("number"));
+        assert_eq!(pad_properties["roundrect_rratio"]["maximum"], json!(0.5));
+    }
+
+    #[tokio::test]
+    async fn create_footprint_emits_bottom_layer_rotated_roundrect_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("BOTTOM.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "BOTTOM",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": -8.075,
+                "y": 4.7,
+                "width": 2.5,
+                "height": 2.55,
+                "layers": ["B.Cu", "B.Paste", "B.Mask"],
+                "rotation": 180.0,
+                "roundrect_rratio": 0.2
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            content.contains("(at -8.075 4.7 180)"),
+            "missing pad rotation:\n{content}"
+        );
+        assert!(
+            content.contains("(layers \"B.Cu\" \"B.Paste\" \"B.Mask\")"),
+            "missing bottom pad layers:\n{content}"
+        );
+        assert!(
+            content.contains("(roundrect_rratio 0.2)"),
+            "missing roundrect ratio:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_legacy_pad_payload_remains_front_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("LEGACY.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "LEGACY",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("(at 0 0)"), "{content}");
+        assert!(
+            content.contains("(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")"),
+            "{content}"
+        );
+        assert!(!content.contains("(at 0 0 0)"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_invalid_pad_layer_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("INVALID_LAYER.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "INVALID_LAYER",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "rect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0,
+                "layers": ["User.MadeUp"]
+            }]
+        });
+
+        let error = handle_create_footprint(&args, &test_ctx())
+            .await
+            .expect_err("invalid layer must be rejected");
+        assert!(error.to_string().contains("invalid pad layer"));
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_invalid_roundrect_ratio_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("INVALID_RATIO.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "INVALID_RATIO",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0,
+                "roundrect_rratio": 0.75
+            }]
+        });
+
+        let error = handle_create_footprint(&args, &test_ctx())
+            .await
+            .expect_err("invalid roundrect ratio must be rejected");
+        assert!(error.to_string().contains("roundrect_rratio"));
+        assert!(!out.exists());
     }
 
     #[tokio::test]
