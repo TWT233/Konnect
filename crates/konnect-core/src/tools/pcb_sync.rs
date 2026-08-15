@@ -671,7 +671,7 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
     }
 }
 
-/// The netlist with its volatile export header removed.
+/// A stable identity for the design-bearing netlist sections.
 ///
 /// `kicad-cli sch export netlist` stamps `(date "…T14:48:16")` and the
 /// exporting tool's version into every export, so hashing the raw source
@@ -681,43 +681,61 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
 /// is a race, not a guarantee: it passes on a fast machine and fails on a
 /// human reviewing the plan first, which is the whole point of the plan.
 ///
-/// The revision must cover what the plan *read*: the components and nets. It
-/// must not cover when the export ran or which KiCad wrote it — a version
-/// upgrade would otherwise invalidate every outstanding plan for an unchanged
-/// design.
-fn netlist_identity(netlist_source: &str) -> String {
-    let mut out = String::with_capacity(netlist_source.len());
-    let mut rest = netlist_source;
-    while let Some(start) = rest.find("(date ") {
-        // Only the header stamp: a `(date …)` node nested in a component's
-        // fields is design content and stays in the hash.
-        let Some(end) = rest[start..].find(')') else {
-            break;
-        };
-        out.push_str(&rest[..start]);
-        rest = &rest[start + end + 1..];
+/// The revision must cover what the plan *read*: the complete top-level
+/// `components` and `nets` trees. Hashing those trees structurally ignores the
+/// volatile header without confusing nested nodes or quoted text for header
+/// metadata.
+fn netlist_identity(netlist_source: &str) -> Vec<u8> {
+    let Ok(root) = konnect_sexp::parse_sexp(netlist_source) else {
+        // Production reaches this function only after successful netlist
+        // parsing. Keeping invalid synthetic planner inputs distinct makes the
+        // pure planner tests useful without creating a second error path here.
+        return netlist_source.as_bytes().to_vec();
+    };
+
+    let mut identity = Vec::new();
+    for tag in ["components", "nets"] {
+        match root.find(tag) {
+            Some(node) => {
+                identity.push(1);
+                append_sexp_identity(node, &mut identity);
+            }
+            None => identity.push(0),
+        }
     }
-    out.push_str(rest);
-    // `(tool "kicad-cli (10.0.5)")` moves with the installed KiCad, not the
-    // design.
-    let mut cleaned = String::with_capacity(out.len());
-    let mut rest = out.as_str();
-    while let Some(start) = rest.find("(tool ") {
-        let Some(end) = rest[start..].find(')') else {
-            break;
-        };
-        cleaned.push_str(&rest[..start]);
-        rest = &rest[start + end + 1..];
+    identity
+}
+
+fn append_sexp_identity(node: &SexpNode, identity: &mut Vec<u8>) {
+    match node {
+        SexpNode::Atom(value) => {
+            identity.push(0);
+            append_identity_bytes(value.as_bytes(), identity);
+        }
+        SexpNode::Str(value) => {
+            identity.push(1);
+            append_identity_bytes(value.as_bytes(), identity);
+        }
+        SexpNode::List(children) => {
+            identity.push(2);
+            identity.extend_from_slice(&(children.len() as u64).to_le_bytes());
+            for child in children {
+                append_sexp_identity(child, identity);
+            }
+        }
     }
-    cleaned.push_str(rest);
-    cleaned
+}
+
+fn append_identity_bytes(value: &[u8], identity: &mut Vec<u8>) {
+    identity.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    identity.extend_from_slice(value);
 }
 
 fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
     let mut footprints = board.footprints.iter().collect::<Vec<_>>();
     footprints.sort_by(|a, b| a.kiid.cmp(&b.kiid));
     let mut hasher = Sha256::new();
-    hasher.update(netlist_identity(netlist_source).as_bytes());
+    hasher.update(netlist_identity(netlist_source));
     hasher.update(serde_json::to_vec(&board.bounds).expect("bounds serialize"));
     for footprint in footprints {
         hasher.update(footprint.kiid.as_bytes());
@@ -1915,6 +1933,38 @@ mod tests {
             a,
             plan_revision(&changed, &board),
             "a footprint swap must move the revision"
+        );
+    }
+
+    #[test]
+    fn plan_revision_keeps_nested_and_quoted_design_content() {
+        let netlist = |nested_date: &str, value: &str| {
+            format!(
+                r#"(export
+  (design (date "2026-08-15T14:48:16") (tool "kicad-cli (10.0.5)"))
+  (components
+    (comp (ref "R1")
+      (value "{value}")
+      (footprint "Resistor_SMD:R_0805")
+      (date "{nested_date}")
+      (tstamps "/aaa")))
+  (nets
+    (net (code "1") (name "GND")
+      (node (ref "R1") (pin "1")))))"#
+            )
+        };
+        let board = board_with(Vec::new());
+        let baseline = plan_revision(&netlist("2025-01-01", "literal (tool alpha)"), &board);
+
+        assert_ne!(
+            baseline,
+            plan_revision(&netlist("2025-01-02", "literal (tool alpha)"), &board),
+            "a nested date node is component content, not export metadata"
+        );
+        assert_ne!(
+            baseline,
+            plan_revision(&netlist("2025-01-01", "literal (tool beta)"), &board),
+            "tool-like text inside a quoted value is design content"
         );
     }
 }
