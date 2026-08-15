@@ -379,9 +379,19 @@ pub fn tools() -> Vec<ToolDef> {
 
 pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
     // Find the first top-level (symbol block — insert before it
-    let insert_pos = find_first_symbol_instance(content)
+    let item_pos = find_first_symbol_instance(content)
         .unwrap_or_else(|| content.rfind(')').unwrap_or(content.len()));
-    let edits = vec![SexpEdit::insert(insert_pos, new_sexp)];
+    let line_start = content[..item_pos].rfind('\n').map_or(0, |pos| pos + 1);
+    let insert_pos = if content[line_start..item_pos]
+        .chars()
+        .all(char::is_whitespace)
+    {
+        line_start
+    } else {
+        item_pos
+    };
+    let insertion = format!("{}\n", new_sexp.trim_matches('\n'));
+    let edits = vec![SexpEdit::insert(insert_pos, insertion)];
     apply_edits(content.to_string(), edits)
 }
 

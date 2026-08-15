@@ -1872,6 +1872,11 @@ mod tests {
             sym.has_instance_path("amp", &format!("/{}", root_uuid)),
             "instance path must be /<root-uuid> under the file-stem project name"
         );
+        assert!(
+            !raw.lines()
+                .any(|line| line.ends_with(' ') || line.ends_with('\t')),
+            "component placement must not leave trailing whitespace: {raw:?}"
+        );
     }
 
     #[tokio::test]
