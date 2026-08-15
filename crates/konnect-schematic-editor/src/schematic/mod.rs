@@ -91,6 +91,10 @@ impl<'a> LocatedElement<'a> {
 pub struct Schematic {
     filepath: PathBuf,
     original_source: Mutex<String>,
+    /// The indentation unit the loaded file used, so a targeted edit does not
+    /// come back as a whole-file reindent (#210). KiCAD writes tabs; this
+    /// crate used to emit two spaces unconditionally.
+    indent: String,
 
     pub version: Option<u32>,
     pub generator: Option<String>,
@@ -138,7 +142,7 @@ impl Schematic {
     /// Saving to the loaded path instead performs a revision-checked commit.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let text = writer::write(&self.to_sexp());
+        let text = writer::write_with_indent(&self.to_sexp(), &self.indent);
         if path == self.filepath {
             let mut original_source = self.original_source.lock().map_err(|_| {
                 crate::error::Error::Io(std::io::Error::other(
@@ -164,7 +168,7 @@ impl Schematic {
     /// commands from an edited candidate and commit through `konnect-sexp`.
     #[must_use]
     pub fn to_source(&self) -> String {
-        writer::write(&self.to_sexp())
+        writer::write_with_indent(&self.to_sexp(), &self.indent)
     }
 
     pub fn filepath(&self) -> &Path {
@@ -476,6 +480,7 @@ impl Schematic {
 
         Ok(Schematic {
             filepath,
+            indent: crate::sexp::writer::detect_indent(&original_source),
             original_source: Mutex::new(original_source),
             version,
             generator,

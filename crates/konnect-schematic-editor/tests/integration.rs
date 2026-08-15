@@ -748,3 +748,99 @@ fn named_paper_gains_no_extra_tokens() {
         "a plain named page must round-trip unchanged:\n{out}"
     );
 }
+
+/// #210: every typed-model write reindented the whole sheet, because the
+/// writer emitted two spaces unconditionally while KiCAD writes tabs. A
+/// one-symbol edit came back as a whole-file diff, which makes the change
+/// unreviewable and the history useless.
+#[test]
+fn a_tab_indented_sheet_stays_tab_indented() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tabs.kicad_sch");
+    // As eeschema writes it.
+    let source = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\n\t(junction\n\t\t(at 100 100)\n\t\t(diameter 0)\n\t\t(uuid \"j1\")\n\t)\n\n\t(sheet_instances\n\t\t(path \"/\"\n\t\t\t(page \"1\")\n\t\t)\n\t)\n)\n";
+    std::fs::write(&path, source).unwrap();
+
+    let sch = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    let out = sch.to_source();
+
+    assert!(
+        !out.lines().any(|l| l.starts_with("  ")),
+        "no line may be space-indented after a round trip:\n{out}"
+    );
+    assert!(
+        out.lines().filter(|l| l.starts_with('\t')).count() > 3,
+        "the sheet must still be tab-indented:\n{out}"
+    );
+}
+
+/// The converse: a two-space file keeps two spaces, so this crate's own
+/// output round-trips without churn either.
+#[test]
+fn a_space_indented_sheet_stays_space_indented() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spaces.kicad_sch");
+    let source = "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (paper \"A4\")\n  (lib_symbols)\n\n  (junction\n    (at 100 100)\n    (diameter 0)\n    (uuid \"j1\")\n  )\n)\n";
+    std::fs::write(&path, source).unwrap();
+
+    let sch = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    let out = sch.to_source();
+    assert!(
+        !out.contains('\t'),
+        "a space-indented sheet must not gain tabs:\n{out}"
+    );
+    assert!(out.contains("\n  (version"), "{out}");
+}
+
+/// Indentation must stop being a source of diff. Two other sources remain
+/// (#210): this crate collapses a node's closing paren onto the last child's
+/// line, and inserts blank lines KiCad never writes -- a real KiCad sheet of
+/// 3713 lines contains exactly one. Both would change the output of every
+/// file this crate writes, so they are a deliberate decision rather than part
+/// of the indent fix; this test pins the part that is fixed.
+#[test]
+fn editing_a_tab_indented_sheet_reindents_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edit.kicad_sch");
+    let source = "(kicad_sch
+	(version 20250610)
+	(generator \"eeschema\")
+	(uuid \"root\")
+	(paper \"A4\")
+	(lib_symbols)
+	(junction
+		(at 10 10)
+		(diameter 0)
+		(uuid \"j1\")
+	)
+)
+";
+    std::fs::write(&path, source).unwrap();
+
+    let mut sch = konnect_schematic_editor::Schematic::load(&path).unwrap();
+    sch.add_junction(30.0, 30.0);
+    sch.overwrite().unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        !after.lines().any(|l| l.starts_with("  ")),
+        "the edit must not convert the sheet to space indentation:
+{after}"
+    );
+    // Every surviving line keeps the tab depth it had.
+    for (line, depth) in [("(version 20250610)", 1), ("(at 10 10)", 2)] {
+        let found = after.lines().find(|l| l.trim() == line).unwrap_or_else(|| {
+            panic!(
+                "{line} missing from:
+{after}"
+            )
+        });
+        assert_eq!(
+            found.len() - found.trim_start().len(),
+            depth,
+            "{line} changed indentation depth:
+{after}"
+        );
+    }
+    assert!(after.contains("(at 30 30)"), "{after}");
+}
