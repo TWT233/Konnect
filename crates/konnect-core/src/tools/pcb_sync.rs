@@ -671,11 +671,53 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
     }
 }
 
+/// The netlist with its volatile export header removed.
+///
+/// `kicad-cli sch export netlist` stamps `(date "…T14:48:16")` and the
+/// exporting tool's version into every export, so hashing the raw source
+/// yields a different revision **every second** for a design nobody touched —
+/// and since apply requires the revision a dry run returned, apply could only
+/// ever succeed if both calls landed inside the same wall-clock second. That
+/// is a race, not a guarantee: it passes on a fast machine and fails on a
+/// human reviewing the plan first, which is the whole point of the plan.
+///
+/// The revision must cover what the plan *read*: the components and nets. It
+/// must not cover when the export ran or which KiCad wrote it — a version
+/// upgrade would otherwise invalidate every outstanding plan for an unchanged
+/// design.
+fn netlist_identity(netlist_source: &str) -> String {
+    let mut out = String::with_capacity(netlist_source.len());
+    let mut rest = netlist_source;
+    while let Some(start) = rest.find("(date ") {
+        // Only the header stamp: a `(date …)` node nested in a component's
+        // fields is design content and stays in the hash.
+        let Some(end) = rest[start..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    // `(tool "kicad-cli (10.0.5)")` moves with the installed KiCad, not the
+    // design.
+    let mut cleaned = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(start) = rest.find("(tool ") {
+        let Some(end) = rest[start..].find(')') else {
+            break;
+        };
+        cleaned.push_str(&rest[..start]);
+        rest = &rest[start + end + 1..];
+    }
+    cleaned.push_str(rest);
+    cleaned
+}
+
 fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
     let mut footprints = board.footprints.iter().collect::<Vec<_>>();
     footprints.sort_by(|a, b| a.kiid.cmp(&b.kiid));
     let mut hasher = Sha256::new();
-    hasher.update(netlist_source.as_bytes());
+    hasher.update(netlist_identity(netlist_source).as_bytes());
     hasher.update(serde_json::to_vec(&board.bounds).expect("bounds serialize"));
     for footprint in footprints {
         hasher.update(footprint.kiid.as_bytes());
@@ -1812,5 +1854,67 @@ mod tests {
         let second = plan_sync("netlist", &design, &changed_board);
 
         assert_ne!(first.plan_revision, second.plan_revision);
+    }
+
+    /// A plan revision must survive the clock. `kicad-cli` stamps the export
+    /// time and its own version into every netlist, so hashing the raw source
+    /// changed the revision every second — and apply, which requires the
+    /// revision a dry run returned, could then only succeed if both calls
+    /// landed inside the same wall-clock second.
+    #[test]
+    fn plan_revision_ignores_the_export_timestamp_and_tool_version() {
+        let netlist = |date: &str, tool: &str| {
+            format!(
+                "(export (version \"E\")
+  (design
+    (source \"/tmp/x.kicad_sch\")
+    (date \"{date}\")
+    (tool \"{tool}\")
+  )
+  (components
+    (comp (ref \"R1\")
+      (value \"10k\")
+      (footprint \"Resistor_SMD:R_0805\")
+      (tstamps \"/aaa\")))
+  (nets
+    (net (code \"1\") (name \"GND\")
+      (node (ref \"R1\") (pin \"1\")))))
+"
+            )
+        };
+        let board = BoardState {
+            footprints: Vec::new(),
+            routed_nets: BTreeMap::new(),
+            bounds: Bounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 0.0,
+                max_y: 0.0,
+            },
+        };
+        let a = plan_revision(
+            &netlist("2026-08-15T14:48:16", "kicad-cli (10.0.5)"),
+            &board,
+        );
+        let b = plan_revision(
+            &netlist("2026-08-15T14:48:18", "kicad-cli (10.0.5)"),
+            &board,
+        );
+        assert_eq!(a, b, "two seconds apart is not a design change");
+
+        let c = plan_revision(
+            &netlist("2026-08-15T14:48:16", "kicad-cli (10.1.0)"),
+            &board,
+        );
+        assert_eq!(a, c, "a KiCad upgrade is not a design change");
+
+        // A real change still moves it, or the guard is worthless.
+        let changed = netlist("2026-08-15T14:48:16", "kicad-cli (10.0.5)")
+            .replace("Resistor_SMD:R_0805", "Resistor_SMD:R_0603");
+        assert_ne!(
+            a,
+            plan_revision(&changed, &board),
+            "a footprint swap must move the revision"
+        );
     }
 }

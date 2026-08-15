@@ -1498,6 +1498,12 @@ mod batch_place_and_connect_tests {
             1,
             "lib_symbols entry must not be duplicated: {after}"
         );
+        assert!(
+            !after
+                .lines()
+                .any(|line| line.ends_with(' ') || line.ends_with('\t')),
+            "batch placement must not leave trailing whitespace: {after:?}"
+        );
     }
 
     #[tokio::test]
@@ -1793,6 +1799,12 @@ mod connect_to_net_orientation_tests {
             ("89.84 100 180".into(), "right bottom".into())
         );
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+        assert!(
+            !after
+                .lines()
+                .any(|line| line.ends_with(' ') || line.ends_with('\t')),
+            "label insertion must not leave the symbol line's indent behind: {after:?}"
+        );
     }
 
     #[tokio::test]
@@ -2180,6 +2192,15 @@ mod insert_order_tests {
         assert!(
             label < inst,
             "a label after the instances makes the file unloadable:\n{out}"
+        );
+        assert!(
+            !out.contains(")(symbol"),
+            "elements must not be glued: {out}"
+        );
+        assert!(
+            !out.lines()
+                .any(|line| line.ends_with(' ') || line.ends_with('\t')),
+            "insertion must consume the target line's indent: {out:?}"
         );
     }
 

@@ -3,12 +3,16 @@
 //! Operations are file-based (S-expression manipulation + directory scanning).
 //! No IPC or kicad-cli is required for most tools.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
-use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
+use konnect_sexp::writer::{
+    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
+    write_atomic, write_atomic_if_unchanged, write_new_atomic, SexpEdit,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +54,7 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
 }
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "create_footprint",
             "Create a new footprint (.kicad_mod) file from a pad layout description.",
@@ -73,7 +77,22 @@ pub fn tools() -> Vec<ToolDef> {
                                 "y": { "type": "number" },
                                 "width": { "type": "number" },
                                 "height": { "type": "number" },
-                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" }
+                                "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
+                                "layers": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Explicit canonical KiCAD pad layers. Defaults to F.Cu/F.Paste/F.Mask for SMD and *.Cu/*.Mask otherwise."
+                                },
+                                "rotation": {
+                                    "type": "number",
+                                    "description": "Pad rotation in degrees (default 0)"
+                                },
+                                "roundrect_rratio": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 0.5,
+                                    "description": "Rounded-rectangle corner radius ratio (0..0.5)"
+                                }
                             },
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
                         }
@@ -106,6 +125,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file" },
                     "pad_number": { "type": "string", "description": "Pad number to edit" },
+                    "new_number": { "type": "string", "description": "New pad number (optional; duplicate destination numbers are allowed)" },
+                    "match_all": { "type": "boolean", "description": "Edit every direct-child pad with pad_number instead of only the first match", "default": false },
                     "x": { "type": "number", "description": "New X position in mm (optional)" },
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
                     "width": { "type": "number", "description": "New pad width in mm (optional)" },
@@ -130,7 +151,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" }
+                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
+                        "default": false
+                    }
                 },
                 "required": ["library_path", "nickname"]
             }),
@@ -301,11 +327,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_footprint_info",
-            "Return detailed information about a footprint: pad layout, courtyard, description.",
+            "Return detailed information about a footprint: pad layout, courtyard, description, \
+             and optionally its supported graphical primitives.",
             json!({
                 "type": "object",
                 "properties": {
-                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" }
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
+                    "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
+                    "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
+                    "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
                 },
                 "required": ["footprint_path"]
             }),
@@ -337,7 +367,27 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
+    ];
+    // Grouped after `create_footprint` so the footprint-editing tools read as
+    // one family in `tools/list`. Anchored on that tool's name rather than a
+    // literal index: the list above is edited often, and a positional insert
+    // silently reorders the catalogue the first time a tool moves.
+    let after_create_footprint = tools
+        .iter()
+        .position(|t| t.name == "create_footprint")
+        .map(|i| i + 1)
+        .unwrap_or(tools.len());
+    for (offset, tool) in [
+        super::footprint_graphics::tool(),
+        super::footprint_metadata::tool(),
+        super::footprint_models::tool(),
     ]
+    .into_iter()
+    .enumerate()
+    {
+        tools.insert(after_create_footprint + offset, tool);
+    }
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -635,10 +685,59 @@ async fn handle_create_footprint(
         let w = pad["width"].as_f64().unwrap_or(1.0);
         let h = pad["height"].as_f64().unwrap_or(1.0);
 
-        let layers = if pad_type == "smd" {
-            r#"(layers "F.Cu" "F.Paste" "F.Mask")"#
+        let layer_names = if let Some(layers) = pad["layers"].as_array() {
+            let mut names = Vec::with_capacity(layers.len());
+            for layer in layers {
+                let layer = layer
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("pad layers must contain strings"))?;
+                if !matches!(
+                    layer,
+                    "F.Cu"
+                        | "B.Cu"
+                        | "F.Paste"
+                        | "B.Paste"
+                        | "F.Mask"
+                        | "B.Mask"
+                        | "*.Cu"
+                        | "*.Mask"
+                ) {
+                    anyhow::bail!("invalid pad layer: {layer}");
+                }
+                names.push(layer);
+            }
+            if names.is_empty() {
+                anyhow::bail!("pad layers must not be empty");
+            }
+            names
+        } else if pad_type == "smd" {
+            vec!["F.Cu", "F.Paste", "F.Mask"]
         } else {
-            r#"(layers "*.Cu" "*.Mask")"#
+            vec!["*.Cu", "*.Mask"]
+        };
+        let layers = format!(
+            "(layers {})",
+            layer_names
+                .iter()
+                .map(|layer| format!("\"{layer}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        let rotation = pad["rotation"].as_f64().unwrap_or(0.0);
+        let at = if rotation == 0.0 {
+            format!("(at {x} {y})")
+        } else {
+            format!("(at {x} {y} {rotation})")
+        };
+
+        let roundrect_ratio = if let Some(ratio) = pad["roundrect_rratio"].as_f64() {
+            if !(0.0..=0.5).contains(&ratio) {
+                anyhow::bail!("roundrect_rratio must be between 0 and 0.5");
+            }
+            format!("(roundrect_rratio {ratio})")
+        } else {
+            String::new()
         };
 
         let drill_sexp = if let Some(drill) = pad["drill"].as_f64() {
@@ -648,8 +747,8 @@ async fn handle_create_footprint(
         };
 
         pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} (at {} {}) (size {} {}) {} {})",
-            number, pad_type, shape, x, y, w, h, layers, drill_sexp
+            "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
+            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -709,49 +808,129 @@ async fn handle_edit_footprint_pad(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-
-    let content = tokio::fs::read_to_string(&path).await?;
-
-    // Find the pad block:  (pad "N" ... (at X Y) (size W H) ...)
-    // We search for the at/size/drill atoms and replace them individually.
-    let pad_pat = format!(r#"(pad "{}""#, pad_number);
-    let pad_start = content
-        .find(&pad_pat)
-        .ok_or_else(|| anyhow::anyhow!("Pad '{}' not found in footprint", pad_number))?;
-
-    // Find the closing paren of this pad block (simple depth count)
-    let pad_end = {
-        let mut depth = 0i32;
-        let mut end = pad_start;
-        for (i, ch) in content[pad_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = pad_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
+    let new_number = match args.get("new_number") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(number) => Some(number),
+            None => {
+                return Ok(invalid_library_argument(
+                    "new_number",
+                    "must be a string when supplied",
+                ))
             }
-        }
-        end
+        },
     };
-    let pad_block = &content[pad_start..pad_end];
+    let match_all = match args.get("match_all") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(match_all) => match_all,
+            None => {
+                return Ok(invalid_library_argument(
+                    "match_all",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
-    // Helper: replace or add a sub-expression within the pad block
+    let content = read_consistent(&path)?;
+    match parse_sexp(&content) {
+        Ok(root) if root.head() == Some("footprint") => {}
+        Ok(_) => {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                "file root must be a footprint",
+            ))
+        }
+        Err(error) => {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                format!("footprint is malformed: {error}"),
+            ))
+        }
+    }
+
+    let mut edits = Vec::new();
+    let mut matched_count = 0usize;
+    for (start, end) in find_direct_child_blocks(&content, "footprint") {
+        let block = &content[start..end];
+        let Ok(node) = parse_sexp(block) else {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                "footprint contains a malformed direct child",
+            ));
+        };
+        if node.head() != Some("pad") || node.get(1).and_then(SexpNode::as_str) != Some(pad_number)
+        {
+            continue;
+        }
+
+        matched_count += 1;
+        edits.push(SexpEdit::replace(
+            start,
+            end,
+            edit_footprint_pad_block(block, args, new_number),
+        ));
+        if !match_all {
+            break;
+        }
+    }
+
+    if matched_count == 0 {
+        return Ok(invalid_library_argument(
+            "pad_number",
+            format!("pad '{pad_number}' was not found"),
+        ));
+    }
+
+    let new_content = apply_edits(content.clone(), edits);
+    write_atomic_if_unchanged(&path, &content, &new_content)?;
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "pad": pad_number,
+            "matched_count": matched_count,
+            "updated_count": matched_count
+        }))
+        .unwrap(),
+    ))
+}
+
+fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn edit_footprint_pad_block(
+    pad_block: &str,
+    args: &serde_json::Value,
+    new_number: Option<&str>,
+) -> String {
     let mut new_pad = pad_block.to_string();
 
+    if let Some(number) = new_number {
+        if let Some(number_start) = new_pad.find('"') {
+            if let Some(number_end) = new_pad[number_start + 1..].find('"') {
+                let number_end = number_start + 1 + number_end;
+                new_pad.replace_range(number_start + 1..number_end, &escape_library_string(number));
+            }
+        }
+    }
+
     if let Some(x) = args["x"].as_f64() {
-        // Replace (at OLD_X OLD_Y [ROT]) → update X
         if let Some(at_pos) = new_pad.find("(at ") {
             let at_end = new_pad[at_pos..]
                 .find(')')
                 .map(|i| at_pos + i + 1)
                 .unwrap_or(new_pad.len());
             let at_block = &new_pad[at_pos..at_end];
-            // Parse existing values
             let parts: Vec<&str> = at_block
                 .trim_start_matches("(at ")
                 .trim_end_matches(')')
@@ -762,8 +941,7 @@ async fn handle_edit_footprint_pad(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            let new_at = format!("(at {} {}{})", x, old_y, rot);
-            new_pad.replace_range(at_pos..at_end, &new_at);
+            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", x, old_y, rot));
         }
     }
     if let Some(y) = args["y"].as_f64() {
@@ -783,51 +961,36 @@ async fn handle_edit_footprint_pad(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            let new_at = format!("(at {} {}{})", old_x, y, rot);
-            new_pad.replace_range(at_pos..at_end, &new_at);
+            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", old_x, y, rot));
         }
     }
-    if let (Some(w), Some(h)) = (args["width"].as_f64(), args["height"].as_f64()) {
-        if let Some(sz_pos) = new_pad.find("(size ") {
-            let sz_end = new_pad[sz_pos..]
+    if let (Some(width), Some(height)) = (args["width"].as_f64(), args["height"].as_f64()) {
+        if let Some(size_pos) = new_pad.find("(size ") {
+            let size_end = new_pad[size_pos..]
                 .find(')')
-                .map(|i| sz_pos + i + 1)
+                .map(|i| size_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            let new_size = format!("(size {} {})", w, h);
-            new_pad.replace_range(sz_pos..sz_end, &new_size);
+            new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
     if let Some(drill) = args["drill"].as_f64() {
-        if let Some(dr_pos) = new_pad.find("(drill ") {
-            let dr_end = new_pad[dr_pos..]
+        if let Some(drill_pos) = new_pad.find("(drill ") {
+            let drill_end = new_pad[drill_pos..]
                 .find(')')
-                .map(|i| dr_pos + i + 1)
+                .map(|i| drill_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            let new_drill = format!("(drill {})", drill);
-            new_pad.replace_range(dr_pos..dr_end, &new_drill);
+            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
         } else {
-            // Insert drill before closing paren of pad
             let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {})", drill));
+            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
         }
     }
 
-    // Apply the pad block replacement
-    let new_content = format!(
-        "{}{}{}",
-        &content[..pad_start],
-        new_pad,
-        &content[pad_end..]
-    );
-    write_atomic(&path, &new_content)?;
+    new_pad
+}
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "pad": pad_number
-        }))
-        .unwrap(),
-    ))
+fn escape_library_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ─── Library table helpers ────────────────────────────────────────────────────
@@ -1344,6 +1507,18 @@ async fn handle_register_footprint_library(
         Err(e) => return Ok(e),
     };
     let scope = args["scope"].as_str().unwrap_or("project");
+    let replace_existing = match args.get("replace_existing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "replace_existing",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
     let (table_path, uri) = match lib_table_target(
         scope,
@@ -1356,7 +1531,18 @@ async fn handle_register_footprint_library(
         Err(e) => return Ok(e),
     };
 
-    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
+    let registration = match register_in_lib_table_with_policy(
+        &table_path,
+        nickname,
+        &uri,
+        "KiCad",
+        replace_existing,
+    )
+    .await?
+    {
+        Ok(registration) => registration,
+        Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
+    };
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1364,7 +1550,9 @@ async fn handle_register_footprint_library(
             "nickname": nickname,
             "scope": scope,
             "table": table_path.to_str().unwrap_or(""),
-            "repaired_table_root": repaired_root
+            "uri": uri,
+            "state": registration.state.as_str(),
+            "repaired_table_root": registration.repaired_root
         }))
         .unwrap(),
     ))
@@ -1464,6 +1652,61 @@ fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
     }
 }
 
+fn repository_relative_uri(
+    lib_path: &Path,
+    table_dir: &Path,
+    project_path: &Path,
+) -> Option<String> {
+    if !project_path.is_file()
+        || project_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("kicad_pro")
+    {
+        return None;
+    }
+    let repository = table_dir
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())?;
+    let repository = std::fs::canonicalize(repository).ok()?;
+    let table_dir = std::fs::canonicalize(table_dir).ok()?;
+    let library = std::fs::canonicalize(lib_path).ok()?;
+    if !table_dir.starts_with(&repository) || !library.starts_with(&repository) {
+        return None;
+    }
+    let relative = lexical_relative_path(&table_dir, &library)?;
+    Some(format!("${{KIPRJMOD}}/{}", portable_uri(&relative)))
+}
+
+fn lexical_relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+    if from_components.first() != to_components.first() {
+        return None;
+    }
+    let common = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &from_components[common..] {
+        if matches!(component, Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    for component in &to_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
 /// Which lib-table a `register_*` call writes to, and the URI it records.
 ///
 /// Shared by the symbol and footprint registrars so the two cannot drift: both
@@ -1491,6 +1734,11 @@ fn lib_table_target(
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let uri = project_relative_uri(lib_path, &table_dir);
+    let uri = if uri.starts_with("${KIPRJMOD}") {
+        uri
+    } else {
+        repository_relative_uri(lib_path, &table_dir, Path::new(proj)).unwrap_or(uri)
+    };
     Ok((table_dir.join(table_filename), uri))
 }
 
@@ -1624,57 +1872,216 @@ fn repair_table_root(content: String, expected_root: &str) -> (String, bool) {
     }
 }
 
-/// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
-/// Creates the file with minimal scaffolding if it doesn't exist, and repairs a
-/// mismatched root element on an existing one.
-///
-/// Returns whether the root element had to be repaired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibTableRegistrationState {
+    Inserted,
+    Unchanged,
+    Updated,
+}
+
+impl LibTableRegistrationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Unchanged => "unchanged",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibTableRegistration {
+    state: LibTableRegistrationState,
+    repaired_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibTableRegistrationError {
+    field: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedLibTableRegistration {
+    content: String,
+    registration: LibTableRegistration,
+}
+
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
     uri: &str,
     lib_type: &str,
 ) -> anyhow::Result<bool> {
-    // The root element must match the table kind: a sym-lib-table with an
-    // (fp_lib_table root is rejected by KiCad. Decide from the filename, which
-    // is fixed by convention.
+    let registration =
+        register_in_lib_table_with_policy(table_path, nickname, uri, lib_type, false)
+            .await?
+            .map_err(|error| anyhow::anyhow!(error.reason))?;
+    Ok(registration.repaired_root)
+}
+
+async fn register_in_lib_table_with_policy(
+    table_path: &Path,
+    nickname: &str,
+    uri: &str,
+    lib_type: &str,
+    replace_existing: bool,
+) -> anyhow::Result<Result<LibTableRegistration, LibTableRegistrationError>> {
     let root = table_root_element(table_path);
-    let (content, repaired_root) = if table_path.exists() {
-        repair_table_root(tokio::fs::read_to_string(table_path).await?, root)
+    let existing = table_path.exists();
+    let source = if existing {
+        read_consistent(table_path)?
     } else {
-        (format!("({root}\n  (version 7)\n)\n"), false)
+        format!("({root}\n  (version 7)\n)\n")
     };
-    if repaired_root {
+    let prepared = match prepare_lib_table_registration(
+        &source,
+        root,
+        nickname,
+        uri,
+        lib_type,
+        replace_existing,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(Err(error)),
+    };
+    if prepared.registration.repaired_root {
         tracing::warn!(
             "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
             table_path.display()
         );
     }
 
-    // Check if nickname already registered
-    if content.contains(&format!("(name \"{}\")", nickname)) {
-        // Idempotent — but a repaired root still has to reach disk, or a table
-        // that already lists this nickname stays rejected forever.
-        if repaired_root {
-            write_atomic(table_path, &content)?;
+    if prepared.content != source {
+        if let Some(parent) = table_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        return Ok(repaired_root);
+        if existing {
+            persist_lib_table_registration(table_path, &source, &prepared.content)?;
+        } else {
+            write_new_atomic(table_path, &prepared.content)?;
+        }
+    }
+    Ok(Ok(prepared.registration))
+}
+
+fn prepare_lib_table_registration(
+    source: &str,
+    expected_root: &str,
+    nickname: &str,
+    uri: &str,
+    lib_type: &str,
+    replace_existing: bool,
+) -> Result<PreparedLibTableRegistration, LibTableRegistrationError> {
+    let (content, repaired_root) = repair_table_root(source.to_string(), expected_root);
+    let parsed = parse_sexp(&content).map_err(|error| LibTableRegistrationError {
+        field: "table".to_string(),
+        reason: format!("invalid library table S-expression: {error}"),
+    })?;
+    if parsed.head() != Some(expected_root) {
+        return Err(LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: format!("root must be {expected_root}"),
+        });
     }
 
-    // Find closing paren of the root expression
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let entry = format!(
-        "\n  (lib (name \"{}\") (type \"{}\") (uri \"{}\") (options \"\") (descr \"\"))",
-        nickname, lib_type, uri
-    );
-
-    let new_content = format!("{}{}\n)", &content[..insert_pos], entry);
-
-    if let Some(parent) = table_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let mut matches = Vec::new();
+    for (start, end) in find_direct_child_blocks(&content, expected_root) {
+        let block = &content[start..end];
+        let node = parse_sexp(block).map_err(|_| LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: "contains a malformed direct child".to_string(),
+        })?;
+        if node.head() == Some("lib") && node.find_str("name") == Some(nickname) {
+            matches.push((start, end));
+        }
     }
-    write_atomic(table_path, &new_content)?;
-    Ok(repaired_root)
+    if matches.len() > 1 {
+        return Err(LibTableRegistrationError {
+            field: "nickname".to_string(),
+            reason: format!("library table contains duplicate nickname '{nickname}'"),
+        });
+    }
+
+    let (content, state) = if let Some((start, end)) = matches.first().copied() {
+        if !replace_existing {
+            (content, LibTableRegistrationState::Unchanged)
+        } else {
+            let block = &content[start..end];
+            let current_uri = parse_sexp(block)
+                .ok()
+                .and_then(|node| node.find_str("uri").map(str::to_string))
+                .ok_or_else(|| LibTableRegistrationError {
+                    field: "table".to_string(),
+                    reason: format!("entry '{nickname}' has no valid uri"),
+                })?;
+            if current_uri == uri {
+                (content, LibTableRegistrationState::Unchanged)
+            } else {
+                let uri_range = find_direct_child_blocks(block, "lib")
+                    .into_iter()
+                    .find(|(child_start, child_end)| {
+                        parse_sexp(&block[*child_start..*child_end])
+                            .is_ok_and(|node| node.head() == Some("uri"))
+                    })
+                    .ok_or_else(|| LibTableRegistrationError {
+                        field: "table".to_string(),
+                        reason: format!("entry '{nickname}' has no uri block"),
+                    })?;
+                let replacement = format!("(uri {})", quote_lib_table_string(uri));
+                let updated = apply_edits(
+                    content,
+                    vec![SexpEdit::replace(
+                        start + uri_range.0,
+                        start + uri_range.1,
+                        replacement,
+                    )],
+                );
+                (updated, LibTableRegistrationState::Updated)
+            }
+        }
+    } else {
+        let root_end = find_balanced_block(&content, 0)
+            .map(|range| range.1 - 1)
+            .ok_or_else(|| LibTableRegistrationError {
+                field: "table".to_string(),
+                reason: "unbalanced library table root".to_string(),
+            })?;
+        let entry = format!(
+            "\n  (lib (name {}) (type {}) (uri {}) (options \"\") (descr \"\"))",
+            quote_lib_table_string(nickname),
+            quote_lib_table_string(lib_type),
+            quote_lib_table_string(uri)
+        );
+        (
+            apply_edits(content, vec![SexpEdit::insert(root_end, entry)]),
+            LibTableRegistrationState::Inserted,
+        )
+    };
+
+    parse_sexp(&content).map_err(|error| LibTableRegistrationError {
+        field: "table".to_string(),
+        reason: format!("updated library table does not parse: {error}"),
+    })?;
+    Ok(PreparedLibTableRegistration {
+        content,
+        registration: LibTableRegistration {
+            state,
+            repaired_root,
+        },
+    })
+}
+
+fn quote_lib_table_string(value: &str) -> String {
+    format!("\"{}\"", escape_library_string(value))
+}
+
+fn persist_lib_table_registration(
+    table_path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), konnect_sexp::SexpError> {
+    write_atomic_if_unchanged(table_path, expected, replacement)
 }
 
 // ─── Symbol library tools ─────────────────────────────────────────────────────
@@ -2688,27 +3095,67 @@ async fn handle_create_symbol(
         None => (2.54, -2.54),
     };
 
-    let numbers_vis = if show_numbers { "" } else { " hide" };
-    let names_vis = if show_names { "" } else { " hide" };
+    let numbers = if show_numbers {
+        String::new()
+    } else {
+        "\n    (pin_numbers hide)".to_string()
+    };
+    let names = if show_names {
+        format!(
+            "\n    (pin_names\n      (offset {}))",
+            fmt_f64(PIN_NAME_OFFSET)
+        )
+    } else {
+        format!(
+            "\n    (pin_names\n      (offset {})\n      (hide yes))",
+            fmt_f64(PIN_NAME_OFFSET)
+        )
+    };
+    let visible_property = |name: &str, value: &str, y: f64| {
+        format!(
+            "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
+             (show_name no) (do_not_autoplace no) \
+             (effects (font (size 1.27 1.27))))"
+        )
+    };
+    let hidden_property = |name: &str, value: &str| {
+        format!(
+            "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
+             (show_name no) (do_not_autoplace no) (hide yes) \
+             (effects (font (size 1.27 1.27))))"
+        )
+    };
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset {}){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
+        "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
         name,
-        numbers_vis,
-        fmt_f64(PIN_NAME_OFFSET),
-        names_vis,
-        ref_prefix,
-        ref_y,
-        value_str,
-        value_y,
+        numbers,
+        names,
+        visible_property("Reference", ref_prefix, ref_y),
+        visible_property("Value", value_str, value_y),
+        hidden_property("Footprint", ""),
+        hidden_property("Datasheet", ""),
+        hidden_property("Description", ""),
         units_sexp
     );
 
     // If file doesn't exist, create scaffold
     let content = if lib_path.exists() {
-        tokio::fs::read_to_string(&lib_path).await?
+        let mut content = tokio::fs::read_to_string(&lib_path).await?;
+        content = content.replace("(version 20240108)", "(version 20251024)");
+        if !content.contains("(generator_version ") {
+            if let Some(position) = content.find("(generator \"") {
+                if let Some(end) = content[position..].find(')') {
+                    let insert_at = position + end + 1;
+                    content.insert_str(insert_at, "\n  (generator_version \"10.0\")");
+                }
+            }
+        }
+        content
     } else {
-        "(kicad_symbol_lib\n  (version 20240108)\n  (generator \"konnect\")\n)\n".to_string()
+        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"konnect\")\n  \
+         (generator_version \"10.0\")\n)\n"
+            .to_string()
     };
 
     // Insert before closing paren of root expression
@@ -3072,17 +3519,41 @@ async fn handle_get_footprint_info(
     let has_courtyard = content.contains("B.CrtYd") || content.contains("F.CrtYd");
     let has_3d = content.contains("(model ");
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "name": fp_name,
-            "description": description,
-            "pad_count": pad_count,
-            "has_courtyard": has_courtyard,
-            "has_3d_model": has_3d,
-            "path": path.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut response = json!({
+        "name": fp_name,
+        "description": description,
+        "pad_count": pad_count,
+        "has_courtyard": has_courtyard,
+        "has_3d_model": has_3d,
+        "path": path.to_str().unwrap_or("")
+    });
+    let graphics_layer = args["graphics_layer"].as_str();
+    let include_graphics =
+        args["include_graphics"].as_bool().unwrap_or(false) || graphics_layer.is_some();
+    if include_graphics {
+        let graphics = match super::footprint_graphics::inspect_graphics(&content, graphics_layer) {
+            Ok(graphics) => graphics,
+            Err(super::footprint_graphics::FootprintGraphicsError::InvalidArgument {
+                field,
+                reason,
+            }) => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: field.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("Argument '{field}' is invalid: {reason}"),
+                ));
+            }
+            Err(super::footprint_graphics::FootprintGraphicsError::Conflict(reason)) => {
+                return Ok(CallToolResult::error(reason));
+            }
+        };
+        response["graphic_count"] = json!(graphics.len());
+        response["graphics"] = serde_json::to_value(graphics)?;
+    }
+
+    Ok(CallToolResult::json(&response))
 }
 
 // ─── search_footprints (moved from verification toolset) ─────────────────────
@@ -3787,6 +4258,289 @@ mod tests {
     }
 
     #[test]
+    fn register_footprint_library_schema_exposes_opt_in_replacement() {
+        let registration = tools()
+            .into_iter()
+            .find(|tool| tool.name == "register_footprint_library")
+            .expect("library must expose register_footprint_library");
+        let replace = &registration.input_schema["properties"]["replace_existing"];
+
+        assert_eq!(replace["type"], "boolean");
+        assert_eq!(replace["default"], false);
+        assert_eq!(
+            registration.input_schema["required"],
+            json!(["library_path", "nickname"])
+        );
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_keeps_existing_uri_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let table = project.parent().unwrap().join("fp-lib-table");
+        let original = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.pretty\") (options \"keep=1\") (descr \"keep me\"))\n)\n";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": tmp.path().join("lib").join("Parts.pretty"),
+                "nickname": "Parts",
+                "project": project
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "unchanged");
+        assert_eq!(std::fs::read_to_string(table).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_replaces_uri_portably_and_preserves_entry_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "{}").unwrap();
+        let library = tmp.path().join("lib").join("Parts.pretty");
+        std::fs::create_dir_all(&library).unwrap();
+        let table = project.parent().unwrap().join("fp-lib-table");
+        let original = "(fp_lib_table\n\t(version 7)\n\t(lib (name \"Other\") (type \"KiCad\") (uri \"${KIPRJMOD}/other.pretty\") (options \"\") (descr \"other\"))\n\t(lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.pretty\") (options \"keep=1\") (descr \"keep me\"))\n)\n";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "updated");
+        assert_eq!(output["uri"], "${KIPRJMOD}/../lib/Parts.pretty");
+
+        let updated = std::fs::read_to_string(table).unwrap();
+        assert!(updated.starts_with("(fp_lib_table\n\t(version 7)"));
+        assert!(updated
+            .contains("(name \"Other\") (type \"KiCad\") (uri \"${KIPRJMOD}/other.pretty\")"));
+        assert!(updated.contains("(name \"Parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/../lib/Parts.pretty\") (options \"keep=1\") (descr \"keep me\")"));
+        assert!(!updated.contains("C:/stale"));
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_rejects_duplicate_nicknames_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("board.kicad_pro");
+        let table = tmp.path().join("fp-lib-table");
+        let duplicate = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/one\") (options \"\") (descr \"\"))\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/two\") (options \"\") (descr \"\"))\n)\n";
+        std::fs::write(&table, duplicate).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": tmp.path().join("Parts.pretty"),
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .expect("a malformed table is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "nickname");
+        assert_eq!(std::fs::read_to_string(table).unwrap(), duplicate);
+    }
+
+    #[test]
+    fn stale_library_table_source_is_rejected_without_overwriting_newer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        let original = "(fp_lib_table\n  (version 7)\n)\n";
+        std::fs::write(&table, original).unwrap();
+        let prepared = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/parts\") (options \"\") (descr \"\"))\n)\n";
+        let newer = "(fp_lib_table\n  (version 7)\n  (lib (name \"Other\") (type \"KiCad\") (uri \"/other\") (options \"\") (descr \"\"))\n)\n";
+        std::fs::write(&table, newer).unwrap();
+
+        let error = persist_lib_table_registration(&table, original, prepared)
+            .expect_err("a stale expected table must conflict");
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(table).unwrap(), newer);
+    }
+
+    const DUPLICATE_PAD_FOOTPRINT: &str = r#"(footprint "DualSocket"
+  (version 20240108)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (descr "preserve me")
+  (fp_line (start 0 0) (end 1 1) (stroke (width 0.1) (type default)) (layer "F.SilkS"))
+  (pad "3" thru_hole circle (at 1 2) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+  (pad "3" thru_hole oval (at 3 4 90) (size 3 2) (drill oval 1 2) (layers "*.Cu" "*.Mask"))
+  (pad "1" thru_hole circle (at 5 6) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+  (model "../models/keep.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#;
+
+    #[tokio::test]
+    async fn edit_footprint_pad_renumbers_only_the_first_duplicate_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": "1"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["matched_count"], 1);
+        assert_eq!(output["updated_count"], 1);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("(pad \"3\"").count(), 1);
+        assert_eq!(updated.matches("(pad \"1\"").count(), 2);
+        assert!(
+            updated.contains("(pad \"1\" thru_hole circle (at 1 2) (size 2 2) (drill 1)"),
+            "the first duplicate should be renumbered: {updated}"
+        );
+        assert!(
+            updated.contains("(pad \"3\" thru_hole oval (at 3 4 90) (size 3 2) (drill oval 1 2)"),
+            "the second duplicate should remain unchanged: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_renumbers_and_resizes_every_duplicate_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": "1",
+                "match_all": true,
+                "x": 9.5,
+                "width": 4.0,
+                "height": 5.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["matched_count"], 2);
+        assert_eq!(output["updated_count"], 2);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("(pad \"3\"").count(), 0);
+        assert_eq!(updated.matches("(pad \"1\"").count(), 3);
+        assert_eq!(updated.matches("(at 9.5 ").count(), 2);
+        assert_eq!(updated.matches("(size 4 5)").count(), 2);
+        assert!(updated.contains("(descr \"preserve me\")"));
+        assert!(updated.contains("(fp_line (start 0 0) (end 1 1)"));
+        assert!(updated.contains("(model \"../models/keep.step\""));
+        parse_sexp(&updated).expect("the edited footprint must remain parseable");
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_missing_match_returns_structured_error_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "404",
+                "new_number": "1",
+                "match_all": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .expect("a missing pad is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "pad_number");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DUPLICATE_PAD_FOOTPRINT
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_rejects_non_string_new_number_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": 1
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "new_number");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DUPLICATE_PAD_FOOTPRINT
+        );
+    }
+
+    #[test]
+    fn edit_footprint_pad_schema_exposes_batch_renumbering_compatibly() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "edit_footprint_pad")
+            .expect("library must expose edit_footprint_pad");
+        let properties = &tool.input_schema["properties"];
+
+        assert_eq!(properties["new_number"]["type"], "string");
+        assert_eq!(properties["match_all"]["type"], "boolean");
+        assert_eq!(properties["match_all"]["default"], false);
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["footprint_path", "pad_number"])
+        );
+    }
+
+    #[test]
     fn a_correct_root_and_a_mention_inside_a_descr_are_left_alone() {
         let ok = "(fp_lib_table\n  (version 7)\n)\n".to_string();
         assert_eq!(
@@ -4124,6 +4878,224 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_footprint_schema_exposes_pad_layers_rotation_and_roundrect_ratio() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_footprint")
+            .expect("library must expose create_footprint");
+        let pad_properties = &tool.input_schema["properties"]["pads"]["items"]["properties"];
+        assert_eq!(pad_properties["layers"]["items"]["type"], json!("string"));
+        assert_eq!(pad_properties["rotation"]["type"], json!("number"));
+        assert_eq!(pad_properties["roundrect_rratio"]["maximum"], json!(0.5));
+    }
+
+    #[tokio::test]
+    async fn create_footprint_emits_bottom_layer_rotated_roundrect_pad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("BOTTOM.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "BOTTOM",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": -8.075,
+                "y": 4.7,
+                "width": 2.5,
+                "height": 2.55,
+                "layers": ["B.Cu", "B.Paste", "B.Mask"],
+                "rotation": 180.0,
+                "roundrect_rratio": 0.2
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            content.contains("(at -8.075 4.7 180)"),
+            "missing pad rotation:\n{content}"
+        );
+        assert!(
+            content.contains("(layers \"B.Cu\" \"B.Paste\" \"B.Mask\")"),
+            "missing bottom pad layers:\n{content}"
+        );
+        assert!(
+            content.contains("(roundrect_rratio 0.2)"),
+            "missing roundrect ratio:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_legacy_pad_payload_remains_front_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("LEGACY.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "LEGACY",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0
+            }]
+        });
+
+        let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("(at 0 0)"), "{content}");
+        assert!(
+            content.contains("(layers \"F.Cu\" \"F.Paste\" \"F.Mask\")"),
+            "{content}"
+        );
+        assert!(!content.contains("(at 0 0 0)"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_invalid_pad_layer_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("INVALID_LAYER.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "INVALID_LAYER",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "rect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0,
+                "layers": ["User.MadeUp"]
+            }]
+        });
+
+        let error = handle_create_footprint(&args, &test_ctx())
+            .await
+            .expect_err("invalid layer must be rejected");
+        assert!(error.to_string().contains("invalid pad layer"));
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn create_footprint_rejects_invalid_roundrect_ratio_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("INVALID_RATIO.kicad_mod");
+        let args = json!({
+            "output": out.to_string_lossy(),
+            "name": "INVALID_RATIO",
+            "pads": [{
+                "number": "1",
+                "type": "smd",
+                "shape": "roundrect",
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0,
+                "roundrect_rratio": 0.75
+            }]
+        });
+
+        let error = handle_create_footprint(&args, &test_ctx())
+            .await
+            .expect_err("invalid roundrect ratio must be rejected");
+        assert!(error.to_string().contains("roundrect_rratio"));
+        assert!(!out.exists());
+    }
+
+    #[tokio::test]
+    async fn get_footprint_info_includes_graphics_only_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("inspect.kicad_mod");
+        std::fs::write(
+            &path,
+            r#"(footprint "Inspect" (version 20240108) (generator "pcbnew")
+  (layer "F.Cu")
+  (descr "Inspection fixture")
+  (fp_line (start 0 0) (end 1 0)
+    (stroke (width 0.1) (type solid)) (layer "F.SilkS"))
+  (fp_poly
+    (pts (xy 0 0) (xy 2 0) (xy 2 1))
+    (stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd"))
+  (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask"))
+)
+"#,
+        )
+        .unwrap();
+
+        let default = handle_get_footprint_info(
+            &json!({"footprint_path": path.to_string_lossy()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &default.content[0] else {
+            panic!("expected text");
+        };
+        let default: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(default["name"], "Inspect");
+        assert_eq!(default["pad_count"], 1);
+        assert!(
+            default.get("graphics").is_none(),
+            "default response must stay compact: {default}"
+        );
+        assert!(default.get("graphic_count").is_none());
+
+        let detailed = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "include_graphics": true,
+                "graphics_layer": "B.CrtYd"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &detailed.content[0] else {
+            panic!("expected text");
+        };
+        let detailed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(detailed["graphic_count"], 1);
+        assert_eq!(detailed["graphics"][0]["type"], "poly");
+        assert_eq!(detailed["graphics"][0]["layer"], "B.CrtYd");
+        assert_eq!(detailed["graphics"][0]["point_count"], 3);
+        assert_eq!(detailed["graphics"][0]["closed"], true);
+        assert_eq!(detailed["graphics"][0]["stroke_width_mm"], 0.05);
+        assert_eq!(detailed["graphics"][0]["fill"], "none");
+
+        let invalid = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "graphics_layer": "BottomCourtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(invalid.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &invalid.content[0] else {
+            panic!("expected text");
+        };
+        let invalid: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(invalid["error"]["kind"], "invalid_argument");
+        assert_eq!(invalid["error"]["field"], "graphics_layer");
+
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "get_footprint_info")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["include_graphics"]["type"], "boolean");
+        assert_eq!(schema["properties"]["graphics_layer"]["type"], "string");
+    }
+
     #[tokio::test]
     async fn create_symbol_emits_body_and_shows_pins() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4149,12 +5121,49 @@ mod tests {
             c.contains("(generator \"konnect\")"),
             "stale generator string"
         );
-        assert!(c.contains("(pin_numbers)"), "pin numbers should be shown");
-        assert!(!c.contains("(pin_numbers hide)"));
+        assert!(
+            !c.contains("(pin_numbers hide)"),
+            "KiCad 10 shows pin numbers by omitting the hide override"
+        );
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
         );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_emits_kicad10_library_match_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("modern.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "Modern",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0}
+            ]
+        });
+
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let output = std::fs::read_to_string(&lib).unwrap();
+
+        assert!(output.contains("(version 20251024)"), "{output}");
+        assert!(output.contains("(generator_version \"10.0\")"), "{output}");
+        assert!(output.contains("(exclude_from_sim no)"), "{output}");
+        assert!(output.contains("(in_pos_files yes)"), "{output}");
+        assert!(
+            output.contains("(duplicate_pin_numbers_are_jumpers no)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("(property \"Description\" \"\""),
+            "{output}"
+        );
+        assert!(output.contains("(show_name no)"), "{output}");
+        assert!(output.contains("(do_not_autoplace no)"), "{output}");
+        assert!(output.contains("(hide yes)"), "{output}");
+        assert!(output.contains("(embedded_fonts no)"), "{output}");
     }
 
     #[tokio::test]
