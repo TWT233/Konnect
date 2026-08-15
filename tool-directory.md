@@ -88,8 +88,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |------|-------------|
 | `add_wire` | Add a wire segment (H or V) between two points. T-junctions are auto-detected and junction dots inserted. |
 | `batch_add_wire` | Add multiple wire segments in a single file read/write cycle. |
-| `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates. |
-| `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle. |
+| `delete_schematic_wire` | Delete a wire segment by UUID or by matching start/end coordinates, pruning the junction dots it leaves unjustified. |
+| `batch_delete_schematic_wire` | Delete multiple wire segments in a single file read/write cycle, pruning the junction dots they leave unjustified. |
 | `split_wire_at_point` | Split a wire at a given point, creating two segments and a junction. |
 | `add_schematic_net_label` | Add a net label (`net_label`, `global_label`, or `hierarchical_label`). |
 | `delete_schematic_net_label` | Delete a net label by net name and position. |
