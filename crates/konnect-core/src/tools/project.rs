@@ -67,6 +67,25 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_save_project(args, ctx).await }
         ),
         tool!(
+            "rename_project",
+            "Rename a KiCAD project: renames the .kicad_pro/.kicad_sch/.kicad_pcb/.kicad_prl \
+             files and rewrites the internal references that carry the old name. Renaming the \
+             files alone is NOT enough — every symbol instance stores (project \"name\"), and \
+             a mismatch there makes KiCAD treat the design as unannotated, losing every \
+             reference designator. Equivalent to eeschema's File > Save As. Use dry_run first.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Path to the existing .kicad_pro file" },
+                    "new_name": { "type": "string", "description": "New project name, without extension" },
+                    "rename_directory": { "type": "boolean", "description": "Also rename the containing folder when it matches the old project name. Default false.", "default": false },
+                    "dry_run": { "type": "boolean", "description": "Report the planned changes without touching anything. Default false.", "default": false }
+                },
+                "required": ["project", "new_name"]
+            }),
+            |args, ctx| async move { handle_rename_project(args, ctx).await }
+        ),
+        tool!(
             "get_project_info",
             "Read project metadata from a .kicad_pro file. Returns the project name, \
              schematic and PCB paths, and last modified times.",
@@ -685,5 +704,515 @@ mod tests {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             _ => panic!("expected text content"),
         }
+    }
+}
+
+// ─── rename_project ──────────────────────────────────────────────────────────
+
+/// Project files that carry the project name, in the order they are renamed.
+const PROJECT_EXTS: [&str; 4] = ["kicad_pro", "kicad_sch", "kicad_pcb", "kicad_prl"];
+
+/// Every other `.kicad_sch` in the project directory — the child sheets.
+///
+/// A hierarchical design keeps each sheet in its own file, and **every one of
+/// them** stores `(project "NAME"` on its symbol instances: KiCad's own
+/// `complex_hierarchy` demo has 46 of them in `ampli_ht.kicad_sch` alone,
+/// which is not named after the project and so is never renamed. Rewriting
+/// only the root sheet leaves those pointing at the old name, and KiCad reads
+/// their symbols as unannotated — the exact failure this tool exists to
+/// prevent, moved from the root sheet to the children.
+///
+/// Child sheets are rewritten in place; they are not renamed, since their
+/// names are referenced by `(sheet … (property "Sheetfile" …))` entries.
+fn sibling_sheets(
+    dir: &std::path::Path,
+    already: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut sheets: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("kicad_sch"))
+        .filter(|p| !already.contains(p))
+        .collect();
+    // Directory order is filesystem-defined; a stable report beats a shuffled one.
+    sheets.sort();
+    sheets
+}
+
+/// Rewrite the project name only where it is structurally meaningful.
+///
+/// A blind `text.replace(old, new)` corrupts unrelated content, and the blast
+/// radius scales with how ordinary the name is: a project called `led` would
+/// rewrite the footprint `LED_THT:LED_D3.0mm`, a net named `LED_LIGHT` and
+/// every value containing the substring, silently, across the whole board and
+/// schematic.
+///
+/// Every real occurrence is quoted, and the two file families need different
+/// care:
+///
+/// - `.kicad_sch` / `.kicad_pcb` hold user content, so only `(project "NAME"`
+///   is touched — the key symbol instances hang their annotation off. Getting
+///   this wrong is what makes KiCad treat the design as unannotated.
+/// - `.kicad_pro` / `.kicad_prl` are settings/metadata with no netlist in
+///   them, so quoted whole-string matches and `NAME.kicad_*` filenames are
+///   safe there.
+fn rewrite_project_references(text: &str, old: &str, new: &str, sexp: bool) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut hits = 0usize;
+
+    let swap = |out: &mut String, hits: &mut usize, from: &str, to: &str| {
+        if from != to {
+            let n = out.matches(from).count();
+            if n > 0 {
+                *hits += n;
+                *out = out.replace(from, to);
+            }
+        }
+    };
+
+    if sexp {
+        // The annotation key, and nothing else.
+        swap(
+            &mut out,
+            &mut hits,
+            &format!("(project \"{old}\""),
+            &format!("(project \"{new}\""),
+        );
+    } else {
+        for ext in PROJECT_EXTS {
+            swap(
+                &mut out,
+                &mut hits,
+                &format!("\"{old}.{ext}\""),
+                &format!("\"{new}.{ext}\""),
+            );
+        }
+        // Bare quoted name: the `name` field and the root sheet entry.
+        swap(
+            &mut out,
+            &mut hits,
+            &format!("\"{old}\""),
+            &format!("\"{new}\""),
+        );
+    }
+
+    (out, hits)
+}
+
+async fn handle_rename_project(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let pro_path = get_path(args, "project")?;
+    let new_name = match require_str(args, "new_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rename_dir = args
+        .get("rename_directory")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if !pro_path.exists() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: pro_path.display().to_string(),
+            },
+            format!("Project file not found: {}", pro_path.display()),
+        ));
+    }
+    let Some(dir) = pro_path.parent().map(std::path::Path::to_path_buf) else {
+        return Ok(CallToolResult::error(
+            "project path has no parent directory",
+        ));
+    };
+    let Some(old_name) = pro_path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(CallToolResult::error("project path has no file stem"));
+    };
+    let old_name = old_name.to_string();
+
+    if new_name == old_name {
+        return Ok(CallToolResult::json(&json!({
+            "renamed": false, "note": "new_name matches the current name"
+        })));
+    }
+    // A name with a path separator would move the project, not rename it.
+    if new_name.contains('/') || new_name.contains('\\') {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "new_name".to_string(),
+                reason: "must be a bare name, not a path".to_string(),
+            },
+            "new_name must not contain a path separator.",
+        ));
+    }
+
+    let mut planned_files = Vec::new();
+    let mut collisions = Vec::new();
+    for ext in PROJECT_EXTS {
+        let from = dir.join(format!("{old_name}.{ext}"));
+        if !from.exists() {
+            continue;
+        }
+        let to = dir.join(format!("{new_name}.{ext}"));
+        if to.exists() {
+            collisions.push(to.display().to_string());
+        }
+        planned_files.push((from, to));
+    }
+    if !collisions.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "Refusing to rename: these target files already exist: {}",
+            collisions.join(", ")
+        )));
+    }
+
+    // Rewriting content is what keeps annotations attached: each symbol
+    // instance in the schematic stores `(project "NAME"`, and the .kicad_pro
+    // and .kicad_prl embed their own filenames.
+    let mut rewritten = Vec::new();
+    if !dry_run {
+        // Rename the set, undoing what landed if one fails: a half-renamed
+        // project is one KiCad cannot open at all.
+        let mut done: Vec<(&std::path::PathBuf, &std::path::PathBuf)> = Vec::new();
+        for (from, to) in &planned_files {
+            if let Err(e) = std::fs::rename(from, to) {
+                for (undo_from, undo_to) in done.iter().rev() {
+                    let _ = std::fs::rename(undo_to, undo_from);
+                }
+                return Ok(CallToolResult::error(format!(
+                    "Rename failed on {} ({e}); rolled back, nothing was changed.",
+                    to.display()
+                )));
+            }
+            done.push((from, to));
+        }
+        // The renamed set plus every child sheet: a hierarchical design keeps
+        // `(project "NAME"` in each sheet file, and the children are never
+        // renamed, so rewriting only the root would de-annotate them.
+        let renamed: Vec<std::path::PathBuf> =
+            planned_files.iter().map(|(_, to)| to.clone()).collect();
+        let mut to_rewrite = renamed.clone();
+        to_rewrite.extend(sibling_sheets(&dir, &renamed));
+
+        for target in &to_rewrite {
+            let sexp = matches!(
+                target.extension().and_then(|s| s.to_str()),
+                Some("kicad_sch" | "kicad_pcb")
+            );
+            let text = std::fs::read_to_string(target)?;
+            let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+            if hits > 0 {
+                konnect_sexp::writer::write_atomic(target, &updated)?;
+                rewritten.push(json!({
+                    "file": target.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                    "references_updated": hits,
+                }));
+            }
+        }
+    } else {
+        let sources: Vec<std::path::PathBuf> =
+            planned_files.iter().map(|(from, _)| from.clone()).collect();
+        let mut previewed: Vec<(std::path::PathBuf, String)> = planned_files
+            .iter()
+            .map(|(from, to)| {
+                (
+                    from.clone(),
+                    to.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        // Child sheets keep their names, so the reported name is their own.
+        for sheet in sibling_sheets(&dir, &sources) {
+            let name = sheet
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            previewed.push((sheet, name));
+        }
+
+        for (source, reported_name) in &previewed {
+            let sexp = matches!(
+                source.extension().and_then(|s| s.to_str()),
+                Some("kicad_sch" | "kicad_pcb")
+            );
+            let text = std::fs::read_to_string(source).unwrap_or_default();
+            let (_, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
+            rewritten.push(json!({
+                "file": reported_name,
+                "references_updated": hits,
+            }));
+        }
+    }
+
+    // The auto-backup folder is named after the project too.
+    let backups_from = dir.join(format!("{old_name}-backups"));
+    let mut backups = serde_json::Value::Null;
+    if backups_from.is_dir() {
+        let backups_to = dir.join(format!("{new_name}-backups"));
+        if !dry_run && !backups_to.exists() {
+            std::fs::rename(&backups_from, &backups_to)?;
+        }
+        backups = json!(backups_to.file_name().and_then(|s| s.to_str()));
+    }
+
+    let mut directory = serde_json::Value::Null;
+    if rename_dir && dir.file_name().and_then(|s| s.to_str()) == Some(old_name.as_str()) {
+        if let Some(parent) = dir.parent() {
+            let new_dir = parent.join(&new_name);
+            if !new_dir.exists() {
+                if !dry_run {
+                    std::fs::rename(&dir, &new_dir)?;
+                }
+                directory = json!(new_dir.display().to_string());
+            }
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "dry_run": dry_run,
+        "old_name": old_name,
+        "new_name": new_name,
+        "files": planned_files.iter()
+            .map(|(f, t)| json!({
+                "from": f.file_name().and_then(|s| s.to_str()),
+                "to": t.file_name().and_then(|s| s.to_str())
+            }))
+            .collect::<Vec<_>>(),
+        "content_rewrites": rewritten,
+        "backups_folder": backups,
+        "directory": directory,
+    })))
+}
+
+#[cfg(test)]
+mod rename_rewrite_tests {
+    use super::rewrite_project_references;
+
+    /// The corruption this guards against. A project named `led` used to have
+    /// every occurrence of that substring rewritten across the schematic —
+    /// footprints, net names, values — because the rewrite was a bare
+    /// `text.replace(old, new)`.
+    #[test]
+    fn an_ordinary_name_does_not_eat_unrelated_content() {
+        let sch = r#"(kicad_sch
+	(symbol (lib_id "Device:LED")
+		(property "Footprint" "LED_THT:LED_D3.0mm")
+		(property "Value" "led")
+	)
+	(label "LED_LIGHT" (at 10 20 0))
+	(instances
+		(project "led"
+			(path "/abc" (reference "D1") (unit 1))
+		)
+	)
+)
+"#;
+        let (out, hits) = rewrite_project_references(sch, "led", "dro", true);
+        assert_eq!(hits, 1, "only the (project …) key should match");
+        assert!(out.contains(r#"(project "dro""#));
+        // Everything else survives untouched.
+        assert!(out.contains(r#""LED_THT:LED_D3.0mm""#));
+        assert!(out.contains(r#"(property "Value" "led")"#));
+        assert!(out.contains(r#"(label "LED_LIGHT""#));
+        assert!(out.contains(r#"(lib_id "Device:LED")"#));
+    }
+
+    #[test]
+    fn sexp_files_rewrite_the_annotation_key() {
+        let sch = "(instances\n\t(project \"old name\"\n\t\t(path \"/x\")\n\t)\n)\n";
+        let (out, hits) = rewrite_project_references(sch, "old name", "new name", true);
+        assert_eq!(hits, 1);
+        assert!(out.contains("(project \"new name\""));
+        assert!(!out.contains("old name"));
+    }
+
+    /// Settings files carry the name as a bare quoted string and inside
+    /// `NAME.kicad_*` filenames; both must move or KiCad reopens the old paths.
+    #[test]
+    fn settings_files_rewrite_names_and_filenames() {
+        let pro = r#"{
+  "meta": { "filename": "old.kicad_pro" },
+  "sheets": [ [ "uuid-1", "old" ] ],
+  "schematic": { "filename": "old.kicad_sch" },
+  "board": { "filename": "old.kicad_pcb" },
+  "name": "old"
+}
+"#;
+        let (out, hits) = rewrite_project_references(pro, "old", "new", false);
+        assert!(hits >= 5, "expected every quoted form to move, got {hits}");
+        for want in [
+            "\"new.kicad_pro\"",
+            "\"new.kicad_sch\"",
+            "\"new.kicad_pcb\"",
+            "\"uuid-1\", \"new\"",
+            "\"name\": \"new\"",
+        ] {
+            assert!(out.contains(want), "missing {want} in:\n{out}");
+        }
+        assert!(!out.contains("\"old"), "an old reference survived:\n{out}");
+    }
+
+    /// A settings file must not have unrelated *unquoted* text touched, and a
+    /// schematic must not have its quoted values touched at all.
+    #[test]
+    fn no_partial_word_matches() {
+        let sch = "(property \"Value\" \"prototype\")\n(project \"proto\"\n";
+        let (out, hits) = rewrite_project_references(sch, "proto", "final", true);
+        assert_eq!(hits, 1);
+        assert!(out.contains("\"prototype\""), "substring was eaten: {out}");
+        assert!(out.contains("(project \"final\""));
+    }
+
+    #[test]
+    fn a_no_op_rename_changes_nothing() {
+        let sch = "(project \"same\"\n";
+        let (out, hits) = rewrite_project_references(sch, "same", "same", true);
+        assert_eq!(hits, 0);
+        assert_eq!(out, sch);
+    }
+}
+
+/// A hierarchical project keeps each sheet in its own file, and every one of
+/// them stores `(project "NAME"` on its symbol instances. Only the root sheet
+/// is named after the project, so a rename that rewrites just the renamed set
+/// leaves every child sheet pointing at the old name — KiCad then reads those
+/// symbols as unannotated, which is the failure this tool exists to prevent.
+#[cfg(test)]
+mod rename_hierarchy_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Root sheet + one child, shaped like KiCad's `complex_hierarchy` demo:
+    /// the child is not named after the project and carries its own
+    /// `(project …)` instances.
+    fn hierarchy(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let pro = dir.join(format!("{name}.kicad_pro"));
+        std::fs::write(
+            &pro,
+            format!("{{\n  \"meta\": {{\n    \"filename\": \"{name}.kicad_pro\"\n  }},\n  \"sheets\": []\n}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.kicad_sch")),
+            format!("(kicad_sch\n\t(uuid \"root\")\n\t(sheet\n\t\t(property \"Sheetfile\" \"ampli.kicad_sch\")\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root\" (reference \"R1\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n)\n"),
+        )
+        .unwrap();
+        // The child sheet: never renamed, and full of project references.
+        std::fs::write(
+            dir.join("ampli.kicad_sch"),
+            format!("(kicad_sch\n\t(uuid \"child\")\n\t(symbol\n\t\t(lib_id \"Device:C\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root/child\" (reference \"C1\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root/child\" (reference \"R9\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n)\n"),
+        )
+        .unwrap();
+        pro
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_rewrites_child_sheets_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = hierarchy(dir.path(), "oldproj");
+
+        let result = handle_rename_project(
+            &json!({ "project": pro.to_str().unwrap(), "new_name": "newproj" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        // The child keeps its filename and gains the new project name.
+        let child = std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap();
+        assert_eq!(
+            child.matches("(project \"newproj\"").count(),
+            2,
+            "every child instance must follow the rename:\n{child}"
+        );
+        assert!(
+            !child.contains("oldproj"),
+            "no stale project reference may survive:\n{child}"
+        );
+        let root = std::fs::read_to_string(dir.path().join("newproj.kicad_sch")).unwrap();
+        assert!(root.contains("(project \"newproj\""), "{root}");
+        // The child sheet is referenced by name, so it must NOT be renamed.
+        assert!(dir.path().join("ampli.kicad_sch").exists());
+        assert!(root.contains("\"ampli.kicad_sch\""), "{root}");
+
+        let reported: Vec<String> = body(&result)["content_rewrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["file"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            reported.iter().any(|f| f == "ampli.kicad_sch"),
+            "the child sheet must be reported: {reported:?}"
+        );
+    }
+
+    /// dry_run must preview the child sheets too, and write nothing.
+    #[tokio::test]
+    async fn dry_run_previews_child_sheets_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = hierarchy(dir.path(), "oldproj");
+        let before = std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap();
+
+        let result = handle_rename_project(
+            &json!({ "project": pro.to_str().unwrap(), "new_name": "newproj",
+                     "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let entry = body(&result)["content_rewrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["file"] == "ampli.kicad_sch")
+            .cloned()
+            .unwrap_or_else(|| panic!("child sheet missing from the preview: {:?}", body(&result)));
+        assert_eq!(entry["references_updated"], json!(2), "{entry}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap(),
+            before,
+            "dry_run must not write"
+        );
+        assert!(pro.exists(), "dry_run must not rename");
     }
 }

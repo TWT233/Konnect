@@ -206,7 +206,7 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_power_symbol",
             "Add a power symbol (VCC, GND, etc.) to the schematic. Auto-numbers the \
-             internal #PWR reference.",
+             internal #PWR reference to the lowest number free on the sheet.",
             json!({
                 "type": "object",
                 "properties": {
@@ -379,9 +379,19 @@ pub fn tools() -> Vec<ToolDef> {
 
 pub(crate) fn insert_before_close(content: &str, new_sexp: &str) -> String {
     // Find the first top-level (symbol block — insert before it
-    let insert_pos = find_first_symbol_instance(content)
+    let item_pos = find_first_symbol_instance(content)
         .unwrap_or_else(|| content.rfind(')').unwrap_or(content.len()));
-    let edits = vec![SexpEdit::insert(insert_pos, new_sexp)];
+    let line_start = content[..item_pos].rfind('\n').map_or(0, |pos| pos + 1);
+    let insert_pos = if content[line_start..item_pos]
+        .chars()
+        .all(char::is_whitespace)
+    {
+        line_start
+    } else {
+        item_pos
+    };
+    let insertion = format!("{}\n", new_sexp.trim_matches('\n'));
+    let edits = vec![SexpEdit::insert(insert_pos, insertion)];
     apply_edits(content.to_string(), edits)
 }
 
@@ -428,6 +438,24 @@ fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> 
                 && !konnect_sexp::geometry::points_coincident(px, py, x2, y2, tol)
         })
         .collect()
+}
+
+/// Add a junction dot at each position that does not already carry one.
+///
+/// `find_t_junctions` reports every T on the sheet, not only the ones the new
+/// wire made, so an unguarded loop re-emits a dot at every existing T on every
+/// call — quadratic in a batch. `insert_wire_with_junctions` guards the same
+/// way on the string path.
+fn add_missing_junctions(sch: &mut cse::Schematic, positions: &[(f64, f64)]) {
+    for &(x, y) in positions {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(x, y, j.x, j.y, 0.01))
+        {
+            sch.add_junction(x, y);
+        }
+    }
 }
 
 pub(crate) fn insert_wire_with_junctions(
@@ -541,21 +569,11 @@ async fn handle_add_wire(
     let junctions = find_t_junctions(&existing_wires, 0.01);
 
     sch.add_wire(x1, y1, x2, y2);
-    for (jx, jy) in &junctions {
-        sch.add_junction(*jx, *jy);
-    }
+    add_missing_junctions(&mut sch, &junctions);
     // Pins the new wire passes over mid-segment also need junction dots.
     let (_, tree) = read_schematic(&sch_path)?;
     let pins = crate::tools::all_pin_endpoints(&tree);
-    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-        if !sch
-            .junctions
-            .iter()
-            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
-        {
-            sch.add_junction(px, py);
-        }
-    }
+    add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -598,19 +616,9 @@ async fn handle_batch_add_wire(
         let junctions = find_t_junctions(&existing_wires, 0.01);
 
         sch.add_wire(x1, y1, x2, y2);
-        for (jx, jy) in &junctions {
-            sch.add_junction(*jx, *jy);
-        }
+        add_missing_junctions(&mut sch, &junctions);
         // Pins this wire passes over mid-segment also need junction dots.
-        for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
-            if !sch
-                .junctions
-                .iter()
-                .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
-            {
-                sch.add_junction(px, py);
-            }
-        }
+        add_missing_junctions(&mut sch, &pins_mid_segment(&pins, x1, y1, x2, y2));
         added += 1;
     }
 
@@ -1238,6 +1246,22 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
+/// The lowest `#PWR` number no symbol on the sheet is using.
+///
+/// Counting the power symbols instead re-issues a live designator after a
+/// deletion: drop `#PWR028` from a sheet of 29 and the count is 28, so the
+/// next symbol is handed `#PWR029` — still in use, silently duplicated.
+fn next_pwr_number(sch: &cse::Schematic) -> u32 {
+    let used: std::collections::HashSet<u32> = sch
+        .symbols
+        .iter()
+        .filter_map(|s| s.reference())
+        .filter_map(|r| r.strip_prefix("#PWR"))
+        .filter_map(|n| n.parse::<u32>().ok())
+        .collect();
+    (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
 async fn handle_add_power_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1259,17 +1283,7 @@ async fn handle_add_power_symbol(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // Auto-number the #PWR reference by counting existing power symbols
-    let pwr_count = sch
-        .symbols
-        .iter()
-        .filter(|s| {
-            s.reference()
-                .map(|r| r.starts_with("#PWR"))
-                .unwrap_or(false)
-        })
-        .count();
-    let pwr_ref = format!("#PWR{:03}", pwr_count + 1);
+    let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
@@ -1606,20 +1620,13 @@ async fn handle_connect_to_net(
 
     // Add wire stub
     sch.add_wire(pin_x, pin_y, label_x, label_y);
-    for (jx, jy) in &junctions {
-        sch.add_junction(*jx, *jy);
-    }
+    add_missing_junctions(&mut sch, &junctions);
     // Pins the stub passes over mid-segment also need junction dots.
     let pins = crate::tools::all_pin_endpoints(&tree);
-    for (px, py) in pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y) {
-        if !sch
-            .junctions
-            .iter()
-            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
-        {
-            sch.add_junction(px, py);
-        }
-    }
+    add_missing_junctions(
+        &mut sch,
+        &pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y),
+    );
 
     // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
     // unset, and KiCad then centres the text on the anchor (#43).
@@ -1940,6 +1947,78 @@ mod unit_aware_wiring_tests {
                 .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
             "junction expected at the mid-wire pin, got {juncs:?}"
         );
+    }
+
+    // ─── One junction per T, however many wires arrive ─────────────────────
+
+    /// An empty sheet: these tests only need somewhere to put wires.
+    fn bare_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// A rail plus three taps hanging off it: each tap makes one T.
+    fn rail_and_taps() -> (Vec<serde_json::Value>, Vec<(f64, f64)>) {
+        let rail = json!({ "x1": 101.6, "y1": 101.6, "x2": 127.0, "y2": 101.6 });
+        let taps: Vec<f64> = vec![106.68, 111.76, 116.84];
+        let wires = std::iter::once(rail)
+            .chain(
+                taps.iter()
+                    .map(|&x| json!({ "x1": x, "y1": 101.6, "x2": x, "y2": 106.68 })),
+            )
+            .collect();
+        (wires, taps.into_iter().map(|x| (x, 101.6)).collect())
+    }
+
+    fn junctions_at(path: &std::path::Path, x: f64, y: f64) -> usize {
+        let tree = konnect_sexp::parse_sexp(&std::fs::read_to_string(path).unwrap()).unwrap();
+        konnect_sexp::schematic::extract_junctions(&tree)
+            .iter()
+            .filter(|&&(jx, jy)| (jx - x).abs() < 0.01 && (jy - y).abs() < 0.01)
+            .count()
+    }
+
+    /// `find_t_junctions` reports every T on the sheet, so each call used to
+    /// re-emit a dot at every T already there — five wires left five dots
+    /// stacked on one point.
+    #[tokio::test]
+    async fn repeated_add_wire_leaves_one_junction_per_t() {
+        let (_d, path) = bare_schematic();
+        let (wires, tees) = rail_and_taps();
+        for w in &wires {
+            let mut args = json!({ "schematic": path.display().to_string() });
+            for (k, v) in w.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            let result = handle_add_wire(&args, &test_ctx()).await.unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+        }
+        for (x, y) in tees {
+            assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
+        }
+    }
+
+    /// The same in one batch, where the duplication was quadratic.
+    #[tokio::test]
+    async fn batch_add_wire_leaves_one_junction_per_t() {
+        let (_d, path) = bare_schematic();
+        let (wires, tees) = rail_and_taps();
+        let result = handle_batch_add_wire(
+            &json!({ "schematic": path.display().to_string(), "wires": wires }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        for (x, y) in tees {
+            assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
+        }
     }
 
     // ─── connect_to_net stub orientation ───────────────────────────────────
@@ -2688,6 +2767,50 @@ mod power_symbol_tests {
         assert!(
             val_sexp.contains("76.444"),
             "VCC's Value belongs above the symbol at y-3.556, not below: {val_sexp}"
+        );
+    }
+
+    /// Numbering by count re-issued a designator that was still on the sheet:
+    /// delete `#PWR002` of three and the next add produced a second `#PWR003`.
+    #[tokio::test]
+    async fn add_power_symbol_fills_a_freed_number_instead_of_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gnd.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let add = |x: f64| {
+            let args = json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": x,
+                "y": 80.0
+            });
+            async move {
+                let result = handle_add_power_symbol(&args, &test_ctx()).await.unwrap();
+                assert!(!result.is_error, "{result:?}");
+            }
+        };
+        add(100.0).await;
+        add(110.0).await;
+        add(120.0).await;
+
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.symbols.retain(|s| s.reference() != Some("#PWR002"));
+        sch.overwrite().unwrap();
+
+        add(130.0).await;
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let mut refs: Vec<&str> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
+        refs.sort_unstable();
+        assert_eq!(
+            refs,
+            ["#PWR001", "#PWR002", "#PWR003"],
+            "the freed number belongs to the new symbol, and nothing may repeat"
         );
     }
 }

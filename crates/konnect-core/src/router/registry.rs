@@ -20,15 +20,15 @@ pub static STARTER_KIT: &[&str] = &["project", "config"];
 pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     ToolsetMeta {
         name: "project",
-        description: "Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer",
+        description: "Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer",
         category: "project",
-        tool_count: 6,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "sch_components",
         description: "Add, edit, move, rotate, and delete schematic symbols",
         category: "schematic",
-        tool_count: 18,
+        tool_count: 19,
     },
     ToolsetMeta {
         name: "sch_wiring",
@@ -88,7 +88,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "library",
         description: "Symbol libraries, footprint libraries, search and registration",
         category: "library",
-        tool_count: 14,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "integration",

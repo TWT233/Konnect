@@ -676,3 +676,75 @@ fn raw_and_typed_symbol_children_survive_interleaving() {
     assert_eq!(r2.unit, 1);
     assert_eq!(r2.value_str(), Some("22k"));
 }
+
+// ---- (paper …) round-trip ---------------------------------------------------
+
+/// Load a one-off schematic whose only interesting content is its paper node.
+fn sch_with_paper(paper_line: &str) -> Schematic {
+    let src = format!(
+        "(kicad_sch\n  (version 20250114)\n  (generator \"eeschema\")\n  \
+         (generator_version \"10.0\")\n  \
+         (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  {paper_line}\n  \
+         (lib_symbols\n  )\n)"
+    );
+    let tmp = tempfile::Builder::new()
+        .suffix(".kicad_sch")
+        .tempfile()
+        .expect("create tempfile");
+    std::fs::write(tmp.path(), src).unwrap();
+    Schematic::load(tmp.path()).unwrap()
+}
+
+#[test]
+fn custom_paper_keeps_its_dimensions() {
+    // `User` is the one page size whose width and height are mandatory. Writing
+    // a bare `(paper "User")` produces a file KiCAD refuses to load, with no
+    // diagnostic beyond "Failed to load schematic" — and KiCAD's own EasyEDA
+    // importer lands every imported sheet on `User`.
+    let sch = sch_with_paper(r#"(paper "User" 292.1 205.105)"#);
+    assert_eq!(sch.paper.as_deref(), Some("User"));
+
+    let out = sch.to_source();
+    assert!(
+        out.contains(r#"(paper "User" 292.1 205.105)"#),
+        "custom page dimensions must survive a parse -> write cycle:\n{out}"
+    );
+}
+
+#[test]
+fn custom_paper_survives_repeated_round_trips() {
+    let mut sch = sch_with_paper(r#"(paper "User" 292.1 205.105)"#);
+    for _ in 0..3 {
+        let tmp = tempfile::Builder::new()
+            .suffix(".kicad_sch")
+            .tempfile()
+            .expect("create tempfile");
+        std::fs::write(tmp.path(), sch.to_source()).unwrap();
+        sch = Schematic::load(tmp.path()).unwrap();
+    }
+    assert!(
+        sch.to_source().contains(r#"(paper "User" 292.1 205.105)"#),
+        "dimensions must not erode across successive edits"
+    );
+}
+
+#[test]
+fn portrait_paper_keeps_its_orientation() {
+    let sch = sch_with_paper(r#"(paper "A4" portrait)"#);
+    assert_eq!(sch.paper.as_deref(), Some("A4"));
+
+    let out = sch.to_source();
+    assert!(
+        out.contains(r#"(paper "A4" portrait)"#),
+        "the portrait flag must survive a parse -> write cycle:\n{out}"
+    );
+}
+
+#[test]
+fn named_paper_gains_no_extra_tokens() {
+    let out = sch_with_paper(r#"(paper "A4")"#).to_source();
+    assert!(
+        out.contains(r#"(paper "A4")"#),
+        "a plain named page must round-trip unchanged:\n{out}"
+    );
+}
