@@ -20,7 +20,8 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 
 ```
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
-                           # register_symbol_library, register_footprint_library, get_symbol_info
+                           # set_footprint_graphics, get_footprint_info, register_symbol_library,
+                           # register_footprint_library, get_symbol_info
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -159,6 +160,31 @@ Optional but recommended:
 - Reference (`%R`) on F.SilkS, readable at 1.0mm text height
 - Value on F.Fab layer
 
+### Existing Footprint Graphics
+
+Use `set_footprint_graphics` to add or change line, arc, rectangle, circle, or polygon
+primitives in an existing `.kicad_mod`. Never patch the file directly.
+
+```text
+set_footprint_graphics(
+  footprint path,
+  selector={layer: "B.CrtYd"},
+  mode="replace",
+  graphics=[...]
+)
+```
+
+- `append` preserves existing supported graphics on the selected layer.
+- `replace` replaces all supported graphics on the selected layer in one atomic write.
+- `delete` removes all supported graphics on the selected layer.
+- Text, pads, properties, models, groups, and graphics on other layers are preserved.
+- Replacement/deletion stops with a conflict if a selected graphic belongs to a group;
+  do not work around this by editing the file.
+- Polygons close automatically. Supply at least three distinct points; repeating the
+  first point at the end is optional.
+- Use `get_footprint_info` with graphics inclusion enabled and a layer filter to verify
+  the resulting type, geometry, stroke width, fill, and item ID.
+
 ---
 
 ## Library Registration
@@ -252,3 +278,5 @@ Dimension format: `LxW` in mm (body dimensions, not pad-to-pad).
 8. **Use project scope by default** — avoid polluting global libraries
 9. **Name footprints per IPC** — consistent naming helps future reuse
 10. **Load toolsets first** — check `get_active_toolsets()` and load `library` before starting
+11. **Use layer-scoped graphic edits deliberately** — `replace` and `delete` affect every
+    supported primitive on the selected layer
