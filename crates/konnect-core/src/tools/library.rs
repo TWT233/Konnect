@@ -50,7 +50,7 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
 }
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "create_footprint",
             "Create a new footprint (.kicad_mod) file from a pad layout description.",
@@ -337,7 +337,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
-    ]
+    ];
+    tools.insert(2, super::footprint_graphics::tool());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
