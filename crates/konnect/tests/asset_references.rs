@@ -234,6 +234,7 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "new_number",
         "match_all",
         "replace_existing",
+        "roundrect_rratio",
     ];
 
     let mut phantom = Vec::new();

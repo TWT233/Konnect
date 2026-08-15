@@ -117,6 +117,38 @@ Optional but recommended:
 | `thru_hole`     | Through-hole pads (plated drill)                     |
 | `np_thru_hole`  | Non-plated through hole (mounting holes, slots)      |
 
+### Pad Side and Shape Details
+
+`create_footprint` defaults SMD pads to the front-side layer set
+`["F.Cu", "F.Paste", "F.Mask"]`. For bottom-side SMD pads, set
+`layers=["B.Cu", "B.Paste", "B.Mask"]` explicitly. Through-hole pads default to
+`["*.Cu", "*.Mask"]`.
+
+Each pad may also set:
+
+- `rotation` in degrees; omit it for `0`.
+- `roundrect_rratio` from `0` through `0.5` when `shape="roundrect"`.
+- `layers` using only canonical pad layers: `F.Cu`, `B.Cu`, `F.Paste`, `B.Paste`,
+  `F.Mask`, `B.Mask`, `*.Cu`, and `*.Mask`.
+
+```text
+create_footprint(
+  ...,
+  pads=[{
+    number: "1",
+    type: "smd",
+    shape: "roundrect",
+    x: -8.075,
+    y: 4.7,
+    width: 2.5,
+    height: 2.55,
+    layers: ["B.Cu", "B.Paste", "B.Mask"],
+    rotation: 180,
+    roundrect_rratio: 0.2
+  }]
+)
+```
+
 ### Standard Pad Sizes Reference
 
 | Package   | Pad Size (mm)   | Pitch (mm) | Notes                        |
@@ -148,7 +180,9 @@ Optional but recommended:
 | F.Cu       | Front copper (pads)                                   |
 | B.Cu       | Back copper (pads for bottom-side components)         |
 | F.Mask     | Front solder mask opening (auto-generated from pads)  |
+| B.Mask     | Back solder mask opening                              |
 | F.Paste    | Front solder paste (stencil openings)                 |
+| B.Paste    | Back solder paste (stencil openings)                  |
 | F.SilkS    | Front silkscreen (component outline, pin 1 marker)    |
 | F.CrtYd    | Front courtyard (assembly spacing)                    |
 | F.Fab      | Front fabrication (true component dimensions)         |
