@@ -350,6 +350,7 @@ pub fn tools() -> Vec<ToolDef> {
     ];
     tools.insert(2, super::footprint_graphics::tool());
     tools.insert(3, super::footprint_metadata::tool());
+    tools.insert(4, super::footprint_models::tool());
     tools
 }
 

@@ -68,9 +68,10 @@ Konnect/
 │   │           ├── pcb_components.rs # 13 tools (IPC real-time via NNG+protobuf)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
-│   │           ├── library.rs        # 16 tools (symbol/footprint library management)
+│   │           ├── library.rs        # 17 tools (symbol/footprint library management)
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
+│   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
 │   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting, datasheets)
 │   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
@@ -208,7 +209,7 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 190 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 191 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
 ## Observability
 
@@ -229,7 +230,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 190 tools (196 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 191 tools (197 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is ~19 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -301,9 +302,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 190 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 191 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 196 tools (190 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 197 tools (191 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)

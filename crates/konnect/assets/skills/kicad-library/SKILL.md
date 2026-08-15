@@ -21,7 +21,7 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 ```
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
-                           # get_footprint_info, register_symbol_library,
+                           # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info
 ```
 
@@ -208,6 +208,29 @@ set_footprint_metadata(
   implicitly adding `exclude_from_bom`.
 - Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
   renumber one or every matching direct-child pad atomically.
+
+### Existing Footprint 3D Models
+
+Use `set_footprint_models` to append, replace, or delete top-level 3D model
+associations without changing any non-model footprint content.
+
+```text
+set_footprint_models(
+  footprint_path=".../Part.kicad_mod",
+  mode="replace",
+  models=[{
+    path: "../models/Part.step",
+    offset: {x: 0, y: 0, z: 0},
+    scale: {x: 1, y: 1, z: 1},
+    rotate: {x: 0, y: 0, z: 90}
+  }]
+)
+```
+
+- `append` and `replace` require at least one model.
+- `delete` requires models to be omitted or empty and removes every top-level model.
+- Omitted transforms default to offset `0/0/0`, scale `1/1/1`, and rotation `0/0/0`.
+- Multiple model blocks are written in payload order in one atomic operation.
 
 ---
 
