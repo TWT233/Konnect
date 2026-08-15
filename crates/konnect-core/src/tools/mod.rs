@@ -3,6 +3,9 @@
 pub mod cli;
 pub mod config;
 pub mod design_review;
+mod footprint_graphics;
+mod footprint_metadata;
+mod footprint_models;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
@@ -873,20 +876,181 @@ pub fn ensure_lib_symbol_in_schematic(
                 _ => {}
             }
         }
-        let indented = sym_def
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    String::new()
-                } else {
-                    format!("\t\t{}", l)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        content.insert_str(ls_end, &format!("\n{}\n\t", indented));
+        content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
     }
     true
+}
+
+/// A resolved library definition indented to sit inside `lib_symbols`. Shared
+/// so an embedded copy can be compared against the library it came from.
+fn indent_lib_symbol(sym_def: &str) -> String {
+    sym_def
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("\t\t{}", l)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Outcome of re-embedding one symbol definition.
+pub(crate) enum ReembedOutcome {
+    Updated,
+    /// The embedded copy already matches the library.
+    Unchanged,
+    /// The library no longer resolves this lib_id.
+    Unresolved,
+    /// The schematic has no embedded copy to replace.
+    NotEmbedded,
+    /// The library moved or removed pin anchors, so the update was refused:
+    /// wires and labels attach at pin coordinates, and refreshing the
+    /// definition under them would silently orphan them (#177). Carries a
+    /// human-readable description per affected pin.
+    PinsMoved(Vec<String>),
+}
+
+/// Replace each embedded definition in `lib_ids` with the library's current
+/// one, returning an outcome per entry in the same order.
+///
+/// [`ensure_lib_symbol_in_schematic`] deliberately leaves an existing copy
+/// alone, so a symbol edited in its library keeps rendering from the stale
+/// copy — what KiCad reports as "doesn't match copy in library". This is the
+/// explicit refresh, mirroring eeschema's "Update Symbols from Library".
+///
+/// Takes the whole batch so `lib_symbols` is located once rather than per
+/// symbol, and so the edits can be applied back to front against offsets that
+/// stay valid.
+pub(crate) fn reembed_lib_symbols(
+    content: &mut String,
+    lib_ids: &[String],
+    allow_pin_moves: bool,
+    src: &dyn konnect_schematic_editor::library::SymbolLibrarySource,
+) -> Vec<ReembedOutcome> {
+    let blocks = konnect_sexp::writer::find_direct_child_blocks(content, "lib_symbols");
+    let mut outcomes = Vec::with_capacity(lib_ids.len());
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for lib_id in lib_ids {
+        let Some(&(start, end)) = blocks
+            .iter()
+            .find(|&&(s, e)| lib_symbol_name(&content[s..e]) == Some(lib_id.as_str()))
+        else {
+            outcomes.push(ReembedOutcome::NotEmbedded);
+            continue;
+        };
+        // Flattened, same as the embed path: a derived symbol's copy must
+        // carry its parent's units, not an (extends …) stub (#35).
+        let Some(sym_def) =
+            konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id, src)
+        else {
+            outcomes.push(ReembedOutcome::Unresolved);
+            continue;
+        };
+        // The leading indentation is already in place before `start`.
+        let indented = indent_lib_symbol(&sym_def);
+        let fresh = indented.trim_start();
+        // Compare parsed, not byte for byte: the two embed paths lay a
+        // definition out differently, and reflowing one is not an update worth
+        // writing. A block that won't parse counts as changed — and forfeits
+        // the pin guard below, which needs both trees to compare anchors.
+        if let (Ok(embedded), Ok(library)) = (
+            konnect_sexp::parse_sexp(&content[start..end]),
+            konnect_sexp::parse_sexp(fresh),
+        ) {
+            if embedded == library {
+                outcomes.push(ReembedOutcome::Unchanged);
+                continue;
+            }
+            if !allow_pin_moves {
+                let moved = moved_pin_anchors(&embedded, &library);
+                if !moved.is_empty() {
+                    outcomes.push(ReembedOutcome::PinsMoved(moved));
+                    continue;
+                }
+            }
+        }
+        edits.push((start, end, fresh.to_string()));
+        outcomes.push(ReembedOutcome::Updated);
+    }
+
+    edits.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
+    for (start, end, fresh) in edits {
+        content.replace_range(start..end, &fresh);
+    }
+    outcomes
+}
+
+/// The quoted name in a `(symbol "Lib:Name" …)` definition.
+///
+/// The name may sit on the same line as `(symbol` or on the next one depending
+/// on which embed path wrote it, so this skips whitespace rather than
+/// pattern-matching a single layout.
+fn lib_symbol_name(block: &str) -> Option<&str> {
+    block
+        .strip_prefix("(symbol")?
+        .trim_start()
+        .strip_prefix('"')?
+        .split('"')
+        .next()
+}
+
+/// Every pin anchor in a symbol definition: `(number, x, y)` from each
+/// `(pin … (at x y angle) … (number "N"))`, at any nesting depth so both
+/// single- and multi-unit bodies are covered. Duplicates are kept — stacked
+/// power pins share a number, and losing one of them is still a move.
+fn pin_anchors(def: &konnect_sexp::SexpNode) -> Vec<(String, f64, f64)> {
+    let mut anchors = Vec::new();
+    let mut stack = vec![def];
+    while let Some(node) = stack.pop() {
+        for pin in node.find_all("pin") {
+            let Some(at) = pin.find("at") else { continue };
+            let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) else {
+                continue;
+            };
+            let number = pin
+                .find("number")
+                .and_then(|n| n.get(1))
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            anchors.push((number, x, y));
+        }
+        stack.extend(node.find_all("symbol"));
+    }
+    anchors
+}
+
+/// Anchors present in `old_def` that `new_def` no longer has, as
+/// human-readable descriptions. Empty means every existing pin kept its
+/// position — the safe case for an in-place refresh, since wires and labels
+/// attach at pin coordinates. New pins are not moves: nothing attaches to a
+/// pin that didn't exist.
+fn moved_pin_anchors(
+    old_def: &konnect_sexp::SexpNode,
+    new_def: &konnect_sexp::SexpNode,
+) -> Vec<String> {
+    let mut remaining = pin_anchors(new_def);
+    let mut moves = Vec::new();
+    for (number, x, y) in pin_anchors(old_def) {
+        if let Some(i) = remaining
+            .iter()
+            .position(|(n, nx, ny)| *n == number && (nx - x).abs() < 1e-6 && (ny - y).abs() < 1e-6)
+        {
+            remaining.swap_remove(i);
+            continue;
+        }
+        match remaining.iter().find(|(n, ..)| *n == number) {
+            Some((_, nx, ny)) => moves.push(format!(
+                "pin {number} moved from ({x}, {y}) to ({nx}, {ny})"
+            )),
+            None => moves.push(format!("pin {number} at ({x}, {y}) was removed")),
+        }
+    }
+    moves
 }
 
 /// Roots under which KiCAD ships its bundled libraries — the directory that

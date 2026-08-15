@@ -17,43 +17,43 @@
   },
   "versions": [
     {
-      "version": "0.3.1",
+      "version": "0.3.2",
       "status": "stable",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99",
       "platforms": [
         "linux"
       ],
-      "download_sha256": "f0e3a8472160e6ad00e3e7cdca5ce7f4880d91dcc8a0d286b7e471989acea765",
-      "download_size": 12054832,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.1/konnect-pcm-v0.3.1-linux.zip",
-      "install_size": 34427563
+      "download_sha256": "71f8fef7e581c2de7414aed0c244fb65475658ab10db1934d546c00ee4ec2dff",
+      "download_size": 12464858,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.2/konnect-pcm-v0.3.2-linux.zip",
+      "install_size": 35890851
     },
     {
-      "version": "0.3.1",
+      "version": "0.3.2",
       "status": "stable",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99",
       "platforms": [
         "macos"
       ],
-      "download_sha256": "189cc56b3d3c704cc0cf1d0357480e94a92a15cf3d82504e9acb3c1298cf37ae",
-      "download_size": 23001945,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.1/konnect-pcm-v0.3.1-macos.zip",
-      "install_size": 59811323
+      "download_sha256": "8a3e68c7c7fe83f410dae4e2e060f12580dc410bdf3f5be1b9688ba989874a4a",
+      "download_size": 23807057,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.2/konnect-pcm-v0.3.2-macos.zip",
+      "install_size": 62320347
     },
     {
-      "version": "0.3.1",
+      "version": "0.3.2",
       "status": "stable",
       "kicad_version": "10.0",
       "kicad_version_max": "10.99",
       "platforms": [
         "windows"
       ],
-      "download_sha256": "b25802edbe93c8d86f92f1e5c1f3171f506ea4a59854321c6523faa2f199c890",
-      "download_size": 10836628,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.1/konnect-pcm-v0.3.1-windows.zip",
-      "install_size": 29051348
+      "download_sha256": "a293574b8393545dfb6540b9729cc4c446e943fa7dae25be1ddefc73213010d7",
+      "download_size": 11198916,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.3.2/konnect-pcm-v0.3.2-windows.zip",
+      "install_size": 30224852
     }
   ]
 }

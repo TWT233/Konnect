@@ -126,6 +126,111 @@ fn walk(node: &SexpNode, names: &mut HashSet<String>, ids: &mut HashSet<String>)
     }
 }
 
+/// Whether this board names nets in place — the KiCad 10 format, which has no
+/// top-level net table and no numeric ids.
+///
+/// Structure first: a single name-only `(net "GND")` node anywhere is
+/// conclusive, because no earlier format ever wrote that shape. Only when the
+/// board names no net at all — a blank board, where the structure cannot say —
+/// does this fall back to the format version. 20260101 is below KiCad 10's
+/// first release format (20260206) and above every 9.x one including the 9.99
+/// development builds, which still wrote `(net N "name")`.
+pub fn names_nets_in_place(tree: &SexpNode) -> bool {
+    fn has_name_only_net(node: &SexpNode) -> bool {
+        let Some(children) = node.children() else {
+            return false;
+        };
+        if node.head() == Some("net") && matches!(children.get(1), Some(SexpNode::Str(_))) {
+            return true;
+        }
+        children.iter().any(has_name_only_net)
+    }
+
+    if has_name_only_net(tree) {
+        return true;
+    }
+    tree.find("version")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|v| v >= 20260101)
+}
+
+/// How a **new copper item** should reference a net on this board — the
+/// write-side counterpart of [`net_name`]'s read-by-shape rule (#192).
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetRef {
+    /// KiCad 10: `(net "GND")`. A net exists by being named on copper, so any
+    /// name is writable.
+    ByName(String),
+    /// Legacy: `(net 3)` plus the companion `(net_name "GND")` that zones
+    /// carry, with the id resolved structurally from the top-level table.
+    ById { id: String, name: String },
+}
+
+impl NetRef {
+    /// The `(net …)` node — and for the legacy shape its `(net_name …)`
+    /// companion — exactly as a zone should embed them.
+    pub fn zone_net_nodes(&self) -> String {
+        match self {
+            NetRef::ByName(name) => format!("(net \"{name}\")"),
+            NetRef::ById { id, name } => format!("(net {id}) (net_name \"{name}\")"),
+        }
+    }
+
+    /// The layer node in the same format's convention: KiCad 10 writes
+    /// `(layers …)` (plural, and zones may span several); legacy single-layer
+    /// zones use `(layer …)`.
+    pub fn zone_layer_node(&self, layer: &str) -> String {
+        match self {
+            NetRef::ByName(_) => format!("(layers \"{layer}\")"),
+            NetRef::ById { .. } => format!("(layer \"{layer}\")"),
+        }
+    }
+}
+
+/// Resolve how to write a reference to `name` on this board.
+///
+/// On a KiCad 10 board every name is writable. On a legacy board the name
+/// must already be declared in the net table — the id is looked up
+/// structurally, never by string offset. `None` means the net does not exist
+/// there, and the caller must refuse: substituting net 0 attaches the copper
+/// to the unconnected pseudo-net, which is the silent orphan #192 reports.
+///
+/// ```
+/// use konnect_sexp::{parse_sexp, net::{net_ref_for_write, NetRef}};
+/// let k10 = parse_sexp("(kicad_pcb (segment (net \"GND\")))").unwrap();
+/// assert_eq!(
+///     net_ref_for_write(&k10, "GND"),
+///     Some(NetRef::ByName("GND".into()))
+/// );
+/// let k9 = parse_sexp("(kicad_pcb (net 0 \"\") (net 3 \"GND\"))").unwrap();
+/// assert_eq!(
+///     net_ref_for_write(&k9, "GND"),
+///     Some(NetRef::ById { id: "3".into(), name: "GND".into() })
+/// );
+/// assert_eq!(net_ref_for_write(&k9, "PWR"), None);
+/// ```
+pub fn net_ref_for_write(tree: &SexpNode, name: &str) -> Option<NetRef> {
+    if names_nets_in_place(tree) {
+        return Some(NetRef::ByName(name.to_string()));
+    }
+    fn find_declared_id<'a>(node: &'a SexpNode, name: &str) -> Option<&'a str> {
+        if node.head() == Some("net") && net_name(node) == Some(name) {
+            if let Some(id) = net_id(node) {
+                return Some(id);
+            }
+        }
+        node.children()?
+            .iter()
+            .find_map(|c| find_declared_id(c, name))
+    }
+    find_declared_id(tree, name).map(|id| NetRef::ById {
+        id: id.to_string(),
+        name: name.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
