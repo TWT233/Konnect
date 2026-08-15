@@ -670,6 +670,9 @@ impl FootprintGraphic {
                 if !radius_mm.is_finite() || *radius_mm <= 0.0 {
                     return Err("radius_mm must be finite and positive".to_string());
                 }
+                if !(center.x + *radius_mm).is_finite() {
+                    return Err("circle end point must remain finite".to_string());
+                }
             }
             Self::Poly {
                 points,
@@ -1161,6 +1164,19 @@ mod tests {
         let mut non_finite = non_finite;
         non_finite[0]["center"]["x"] = serde_json::Value::from(f64::INFINITY);
         assert!(parse_graphics(&non_finite).is_err());
+    }
+
+    #[test]
+    fn rejects_a_circle_whose_derived_end_point_overflows() {
+        let value = json!([{
+            "type": "circle",
+            "center": {"x": f64::MAX, "y": 0.0},
+            "radius_mm": f64::MAX,
+            "stroke_width_mm": 0.05,
+            "fill": "none"
+        }]);
+
+        assert!(parse_graphics(&value).is_err());
     }
 
     #[test]
