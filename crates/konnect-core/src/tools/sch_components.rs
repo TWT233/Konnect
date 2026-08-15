@@ -1512,6 +1512,7 @@ async fn handle_reset_schematic_field_positions(
     let mut moved = Vec::new();
     let mut unchanged = Vec::new();
     let mut no_anchor = Vec::new();
+    let mut no_property = Vec::new();
     let mut missing: Vec<String> = only
         .clone()
         .map(|r| r.into_iter().collect())
@@ -1545,7 +1546,11 @@ async fn handle_reset_schematic_field_positions(
                 continue;
             };
             let (x, y, rot) = crate::tools::field_at(Some(anchor), (0.0, 0.0, 0.0), t);
+            // The library anchors this field but the placed symbol carries no
+            // such property. Report it rather than dropping it in silence —
+            // an unreported skip reads as "reset" to the caller.
             let Some(prop) = sym.properties.iter_mut().find(|p| p.name == name) else {
+                no_property.push(format!("{}.{}", reference, name));
                 continue;
             };
             if set_property_at(prop, x, y, rot) {
@@ -1559,12 +1564,17 @@ async fn handle_reset_schematic_field_positions(
     if !moved.is_empty() && !dry_run {
         sch.overwrite()?;
     }
+    // `missing` starts life as a HashSet, whose iteration order varies run to
+    // run; a caller asking about several unknown references would get them
+    // back in a different order each time.
+    missing.sort_unstable();
 
     Ok(CallToolResult::json(&json!({
         "moved": moved,
         "moved_count": moved.len(),
         "unchanged": unchanged,
         "no_library_anchor": no_anchor,
+        "no_property": no_property,
         "not_found": missing,
         "dry_run": dry_run
     })))
@@ -2573,6 +2583,71 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(body["not_found"], json!(["R9"]));
         assert_eq!(body["moved"], json!([]));
+    }
+
+    /// `not_found` is built from a HashSet, whose iteration order varies run
+    /// to run — several unknown references would come back in a different
+    /// order each call unless it is sorted.
+    #[tokio::test]
+    async fn reset_field_positions_reports_unknown_references_in_a_stable_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stable.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n    (property \"Value\" \"10k\" (at 101.6 54.61 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        // Repeated because a HashSet of this size reorders between runs; an
+        // unsorted list passes once and then does not.
+        for _ in 0..8 {
+            let result = handle_reset_schematic_field_positions(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "references": ["R9", "R2", "U7", "C3"]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text")
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(body["not_found"], json!(["C3", "R2", "R9", "U7"]));
+        }
+    }
+
+    /// A field the library anchors but the placed symbol does not carry is
+    /// reported, not skipped in silence — an unreported skip reads as "reset".
+    #[tokio::test]
+    async fn reset_field_positions_reports_a_field_the_symbol_does_not_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-value.kicad_sch");
+        // The library anchors Reference and Value; the instance has only
+        // Reference.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 101.6 50.8 0)\n    (unit 1)\n    (uuid \"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee\")\n    (property \"Reference\" \"R1\" (at 101.6 46.99 0))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_reset_schematic_field_positions(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved"], json!(["R1.Reference"]));
+        assert_eq!(
+            body["no_property"],
+            json!(["R1.Value"]),
+            "the skipped field must be accounted for: {body}"
+        );
     }
 
     #[tokio::test]
