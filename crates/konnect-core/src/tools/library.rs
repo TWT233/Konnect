@@ -3,12 +3,16 @@
 //! Operations are file-based (S-expression manipulation + directory scanning).
 //! No IPC or kicad-cli is required for most tools.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
-use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
+use konnect_sexp::writer::{
+    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
+    write_atomic, write_atomic_if_unchanged, SexpEdit,
+};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -106,6 +110,8 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "footprint_path": { "type": "string", "description": "Path to .kicad_mod file" },
                     "pad_number": { "type": "string", "description": "Pad number to edit" },
+                    "new_number": { "type": "string", "description": "New pad number (optional; duplicate destination numbers are allowed)" },
+                    "match_all": { "type": "boolean", "description": "Edit every direct-child pad with pad_number instead of only the first match", "default": false },
                     "x": { "type": "number", "description": "New X position in mm (optional)" },
                     "y": { "type": "number", "description": "New Y position in mm (optional)" },
                     "width": { "type": "number", "description": "New pad width in mm (optional)" },
@@ -715,49 +721,129 @@ async fn handle_edit_footprint_pad(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-
-    let content = tokio::fs::read_to_string(&path).await?;
-
-    // Find the pad block:  (pad "N" ... (at X Y) (size W H) ...)
-    // We search for the at/size/drill atoms and replace them individually.
-    let pad_pat = format!(r#"(pad "{}""#, pad_number);
-    let pad_start = content
-        .find(&pad_pat)
-        .ok_or_else(|| anyhow::anyhow!("Pad '{}' not found in footprint", pad_number))?;
-
-    // Find the closing paren of this pad block (simple depth count)
-    let pad_end = {
-        let mut depth = 0i32;
-        let mut end = pad_start;
-        for (i, ch) in content[pad_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = pad_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
+    let new_number = match args.get("new_number") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some(number) => Some(number),
+            None => {
+                return Ok(invalid_library_argument(
+                    "new_number",
+                    "must be a string when supplied",
+                ))
             }
-        }
-        end
+        },
     };
-    let pad_block = &content[pad_start..pad_end];
+    let match_all = match args.get("match_all") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(match_all) => match_all,
+            None => {
+                return Ok(invalid_library_argument(
+                    "match_all",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
-    // Helper: replace or add a sub-expression within the pad block
+    let content = read_consistent(&path)?;
+    match parse_sexp(&content) {
+        Ok(root) if root.head() == Some("footprint") => {}
+        Ok(_) => {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                "file root must be a footprint",
+            ))
+        }
+        Err(error) => {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                format!("footprint is malformed: {error}"),
+            ))
+        }
+    }
+
+    let mut edits = Vec::new();
+    let mut matched_count = 0usize;
+    for (start, end) in find_direct_child_blocks(&content, "footprint") {
+        let block = &content[start..end];
+        let Ok(node) = parse_sexp(block) else {
+            return Ok(invalid_library_argument(
+                "footprint_path",
+                "footprint contains a malformed direct child",
+            ));
+        };
+        if node.head() != Some("pad") || node.get(1).and_then(SexpNode::as_str) != Some(pad_number)
+        {
+            continue;
+        }
+
+        matched_count += 1;
+        edits.push(SexpEdit::replace(
+            start,
+            end,
+            edit_footprint_pad_block(block, args, new_number),
+        ));
+        if !match_all {
+            break;
+        }
+    }
+
+    if matched_count == 0 {
+        return Ok(invalid_library_argument(
+            "pad_number",
+            format!("pad '{pad_number}' was not found"),
+        ));
+    }
+
+    let new_content = apply_edits(content.clone(), edits);
+    write_atomic_if_unchanged(&path, &content, &new_content)?;
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "pad": pad_number,
+            "matched_count": matched_count,
+            "updated_count": matched_count
+        }))
+        .unwrap(),
+    ))
+}
+
+fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn edit_footprint_pad_block(
+    pad_block: &str,
+    args: &serde_json::Value,
+    new_number: Option<&str>,
+) -> String {
     let mut new_pad = pad_block.to_string();
 
+    if let Some(number) = new_number {
+        if let Some(number_start) = new_pad.find('"') {
+            if let Some(number_end) = new_pad[number_start + 1..].find('"') {
+                let number_end = number_start + 1 + number_end;
+                new_pad.replace_range(number_start + 1..number_end, &escape_library_string(number));
+            }
+        }
+    }
+
     if let Some(x) = args["x"].as_f64() {
-        // Replace (at OLD_X OLD_Y [ROT]) → update X
         if let Some(at_pos) = new_pad.find("(at ") {
             let at_end = new_pad[at_pos..]
                 .find(')')
                 .map(|i| at_pos + i + 1)
                 .unwrap_or(new_pad.len());
             let at_block = &new_pad[at_pos..at_end];
-            // Parse existing values
             let parts: Vec<&str> = at_block
                 .trim_start_matches("(at ")
                 .trim_end_matches(')')
@@ -768,8 +854,7 @@ async fn handle_edit_footprint_pad(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            let new_at = format!("(at {} {}{})", x, old_y, rot);
-            new_pad.replace_range(at_pos..at_end, &new_at);
+            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", x, old_y, rot));
         }
     }
     if let Some(y) = args["y"].as_f64() {
@@ -789,51 +874,36 @@ async fn handle_edit_footprint_pad(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let rot = parts.get(2).map(|s| format!(" {}", s)).unwrap_or_default();
-            let new_at = format!("(at {} {}{})", old_x, y, rot);
-            new_pad.replace_range(at_pos..at_end, &new_at);
+            new_pad.replace_range(at_pos..at_end, &format!("(at {} {}{})", old_x, y, rot));
         }
     }
-    if let (Some(w), Some(h)) = (args["width"].as_f64(), args["height"].as_f64()) {
-        if let Some(sz_pos) = new_pad.find("(size ") {
-            let sz_end = new_pad[sz_pos..]
+    if let (Some(width), Some(height)) = (args["width"].as_f64(), args["height"].as_f64()) {
+        if let Some(size_pos) = new_pad.find("(size ") {
+            let size_end = new_pad[size_pos..]
                 .find(')')
-                .map(|i| sz_pos + i + 1)
+                .map(|i| size_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            let new_size = format!("(size {} {})", w, h);
-            new_pad.replace_range(sz_pos..sz_end, &new_size);
+            new_pad.replace_range(size_pos..size_end, &format!("(size {width} {height})"));
         }
     }
     if let Some(drill) = args["drill"].as_f64() {
-        if let Some(dr_pos) = new_pad.find("(drill ") {
-            let dr_end = new_pad[dr_pos..]
+        if let Some(drill_pos) = new_pad.find("(drill ") {
+            let drill_end = new_pad[drill_pos..]
                 .find(')')
-                .map(|i| dr_pos + i + 1)
+                .map(|i| drill_pos + i + 1)
                 .unwrap_or(new_pad.len());
-            let new_drill = format!("(drill {})", drill);
-            new_pad.replace_range(dr_pos..dr_end, &new_drill);
+            new_pad.replace_range(drill_pos..drill_end, &format!("(drill {drill})"));
         } else {
-            // Insert drill before closing paren of pad
             let insert_at = new_pad.rfind(')').unwrap_or(new_pad.len());
-            new_pad.insert_str(insert_at, &format!(" (drill {})", drill));
+            new_pad.insert_str(insert_at, &format!(" (drill {drill})"));
         }
     }
 
-    // Apply the pad block replacement
-    let new_content = format!(
-        "{}{}{}",
-        &content[..pad_start],
-        new_pad,
-        &content[pad_end..]
-    );
-    write_atomic(&path, &new_content)?;
+    new_pad
+}
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "success": true,
-            "pad": pad_number
-        }))
-        .unwrap(),
-    ))
+fn escape_library_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ─── Library table helpers ────────────────────────────────────────────────────
@@ -3813,6 +3883,166 @@ mod tests {
             content.matches("(lib ").count(),
             1,
             "an already-registered nickname must not be duplicated: {content}"
+        );
+    }
+
+    const DUPLICATE_PAD_FOOTPRINT: &str = r#"(footprint "DualSocket"
+  (version 20240108)
+  (generator "pcbnew")
+  (layer "F.Cu")
+  (descr "preserve me")
+  (fp_line (start 0 0) (end 1 1) (stroke (width 0.1) (type default)) (layer "F.SilkS"))
+  (pad "3" thru_hole circle (at 1 2) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+  (pad "3" thru_hole oval (at 3 4 90) (size 3 2) (drill oval 1 2) (layers "*.Cu" "*.Mask"))
+  (pad "1" thru_hole circle (at 5 6) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+  (model "../models/keep.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#;
+
+    #[tokio::test]
+    async fn edit_footprint_pad_renumbers_only_the_first_duplicate_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": "1"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["matched_count"], 1);
+        assert_eq!(output["updated_count"], 1);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("(pad \"3\"").count(), 1);
+        assert_eq!(updated.matches("(pad \"1\"").count(), 2);
+        assert!(
+            updated.contains("(pad \"1\" thru_hole circle (at 1 2) (size 2 2) (drill 1)"),
+            "the first duplicate should be renumbered: {updated}"
+        );
+        assert!(
+            updated.contains("(pad \"3\" thru_hole oval (at 3 4 90) (size 3 2) (drill oval 1 2)"),
+            "the second duplicate should remain unchanged: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_renumbers_and_resizes_every_duplicate_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": "1",
+                "match_all": true,
+                "x": 9.5,
+                "width": 4.0,
+                "height": 5.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["matched_count"], 2);
+        assert_eq!(output["updated_count"], 2);
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated.matches("(pad \"3\"").count(), 0);
+        assert_eq!(updated.matches("(pad \"1\"").count(), 3);
+        assert_eq!(updated.matches("(at 9.5 ").count(), 2);
+        assert_eq!(updated.matches("(size 4 5)").count(), 2);
+        assert!(updated.contains("(descr \"preserve me\")"));
+        assert!(updated.contains("(fp_line (start 0 0) (end 1 1)"));
+        assert!(updated.contains("(model \"../models/keep.step\""));
+        parse_sexp(&updated).expect("the edited footprint must remain parseable");
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_missing_match_returns_structured_error_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "404",
+                "new_number": "1",
+                "match_all": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .expect("a missing pad is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "pad_number");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DUPLICATE_PAD_FOOTPRINT
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_footprint_pad_rejects_non_string_new_number_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("DualSocket.kicad_mod");
+        std::fs::write(&path, DUPLICATE_PAD_FOOTPRINT).unwrap();
+
+        let result = handle_edit_footprint_pad(
+            &json!({
+                "footprint_path": path,
+                "pad_number": "3",
+                "new_number": 1
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "new_number");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DUPLICATE_PAD_FOOTPRINT
+        );
+    }
+
+    #[test]
+    fn edit_footprint_pad_schema_exposes_batch_renumbering_compatibly() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "edit_footprint_pad")
+            .expect("library must expose edit_footprint_pad");
+        let properties = &tool.input_schema["properties"];
+
+        assert_eq!(properties["new_number"]["type"], "string");
+        assert_eq!(properties["match_all"]["type"], "boolean");
+        assert_eq!(properties["match_all"]["default"], false);
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["footprint_path", "pad_number"])
         );
     }
 
