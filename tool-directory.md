@@ -296,7 +296,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
-| `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. |
+| `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |

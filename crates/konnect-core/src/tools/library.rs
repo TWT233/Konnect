@@ -265,7 +265,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "register_symbol_library",
-            "Register a .kicad_sym library file in the KiCAD global or project symbol table.",
+            "Register a .kicad_sym library file in the KiCAD global or project symbol table. \
+             Reports whether the entry was inserted, left unchanged, or updated — an existing \
+             nickname is kept as-is unless replace_existing is set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -276,7 +278,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" }
+                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
+                        "default": false
+                    }
                 },
                 "required": ["library_path", "nickname"]
             }),
@@ -1752,6 +1759,18 @@ async fn handle_register_symbol_library(
         Err(e) => return Ok(e),
     };
     let scope = args["scope"].as_str().unwrap_or("project");
+    let replace_existing = match args.get("replace_existing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "replace_existing",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
     let (table_path, uri) = match lib_table_target(
         scope,
@@ -1764,7 +1783,21 @@ async fn handle_register_symbol_library(
         Err(e) => return Ok(e),
     };
 
-    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
+    // Same contract as register_footprint_library: report which of
+    // inserted/unchanged/updated happened, rather than a bare "success" that
+    // cannot be told apart from a silent no-op on an existing nickname (#211).
+    let registration = match register_in_lib_table_with_policy(
+        &table_path,
+        nickname,
+        &uri,
+        "KiCad",
+        replace_existing,
+    )
+    .await?
+    {
+        Ok(registration) => registration,
+        Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
+    };
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1773,7 +1806,8 @@ async fn handle_register_symbol_library(
             "scope": scope,
             "table": table_path.to_str().unwrap_or(""),
             "uri": uri,
-            "repaired_table_root": repaired_root
+            "state": registration.state.as_str(),
+            "repaired_table_root": registration.repaired_root
         }))
         .unwrap(),
     ))
@@ -1907,6 +1941,13 @@ struct PreparedLibTableRegistration {
     registration: LibTableRegistration,
 }
 
+/// Register without the replace policy, reporting only whether the table's
+/// root element needed repairing.
+///
+/// Both handlers call `register_in_lib_table_with_policy` directly now that
+/// each reports its own registration state (#211), so this is only the
+/// narrower shape the root-repair tests are written against.
+#[cfg(test)]
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
@@ -4271,6 +4312,134 @@ mod tests {
             registration.input_schema["required"],
             json!(["library_path", "nickname"])
         );
+    }
+
+    /// #211: registering a nickname that already exists silently reported
+    /// success while changing nothing, so a stale project URI could not be
+    /// corrected and the caller could not tell. The footprint half gained a
+    /// reported state and `replace_existing` in #205; the symbol half kept
+    /// the old always-`true` shape, which left the API asymmetric.
+    #[tokio::test]
+    async fn register_symbol_library_reports_that_it_changed_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let table = project.parent().unwrap().join("sym-lib-table");
+        let original = "(sym_lib_table
+  (version 7)
+  (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.kicad_sym\") (options \"keep=1\") (descr \"keep me\"))
+)
+";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": tmp.path().join("lib").join("Parts.kicad_sym"),
+                "nickname": "Parts",
+                "project": project
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(
+            output["state"], "unchanged",
+            "a no-op must say so rather than reporting a bare success: {output}"
+        );
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn register_symbol_library_reports_a_new_entry_as_inserted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": tmp.path().join("lib").join("Parts.kicad_sym"),
+                "nickname": "Parts",
+                "project": project
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "inserted", "{output}");
+    }
+
+    /// The point of the issue: a stale URI must be correctable, and the entry's
+    /// own options/descr must survive the correction.
+    #[tokio::test]
+    async fn register_symbol_library_replaces_a_stale_uri_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "{}").unwrap();
+        let library = tmp.path().join("test").join("Parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)").unwrap();
+        let table = project.parent().unwrap().join("sym-lib-table");
+        std::fs::write(
+            &table,
+            "(sym_lib_table
+  (version 7)
+  (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.kicad_sym\") (options \"keep=1\") (descr \"keep me\"))
+)
+",
+        )
+        .unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "updated", "{output}");
+        let written = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            !written.contains("C:/stale"),
+            "stale URI must be gone:
+{written}"
+        );
+        assert!(
+            written.contains("keep=1") && written.contains("keep me"),
+            "the entry's own metadata must survive:
+{written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_symbol_library_rejects_a_non_boolean_replace_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": tmp.path().join("lib").join("Parts.kicad_sym"),
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": "yes"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{:?}", result.content);
     }
 
     #[tokio::test]
