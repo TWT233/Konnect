@@ -80,12 +80,22 @@ fn pcb_pad_board_position() {
     let pads = r1.find_all("pad");
     let pad1_at = pads[0].find("at").unwrap();
     let local_x = pad1_at.get_f64(1).unwrap();
+    let local_y = pad1_at.get_f64(2).unwrap();
 
     let board_x = fp_x + local_x;
     assert!(
         (board_x - 99.5).abs() < 0.01,
         "R1 pad 1 board X should be 99.5, got {}",
         board_x
+    );
+    // Y was read and then dropped, so half of the transform went unchecked —
+    // a pad offset applied to the wrong axis would have passed. Footprint at
+    // (100, 50), pad 1 at local (-0.5, 0).
+    let board_y = fp_y + local_y;
+    assert!(
+        (board_y - 50.0).abs() < 0.01,
+        "R1 pad 1 board Y should be 50.0, got {}",
+        board_y
     );
 }
 
@@ -225,6 +235,7 @@ async fn observability_meta_tools_surface_recorded_calls() {
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
+            eager_toolsets: false,
         },
         router,
         observer.clone(),
@@ -284,4 +295,72 @@ async fn observability_meta_tools_surface_recorded_calls() {
     let add_wire_stats = &stats_body["per_tool"]["add_wire"];
     assert_eq!(add_wire_stats["total"], 3);
     assert_eq!(add_wire_stats["errors"], 1);
+}
+
+// ─── derived (lib_name) symbols (#143) ─────────────────────────────────────────
+
+/// Every pin coordinate in the fixture, keyed by reference, resolved the way
+/// KiCAD resolves them.
+fn pin_map(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<(f64, f64)>> {
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
+        read_schematic,
+    };
+    let (_, tree) = read_schematic(path).unwrap();
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    extract_symbol_instances(&tree)
+        .iter()
+        .map(|inst| {
+            let sym = find_lib_symbol(&lib_syms, inst)
+                .unwrap_or_else(|| panic!("{} has no lib_symbols entry", inst.reference));
+            let t = inst.pin_transform();
+            let pins = extract_lib_pins_for_unit(sym, inst.unit)
+                .iter()
+                .map(|p| pin_endpoint(p, t))
+                .collect();
+            (inst.reference.clone(), pins)
+        })
+        .collect()
+}
+
+#[test]
+fn derived_symbols_resolve_through_lib_name() {
+    let path = fixtures_dir().join("derived_lib_name.kicad_sch");
+    let pins = pin_map(&path);
+
+    // R1 is a plain Device:R: pins at ±3.81 from the body centre.
+    assert_eq!(pins["R1"], vec![(63.5, 59.69), (63.5, 67.31)]);
+    // R2 carries (lib_name "R_1"), whose pins sit at ±6.35. Resolving on
+    // lib_id would silently yield R1's geometry instead.
+    assert_eq!(pins["R2"], vec![(88.9, 57.15), (88.9, 69.85)]);
+    // C1 carries (lib_name "C_1") and its base Device:C is not embedded at
+    // all — lib_id resolution finds nothing and reports a bogus error.
+    assert_eq!(pins["C1"], vec![(139.7, 59.69), (139.7, 67.31)]);
+}
+
+#[test]
+fn editing_a_derived_symbol_schematic_preserves_every_pin_position() {
+    // The reported corruption: one edit re-serialized the whole file, dropped
+    // (lib_name …) from symbols it never touched, and moved their pins off the
+    // wires — a silent short that only a netlist diff catches.
+    let tmp = temp_copy("derived_lib_name.kicad_sch");
+    let before = pin_map(tmp.path());
+
+    let mut sch = konnect_schematic_editor::Schematic::load(tmp.path()).unwrap();
+    sch.symbols
+        .by_reference_mut("R1")
+        .unwrap()
+        .set_value_str("4.7k");
+    sch.overwrite().unwrap();
+
+    assert_eq!(pin_map(tmp.path()), before);
+    let after = std::fs::read_to_string(tmp.path()).unwrap();
+    assert_eq!(
+        after.matches("(lib_name").count(),
+        2,
+        "both derived instances must keep their lib_name:\n{after}"
+    );
 }

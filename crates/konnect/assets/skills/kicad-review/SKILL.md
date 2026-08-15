@@ -178,6 +178,13 @@ run_design_review()
 Runs ALL audits and checks in sequence, producing a consolidated report.
 Use this for a comprehensive pre-manufacturing review.
 
+Read `status`, `coverage`, and `diagnostics` before interpreting the findings.
+If `status` is `partial` or `failed`, the verdict is `INCOMPLETE — review could
+not evaluate the full design`. Report that verdict verbatim, explain the
+diagnostics and unevaluated coverage, and do not describe the design as ready,
+passing, clean, or looking good. Findings gathered before the coverage gap are
+still valid and should still be reported.
+
 Equivalent to running:
 1. find_orphan_items
 2. find_shorted_nets
@@ -260,7 +267,9 @@ Present findings grouped by severity with actionable fix suggestions:
 - Critical: X (must resolve)
 - Warnings: X (recommended)
 - Suggestions: X (optional)
-- Verdict: [PASS / FAIL / PASS WITH WARNINGS]
+- Verdict: [LOOKS GOOD / NEEDS ATTENTION / NOT READY / INCOMPLETE]
+- Coverage status: [complete / partial / failed]
+- Coverage diagnostics: [none, or each unevaluated sheet/object/audit]
 ```
 
 ---
@@ -278,9 +287,10 @@ Present findings grouped by severity with actionable fix suggestions:
 
 1. Load all review toolsets
 2. `run_design_review()` — full audit suite
-3. Classify all findings by severity
-4. Present report with fix suggestions
-5. Offer to fix CRITICAL issues immediately
+3. Check `status`, `coverage`, and `diagnostics`; never approve an incomplete review
+4. Classify all gathered findings by severity
+5. Present report with fix suggestions
+6. Offer to fix CRITICAL issues immediately
 
 ### Pre-Manufacturing Review
 
@@ -304,3 +314,4 @@ Present findings grouped by severity with actionable fix suggestions:
 8. **Offer to fix** — after reporting, offer to use MCP tools to resolve issues
 9. **Re-run after fixes** — always verify fixes resolved the issue and created no new ones
 10. **Document waivers** — if user explicitly waives a warning, note it in the report
+11. **Never soften `INCOMPLETE`** — partial or failed coverage is not a passing review

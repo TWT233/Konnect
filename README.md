@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**187 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
+**199 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -22,6 +22,18 @@ that teach Claude KiCAD conventions out of the box.
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
+
+> ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
+>
+> [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
+> quality-scored Google search, clean webpage extraction, and deep multi-source
+> research. Design the board with Konnect while Nimrod pulls live parts availability, datasheets,
+> and errata — no more guessing from year-old training data
+>
+> - Works with claude.ai, Claude Desktop, Claude Code, VS Code, and any MCP client
+> - 1 credit = 1 search · extraction always free · free 50-credit trial, no card
+> - Official MCP Registry: [`ai.orchis/nimrod`](https://registry.modelcontextprotocol.io)
+
 
 ## Why Konnect exists
 
@@ -92,7 +104,7 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | Layer | Mechanism |
 |-------|-----------|
 | Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
-| PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time, undo-aware, requires KiCAD running |
+| PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
 
@@ -223,7 +235,8 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   compiles and passes tests in CI but hasn't had per-platform QA yet; both are
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
-- For PCB tools: KiCAD running with the target board open (IPC API)
+- For most PCB tools: KiCAD running with the target board open (IPC API).
+  `place_component` can safely fall back to a closed board file when IPC is unreachable.
 
 ## License: free for the little guys
 
@@ -259,7 +272,8 @@ the architecture it proved, rebuilt for production:
 manual copy), then restart KiCAD.
 
 **PCB tools return "IPC connect failed"** — open KiCAD with your board file first;
-PCB tools talk to the running PCB editor.
+most PCB tools talk to the running PCB editor. `place_component` alone can fall
+back to a closed board file when no KiCAD process is reachable.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
 explicitly in the plugin settings dialog or your `konnect-settings.json` if yours

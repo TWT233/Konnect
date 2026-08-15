@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
         project_dir: config.project_dir.clone(),
         jlcpcb_db_path: config.jlcpcb_db_path.clone(),
         auto_load_toolsets: config.auto_load_toolsets,
+        eager_toolsets: config.eager_toolsets,
     };
     let handler = McpHandler::new(server_config).await?;
 

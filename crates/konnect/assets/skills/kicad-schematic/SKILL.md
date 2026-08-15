@@ -93,7 +93,7 @@ Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow poi
 |-----------------------------------------|-------------------------|------------------------------------------|
 | Two pins physically close (<30mm)       | `connect_pins`          | Direct wire, auto-routed                 |
 | Named signal (SDA, MOSI, EN, etc.)      | `connect_to_net`        | Stub wire + net label, cleaner           |
-| Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, auto-connects       |
+| Power rail (VCC, GND, +3V3)             | `add_power_symbol`      | Proper power symbol, global net          |
 | Bus signals (D0-D7)                     | `connect_to_net`        | Net labels with bus naming               |
 | Cross-sheet signal                      | Global label            | Connects across schematic sheets         |
 | Multiple pins to same net (3+)          | `batch_connect_to_net`  | Efficient bulk operation                 |
@@ -103,7 +103,7 @@ Power symbols: GND uses 0 (arrow points down), VCC/VDD/+3V3/+5V use 0 (arrow poi
 Use for direct pin-to-pin connections. The tool auto-routes with L-bends.
 
 ```
-connect_pins(from_component, from_pin, to_component, to_pin)
+connect_pins(schematic, ref1, pin1, ref2, pin2)
 ```
 
 - Specify pins by pin number (from get_schematic_pin_locations)
@@ -115,25 +115,40 @@ connect_pins(from_component, from_pin, to_component, to_pin)
 Use for named nets. Creates a short stub wire and attaches a net label.
 
 ```
-connect_to_net(component_reference, pin_number, net_name)
+connect_to_net(schematic, reference, pin_number, net)
 ```
 
 - Preferred for signals that connect to 3+ pins
 - Preferred for named buses and control signals
 - Keeps schematic clean and readable
 - Net name must be consistent across all connections
+- Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
+  from the symbol body on its own, instead of the label text running back
+  across the pin names. Override with `direction` only to fix a layout clash.
+- `batch_connect_to_net` does the same for many pins in one read/write, and
+  places its labels directly on the pin endpoints without stubs.
+- Placing a label by hand with `add_schematic_net_label` instead? Take its
+  rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
+  text reads back across the symbol's pin names.
 
 ### add_power_symbol
 
-Use for all power connections. Never manually wire to power symbols.
+Use for all power connections, in preference to labelling a pin with the rail name.
 
 ```
-add_power_symbol(component_reference, pin_number, power_net)
+add_power_symbol(schematic, power_net, x, y, rotation?)
 ```
 
-- Automatically places the correct power symbol (GND, VCC, etc.)
-- Handles orientation automatically
-- Connects the pin to the global power net
+- Takes coordinates, not a reference and pin number. Place it on the pin
+  endpoint (from `get_schematic_pin_locations`) — a power symbol carries its
+  pin at its own origin, so the two coinciding is the connection.
+- `power_net` is loaded as `power:<power_net>`, so it must name a symbol in
+  KiCad's power library: `+3V3` and `+12V`, never `3V3` or `12V`. A miss is an
+  error and nothing is placed.
+- `rotation` defaults to 0 — see Rotation Conventions above.
+- A power pin landing mid-segment on a wire gets its junction dot
+  automatically, in either order: symbol onto an existing wire, or a wire
+  routed across an already-placed symbol.
 
 ---
 
@@ -227,7 +242,7 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 3. **Always verify after changes** — run validation tools after placing and wiring
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
-6. **Power symbols for power** — never manually wire power connections
+6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels
 7. **Net labels for named signals** — keeps schematics readable
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting

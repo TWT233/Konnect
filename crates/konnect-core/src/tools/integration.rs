@@ -19,7 +19,17 @@ use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
 use konnect_sexp::writer::{read_consistent, write_atomic_if_unchanged};
 use serde_json::json;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
+
+const JLCPCB_FEED_BASE_URL: &str = "https://bouni.github.io/kicad-jlcpcb-tools";
+const JLCPCB_FEED_SENTINEL: &str = "chunk_num_current_parts_fts5.txt";
+const JLCPCB_FEED_ARCHIVE: &str = "current-parts-fts5.db.zip";
+const JLCPCB_MAX_CHUNKS: usize = 64;
+const JLCPCB_MAX_ARCHIVE_BYTES: u64 = 1_073_741_824;
+const JLCPCB_MAX_DATABASE_BYTES: u64 = 8_589_934_592;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -238,6 +248,229 @@ async fn get_with_backoff(
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+fn parse_jlcpcb_chunk_count(value: &str) -> anyhow::Result<usize> {
+    let chunk_count = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("Invalid JLCPCB feed chunk count: {value:?}"))?;
+    if !(1..=JLCPCB_MAX_CHUNKS).contains(&chunk_count) {
+        anyhow::bail!(
+            "JLCPCB feed chunk count {chunk_count} is outside the supported range 1..={JLCPCB_MAX_CHUNKS}"
+        );
+    }
+    Ok(chunk_count)
+}
+
+async fn download_jlcpcb_archive(
+    client: &reqwest::Client,
+    archive_path: &Path,
+) -> anyhow::Result<(usize, u64)> {
+    let sentinel_url = format!("{JLCPCB_FEED_BASE_URL}/{JLCPCB_FEED_SENTINEL}");
+    let sentinel_response = get_with_backoff(client, &sentinel_url).await?;
+    if !sentinel_response.status().is_success() {
+        anyhow::bail!(
+            "Failed to read JLCPCB feed manifest: HTTP {}",
+            sentinel_response.status()
+        );
+    }
+    let chunk_count = parse_jlcpcb_chunk_count(&sentinel_response.text().await?)?;
+
+    let mut archive = tokio::fs::File::create(archive_path).await?;
+    let mut downloaded_bytes = 0u64;
+    for chunk_number in 1..=chunk_count {
+        let chunk_url = format!("{JLCPCB_FEED_BASE_URL}/{JLCPCB_FEED_ARCHIVE}.{chunk_number:03}");
+        let mut response = get_with_backoff(client, &chunk_url).await?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "Failed to download JLCPCB database chunk {chunk_number}/{chunk_count}: HTTP {}",
+                response.status()
+            );
+        }
+
+        while let Some(bytes) = response.chunk().await? {
+            downloaded_bytes = downloaded_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("JLCPCB archive size overflow"))?;
+            if downloaded_bytes > JLCPCB_MAX_ARCHIVE_BYTES {
+                anyhow::bail!(
+                    "JLCPCB archive exceeds the {} byte safety limit",
+                    JLCPCB_MAX_ARCHIVE_BYTES
+                );
+            }
+            archive.write_all(&bytes).await?;
+        }
+    }
+    archive.sync_all().await?;
+    Ok((chunk_count, downloaded_bytes))
+}
+
+fn extract_jlcpcb_database(archive_path: &Path, output_path: &Path) -> anyhow::Result<()> {
+    let archive_file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(archive_file)?;
+    if archive.len() != 1 {
+        anyhow::bail!(
+            "JLCPCB archive must contain exactly one database file; found {} entries",
+            archive.len()
+        );
+    }
+
+    let mut database = archive.by_index(0)?;
+    if database.is_dir() || database.enclosed_name().is_none() {
+        anyhow::bail!("JLCPCB archive does not contain a safe database file");
+    }
+    if database.size() > JLCPCB_MAX_DATABASE_BYTES {
+        anyhow::bail!(
+            "JLCPCB database exceeds the {} byte safety limit",
+            JLCPCB_MAX_DATABASE_BYTES
+        );
+    }
+
+    let output_file = std::fs::File::create(output_path)?;
+    let mut output = BufWriter::new(output_file);
+    io::copy(&mut database, &mut output)?;
+    output.into_inner()?.sync_all()?;
+    Ok(())
+}
+
+fn validate_upstream_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(parts)")?;
+    let columns: HashSet<String> = statement
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    let required = [
+        "LCSC Part",
+        "First Category",
+        "Second Category",
+        "MFR.Part",
+        "Package",
+        "Manufacturer",
+        "Library Type",
+        "Description",
+        "Datasheet",
+        "Price",
+        "Stock",
+    ];
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|column| !columns.contains(*column))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "JLCPCB feed schema is missing required columns: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn build_konnect_jlcpcb_database(upstream_path: &Path, output_path: &Path) -> anyhow::Result<u64> {
+    let upstream = rusqlite::Connection::open_with_flags(
+        upstream_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    validate_upstream_schema(&upstream)?;
+    drop(upstream);
+
+    let mut output = rusqlite::Connection::open(output_path)?;
+    output.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA temp_store = MEMORY;",
+    )?;
+    let upstream_path = upstream_path.to_string_lossy().into_owned();
+    output.execute(
+        "ATTACH DATABASE ?1 AS upstream",
+        rusqlite::params![upstream_path],
+    )?;
+
+    let transaction = output.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE components (
+             LCSC TEXT NOT NULL PRIMARY KEY,
+             MFR_Part TEXT NOT NULL,
+             Package TEXT NOT NULL,
+             Manufacturer TEXT NOT NULL,
+             Library_Type TEXT NOT NULL,
+             Description TEXT NOT NULL,
+             Datasheet TEXT NOT NULL,
+             Price REAL NOT NULL,
+             Stock INTEGER NOT NULL,
+             Category TEXT NOT NULL
+         );
+         PRAGMA user_version = 1;",
+    )?;
+    let imported = transaction.execute(
+        "INSERT INTO components (
+             LCSC, MFR_Part, Package, Manufacturer, Library_Type,
+             Description, Datasheet, Price, Stock, Category
+         )
+         SELECT
+             COALESCE(\"LCSC Part\", ''),
+             COALESCE(\"MFR.Part\", ''),
+             COALESCE(\"Package\", ''),
+             COALESCE(\"Manufacturer\", ''),
+             COALESCE(\"Library Type\", ''),
+             COALESCE(\"Description\", ''),
+             COALESCE(\"Datasheet\", ''),
+             CASE
+                 WHEN instr(COALESCE(\"Price\", ''), ':') > 0
+                 THEN CAST(substr(\"Price\", instr(\"Price\", ':') + 1) AS REAL)
+                 ELSE CAST(COALESCE(NULLIF(\"Price\", ''), '0') AS REAL)
+             END,
+             CAST(COALESCE(NULLIF(\"Stock\", ''), '0') AS INTEGER),
+             CASE
+                 WHEN COALESCE(\"First Category\", '') = '' THEN COALESCE(\"Second Category\", '')
+                 WHEN COALESCE(\"Second Category\", '') = '' THEN \"First Category\"
+                 ELSE \"First Category\" || ' / ' || \"Second Category\"
+             END
+         FROM upstream.parts",
+        [],
+    )?;
+    transaction.execute_batch(
+        "CREATE INDEX components_mfr_part_idx ON components(MFR_Part);
+         CREATE INDEX components_package_idx ON components(Package);
+         CREATE INDEX components_library_stock_idx ON components(Library_Type, Stock);
+         CREATE INDEX components_category_idx ON components(Category);",
+    )?;
+    transaction.commit()?;
+    output.execute_batch("DETACH DATABASE upstream; PRAGMA synchronous = FULL;")?;
+
+    let part_count: i64 =
+        output.query_row("SELECT COUNT(*) FROM components", [], |row| row.get(0))?;
+    if imported == 0 || part_count <= 0 {
+        anyhow::bail!("JLCPCB feed did not contain any components");
+    }
+    let quick_check: String = output.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        anyhow::bail!("Generated JLCPCB database failed validation: {quick_check}");
+    }
+    drop(output);
+    Ok(part_count.try_into()?)
+}
+
+fn replace_jlcpcb_database(
+    staged_path: &Path,
+    destination: &Path,
+    backup_path: &Path,
+) -> anyhow::Result<()> {
+    if !destination.exists() {
+        std::fs::rename(staged_path, destination)?;
+        return Ok(());
+    }
+
+    std::fs::rename(destination, backup_path)?;
+    if let Err(install_error) = std::fs::rename(staged_path, destination) {
+        if let Err(restore_error) = std::fs::rename(backup_path, destination) {
+            anyhow::bail!(
+                "Failed to install the new JLCPCB database ({install_error}) and restore the previous database ({restore_error})"
+            );
+        }
+        return Err(install_error.into());
+    }
+    std::fs::remove_file(backup_path)?;
+    Ok(())
+}
+
 async fn handle_download_jlcpcb(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -258,10 +491,6 @@ async fn handle_download_jlcpcb(
         ));
     }
 
-    // JLCPCB parts database is distributed as a CSV or SQLite download.
-    // The official URL changes — we use a known community mirror format.
-    let url = "https://bouni.github.io/kicad-jlcpcb-tools/jlcpcb_parts.db";
-
     if let Some(parent) = db_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -270,21 +499,37 @@ async fn handle_download_jlcpcb(
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    let resp = get_with_backoff(&client, url).await?;
-    if !resp.status().is_success() {
-        return Ok(CallToolResult::error(format!(
-            "Download failed: HTTP {}",
-            resp.status()
-        )));
-    }
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(&db_path, &bytes).await?;
+    let db_parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let work_dir = tempfile::Builder::new()
+        .prefix("konnect-jlcpcb-")
+        .tempdir_in(db_parent)?;
+    let archive_path = work_dir.path().join(JLCPCB_FEED_ARCHIVE);
+    let upstream_path = work_dir.path().join("upstream.db");
+    let staged_path = work_dir.path().join("konnect.db");
+    let backup_path = work_dir.path().join("previous.db");
+
+    let (chunk_count, downloaded_bytes) = download_jlcpcb_archive(&client, &archive_path).await?;
+    let (part_count, size_bytes) = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> anyhow::Result<(u64, u64)> {
+            extract_jlcpcb_database(&archive_path, &upstream_path)?;
+            let part_count = build_konnect_jlcpcb_database(&upstream_path, &staged_path)?;
+            let size_bytes = std::fs::metadata(&staged_path)?.len();
+            replace_jlcpcb_database(&staged_path, &db_path, &backup_path)?;
+            Ok((part_count, size_bytes))
+        }
+    })
+    .await??;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "path": db_path.to_str().unwrap_or(""),
-            "size_bytes": bytes.len()
+            "size_bytes": size_bytes,
+            "part_count": part_count,
+            "source": JLCPCB_FEED_BASE_URL,
+            "downloaded_chunks": chunk_count,
+            "downloaded_bytes": downloaded_bytes
         }))
         .unwrap(),
     ))
@@ -919,6 +1164,126 @@ mod retry_backoff_tests {
 }
 
 #[cfg(test)]
+mod jlcpcb_database_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn seed_upstream_database(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("open upstream database");
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE parts USING fts5 (
+                 \"LCSC Part\",
+                 \"First Category\",
+                 \"Second Category\",
+                 \"MFR.Part\",
+                 \"Package\",
+                 \"Manufacturer\",
+                 \"Library Type\",
+                 \"Description\",
+                 \"Datasheet\",
+                 \"Price\",
+                 \"Stock\"
+             );
+             INSERT INTO parts VALUES (
+                 'C14663', 'Resistors', 'Chip Resistor - Surface Mount',
+                 'RC0402FR-0710KL', '0402', 'YAGEO', 'Basic',
+                 '10k resistor 0402', 'https://example.com/datasheet.pdf',
+                 '1-9:0.012,10-99:0.008', '5000'
+             );",
+        )
+        .expect("seed upstream database");
+    }
+
+    #[test]
+    fn parses_bounded_chunk_count() {
+        assert_eq!(parse_jlcpcb_chunk_count("3\n").unwrap(), 3);
+        assert!(parse_jlcpcb_chunk_count("0").is_err());
+        assert!(parse_jlcpcb_chunk_count("65").is_err());
+        assert!(parse_jlcpcb_chunk_count("not-a-number").is_err());
+    }
+
+    #[test]
+    fn extracts_single_database_from_feed_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_path = dir.path().join("parts.db.zip");
+        let output_path = dir.path().join("upstream.db");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .start_file(
+                "current-parts-fts5.db",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        archive.write_all(b"SQLite database bytes").unwrap();
+        archive.finish().unwrap();
+
+        extract_jlcpcb_database(&archive_path, &output_path).unwrap();
+
+        assert_eq!(
+            std::fs::read(output_path).unwrap(),
+            b"SQLite database bytes"
+        );
+    }
+
+    #[test]
+    fn builds_stable_components_database_from_current_feed_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let upstream_path = dir.path().join("upstream.db");
+        let output_path = dir.path().join("konnect.db");
+        seed_upstream_database(&upstream_path);
+
+        let part_count = build_konnect_jlcpcb_database(&upstream_path, &output_path).unwrap();
+        assert_eq!(part_count, 1);
+
+        let conn = rusqlite::Connection::open(output_path).expect("open generated database");
+        let row: (String, f64, i64, String) = conn
+            .query_row(
+                "SELECT LCSC, Price, Stock, Category FROM components",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "C14663");
+        assert!((row.1 - 0.012).abs() < f64::EPSILON);
+        assert_eq!(row.2, 5000);
+        assert_eq!(row.3, "Resistors / Chip Resistor - Surface Mount");
+    }
+
+    #[test]
+    fn rejects_an_upstream_schema_missing_required_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let upstream_path = dir.path().join("upstream.db");
+        let output_path = dir.path().join("konnect.db");
+        let conn = rusqlite::Connection::open(&upstream_path).expect("open upstream database");
+        conn.execute("CREATE TABLE parts (\"LCSC Part\" TEXT)", [])
+            .unwrap();
+        drop(conn);
+
+        let error = build_konnect_jlcpcb_database(&upstream_path, &output_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing required columns"));
+    }
+
+    #[test]
+    fn replaces_existing_database_and_removes_temporary_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("jlcpcb.db");
+        let staged = dir.path().join("new.db");
+        let backup = dir.path().join("previous.db");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&staged, b"new").unwrap();
+
+        replace_jlcpcb_database(&staged, &destination, &backup).unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), b"new");
+        assert!(!backup.exists());
+    }
+}
+
+#[cfg(test)]
 mod jlcpcb_cache_tests {
     use super::*;
     use crate::router::ToolRouter;
@@ -934,6 +1299,7 @@ mod jlcpcb_cache_tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -948,13 +1314,14 @@ mod jlcpcb_cache_tests {
         conn.execute(
             "CREATE TABLE components (
                 LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT,
-                Library_Type TEXT, Description TEXT, Price REAL, Stock INTEGER
+                Library_Type TEXT, Description TEXT, Price REAL, Stock INTEGER,
+                Category TEXT
             )",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 "C14663",
                 "RC0402FR-0710KL",
@@ -963,7 +1330,8 @@ mod jlcpcb_cache_tests {
                 "Basic",
                 "10k resistor 0402",
                 0.01,
-                5000
+                5000,
+                "Resistors / Chip Resistor - Surface Mount"
             ],
         )
         .unwrap();

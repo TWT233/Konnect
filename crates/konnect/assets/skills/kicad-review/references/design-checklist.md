@@ -75,6 +75,5 @@
 | Decoupling audit | `audit_decoupling` |
 | Connection audit | `audit_connections` |
 | Power rail audit | `audit_power_rails` |
-| ESD audit | `audit_esd_protection` |
 | DFM audit | `audit_manufacturing` |
 | Full review | `run_design_review` |
