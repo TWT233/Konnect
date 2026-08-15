@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **18 toolsets** organized into 10 categories
-- **192 registered tools** + **6 always-visible meta-tools** = **198 total**
+- **193 registered tools** + **6 always-visible meta-tools** = **199 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -38,7 +38,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Project
 
-### `project` · 6 tools
+### `project` · 7 tools
 **Purpose:** Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
@@ -48,6 +48,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `open_project` | Check whether a KiCAD project is currently open in the running KiCAD UI. Returns the active project path and whether KiCAD IPC is available. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
+| `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
 | `snapshot_project` | Export the schematic and PCB to PDF as a timestamped snapshot/checkpoint. Useful before major edits. |
 | `open_schematic_viewer` | Launch the live schematic viewer (SVG with auto-refresh on file change). Use after placing components so the user can see changes in real time. |
 
