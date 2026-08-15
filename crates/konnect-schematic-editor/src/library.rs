@@ -290,6 +290,162 @@ pub fn ensure_lib_symbol(
     true
 }
 
+/// Library-space (Y-up) anchors of a symbol's Reference and Value text, each
+/// `(x, y, text_rotation)` as written in the library's `(property … (at …))`,
+/// plus the `(justify …)` that says which way the text runs from there.
+///
+/// eeschema places an instance's fields at these anchors pushed through the
+/// instance transform, so reading them is what keeps a placement looking like
+/// one eeschema made. A fixed ±3.81 offset only matches down-pointing symbols
+/// such as `power:GND`; `power:VCC` and every other up-pointing flavor anchor
+/// Value *above* the graphic, and `Device:R` anchors both fields beside the
+/// body at 90° (#101).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FieldAnchors {
+    /// `(x, y, rotation)` of the Reference text, library-local mm/degrees.
+    pub reference_at: Option<(f64, f64, f64)>,
+    /// `(x, y, rotation)` of the Value text, library-local mm/degrees.
+    pub value_at: Option<(f64, f64, f64)>,
+    /// `(justify …)` of the Reference text.
+    pub reference_justify: FieldJustify,
+    /// `(justify …)` of the Value text.
+    pub value_justify: FieldJustify,
+}
+
+/// The `(justify …)` of a field's `(effects …)`: which side of the anchor the
+/// text runs to. Default is KiCad's centred, written as no `(justify …)` at
+/// all.
+///
+/// An anchor without its justification is half the placement. Libraries that
+/// left-justify keep Reference and Value apart at the same `y` —
+/// `Regulator_Linear:AP2112K-3.3` anchors Reference at `(-5.08, 5.715)` and
+/// Value at `(0, 5.715)`, both `justify left`, so centring them prints `U2`
+/// on top of `AP2112K-3.3`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldJustify {
+    /// `left` / `right`; `None` is centred.
+    pub horizontal: Option<HorizontalJustify>,
+    /// `top` / `bottom`; `None` is centred.
+    pub vertical: Option<VerticalJustify>,
+    /// `mirror`: the text reads backwards.
+    pub mirror: bool,
+}
+
+/// Horizontal half of a [`FieldJustify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HorizontalJustify {
+    Left,
+    Right,
+}
+
+/// Vertical half of a [`FieldJustify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalJustify {
+    Top,
+    Bottom,
+}
+
+impl FieldJustify {
+    /// Read the `(justify …)` of a `(property …)` node's `(effects …)`.
+    ///
+    /// Tokens are order-independent and any KiCad does not define is ignored,
+    /// so an unknown one degrades to centred rather than failing a placement.
+    pub fn of_property(property: &SexpNode) -> Self {
+        let mut justify = Self::default();
+        let Some(node) = property.find("effects").and_then(|e| e.find("justify")) else {
+            return justify;
+        };
+        for token in node.scalar_args() {
+            match token {
+                "left" => justify.horizontal = Some(HorizontalJustify::Left),
+                "right" => justify.horizontal = Some(HorizontalJustify::Right),
+                "top" => justify.vertical = Some(VerticalJustify::Top),
+                "bottom" => justify.vertical = Some(VerticalJustify::Bottom),
+                "mirror" => justify.mirror = true,
+                _ => {}
+            }
+        }
+        justify
+    }
+
+    /// The tokens of a `(justify …)`, in the order KiCad writes them. Empty
+    /// when the field is centred, which is spelled by omitting the node.
+    pub fn tokens(&self) -> Vec<&'static str> {
+        let mut tokens = Vec::new();
+        if let Some(h) = self.horizontal {
+            tokens.push(match h {
+                HorizontalJustify::Left => "left",
+                HorizontalJustify::Right => "right",
+            });
+        }
+        if let Some(v) = self.vertical {
+            tokens.push(match v {
+                VerticalJustify::Top => "top",
+                VerticalJustify::Bottom => "bottom",
+            });
+        }
+        if self.mirror {
+            tokens.push("mirror");
+        }
+        tokens
+    }
+}
+
+/// Read the Reference/Value anchors of `lib_id` from the copy embedded in
+/// `schematic`'s `lib_symbols`.
+///
+/// The embedded copy — not the library on disk — is what KiCad draws, so it is
+/// also what a placement should anchor to; it is already flattened by
+/// [`ensure_lib_symbol`], so a derived symbol inherits its parent's anchors.
+/// A `lib_id` the schematic has no definition for yields `None` anchors and
+/// leaves the caller on its fallback.
+pub fn field_anchors(schematic: &Schematic, lib_id: &str) -> FieldAnchors {
+    embedded_lib_symbol(schematic, lib_id)
+        .map(field_anchors_of)
+        .unwrap_or_default()
+}
+
+/// The `lib_symbols` entry `schematic` carries for `lib_id`.
+fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a SexpNode> {
+    schematic
+        .raw_other
+        .iter()
+        .find(|n| n.tag() == Some("lib_symbols"))?
+        .find_all("symbol")
+        .into_iter()
+        .find(|s| s.value() == Some(lib_id))
+}
+
+/// [`FieldAnchors`] of a resolved symbol node.
+///
+/// Only direct `(property …)` children count: a unit sub-symbol carries its
+/// own graphics, not the instance's fields.
+pub fn field_anchors_of(symbol: &SexpNode) -> FieldAnchors {
+    let mut anchors = FieldAnchors::default();
+    for prop in symbol.find_all("property") {
+        let Some(name) = prop.value() else { continue };
+        let Some(at) = prop.find("at") else { continue };
+        let s = at.scalar_args();
+        let num = |i: usize| s.get(i).and_then(|v| v.parse::<f64>().ok());
+        let (Some(x), Some(y)) = (num(0), num(1)) else {
+            continue;
+        };
+        let rot = num(2).unwrap_or(0.0);
+        match name {
+            "Reference" => {
+                anchors.reference_at = Some((x, y, rot));
+                anchors.reference_justify = FieldJustify::of_property(prop);
+            }
+            "Value" => {
+                anchors.value_at = Some((x, y, rot));
+                anchors.value_justify = FieldJustify::of_property(prop);
+            }
+            _ => {}
+        }
+    }
+    anchors
+}
+
 /// Number of units of the symbol `lib_id` resolves to, following the
 /// `(extends "Parent")` chain when the symbol has no unit sub-symbols of its
 /// own (#35). The count is the maximum `N >= 1` over `Name_N_M` sub-symbol
@@ -726,5 +882,120 @@ mod suggestion_tests {
             out.contains("(number \"5\""),
             "pins must come with it — a definition-less instance netlists empty (#34):\n{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod field_anchor_tests {
+    use super::*;
+
+    fn schematic_with(lib_symbols: &str) -> (Schematic, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchors.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"test\")\n\t(lib_symbols\n{}\n\t)\n)\n",
+                lib_symbols
+            ),
+        )
+        .unwrap();
+        // The TempDir rides along: dropping it would delete the file the
+        // Schematic still refers to.
+        (Schematic::load(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn reads_both_anchors_with_their_text_rotation() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:R\" (property \"Reference\" \"R\" (at 2.032 0 90)) (property \"Value\" \"R\" (at 0 0 90)))",
+        );
+        let anchors = field_anchors(&sch, "Device:R");
+        assert_eq!(anchors.reference_at, Some((2.032, 0.0, 90.0)));
+        assert_eq!(anchors.value_at, Some((0.0, 0.0, 90.0)));
+    }
+
+    /// The anchor alone is not enough: `Regulator_Linear:AP2112K-3.3` puts
+    /// Reference and Value on the same `y` and keeps them apart with
+    /// `justify left`.
+    #[test]
+    fn reads_the_justify_that_keeps_fields_on_a_shared_row_apart() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Regulator_Linear:AP2112K-3.3\" (property \"Reference\" \"U\" (at -5.08 5.715 0) (effects (font (size 1.27 1.27)) (justify left))) (property \"Value\" \"AP2112K-3.3\" (at 0 5.715 0) (effects (font (size 1.27 1.27)) (justify left))))",
+        );
+        let anchors = field_anchors(&sch, "Regulator_Linear:AP2112K-3.3");
+        let left = FieldJustify {
+            horizontal: Some(HorizontalJustify::Left),
+            ..Default::default()
+        };
+        assert_eq!(anchors.reference_justify, left);
+        assert_eq!(anchors.value_justify, left);
+        assert_eq!(anchors.reference_justify.tokens(), vec!["left"]);
+    }
+
+    #[test]
+    fn justify_reads_every_token_and_re_emits_them_in_kicads_order() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:R\" (property \"Value\" \"R\" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify mirror bottom right nonsense))))",
+        );
+        let justify = field_anchors(&sch, "Device:R").value_justify;
+        assert_eq!(justify.horizontal, Some(HorizontalJustify::Right));
+        assert_eq!(justify.vertical, Some(VerticalJustify::Bottom));
+        assert!(justify.mirror);
+        assert_eq!(justify.tokens(), vec!["right", "bottom", "mirror"]);
+    }
+
+    /// No `(justify …)` is how KiCad spells centred, and centred must stay
+    /// spelled that way rather than becoming an explicit token.
+    #[test]
+    fn a_field_without_justify_is_centred() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:R\" (property \"Value\" \"R\" (at 0 0 90) (effects (font (size 1.27 1.27)))))",
+        );
+        let justify = field_anchors(&sch, "Device:R").value_justify;
+        assert_eq!(justify, FieldJustify::default());
+        assert!(justify.tokens().is_empty());
+    }
+
+    /// The whole point of #101: one fixed offset cannot serve both, because
+    /// GND anchors Value below the origin and VCC above it.
+    #[test]
+    fn opposite_pointing_power_symbols_anchor_value_opposite_ways() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"power:GND\" (property \"Value\" \"GND\" (at 0 -3.81 0)))\n(symbol \"power:VCC\" (property \"Value\" \"VCC\" (at 0 3.556 0)))",
+        );
+        assert_eq!(
+            field_anchors(&sch, "power:GND").value_at,
+            Some((0.0, -3.81, 0.0))
+        );
+        assert_eq!(
+            field_anchors(&sch, "power:VCC").value_at,
+            Some((0.0, 3.556, 0.0))
+        );
+    }
+
+    #[test]
+    fn a_symbol_the_schematic_does_not_embed_has_no_anchors() {
+        let (sch, _dir) =
+            schematic_with("(symbol \"Device:R\" (property \"Value\" \"R\" (at 0 0 0)))");
+        assert_eq!(field_anchors(&sch, "Device:C"), FieldAnchors::default());
+    }
+
+    /// Unit sub-symbols carry graphics, not instance fields — a property
+    /// nested in one must not be mistaken for the symbol's own anchor.
+    #[test]
+    fn unit_sub_symbol_properties_are_not_anchors() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:R\" (property \"Reference\" \"R\" (at 2.032 0 90)) (symbol \"R_0_1\" (property \"Value\" \"nested\" (at 99 99 0))))",
+        );
+        let anchors = field_anchors(&sch, "Device:R");
+        assert_eq!(anchors.reference_at, Some((2.032, 0.0, 90.0)));
+        assert_eq!(anchors.value_at, None, "nested property must not count");
+    }
+
+    #[test]
+    fn a_property_without_an_at_is_skipped() {
+        let (sch, _dir) = schematic_with("(symbol \"Device:R\" (property \"Value\" \"R\"))");
+        assert_eq!(field_anchors(&sch, "Device:R").value_at, None);
     }
 }
