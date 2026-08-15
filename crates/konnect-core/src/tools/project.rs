@@ -712,6 +712,35 @@ mod tests {
 /// Project files that carry the project name, in the order they are renamed.
 const PROJECT_EXTS: [&str; 4] = ["kicad_pro", "kicad_sch", "kicad_pcb", "kicad_prl"];
 
+/// Every other `.kicad_sch` in the project directory — the child sheets.
+///
+/// A hierarchical design keeps each sheet in its own file, and **every one of
+/// them** stores `(project "NAME"` on its symbol instances: KiCad's own
+/// `complex_hierarchy` demo has 46 of them in `ampli_ht.kicad_sch` alone,
+/// which is not named after the project and so is never renamed. Rewriting
+/// only the root sheet leaves those pointing at the old name, and KiCad reads
+/// their symbols as unannotated — the exact failure this tool exists to
+/// prevent, moved from the root sheet to the children.
+///
+/// Child sheets are rewritten in place; they are not renamed, since their
+/// names are referenced by `(sheet … (property "Sheetfile" …))` entries.
+fn sibling_sheets(
+    dir: &std::path::Path,
+    already: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut sheets: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("kicad_sch"))
+        .filter(|p| !already.contains(p))
+        .collect();
+    // Directory order is filesystem-defined; a stable report beats a shuffled one.
+    sheets.sort();
+    sheets
+}
+
 /// Rewrite the project name only where it is structurally meaningful.
 ///
 /// A blind `text.replace(old, new)` corrupts unrelated content, and the blast
@@ -864,31 +893,63 @@ async fn handle_rename_project(
             }
             done.push((from, to));
         }
-        for (_, to) in &planned_files {
+        // The renamed set plus every child sheet: a hierarchical design keeps
+        // `(project "NAME"` in each sheet file, and the children are never
+        // renamed, so rewriting only the root would de-annotate them.
+        let renamed: Vec<std::path::PathBuf> =
+            planned_files.iter().map(|(_, to)| to.clone()).collect();
+        let mut to_rewrite = renamed.clone();
+        to_rewrite.extend(sibling_sheets(&dir, &renamed));
+
+        for target in &to_rewrite {
             let sexp = matches!(
-                to.extension().and_then(|s| s.to_str()),
+                target.extension().and_then(|s| s.to_str()),
                 Some("kicad_sch" | "kicad_pcb")
             );
-            let text = std::fs::read_to_string(to)?;
+            let text = std::fs::read_to_string(target)?;
             let (updated, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
             if hits > 0 {
-                konnect_sexp::writer::write_atomic(to, &updated)?;
+                konnect_sexp::writer::write_atomic(target, &updated)?;
                 rewritten.push(json!({
-                    "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                    "file": target.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
                     "references_updated": hits,
                 }));
             }
         }
     } else {
-        for (from, to) in &planned_files {
+        let sources: Vec<std::path::PathBuf> =
+            planned_files.iter().map(|(from, _)| from.clone()).collect();
+        let mut previewed: Vec<(std::path::PathBuf, String)> = planned_files
+            .iter()
+            .map(|(from, to)| {
+                (
+                    from.clone(),
+                    to.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        // Child sheets keep their names, so the reported name is their own.
+        for sheet in sibling_sheets(&dir, &sources) {
+            let name = sheet
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            previewed.push((sheet, name));
+        }
+
+        for (source, reported_name) in &previewed {
             let sexp = matches!(
-                from.extension().and_then(|s| s.to_str()),
+                source.extension().and_then(|s| s.to_str()),
                 Some("kicad_sch" | "kicad_pcb")
             );
-            let text = std::fs::read_to_string(from).unwrap_or_default();
+            let text = std::fs::read_to_string(source).unwrap_or_default();
             let (_, hits) = rewrite_project_references(&text, &old_name, &new_name, sexp);
             rewritten.push(json!({
-                "file": to.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                "file": reported_name,
                 "references_updated": hits,
             }));
         }
@@ -1019,5 +1080,139 @@ mod rename_rewrite_tests {
         let (out, hits) = rewrite_project_references(sch, "same", "same", true);
         assert_eq!(hits, 0);
         assert_eq!(out, sch);
+    }
+}
+
+/// A hierarchical project keeps each sheet in its own file, and every one of
+/// them stores `(project "NAME"` on its symbol instances. Only the root sheet
+/// is named after the project, so a rename that rewrites just the renamed set
+/// leaves every child sheet pointing at the old name — KiCad then reads those
+/// symbols as unannotated, which is the failure this tool exists to prevent.
+#[cfg(test)]
+mod rename_hierarchy_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Root sheet + one child, shaped like KiCad's `complex_hierarchy` demo:
+    /// the child is not named after the project and carries its own
+    /// `(project …)` instances.
+    fn hierarchy(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let pro = dir.join(format!("{name}.kicad_pro"));
+        std::fs::write(
+            &pro,
+            format!("{{\n  \"meta\": {{\n    \"filename\": \"{name}.kicad_pro\"\n  }},\n  \"sheets\": []\n}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.kicad_sch")),
+            format!("(kicad_sch\n\t(uuid \"root\")\n\t(sheet\n\t\t(property \"Sheetfile\" \"ampli.kicad_sch\")\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root\" (reference \"R1\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n)\n"),
+        )
+        .unwrap();
+        // The child sheet: never renamed, and full of project references.
+        std::fs::write(
+            dir.join("ampli.kicad_sch"),
+            format!("(kicad_sch\n\t(uuid \"child\")\n\t(symbol\n\t\t(lib_id \"Device:C\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root/child\" (reference \"C1\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(instances\n\t\t\t(project \"{name}\"\n\t\t\t\t(path \"/root/child\" (reference \"R9\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n)\n"),
+        )
+        .unwrap();
+        pro
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_rewrites_child_sheets_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = hierarchy(dir.path(), "oldproj");
+
+        let result = handle_rename_project(
+            &json!({ "project": pro.to_str().unwrap(), "new_name": "newproj" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        // The child keeps its filename and gains the new project name.
+        let child = std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap();
+        assert_eq!(
+            child.matches("(project \"newproj\"").count(),
+            2,
+            "every child instance must follow the rename:\n{child}"
+        );
+        assert!(
+            !child.contains("oldproj"),
+            "no stale project reference may survive:\n{child}"
+        );
+        let root = std::fs::read_to_string(dir.path().join("newproj.kicad_sch")).unwrap();
+        assert!(root.contains("(project \"newproj\""), "{root}");
+        // The child sheet is referenced by name, so it must NOT be renamed.
+        assert!(dir.path().join("ampli.kicad_sch").exists());
+        assert!(root.contains("\"ampli.kicad_sch\""), "{root}");
+
+        let reported: Vec<String> = body(&result)["content_rewrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["file"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            reported.iter().any(|f| f == "ampli.kicad_sch"),
+            "the child sheet must be reported: {reported:?}"
+        );
+    }
+
+    /// dry_run must preview the child sheets too, and write nothing.
+    #[tokio::test]
+    async fn dry_run_previews_child_sheets_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pro = hierarchy(dir.path(), "oldproj");
+        let before = std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap();
+
+        let result = handle_rename_project(
+            &json!({ "project": pro.to_str().unwrap(), "new_name": "newproj",
+                     "dry_run": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let entry = body(&result)["content_rewrites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["file"] == "ampli.kicad_sch")
+            .cloned()
+            .unwrap_or_else(|| panic!("child sheet missing from the preview: {:?}", body(&result)));
+        assert_eq!(entry["references_updated"], json!(2), "{entry}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ampli.kicad_sch")).unwrap(),
+            before,
+            "dry_run must not write"
+        );
+        assert!(pro.exists(), "dry_run must not rename");
     }
 }
