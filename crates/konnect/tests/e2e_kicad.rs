@@ -251,6 +251,27 @@ fn full_design_loop_with_real_kicad() {
         "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
     );
 
+    // The review's runtime coverage uses Konnect's parser so the tool remains
+    // usable without kicad-cli. Cross-check that count here against KiCad's
+    // own netlist so parser drift cannot turn incomplete extraction into a
+    // clean verdict (#184).
+    let netlist_tree = konnect_sexp::parse_sexp(&netlist).expect("KiCad netlist must parse");
+    let kicad_component_count = netlist_tree
+        .find("components")
+        .map(|components| components.find_all("comp").len())
+        .unwrap_or(0);
+    p.load("design_review");
+    let review = body(&p.tool(
+        "run_design_review",
+        json!({"schematic": sch.to_string_lossy()}),
+    ));
+    assert_eq!(review["design_review"]["status"], "complete", "{review}");
+    assert_eq!(
+        review["design_review"]["coverage"]["schematic"]["symbol_instances"],
+        json!(kicad_component_count),
+        "Konnect and KiCad disagree on schematic component coverage: {review}"
+    );
+
     // ── PCB: export Gerbers + DRC through real kicad-cli ─────────────────
     p.load("pcb_export");
     let out_dir = proj.join("gerbers");

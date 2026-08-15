@@ -173,6 +173,9 @@ pub struct ServerConfig {
     /// Auto-load a tool's toolset on call instead of returning
     /// `toolset_not_loaded`. Off by default (see `konnect::Config::auto_load_toolsets`).
     pub auto_load_toolsets: bool,
+    /// Pre-load every toolset at startup so the first `tools/list` is
+    /// complete. Off by default (see `konnect::Config::eager_toolsets`).
+    pub eager_toolsets: bool,
 }
 
 /// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at
@@ -517,6 +520,11 @@ pub(crate) fn add_pin_midwire_junctions(
 /// Hidden properties get KiCAD 10's property-level `(hide yes)` — a sibling
 /// before `(effects)`, exactly as eeschema writes instances (PR #96); the
 /// legacy hide-inside-effects form renders the same but round-trips dirty.
+///
+/// `justify` comes from the library field and is written through unchanged,
+/// like the angle in [`field_at`]: it is expressed in the text's own frame, so
+/// it stays true however the instance is rotated. Centred fields write no
+/// `(justify …)`, which is how KiCad spells centred.
 pub(crate) fn positioned_property(
     name: &str,
     value: &str,
@@ -524,6 +532,7 @@ pub(crate) fn positioned_property(
     y: f64,
     rotation: f64,
     hide: bool,
+    justify: konnect_schematic_editor::library::FieldJustify,
 ) -> konnect_schematic_editor::Property {
     use konnect_schematic_editor::sexp::{atom, SexpNode};
     use konnect_schematic_editor::types::fmt_f64;
@@ -539,15 +548,61 @@ pub(crate) fn positioned_property(
         prop.sub_nodes
             .push(SexpNode::List(vec![atom("hide"), atom("yes")]));
     }
-    prop.sub_nodes.push(SexpNode::List(vec![
+    let mut effects = vec![
         atom("effects"),
         SexpNode::List(vec![
             atom("font"),
             SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
         ]),
-    ]));
+    ];
+    let tokens = justify.tokens();
+    if !tokens.is_empty() {
+        let mut node = vec![atom("justify")];
+        node.extend(tokens.into_iter().map(atom));
+        effects.push(SexpNode::List(node));
+    }
+    prop.sub_nodes.push(SexpNode::List(effects));
     prop
 }
+
+/// Sheet-space `(x, y, rotation)` for one instance field, from its library
+/// anchor (#101).
+///
+/// The two halves are stored differently, which is easy to get backwards:
+///
+/// - **Position is absolute.** The anchor is library space (Y-up), the file
+///   wants sheet space (Y-down), so it goes through the same
+///   flip-rotate-mirror-translate as a pin —
+///   [`transform_pin`](konnect_sexp::geometry::transform_pin) is that math.
+///   This is what carries a label around with a rotated body instead of
+///   leaving it beside the wrong edge.
+/// - **Angle is relative.** KiCad adds the symbol's own rotation to a field's
+///   stored angle when it draws, so the library value is written through
+///   unchanged. Rotating it here too would double-count: verified by
+///   rendering a 90°-rotated `Device:R` with `kicad-cli sch export svg` —
+///   stored 0° draws the reference *vertically* over the horizontal body,
+///   stored 90° (the library's own value) draws it horizontally above it.
+///
+/// `fallback` is a library-space anchor too, used when the library defines
+/// none, so both halves behave identically either way.
+///
+/// The angle folds into 0°..180°: a field is horizontal or vertical, never
+/// upside down.
+pub(crate) fn field_at(
+    anchor: Option<(f64, f64, f64)>,
+    fallback: (f64, f64, f64),
+    t: konnect_sexp::geometry::PinTransform,
+) -> (f64, f64, f64) {
+    let (ax, ay, arot) = anchor.unwrap_or(fallback);
+    let (x, y) = konnect_sexp::geometry::transform_pin(ax, ay, t);
+    (x, y, arot.rem_euclid(180.0))
+}
+
+/// Library-space fallback anchors matching the pre-#101 hardcoded placement:
+/// Reference 3.81mm above the origin, Value 3.81mm below. Y is negated on the
+/// way to sheet coords, hence the sign flip against the old literals.
+pub(crate) const FALLBACK_REFERENCE_AT: (f64, f64, f64) = (0.0, 3.81, 0.0);
+pub(crate) const FALLBACK_VALUE_AT: (f64, f64, f64) = (0.0, -3.81, 0.0);
 
 // ─── Schematic text helpers ──────────────────────────────────────────────────
 

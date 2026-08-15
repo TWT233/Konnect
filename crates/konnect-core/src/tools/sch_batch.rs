@@ -1293,6 +1293,7 @@ mod batch_delete_tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1378,6 +1379,7 @@ mod batch_place_and_connect_tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1562,6 +1564,7 @@ mod midwire_pin_tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1628,6 +1631,7 @@ mod connect_to_net_orientation_tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2037,6 +2041,7 @@ mod add_text_placement_tests {
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
+            eager_toolsets: false,
         };
         let router = Arc::new(crate::router::ToolRouter::new());
         let ctx = Arc::new(ToolContext::new(cfg, router));

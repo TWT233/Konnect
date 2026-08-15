@@ -59,6 +59,24 @@ impl ToolRouter {
         }
     }
 
+    /// Load **every** toolset, so the very first `tools/list` is complete.
+    ///
+    /// This exists for MCP clients that cache the initial tool list and never
+    /// re-fetch it on `notifications/tools/list_changed`. For those, a tool
+    /// that is not in the first listing can never be called: `load_toolset`
+    /// reports the names it loaded but returns no schemas, so the client has
+    /// nothing to invoke and `auto_load_toolsets` never gets a chance to fire
+    /// — it only helps a caller that already knows the tool name (#134, #169).
+    ///
+    /// The cost is the whole point of the router: a complete listing is ~25K
+    /// tokens per `tools/list` instead of ~2K. Off by default; opt in only if
+    /// your client needs it.
+    pub async fn load_all(&self) {
+        for ts in self.registry {
+            let _ = self.load(ts.name).await;
+        }
+    }
+
     /// Find which toolset a tool name belongs to, whether or not that toolset
     /// is currently loaded. Used to give the LLM an actionable error when it
     /// calls a tool whose toolset hasn't been loaded yet.
@@ -141,6 +159,30 @@ mod tests {
         assert!(!active.contains("pcb_board"));
         assert!(!active.contains("integration"));
         assert!(!active.contains("templates"));
+    }
+
+    /// The eager path exists so a client that never re-fetches `tools/list`
+    /// still sees every tool. That only holds if `load_all` really loads all
+    /// of them — a partial listing would leave exactly the silent
+    /// uncallable-tool failure it is meant to cure (#134, #169).
+    #[tokio::test]
+    async fn load_all_activates_every_registered_toolset() {
+        let router = ToolRouter::new();
+        router.load_all().await;
+        let active: std::collections::HashSet<String> =
+            router.active_names().await.into_iter().collect();
+        for ts in registry::ALL_TOOLSETS {
+            assert!(active.contains(ts.name), "load_all missed '{}'", ts.name);
+        }
+        assert_eq!(active.len(), registry::ALL_TOOLSETS.len());
+
+        // And the listing it produces is the full catalogue.
+        let listed = router.active_tools().await.len();
+        let registered: usize = registry::ALL_TOOLSETS.iter().map(|t| t.tool_count).sum();
+        assert_eq!(
+            listed, registered,
+            "an eager tools/list must carry every registered tool"
+        );
     }
 
     #[tokio::test]

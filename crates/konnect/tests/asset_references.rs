@@ -130,3 +130,173 @@ fn display(path: &Path) -> String {
         .to_string()
         .replace('\\', "/")
 }
+
+/// A backticked `snake_case` word that reads like a tool name must be one.
+///
+/// The existing checks only look at `load_toolset(...)` call sites, so a tool
+/// named in ordinary prose escapes them entirely. That is how
+/// `update_pcb_from_schematic` shipped in the PCB skill's numbered layout
+/// order for months — a tool that has never existed in any toolset, instructed
+/// as step 2 of the standard workflow (#187). An agent following it calls a
+/// name the server does not know, at the exact handoff where the netlist
+/// should arrive.
+///
+/// Deliberately narrow: only backticked words, only snake_case with a verb-ish
+/// shape, and an explicit allowlist for the non-tool identifiers the prose
+/// legitimately uses. A broad heuristic here would fail on every future doc
+/// edit and get deleted; this one should only fire on a real phantom.
+#[test]
+fn backticked_tool_names_in_prose_exist_in_the_registry() {
+    let known: BTreeSet<String> = registry::ALL_TOOLSETS
+        .iter()
+        .flat_map(|ts| registry::tools_for(ts.name).unwrap_or_default())
+        .map(|d| d.name.to_string())
+        .chain(
+            ToolRouter::new()
+                .all_toolsets()
+                .iter()
+                .map(|t| t.name.to_string()),
+        )
+        .collect();
+
+    // Identifiers the prose uses that are not tools: meta-tools, config keys,
+    // KiCad's own vocabulary, and file/format names.
+    const NOT_TOOLS: &[&str] = &[
+        "load_toolset",
+        "unload_toolset",
+        "list_toolboxes",
+        "get_active_toolsets",
+        "get_recent_calls",
+        "server_stats",
+        "auto_load_toolsets",
+        "eager_toolsets",
+        "kicad_cli",
+        "kicad_binary",
+        "ipc_address",
+        "project_dir",
+        "lib_id",
+        "lib_name",
+        "sym_lib_table",
+        "fp_lib_table",
+        "kicad_sch",
+        "kicad_pcb",
+        "kicad_pro",
+        "kicad_sym",
+        "no_connect",
+        "power_in",
+        "power_out",
+        "open_collector",
+        "open_emitter",
+        "tri_state",
+        "exclude_dnp",
+        "allow_pin_moves",
+        "dry_run",
+        "net_name",
+        "pin_number",
+        "new_reference",
+        // Tool *parameters* and values named in prose and examples.
+        "from_pad",
+        "from_reference",
+        "to_pad",
+        "to_reference",
+        "net_positive",
+        "net_negative",
+        "outline_points",
+        "output_dir",
+        "output_path",
+        "package_name",
+        "part_name",
+        "power_net",
+        "trace_width",
+        "track_width",
+        "via_diameter",
+        "via_drill",
+        "fab_options",
+        "lcsc_no",
+        "usb_c_5v_sink",
+        // File extensions and other tooling vocabulary.
+        "kicad_mod",
+        "create_file",
+        "str_replace",
+        "net_label",
+        "global_label",
+        "hierarchical_label",
+        "thru_hole",
+        "np_thru_hole",
+        "pin_x",
+        "pin_y",
+        "orientation_degrees",
+        "tool_name",
+    ];
+
+    let mut phantom = Vec::new();
+    for path in asset_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            for word in snake_words(line) {
+                if known.contains(&word) || NOT_TOOLS.contains(&word.as_str()) {
+                    continue;
+                }
+                phantom.push(format!(
+                    "{}:{}: `{word}` reads like a tool but is in no toolset",
+                    display(&path),
+                    lineno + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        phantom.is_empty(),
+        "shipped docs instruct tools that do not exist:\n  {}\n\n\
+         Either the tool was renamed or removed, or the doc invented it. If the \
+         word is not a tool, add it to NOT_TOOLS.",
+        phantom.join("\n  ")
+    );
+}
+
+/// `snake_case` words that look like a tool name — at least two
+/// underscore-separated lowercase parts, so `F.Cu` and `findings` are ignored.
+///
+/// Both backticked and bare occurrences, because the two phantoms this exists
+/// to catch took different forms: `audit_esd_protection` was backticked in a
+/// reference table, and `update_pcb_from_schematic` was bare, in parentheses,
+/// in a numbered workflow step (#187). Checking only one form would have
+/// missed one of them.
+fn snake_words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    // Whether the run we are accumulating began at a real token boundary.
+    // Without this, `Conn_01x02` contributes `onn_01x02` and `SOIC-8_3.9x4.9`
+    // contributes `8_3` — fragments of a longer identifier, not tool names.
+    let mut at_boundary = true;
+    let mut started_clean = true;
+
+    let flush = |word: &mut String, clean: bool, out: &mut Vec<String>| {
+        let ok = clean
+            && word.starts_with(|c: char| c.is_ascii_lowercase())
+            && word.split('_').filter(|p| !p.is_empty()).count() >= 2
+            && !word.split('_').any(str::is_empty);
+        if ok {
+            out.push(word.clone());
+        }
+        word.clear();
+    };
+
+    for ch in line.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
+            if word.is_empty() {
+                started_clean = at_boundary;
+            }
+            word.push(ch);
+        } else {
+            flush(&mut word, started_clean, &mut out);
+        }
+        // A letter, digit or underscore means the next run is a continuation.
+        at_boundary = !(ch.is_ascii_alphanumeric() || ch == '_');
+    }
+    flush(&mut word, started_clean, &mut out);
+    out
+}

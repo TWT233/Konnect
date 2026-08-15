@@ -705,7 +705,10 @@ async fn handle_edit_footprint_pad(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "footprint_path")?;
-    let pad_number = require_str(args, "pad_number").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let pad_number = match require_str(args, "pad_number") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&path).await?;
 
@@ -845,13 +848,29 @@ fn global_sym_lib_table() -> PathBuf {
 ///
 /// The project file is found by scanning for the extension rather than by name:
 /// a sheet's filename says nothing about what the project is called.
+///
+/// A library table sitting beside `file` ends the search before it starts. The
+/// ancestor walk is unbounded, so without that it can leave the file's own
+/// directory and latch onto an unrelated `.kicad_pro` further up — a project
+/// nested inside another project's folder, or a stray file in a shared parent —
+/// and then resolve every library against the wrong `KIPRJMOD`. A directory
+/// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
+/// libraries come from, and that is the more specific answer.
 fn project_root_for(file: &Path) -> Option<PathBuf> {
     let start = file.parent()?;
+    if holds_lib_table(start) {
+        return Some(start.to_path_buf());
+    }
     start
         .ancestors()
         .find(|dir| holds_kicad_pro(dir))
         .map(Path::to_path_buf)
         .or_else(|| Some(start.to_path_buf()))
+}
+
+/// Whether `dir` carries a library table of its own.
+fn holds_lib_table(dir: &Path) -> bool {
+    dir.join("sym-lib-table").is_file() || dir.join("fp-lib-table").is_file()
 }
 
 /// Whether `dir` contains a `.kicad_pro`. An unreadable directory holds none.
@@ -1320,7 +1339,10 @@ async fn handle_register_footprint_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let (table_path, uri) = match lib_table_target(
@@ -1477,7 +1499,10 @@ async fn handle_register_symbol_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let (table_path, uri) = match lib_table_target(
@@ -2716,7 +2741,10 @@ async fn handle_delete_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let symbol_name = require_str(args, "symbol_name").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
@@ -2972,8 +3000,10 @@ async fn handle_list_library_footprints(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let library_path_str =
-        require_str(args, "library_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let library_path_str = match require_str(args, "library_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let lib_dir = PathBuf::from(library_path_str);
 
     if !lib_dir.is_dir() {
@@ -3008,8 +3038,10 @@ async fn handle_get_footprint_info(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fp_path_str =
-        require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let fp_path_str = match require_str(args, "footprint_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     // Resolve "Library:Footprint" against the project's fp-lib-table as well
     // as the global one, when the caller says which project they mean.
@@ -3110,7 +3142,10 @@ async fn handle_get_symbol_info(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let lib_id = require_str(args, "lib_id").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let lib_id = match require_str(args, "lib_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -3218,6 +3253,7 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -5156,6 +5192,49 @@ mod symbol_source_tests {
         );
     }
 
+    /// The walk is unbounded, so an unrelated `.kicad_pro` in any ancestor used
+    /// to capture the search and send every lookup to the wrong `KIPRJMOD`. A
+    /// project nested inside another project's folder is the realistic case;
+    /// the one that actually bit was a stray `.kicad_pro` in the system temp
+    /// directory, which quietly defeated the hermetic fixtures of two tests —
+    /// they passed on CI, where temp is clean, and failed on any machine that
+    /// had accumulated one.
+    ///
+    /// A table beside the file is the more specific statement and must win.
+    #[test]
+    fn a_table_beside_the_file_beats_an_unrelated_project_further_up() {
+        let outer = tempfile::tempdir().unwrap();
+        // An unrelated project sitting above — the interloper.
+        std::fs::write(outer.path().join("Unrelated.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            outer.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/wrong.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let inner = outer.path().join("nested");
+        std::fs::create_dir(&inner).unwrap();
+        let want = inner.join("right.kicad_sym");
+        std::fs::write(&want, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            inner.join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/right.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let sch = inner.join("nested.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Shared");
+        assert!(
+            candidates.contains(&want),
+            "the table beside the schematic must win, got {candidates:?}"
+        );
+        assert!(
+            !candidates.contains(&outer.path().join("wrong.kicad_sym")),
+            "the outer project's table must not be consulted, got {candidates:?}"
+        );
+    }
+
     /// `Path::new("board.kicad_sch").parent()` is `Some("")`, not `None`. The
     /// walk must leave that as-is so a bare relative path keeps resolving
     /// against the working directory.
@@ -5301,5 +5380,93 @@ mod symbol_source_tests {
             !uri.contains("KIPRJMOD"),
             "nothing portable to say about an out-of-project library: {uri}"
         );
+    }
+}
+
+/// A missing argument must stay a structured `invalid_argument` naming the
+/// field, rather than collapsing into a generic `handler_error`.
+///
+/// Seven handlers here did `map_err(|e| anyhow!("{:?}", e))?` on the
+/// `CallToolResult` that `require_str` returns, debug-formatting a typed error
+/// into a string and losing the taxonomy on the way out. `pcb_components`
+/// already returned the result directly. This is what lets a caller tell "you
+/// forgot an argument" from "the tool tried and failed".
+#[cfg(test)]
+mod argument_error_kind_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn missing_required_arguments_report_invalid_argument_with_the_field() {
+        // (tool, args that satisfy everything *except* the field under test,
+        //  the field it should name)
+        //
+        // The args matter: several of these read a path through `get_path`
+        // first, which still returns an `anyhow::Error` and would fail the
+        // call before the `require_str` this test is about is ever reached.
+        let cases = [
+            ("get_symbol_info", json!({}), "lib_id"),
+            ("get_footprint_info", json!({}), "footprint_path"),
+            (
+                "register_footprint_library",
+                json!({ "library_path": "/tmp/x.pretty", "scope": "global" }),
+                "nickname",
+            ),
+            (
+                "register_symbol_library",
+                json!({ "library_path": "/tmp/x.kicad_sym", "scope": "global" }),
+                "nickname",
+            ),
+        ];
+
+        for (tool_name, args, field) in cases {
+            let def = tools()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is registered"));
+
+            // The old pattern turned this into an Err, so the unwrap itself is
+            // part of the assertion.
+            let result = (def.handler)(&args, ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{tool_name} must not bubble an anyhow error: {e}"));
+
+            assert!(result.is_error, "{tool_name}: missing argument must fail");
+
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool_name}: expected text, got {other:?}"),
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool_name}: {e}: {text}"));
+
+            assert_eq!(
+                parsed["error"]["kind"], "invalid_argument",
+                "{tool_name} must report a typed argument error, not a \
+                 debug-formatted handler_error: {text}"
+            );
+            assert_eq!(
+                parsed["error"]["field"], field,
+                "{tool_name} must name the missing field: {text}"
+            );
+        }
     }
 }

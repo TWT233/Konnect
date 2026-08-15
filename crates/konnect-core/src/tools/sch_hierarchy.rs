@@ -806,7 +806,7 @@ async fn handle_get_sheet_hierarchy(
     Ok(CallToolResult::json(&tree))
 }
 
-fn build_hierarchy_node(
+pub(crate) fn build_hierarchy_node(
     path: &Path,
     project_name: &str,
     depth: usize,
@@ -1368,6 +1368,7 @@ mod tests {
             project_dir: None,
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
+            eager_toolsets: false,
         };
         ToolContext::new(config, Arc::new(crate::router::ToolRouter::new()))
     }
