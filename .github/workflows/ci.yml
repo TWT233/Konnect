@@ -38,6 +38,22 @@ jobs:
       - name: Doctests
         run: cargo test --workspace --locked --doc
 
+  # The KiCAD action plugin is Python, so cargo never sees it. Its only real
+  # logic is the server-PID bookkeeping (#103), where an unconditional
+  # os.remove let one KiCAD session delete another's record and leak an
+  # unreapable server. The tests stub pcbnew/wx, so no KiCAD is needed.
+  plugin:
+    name: Plugin (Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test
+        run: python -m unittest discover -s plugin/tests -v
+
   # schematic-viewer is intentionally outside the workspace (Tauri app), so
   # --workspace never touches it. Without this job a viewer break ships
   # silently: release builds it with continue-on-error and the PCM scripts
