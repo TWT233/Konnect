@@ -3,6 +3,8 @@
 pub mod cli;
 pub mod config;
 pub mod design_review;
+#[allow(dead_code)]
+mod footprint_graphics;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
