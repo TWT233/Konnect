@@ -301,11 +301,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_footprint_info",
-            "Return detailed information about a footprint: pad layout, courtyard, description.",
+            "Return detailed information about a footprint: pad layout, courtyard, description, \
+             and optionally its supported graphical primitives.",
             json!({
                 "type": "object",
                 "properties": {
-                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" }
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
+                    "project": { "type": "string", "description": "Path to a .kicad_pro used to resolve project libraries (optional)" },
+                    "include_graphics": { "type": "boolean", "description": "Include supported top-level footprint graphics in the response", "default": false },
+                    "graphics_layer": { "type": "string", "description": "Return graphics only from this canonical KiCad layer; implies include_graphics" }
                 },
                 "required": ["footprint_path"]
             }),
@@ -3074,17 +3078,41 @@ async fn handle_get_footprint_info(
     let has_courtyard = content.contains("B.CrtYd") || content.contains("F.CrtYd");
     let has_3d = content.contains("(model ");
 
-    Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "name": fp_name,
-            "description": description,
-            "pad_count": pad_count,
-            "has_courtyard": has_courtyard,
-            "has_3d_model": has_3d,
-            "path": path.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    let mut response = json!({
+        "name": fp_name,
+        "description": description,
+        "pad_count": pad_count,
+        "has_courtyard": has_courtyard,
+        "has_3d_model": has_3d,
+        "path": path.to_str().unwrap_or("")
+    });
+    let graphics_layer = args["graphics_layer"].as_str();
+    let include_graphics =
+        args["include_graphics"].as_bool().unwrap_or(false) || graphics_layer.is_some();
+    if include_graphics {
+        let graphics = match super::footprint_graphics::inspect_graphics(&content, graphics_layer) {
+            Ok(graphics) => graphics,
+            Err(super::footprint_graphics::FootprintGraphicsError::InvalidArgument {
+                field,
+                reason,
+            }) => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: field.clone(),
+                        reason: reason.clone(),
+                    },
+                    format!("Argument '{field}' is invalid: {reason}"),
+                ));
+            }
+            Err(super::footprint_graphics::FootprintGraphicsError::Conflict(reason)) => {
+                return Ok(CallToolResult::error(reason));
+            }
+        };
+        response["graphic_count"] = json!(graphics.len());
+        response["graphics"] = serde_json::to_value(graphics)?;
+    }
+
+    Ok(CallToolResult::json(&response))
 }
 
 // ─── search_footprints (moved from verification toolset) ─────────────────────
@@ -4124,6 +4152,93 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated footprint doesn't parse"
         );
+    }
+
+    #[tokio::test]
+    async fn get_footprint_info_includes_graphics_only_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("inspect.kicad_mod");
+        std::fs::write(
+            &path,
+            r#"(footprint "Inspect" (version 20240108) (generator "pcbnew")
+  (layer "F.Cu")
+  (descr "Inspection fixture")
+  (fp_line (start 0 0) (end 1 0)
+    (stroke (width 0.1) (type solid)) (layer "F.SilkS"))
+  (fp_poly
+    (pts (xy 0 0) (xy 2 0) (xy 2 1))
+    (stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd"))
+  (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask"))
+)
+"#,
+        )
+        .unwrap();
+
+        let default = handle_get_footprint_info(
+            &json!({"footprint_path": path.to_string_lossy()}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &default.content[0] else {
+            panic!("expected text");
+        };
+        let default: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(default["name"], "Inspect");
+        assert_eq!(default["pad_count"], 1);
+        assert!(
+            default.get("graphics").is_none(),
+            "default response must stay compact: {default}"
+        );
+        assert!(default.get("graphic_count").is_none());
+
+        let detailed = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "include_graphics": true,
+                "graphics_layer": "B.CrtYd"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &detailed.content[0] else {
+            panic!("expected text");
+        };
+        let detailed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(detailed["graphic_count"], 1);
+        assert_eq!(detailed["graphics"][0]["type"], "poly");
+        assert_eq!(detailed["graphics"][0]["layer"], "B.CrtYd");
+        assert_eq!(detailed["graphics"][0]["point_count"], 3);
+        assert_eq!(detailed["graphics"][0]["closed"], true);
+        assert_eq!(detailed["graphics"][0]["stroke_width_mm"], 0.05);
+        assert_eq!(detailed["graphics"][0]["fill"], "none");
+
+        let invalid = handle_get_footprint_info(
+            &json!({
+                "footprint_path": path.to_string_lossy(),
+                "graphics_layer": "BottomCourtyard"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(invalid.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &invalid.content[0] else {
+            panic!("expected text");
+        };
+        let invalid: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(invalid["error"]["kind"], "invalid_argument");
+        assert_eq!(invalid["error"]["field"], "graphics_layer");
+
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "get_footprint_info")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["include_graphics"]["type"], "boolean");
+        assert_eq!(schema["properties"]["graphics_layer"]["type"], "string");
     }
 
     #[tokio::test]

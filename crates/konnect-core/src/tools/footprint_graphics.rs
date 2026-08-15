@@ -7,7 +7,7 @@ use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_with_leading_whitespace, find_direct_child_blocks,
     read_consistent, write_atomic_if_unchanged, SexpEdit,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 fn point_schema() -> serde_json::Value {
@@ -299,13 +299,185 @@ fn persist_replacement(
     write_atomic_if_unchanged(path, expected, replacement)
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+fn parse_point(node: &konnect_sexp::SexpNode, tag: &str) -> Result<Point, FootprintGraphicsError> {
+    let point = node
+        .find(tag)
+        .ok_or_else(|| invalid("footprint_path", format!("{tag} is missing")))?;
+    let x = point
+        .get_f64(1)
+        .ok_or_else(|| invalid("footprint_path", format!("{tag}.x is invalid")))?;
+    let y = point
+        .get_f64(2)
+        .ok_or_else(|| invalid("footprint_path", format!("{tag}.y is invalid")))?;
+    let point = Point { x, y };
+    point
+        .validate(tag)
+        .map_err(|reason| invalid("footprint_path", reason))?;
+    Ok(point)
+}
+
+fn parse_stroke_width(node: &konnect_sexp::SexpNode) -> Result<f64, FootprintGraphicsError> {
+    let width = node
+        .find("stroke")
+        .and_then(|stroke| stroke.find_f64("width"))
+        .ok_or_else(|| {
+            invalid(
+                "footprint_path",
+                "graphic stroke width is missing or invalid",
+            )
+        })?;
+    if !width.is_finite() || width < 0.0 {
+        return Err(invalid(
+            "footprint_path",
+            "graphic stroke width must be finite and non-negative",
+        ));
+    }
+    Ok(width)
+}
+
+fn parse_fill(node: &konnect_sexp::SexpNode) -> Result<Fill, FootprintGraphicsError> {
+    match node.find("fill").and_then(|fill| fill.get(1)) {
+        Some(fill) if matches!(fill.as_str(), Some("none" | "no")) => Ok(Fill::None),
+        Some(fill) if matches!(fill.as_str(), Some("solid" | "yes")) => Ok(Fill::Solid),
+        _ => Err(invalid(
+            "footprint_path",
+            "graphic fill is missing or unsupported",
+        )),
+    }
+}
+
+fn graphic_info_base(
+    graphic_type: &str,
+    node: &konnect_sexp::SexpNode,
+) -> Result<FootprintGraphicInfo, FootprintGraphicsError> {
+    let layer = node
+        .find_str("layer")
+        .ok_or_else(|| invalid("footprint_path", "graphic layer is missing"))?
+        .to_string();
+    let item_id = node
+        .find_str("uuid")
+        .or_else(|| node.find_str("tstamp"))
+        .map(str::to_string);
+    Ok(FootprintGraphicInfo {
+        graphic_type: graphic_type.to_string(),
+        layer,
+        start: None,
+        mid: None,
+        end: None,
+        center: None,
+        radius_mm: None,
+        points: None,
+        point_count: None,
+        closed: None,
+        stroke_width_mm: parse_stroke_width(node)?,
+        fill: None,
+        item_id,
+    })
+}
+
+fn inspect_graphic(
+    node: &konnect_sexp::SexpNode,
+) -> Result<FootprintGraphicInfo, FootprintGraphicsError> {
+    let tag = node
+        .head()
+        .ok_or_else(|| invalid("footprint_path", "graphic type is missing"))?;
+    let graphic_type = tag
+        .strip_prefix("fp_")
+        .ok_or_else(|| invalid("footprint_path", "unsupported graphic type"))?;
+    let mut info = graphic_info_base(graphic_type, node)?;
+    match tag {
+        "fp_line" => {
+            info.start = Some(parse_point(node, "start")?);
+            info.end = Some(parse_point(node, "end")?);
+        }
+        "fp_arc" => {
+            info.start = Some(parse_point(node, "start")?);
+            info.mid = Some(parse_point(node, "mid")?);
+            info.end = Some(parse_point(node, "end")?);
+        }
+        "fp_rect" => {
+            info.start = Some(parse_point(node, "start")?);
+            info.end = Some(parse_point(node, "end")?);
+            info.fill = Some(parse_fill(node)?);
+        }
+        "fp_circle" => {
+            let center = parse_point(node, "center")?;
+            let end = parse_point(node, "end")?;
+            info.center = Some(center);
+            info.radius_mm = Some((end.x - center.x).hypot(end.y - center.y));
+            info.fill = Some(parse_fill(node)?);
+        }
+        "fp_poly" => {
+            let points = node
+                .find("pts")
+                .ok_or_else(|| invalid("footprint_path", "polygon points are missing"))?
+                .find_all("xy")
+                .into_iter()
+                .map(|point| {
+                    let x = point
+                        .get_f64(1)
+                        .ok_or_else(|| invalid("footprint_path", "polygon point x is invalid"))?;
+                    let y = point
+                        .get_f64(2)
+                        .ok_or_else(|| invalid("footprint_path", "polygon point y is invalid"))?;
+                    let point = Point { x, y };
+                    point
+                        .validate("polygon point")
+                        .map_err(|reason| invalid("footprint_path", reason))?;
+                    Ok(point)
+                })
+                .collect::<Result<Vec<_>, FootprintGraphicsError>>()?;
+            info.point_count = Some(points.len());
+            info.closed = Some(true);
+            info.points = Some(points);
+            info.fill = Some(parse_fill(node)?);
+        }
+        _ => return Err(invalid("footprint_path", "unsupported graphic type")),
+    }
+    Ok(info)
+}
+
+pub(super) fn inspect_graphics(
+    source: &str,
+    layer_filter: Option<&str>,
+) -> Result<Vec<FootprintGraphicInfo>, FootprintGraphicsError> {
+    if let Some(layer) = layer_filter {
+        if !konnect_sexp::layers::is_canonical_name(layer) {
+            return Err(invalid("graphics_layer", "not a canonical KiCad layer"));
+        }
+    }
+    let tree = konnect_sexp::parse_sexp(source)
+        .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
+    if tree.head() != Some("footprint") {
+        return Err(invalid("footprint_path", "file root must be a footprint"));
+    }
+
+    let mut graphics = Vec::new();
+    for (start, end) in find_direct_child_blocks(source, "footprint") {
+        let block = konnect_sexp::parse_sexp(&source[start..end]).map_err(|error| {
+            invalid("footprint_path", format!("invalid top-level item: {error}"))
+        })?;
+        let Some(tag) = block.head() else {
+            continue;
+        };
+        if !is_supported_graphic(tag) {
+            continue;
+        }
+        let info = inspect_graphic(&block)?;
+        if layer_filter.is_none_or(|layer| info.layer == layer) {
+            graphics.push(info);
+        }
+    }
+    Ok(graphics)
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 struct Point {
     x: f64,
     y: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Fill {
     None,
@@ -363,7 +535,7 @@ enum GraphicsMode {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum FootprintGraphicsError {
+pub(super) enum FootprintGraphicsError {
     #[error("invalid {field}: {reason}")]
     InvalidArgument { field: String, reason: String },
     #[error("{0}")]
@@ -375,6 +547,33 @@ struct PreparedMutation {
     replacement: String,
     matched_count: usize,
     added_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct FootprintGraphicInfo {
+    #[serde(rename = "type")]
+    graphic_type: String,
+    pub(super) layer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<Point>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mid: Option<Point>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<Point>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    center: Option<Point>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radius_mm: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    points: Option<Vec<Point>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed: Option<bool>,
+    stroke_width_mm: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fill: Option<Fill>,
+    item_id: Option<String>,
 }
 
 fn parse_graphics(value: &serde_json::Value) -> Result<Vec<FootprintGraphic>, String> {
@@ -1220,6 +1419,94 @@ mod tests {
                 json!(["type", "points", "stroke_width_mm", "fill"]),
             ]
         );
+    }
+
+    #[test]
+    fn inspects_old_and_new_footprint_graphic_syntax() {
+        let source = r#"(footprint "Inspect" (version 20240108) (generator "pcbnew")
+  (layer "F.Cu")
+  (fp_line (start 0 1) (end 2 3)
+    (stroke (width 0.05) (type solid)) (layer "F.SilkS")
+    (tstamp 10000000-0000-4000-8000-000000000001))
+  (fp_arc (start 0 0) (mid 1 1) (end 2 0)
+    (stroke (width 0.06) (type solid)) (layer "B.CrtYd")
+    (uuid "20000000-0000-4000-8000-000000000001"))
+  (fp_rect (start -1 -2) (end 3 4)
+    (stroke (width 0.07) (type solid)) (fill no) (layer "B.CrtYd")
+    (uuid "30000000-0000-4000-8000-000000000001"))
+  (fp_circle (center 1 2) (end 2.5 2)
+    (stroke (width 0.08) (type solid)) (fill yes) (layer "B.CrtYd")
+    (tstamp 40000000-0000-4000-8000-000000000001))
+  (fp_poly
+    (pts (xy 0 0) (xy 2 0) (xy 2 1))
+    (stroke (width 0.09) (type solid)) (fill none) (layer "B.CrtYd"))
+  (fp_text user "ignored" (at 0 0) (layer "B.CrtYd")
+    (effects (font (size 1 1))))
+  (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask"))
+)
+"#;
+
+        let graphics = inspect_graphics(source, None).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&graphics).unwrap(),
+            json!([
+                {
+                    "type": "line",
+                    "layer": "F.SilkS",
+                    "start": {"x": 0.0, "y": 1.0},
+                    "end": {"x": 2.0, "y": 3.0},
+                    "stroke_width_mm": 0.05,
+                    "item_id": "10000000-0000-4000-8000-000000000001"
+                },
+                {
+                    "type": "arc",
+                    "layer": "B.CrtYd",
+                    "start": {"x": 0.0, "y": 0.0},
+                    "mid": {"x": 1.0, "y": 1.0},
+                    "end": {"x": 2.0, "y": 0.0},
+                    "stroke_width_mm": 0.06,
+                    "item_id": "20000000-0000-4000-8000-000000000001"
+                },
+                {
+                    "type": "rect",
+                    "layer": "B.CrtYd",
+                    "start": {"x": -1.0, "y": -2.0},
+                    "end": {"x": 3.0, "y": 4.0},
+                    "stroke_width_mm": 0.07,
+                    "fill": "none",
+                    "item_id": "30000000-0000-4000-8000-000000000001"
+                },
+                {
+                    "type": "circle",
+                    "layer": "B.CrtYd",
+                    "center": {"x": 1.0, "y": 2.0},
+                    "radius_mm": 1.5,
+                    "stroke_width_mm": 0.08,
+                    "fill": "solid",
+                    "item_id": "40000000-0000-4000-8000-000000000001"
+                },
+                {
+                    "type": "poly",
+                    "layer": "B.CrtYd",
+                    "points": [
+                        {"x": 0.0, "y": 0.0},
+                        {"x": 2.0, "y": 0.0},
+                        {"x": 2.0, "y": 1.0}
+                    ],
+                    "point_count": 3,
+                    "closed": true,
+                    "stroke_width_mm": 0.09,
+                    "fill": "none",
+                    "item_id": null
+                }
+            ])
+        );
+
+        let courtyard = inspect_graphics(source, Some("B.CrtYd")).unwrap();
+        assert_eq!(courtyard.len(), 4);
+        assert!(courtyard.iter().all(|graphic| graphic.layer == "B.CrtYd"));
     }
 
     #[tokio::test]
