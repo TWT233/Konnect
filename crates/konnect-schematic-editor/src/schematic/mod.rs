@@ -96,7 +96,18 @@ pub struct Schematic {
     pub generator: Option<String>,
     pub generator_version: Option<String>,
     pub uuid: Option<String>,
+    /// Page size name only — `A4`, `USLetter`, `User`, …
     pub paper: Option<String>,
+    /// Tokens that follow the page size name inside `(paper …)`, preserved
+    /// verbatim.
+    ///
+    /// KiCAD writes `(paper "User" 292.1 205.105)` for a custom page — the two
+    /// dimensions are REQUIRED there — and `(paper "A4" portrait)` for a
+    /// portrait named page. Both were dropped when only `paper` was
+    /// round-tripped, and a `(paper "User")` with no dimensions makes KiCAD
+    /// refuse to load the schematic at all ("Failed to load schematic", no
+    /// further diagnostic).
+    pub paper_args: Vec<SexpNode>,
 
     pub symbols: SymbolCollection,
     pub wires: WireCollection,
@@ -386,6 +397,7 @@ impl Schematic {
         let mut generator_version = None;
         let mut uuid = None;
         let mut paper = None;
+        let mut paper_args: Vec<SexpNode> = vec![];
 
         let mut symbols: Vec<Symbol> = vec![];
         let mut wires: Vec<Wire> = vec![];
@@ -414,6 +426,9 @@ impl Schematic {
                 }
                 Some("paper") => {
                     paper = child.value().map(str::to_owned);
+                    // Everything after the size name: `292.1 205.105` for a
+                    // custom page, `portrait` for a portrait named page.
+                    paper_args = child.args().iter().skip(1).cloned().collect();
                 }
                 Some("symbol") => match Symbol::from_sexp(child) {
                     Ok(s) => symbols.push(s),
@@ -467,6 +482,7 @@ impl Schematic {
             generator_version,
             uuid,
             paper,
+            paper_args,
             symbols: SymbolCollection::new(symbols),
             wires: WireCollection::new(wires),
             labels: LabelCollection::new(labels),
@@ -499,8 +515,15 @@ impl Schematic {
         if let Some(u) = &self.uuid {
             c.push(tagged("uuid", vec![qstr(u.clone())]));
         }
+        // The page size name alone is not always a complete `(paper …)` node:
+        // `User` requires its width and height, and a portrait named size
+        // carries a `portrait` token. KiCAD rejects the whole file if either is
+        // missing, so re-emit whatever followed the name.
         if let Some(p) = &self.paper {
-            c.push(tagged("paper", vec![qstr(p.clone())]));
+            let mut args = Vec::with_capacity(1 + self.paper_args.len());
+            args.push(qstr(p.clone()));
+            args.extend(self.paper_args.iter().cloned());
+            c.push(tagged("paper", args));
         }
 
         // Preserved nodes — emit in order:
