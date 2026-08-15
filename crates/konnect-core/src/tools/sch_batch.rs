@@ -690,6 +690,62 @@ fn is_deletable_schematic_item(block: &str) -> bool {
     )
 }
 
+/// Edits translating every `(property …)` anchor inside the symbol block at
+/// `sym_start..sym_end` by `(ddx, ddy)`.
+///
+/// A property's own rotation is left untouched: a translation does not turn
+/// text. Block starts come from `find_block_starts`, which is string-aware, so
+/// a property *value* containing `(property` cannot be mistaken for one.
+fn property_translation_edits(
+    content: &str,
+    sym_start: usize,
+    sym_end: usize,
+    ddx: f64,
+    ddy: f64,
+) -> Vec<SexpEdit> {
+    if ddx == 0.0 && ddy == 0.0 {
+        return Vec::new();
+    }
+    let mut edits = Vec::new();
+    for prop_start in konnect_sexp::writer::find_block_starts(content, "property") {
+        if prop_start < sym_start || prop_start >= sym_end {
+            continue;
+        }
+        let Some((_, prop_end)) = konnect_sexp::writer::find_balanced_block(content, prop_start)
+        else {
+            continue;
+        };
+        let prop = &content[prop_start..prop_end];
+        // The property's own (at …), not one nested deeper in (effects …).
+        let Some(at_rel) = prop.find("(at ") else {
+            continue;
+        };
+        let at_abs = prop_start + at_rel + "(at ".len();
+        let Some(close_rel) = prop[at_rel..].find(')') else {
+            continue;
+        };
+        let at_end = prop_start + at_rel + close_rel;
+        let parts: Vec<&str> = content[at_abs..at_end].split_whitespace().collect();
+        let (Some(px), Some(py)) = (
+            parts.first().and_then(|s| s.parse::<f64>().ok()),
+            parts.get(1).and_then(|s| s.parse::<f64>().ok()),
+        ) else {
+            continue;
+        };
+        let rot = parts.get(2).copied().unwrap_or("0");
+        edits.push(SexpEdit::replace(
+            at_abs,
+            at_end,
+            format!(
+                "{} {} {rot}",
+                cse::types::fmt_f64(px + ddx),
+                cse::types::fmt_f64(py + ddy)
+            ),
+        ));
+    }
+    edits
+}
+
 async fn handle_bulk_move(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -761,6 +817,19 @@ async fn handle_bulk_move(
                 at_abs,
                 at_end,
                 format!("{new_x} {new_y} {rot}"),
+            ));
+            // Property coordinates are ABSOLUTE in .kicad_sch, so the field
+            // text does not follow the symbol on its own — moving only the
+            // symbol's own (at …) strands Reference and Value at the old
+            // location (#202). Shift them by the delta the symbol *actually*
+            // moved, which is the snapped one, or they drift relative to the
+            // part. `Symbol::translate` does the same on the typed path.
+            edits.extend(property_translation_edits(
+                &content,
+                sym_start,
+                sym_end,
+                new_x - x,
+                new_y - y,
             ));
             placements.push(json!({
                 "old_x": x, "old_y": y,
@@ -2124,5 +2193,131 @@ mod insert_order_tests {
             close > inst,
             "this test is meaningless if the last paren precedes the instances"
         );
+    }
+}
+
+/// #202: `bulk_move` shifted only the symbol's own `(at …)`. Property `(at …)`
+/// coordinates are absolute in `.kicad_sch`, so Reference and Value text
+/// stayed at the old location while the symbol moved away. The typed path
+/// (`move_schematic_component` → `Symbol::translate`) always translated the
+/// properties too — this was the second, text-based implementation that never
+/// got the fix.
+#[cfg(test)]
+mod bulk_move_field_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// One symbol with Reference and Value at eeschema-style offsets beside
+    /// it. Reference carries a rotation, which must survive the move.
+    const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 101.6 101.6 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 105.232 100.33 90)\n\t\t\t(effects (font (size 1.27 1.27)))\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 105.232 102.87 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"p\"\n\t\t\t\t(path \"/root\" (reference \"R1\") (unit 1))\n\t\t\t)\n\t\t)\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    /// The placed symbol's `(at …)` and each property's, read back from the
+    /// written file. Numeric, so a float-formatting change can't break the
+    /// test and a wrong coordinate can't hide behind one.
+    fn positions(sch: &str) -> (Vec<f64>, Vec<(String, Vec<f64>)>) {
+        let tree = konnect_sexp::parse_sexp(sch).expect("parses");
+        let symbol = tree
+            .children()
+            .unwrap()
+            .iter()
+            .find(|n| n.head() == Some("symbol") && n.find("lib_id").is_some())
+            .expect("placed symbol");
+        let at_of = |n: &konnect_sexp::SexpNode| -> Vec<f64> {
+            let at = n.find("at").expect("(at …)");
+            (1..at.children().unwrap().len())
+                .filter_map(|i| at.get_f64(i))
+                .collect()
+        };
+        let props = symbol
+            .find_all("property")
+            .into_iter()
+            .map(|p| {
+                (
+                    p.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    at_of(p),
+                )
+            })
+            .collect();
+        (at_of(symbol), props)
+    }
+
+    async fn bulk_move(dx: f64, dy: f64) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("move.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+        let result = handle_bulk_move(
+            &json!({ "schematic": path.to_str().unwrap(),
+                     "references": ["R1"], "dx": dx, "dy": dy }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// Every property keeps its offset from the symbol — which is the same as
+    /// saying it moved by whatever the symbol actually moved.
+    async fn assert_fields_follow(dx: f64, dy: f64) {
+        let (before_sym, before_props) = positions(SCH);
+        let after_src = bulk_move(dx, dy).await;
+        let (after_sym, after_props) = positions(&after_src);
+
+        // The handler snaps to the 1.27 grid, so the effective delta is not
+        // necessarily the requested one — the fields must follow the real one.
+        let (mdx, mdy) = (after_sym[0] - before_sym[0], after_sym[1] - before_sym[1]);
+        assert_eq!(before_props.len(), after_props.len());
+        for ((name, before), (after_name, after)) in before_props.iter().zip(&after_props) {
+            assert_eq!(name, after_name, "property order preserved");
+            assert!(
+                (after[0] - (before[0] + mdx)).abs() < 1e-6
+                    && (after[1] - (before[1] + mdy)).abs() < 1e-6,
+                "'{name}' must move with the symbol (delta {mdx}, {mdy}): \
+                 {before:?} -> {after:?}\n{after_src}"
+            );
+            // A property's own rotation is independent of a translation.
+            assert_eq!(
+                before.get(2),
+                after.get(2),
+                "'{name}' rotation must not change"
+            );
+        }
+        assert!(konnect_sexp::parse_sexp(&after_src).is_ok());
+    }
+
+    #[tokio::test]
+    async fn field_text_moves_with_the_symbol() {
+        // On-grid delta: symbol lands exactly where asked.
+        assert_fields_follow(12.7, 2.54).await;
+    }
+
+    #[tokio::test]
+    async fn fields_follow_the_snapped_delta_not_the_requested_one() {
+        // Off-grid delta: the symbol snaps, so the fields must move by the
+        // snapped amount or they drift relative to the part.
+        assert_fields_follow(1.0, 0.0).await;
+    }
+
+    /// A negative move exercises the same path in the other direction.
+    #[tokio::test]
+    async fn field_text_follows_a_negative_move() {
+        assert_fields_follow(-25.4, -12.7).await;
     }
 }

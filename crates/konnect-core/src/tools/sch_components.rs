@@ -570,6 +570,38 @@ fn property_exists(content: &str, reference: &str, name: &str) -> bool {
     })
 }
 
+/// Update the value of an existing `(property "field" "…")` inside
+/// `reference`'s symbol block, in place. Returns the reason on failure so the
+/// caller can report it instead of silently claiming success. Shared by
+/// `edit_schematic_component` and `add_component_annotation` (#203) — the
+/// second used to append a duplicate instead.
+fn update_property_value(
+    content: &str,
+    reference: &str,
+    field: &str,
+    new_val: &str,
+) -> Result<String, String> {
+    let (sym_start, sym_end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+    let sym_block = &content[sym_start..sym_end];
+    let field_search = format!(r#"(property "{field}" ""#);
+    let field_offset = sym_block
+        .find(&field_search)
+        .map(|o| sym_start + o + field_search.len())
+        .ok_or_else(|| format!("'{reference}' has no '{field}' property"))?;
+    // Find the closing quote of the current value
+    let val_end = content[field_offset..]
+        .find('"')
+        .map(|o| field_offset + o)
+        .ok_or_else(|| format!("'{field}' property on '{reference}' is malformed"))?;
+    Ok(format!(
+        "{}{}{}",
+        &content[..field_offset],
+        new_val,
+        &content[val_end..]
+    ))
+}
+
 /// Append a new `(property …)` to `reference`'s symbol block.
 ///
 /// Anchored at the symbol's own `(at …)` and written hidden: a custom field is
@@ -687,39 +719,13 @@ async fn handle_edit_schematic_component(
     let expected = content.clone();
     let mut changed = Vec::new();
 
-    // Helper: update a property field value in-place within the symbol block
-    // for `ref_`. Returns the reason on failure so the caller can report it
-    // instead of silently claiming success.
-    let update_field =
-        |content: &str, ref_: &str, field: &str, new_val: &str| -> Result<String, String> {
-            let (sym_start, sym_end) = find_symbol_instance_block(content, ref_)
-                .ok_or_else(|| format!("symbol '{ref_}' not found in this schematic"))?;
-            let sym_block = &content[sym_start..sym_end];
-            let field_search = format!(r#"(property "{field}" ""#);
-            let field_offset = sym_block
-                .find(&field_search)
-                .map(|o| sym_start + o + field_search.len())
-                .ok_or_else(|| format!("'{ref_}' has no '{field}' property"))?;
-            // Find the closing quote of the current value
-            let val_end = content[field_offset..]
-                .find('"')
-                .map(|o| field_offset + o)
-                .ok_or_else(|| format!("'{field}' property on '{ref_}' is malformed"))?;
-            Ok(format!(
-                "{}{}{}",
-                &content[..field_offset],
-                new_val,
-                &content[val_end..]
-            ))
-        };
-
     let mut errors: Vec<String> = Vec::new();
     // A macro rather than a closure: the body also needs `changed`/`errors`
     // between calls (the instances rewrite below, and the custom-field loop),
     // and a closure capturing them mutably would lock both for its lifetime.
     macro_rules! apply {
         ($field:expr, $new_val:expr) => {
-            match update_field(&content, &reference, $field, $new_val) {
+            match update_property_value(&content, &reference, $field, $new_val) {
                 Ok(updated) => {
                     content = updated;
                     changed.push(format!("{} → {}", $field, $new_val));
@@ -1247,33 +1253,44 @@ async fn handle_add_component_annotation(
         Err(e) => return Ok(e),
     };
 
+    // Reference/Value/Footprint/Datasheet have dedicated parameters on
+    // edit_schematic_component with their own side effects — a Reference
+    // rename must also rewrite the instances path (#157) — so annotating
+    // them here would bypass those.
+    if is_reserved_property(&key) {
+        return Ok(CallToolResult::error(format!(
+            "'{key}' is a built-in field — set it through edit_schematic_component's \
+             dedicated parameter, not as an annotation."
+        )));
+    }
+
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
 
-    // Find the symbol block for this reference
-    let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
-        Some(r) => r,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}' not found",
-                reference
-            )))
+    if find_symbol_instance_block(&content, &reference).is_none() {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' not found",
+            reference
+        )));
+    }
+
+    // An existing key is updated in place; appending a second `(property
+    // "KEY" …)` gives eeschema two fields with one name — it shows both,
+    // edits the wrong one, and the duplicate survives save/reload (#203).
+    // A new key goes through append_property, which anchors at the symbol's
+    // own position and matches the block's indentation, rather than the
+    // hardcoded origin-anchored form this handler used to write.
+    let (new_content, updated_existing) = if property_exists(&content, &reference, &key) {
+        match update_property_value(&content, &reference, &key, &value) {
+            Ok(updated) => (updated, true),
+            Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
+        }
+    } else {
+        match append_property(&content, &reference, &key, &value) {
+            Ok(updated) => (updated, false),
+            Err(why) => return Ok(CallToolResult::error(format!("{key}: {why}"))),
         }
     };
-
-    // Find the position just before (instances in the symbol block, or before closing paren
-    let sym_block = &content[sym_start..sym_end];
-    let insert_rel = sym_block
-        .find("(instances")
-        .unwrap_or(sym_block.rfind(')').unwrap_or(sym_block.len() - 1));
-    let insert_abs = sym_start + insert_rel;
-
-    // Build the property S-expression
-    let prop_sexp = format!(
-        "    (property \"{key}\" \"{value}\"\n      (at 0 0 0)\n      (effects (font (size 1.27 1.27)) (hide yes))\n    )\n    "
-    );
-
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_abs, prop_sexp)]);
     let item_id = symbol_item_id(&expected, &reference)?;
     let command = SchematicCommand::replace_item_from_document(
         &expected,
@@ -1286,7 +1303,8 @@ async fn handle_add_component_annotation(
     Ok(CallToolResult::json(&json!({
         "reference": reference,
         "added_property": key,
-        "value": value
+        "value": value,
+        "updated_existing": updated_existing
     })))
 }
 
@@ -2780,6 +2798,130 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("(at 0 -5.08 90)"), "{after}");
         assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// #203: annotating the same key twice must update the one property in
+    /// place, not append a sibling — eeschema shows both and edits the wrong
+    /// one, and a malformed duplicate survives save/reload.
+    #[tokio::test]
+    async fn add_component_annotation_updates_an_existing_key_in_place() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("annot.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let first = handle_add_component_annotation(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "key": "MPN", "value": "RC0402" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!first.is_error, "{first:?}");
+        let second = handle_add_component_annotation(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "key": "MPN", "value": "RC0603" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!second.is_error, "{second:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches("(property \"MPN\"").count(),
+            1,
+            "one MPN property, updated in place:
+{after}"
+        );
+        assert!(after.contains("RC0603"), "{after}");
+        assert!(
+            !after.contains("RC0402"),
+            "old value must be gone:
+{after}"
+        );
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    /// The old path hardcoded (at 0 0 0) — the annotation rendered at the
+    /// sheet origin, far from its symbol. append_property anchors on the
+    /// symbol's own position.
+    #[tokio::test]
+    async fn add_component_annotation_anchors_at_the_symbol_not_the_origin() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchor.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_component_annotation(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "key": "MPN", "value": "RC0402" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let prop_at = after.find("(property \"MPN\"").unwrap();
+        let prop_block = &after[prop_at..prop_at + 120];
+        assert!(
+            !prop_block.contains("(at 0 0 0)"),
+            "annotation must anchor near its symbol, not the origin:
+{prop_block}"
+        );
+        assert!(prop_block.contains("(at 100"), "{prop_block}");
+    }
+
+    /// Reference/Value/Footprint/Datasheet have dedicated parameters with
+    /// their own side effects (#157's instances rewrite); annotating them
+    /// would bypass those.
+    #[tokio::test]
+    async fn add_component_annotation_refuses_reserved_keys() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let result = handle_add_component_annotation(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "key": "Reference", "value": "R9" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        assert!(text.contains("edit_schematic_component"), "{text}");
     }
 
     /// A removed pin is as dangerous as a moved one — whatever attached to it
