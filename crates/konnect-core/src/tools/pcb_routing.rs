@@ -41,9 +41,13 @@ macro_rules! ipc {
 
 // ─── S-expression helpers ─────────────────────────────────────────────────────
 
+/// A zone S-expression in the same format the rest of the board uses: KiCad 10
+/// gets `(net "GND")` and `(layers …)`, legacy boards keep the id +
+/// `(net_name …)` pair and singular `(layer …)`. The net reference comes from
+/// [`konnect_sexp::net::net_ref_for_write`] — resolved structurally, never by
+/// string offset, which is how zones used to land on net 0 (#192).
 fn format_zone(
-    net_id: i32,
-    net_name: &str,
+    net: &konnect_sexp::net::NetRef,
     layer: &str,
     clearance: f64,
     min_w: f64,
@@ -55,24 +59,24 @@ fn format_zone(
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
     format!(
-        "\n  (zone (net {net_id}) (net_name \"{net_name}\") (layer \"{layer}\") (uuid \"{uuid}\")\n    \
+        "\n  (zone {net_nodes} {layer_node} (uuid \"{uuid}\")\n    \
          (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
          (min_thickness {min_w})\n    (fill yes)\n    \
-         (polygon (pts{pt_str}\n    ))\n  )"
+         (polygon (pts{pt_str}\n    ))\n  )",
+        net_nodes = net.zone_net_nodes(),
+        layer_node = net.zone_layer_node(layer),
     )
 }
 
-fn find_net_id(content: &str, net_name: &str) -> i32 {
-    let search = format!(r#" "{net_name}")"#);
-    if let Some(pos) = content.find(&search) {
-        let before = &content[..pos];
-        let net_pos = before.rfind("(net ").unwrap_or(0);
-        let num_str = &before[net_pos + 5..];
-        let num_end = num_str.find(' ').unwrap_or(0);
-        num_str[..num_end].parse().unwrap_or(0)
-    } else {
-        0
-    }
+/// The refusal for a net name a legacy board's table does not declare.
+fn unknown_net_error(net_name: &str, board: &std::path::Path) -> CallToolResult {
+    CallToolResult::error(format!(
+        "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board a \
+         zone must reference a declared net id — writing it anyway would attach the copper \
+         to net 0, the unconnected pseudo-net (#192). Declare it first with add_net, or \
+         check the name with list_nets.",
+        board.display()
+    ))
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -336,33 +340,11 @@ async fn handle_add_net(
 
 /// Whether a board is in the KiCad 10 format, where nets are implicit.
 ///
-/// Structure first: a single name-only `(net "GND")` node anywhere is
-/// conclusive, because no earlier format ever wrote that shape. Only when the
-/// board names no net at all — a blank board, where the structure cannot say —
-/// does this fall back to the format version. 20260101 is below KiCad 10's
-/// first release format (20260206) and above every 9.x one including the 9.99
-/// development builds, which still wrote `(net N "name")`.
+/// The detection (shape first, version fallback) moved to
+/// [`konnect_sexp::net::names_nets_in_place`] so the write side (#192) shares
+/// it; this wrapper keeps the call sites readable.
 fn board_is_kicad_10(tree: &konnect_sexp::SexpNode) -> bool {
-    fn has_name_only_net(node: &konnect_sexp::SexpNode) -> bool {
-        let Some(children) = node.children() else {
-            return false;
-        };
-        if node.head() == Some("net")
-            && matches!(children.get(1), Some(konnect_sexp::SexpNode::Str(_)))
-        {
-            return true;
-        }
-        children.iter().any(has_name_only_net)
-    }
-
-    if has_name_only_net(tree) {
-        return true;
-    }
-    tree.find("version")
-        .and_then(|n| n.get(1))
-        .and_then(|n| n.as_str())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|v| v >= 20260101)
+    konnect_sexp::net::names_nets_in_place(tree)
 }
 
 async fn handle_route_trace(
@@ -542,7 +524,7 @@ async fn handle_add_via(
 
 async fn handle_add_copper_pour(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
@@ -568,9 +550,22 @@ async fn handle_add_copper_pour(
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
 
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "copper pour",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+
     let content = std::fs::read_to_string(&board_path)?;
-    let net_id = find_net_id(&content, &net_name);
-    let zone_s = format_zone(net_id, &net_name, &layer, clearance, min_w, &pts);
+    let tree = konnect_sexp::parse_sexp(&content)?;
+    let Some(net) = konnect_sexp::net::net_ref_for_write(&tree, &net_name) else {
+        return Ok(unknown_net_error(&net_name, &board_path));
+    };
+    let zone_s = format_zone(&net, &layer, clearance, min_w, &pts);
     let close = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close, zone_s)]);
     write_atomic(&board_path, &new_content)?;
@@ -1238,5 +1233,100 @@ mod netclass_tests {
         let msg = text_of(&result);
         assert!(msg.contains("HV"), "{msg}");
         assert_eq!(std::fs::read_to_string(&board).unwrap(), BOARD);
+    }
+}
+
+/// Zones must reference their net in the same shape the board uses — KiCad 10
+/// by name, legacy by declared id. Both `add_copper_pour` here and `add_zone`
+/// in `pcb_board.rs` used a string-offset id lookup that returned 0 on every
+/// KiCad 10 board, silently attaching the pour to the unconnected pseudo-net
+/// (#192).
+#[cfg(test)]
+mod zone_net_format_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn text_of(r: &CallToolResult) -> String {
+        match r.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// KiCad 10 names nets on copper; there is no table and no ids.
+    const KICAD_10: &str = "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(segment\n\t\t(start 10 10)\n\t\t(end 20 10)\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"GND\")\n\t)\n)\n";
+    /// Legacy: table at top level, items reference by id.
+    const LEGACY: &str = "(kicad_pcb\n  (version 20240108)\n  (generator \"pcbnew\")\n  (net 0 \"\")\n  (net 7 \"GND\")\n  (segment (start 10 10) (end 20 10) (width 0.2) (layer \"F.Cu\") (net 7))\n)\n";
+
+    async fn pour(board: &str, net: &str) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result = handle_add_copper_pour(
+            &json!({
+                "board": path.to_str().unwrap(), "net_name": net, "layer": "F.Cu",
+                "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_kicad_10_zone_references_the_net_by_name() {
+        let (result, after) = pour(KICAD_10, "GND").await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let zone_at = after.find("(zone").expect("zone written");
+        let zone = &after[zone_at..];
+        assert!(zone.contains("(net \"GND\")"), "{zone}");
+        assert!(!zone.contains("(net 0)"), "{zone}");
+        assert!(
+            !zone.contains("net_name"),
+            "no net_name token in KiCad 10: {zone}"
+        );
+        assert!(zone.contains("(layers \"F.Cu\")"), "plural layers: {zone}");
+        // The #142 read helpers must see the pour on GND, not orphaned.
+        let tree = konnect_sexp::parse_sexp(&after).unwrap();
+        assert!(konnect_sexp::net::collect_net_keys(&tree).contains("GND"));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_zone_keeps_the_declared_id_and_net_name_pair() {
+        let (result, after) = pour(LEGACY, "GND").await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let zone_at = after.find("(zone").expect("zone written");
+        let zone = &after[zone_at..];
+        assert!(zone.contains("(net 7) (net_name \"GND\")"), "{zone}");
+        assert!(zone.contains("(layer \"F.Cu\")"), "singular layer: {zone}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    /// The old lookup fell back to 0 — the orphan. An unknown net on a legacy
+    /// board must refuse and leave the file alone.
+    #[tokio::test]
+    async fn an_undeclared_net_on_a_legacy_board_is_refused_not_zeroed() {
+        let (result, after) = pour(LEGACY, "PWR").await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(text_of(&result).contains("add_net"), "{}", text_of(&result));
+        assert_eq!(after, LEGACY, "file must be untouched");
     }
 }
