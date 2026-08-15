@@ -266,7 +266,9 @@ fn prepare_mutation(source: &str, request: &ModelRequest) -> Result<PreparedMuta
     for (start, end) in find_direct_child_blocks(source, "footprint") {
         let node = konnect_sexp::parse_sexp(&source[start..end])
             .map_err(|_| invalid("footprint_path", "contains an invalid top-level item"))?;
-        child_indent.get_or_insert_with(|| indent_before(source, start));
+        if child_indent.is_none() {
+            child_indent = indent_before(source, start);
+        }
         if node.head() == Some("model") {
             selected.push((start, end));
         }
@@ -274,7 +276,7 @@ fn prepare_mutation(source: &str, request: &ModelRequest) -> Result<PreparedMuta
 
     let indent = selected
         .first()
-        .map(|(start, _)| indent_before(source, *start))
+        .and_then(|(start, _)| indent_before(source, *start))
         .or(child_indent)
         .unwrap_or_else(|| "  ".to_string());
     let serialized = serialize_models(&request.models, &indent);
@@ -377,12 +379,16 @@ fn serialize_model(model: &FootprintModel) -> String {
     )
 }
 
-fn indent_before(source: &str, offset: usize) -> String {
+fn indent_before(source: &str, offset: usize) -> Option<String> {
     let line_start = source[..offset]
         .rfind('\n')
         .map(|index| index + 1)
         .unwrap_or(0);
-    source[line_start..offset].to_string()
+    let indent = &source[line_start..offset];
+    indent
+        .chars()
+        .all(|character| matches!(character, ' ' | '\t'))
+        .then(|| indent.to_string())
 }
 
 fn quote_string(value: &str) -> String {
@@ -566,6 +572,27 @@ mod tests {
             .replacement
             .contains("(fp_line (start 0 0) (end 1 1)"));
         assert!(prepared.replacement.contains("(pad \"1\" thru_hole circle"));
+    }
+
+    #[test]
+    fn old_inline_header_accepts_inserting_the_first_model() {
+        let source = r#"(footprint "Socket" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (descr "old description")
+  (pad "1" thru_hole circle (at 0 0) (size 2 2) (drill 1) (layers "*.Cu" "*.Mask"))
+)
+"#;
+        let request = parse_request(&json!({
+            "mode": "replace",
+            "models": [model("../models/new.step")]
+        }))
+        .unwrap();
+
+        let prepared = prepare_mutation(source, &request).unwrap();
+
+        assert_eq!(prepared.replacement.matches("(footprint ").count(), 1);
+        assert!(prepared.replacement.contains("../models/new.step"));
+        konnect_sexp::parse_sexp(&prepared.replacement).unwrap();
     }
 
     #[test]
