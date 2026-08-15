@@ -54,7 +54,7 @@ Konnect/
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
 │   │       │   └── meta_tools.rs    # 6 always-visible meta-tools
 │   │       └── tools/
-│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
+│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
 │   │           ├── project.rs        # 6 tools (incl. open_schematic_viewer)
@@ -235,6 +235,8 @@ The server does NOT expose all 188 tools (194 total with the 6 meta-tools) in `t
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 - **`auto_load_toolsets` (config key, default `false`)**: when set, a miss in `dispatch_tool` loads the owning toolset and executes the call in the same hop instead of returning `toolset_not_loaded` -- fewer round trips, at the cost of toolsets accumulating monotonically for the rest of the session (`unload_toolset` still prunes, but a tool call reloads its toolset right back). Off by default because the router's whole point is keeping `tools/list` small; turn it on only if your client would rather eat the context growth than handle one recoverable error per miss. Set via `konnect.toml`/`settings.json` (`auto_load_toolsets = true`) or the equivalent `ServerConfig` field when embedding.
 
+- **`eager_toolsets` (config key, default `false`)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed` — for those, a tool absent from the first listing can never be called at all, because `load_toolset` reports the names it loaded but returns no schemas and the client has nothing to invoke (#134, #169). Note `auto_load_toolsets` does **not** cover this case: it fires on a tool *call*, so it only helps a caller that already knows the tool name. Costs ~25K tokens per listing against the ~2K baseline, which is the router's entire reason for existing — hence off by default.
+
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
 ## Build Requirements
@@ -244,10 +246,18 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
   version IS the MSRV: bump it deliberately, in its own commit, after running the full
   local gate on the new version.
 - `protoc` binary (for protobuf code generation in konnect-ipc crate)
-  - Set `PROTOC` environment variable, or leave it unset and `konnect-ipc/build.rs`
-    falls back to `protoc` found on PATH
-  - Well-known-type includes are derived from `<PROTOC>/../../include` (i.e. a standard
-    protoc release layout with `bin/protoc` next to `include/`) when that directory exists
+  - Set `PROTOC` to the binary, or leave it unset and `konnect-ipc/build.rs` resolves
+    `protoc` from PATH
+  - Well-known-type includes (`google/protobuf/any.proto`) are derived from
+    `<protoc>/../../include` after the binary is resolved to an absolute path. This
+    covers both the upstream release layout (`bin/protoc` beside `include/`) and system
+    packages (`/usr/bin/protoc` → `/usr/include`). Set `PROTOC_INCLUDE` to override when
+    the binary and its protos live in unrelated prefixes — notably Chocolatey and scoop,
+    whose shared shim directory is not the package prefix.
+  - Some distributions ship the well-known `.proto` files separately from the compiler.
+    Debian/Ubuntu need `protobuf-compiler` **and** `libprotobuf-dev`; Fedora needs
+    `protobuf-compiler` and `protobuf-devel`. Missing them fails the build with
+    `google/protobuf/any.proto: File not found`.
   - Download: https://github.com/protocolbuffers/protobuf/releases
 - For schematic-viewer (built separately from the workspace — see Quick Start):
   - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`

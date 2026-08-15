@@ -190,6 +190,18 @@ fn full_design_loop_with_real_kicad() {
         }),
     );
 
+    // Labels are placed at the pin endpoint and oriented away from the symbol
+    // body, so a rotated label must still bind its pin to the net. eeschema is
+    // the only thing that can confirm that, hence here rather than a unit test.
+    p.load("sch_batch");
+    p.tool(
+        "batch_connect_to_net",
+        json!({
+            "schematic": sch.to_string_lossy(), "net_name": "VIN",
+            "pins": [{ "reference": "R1", "pin_number": "1" }]
+        }),
+    );
+
     // The written schematic must still parse and contain both parts.
     let content = std::fs::read_to_string(&sch).unwrap();
     let tree = konnect_sexp::parse_sexp(&content).expect("tool output must reparse");
@@ -210,6 +222,54 @@ fn full_design_loop_with_real_kicad() {
             || erc.get("violations").is_some()
             || erc.get("summary").is_some(),
         "unexpected ERC shape: {erc}"
+    );
+
+    // eeschema's own netlist is the only proof that an oriented label still
+    // binds its pin: rotating a label off 0° must not detach it.
+    let net_file = proj.join("e2e.net");
+    p.tool(
+        "generate_netlist",
+        json!({"schematic": sch.to_string_lossy(), "output": net_file.to_string_lossy()}),
+    );
+    let netlist = std::fs::read_to_string(&net_file).expect("kicad-cli wrote no netlist");
+    // Not `netlist.contains("VIN")`: a label a millimetre off the pin still
+    // names a net somewhere in the file. Only R1 pin 1 appearing as a node OF
+    // that net proves the label bound the pin. eeschema may prefix the sheet
+    // path to the name, so match it loosely.
+    let vin = netlist
+        .split("(net")
+        .find(|block| {
+            block
+                .split_once("(name ")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .is_some_and(|(name, _)| name.contains("VIN"))
+        })
+        .unwrap_or_else(|| panic!("eeschema's netlist has no VIN net:\n{netlist}"));
+    assert!(
+        vin.split("(node")
+            .any(|n| n.contains(r#"(ref "R1")"#) && n.contains(r#"(pin "1")"#)),
+        "R1 pin 1 is not a node of VIN — the label did not bind its pin:\n{vin}"
+    );
+
+    // The review's runtime coverage uses Konnect's parser so the tool remains
+    // usable without kicad-cli. Cross-check that count here against KiCad's
+    // own netlist so parser drift cannot turn incomplete extraction into a
+    // clean verdict (#184).
+    let netlist_tree = konnect_sexp::parse_sexp(&netlist).expect("KiCad netlist must parse");
+    let kicad_component_count = netlist_tree
+        .find("components")
+        .map(|components| components.find_all("comp").len())
+        .unwrap_or(0);
+    p.load("design_review");
+    let review = body(&p.tool(
+        "run_design_review",
+        json!({"schematic": sch.to_string_lossy()}),
+    ));
+    assert_eq!(review["design_review"]["status"], "complete", "{review}");
+    assert_eq!(
+        review["design_review"]["coverage"]["schematic"]["symbol_instances"],
+        json!(kicad_component_count),
+        "Konnect and KiCad disagree on schematic component coverage: {review}"
     );
 
     // ── PCB: export Gerbers + DRC through real kicad-cli ─────────────────

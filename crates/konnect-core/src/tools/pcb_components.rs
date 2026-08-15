@@ -35,7 +35,7 @@ where
 /// As [`with_ipc`], but classifying a failure as transport-unreachable vs
 /// KiCad-rejected via [`konnect_ipc::IpcFailure`] — the typed gate for the
 /// file-editing fallback (never a text match on the error message).
-async fn with_ipc_classified<T, F>(
+pub(crate) async fn with_ipc_classified<T, F>(
     addr: String,
     f: F,
 ) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
@@ -950,7 +950,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_component_pads",
-            "Return the pad positions and net assignments for a footprint.",
+            "Return the pad positions and net assignments for a footprint. \
+             A pad's 'net' is its net name, \"\" if the pad carries no net node \
+             (unconnected), or null if the node is present but unreadable — \
+             treat null as an error, not as an unconnected pad.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1332,12 +1335,19 @@ async fn handle_get_component_pads(
             // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
             let (board_x, board_y) =
                 konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
-            let net = pad
-                .find("net")
-                .and_then(|n| n.get(2))
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
+            // Three outcomes, deliberately distinguishable. No (net …) node at
+            // all is an unconnected pad, and "" says so. A node we can read
+            // gives its name. A node that is present but unreadable gives
+            // null — previously it gave "" too, so a fully connected KiCad 10
+            // pad was indistinguishable from an unconnected one. See
+            // konnect_sexp::net for the two shapes.
+            let net = match pad.find("net") {
+                None => json!(""),
+                Some(node) => match konnect_sexp::net::net_name(node) {
+                    Some(name) => json!(name),
+                    None => serde_json::Value::Null,
+                },
+            };
             Some(json!({ "number": number, "x": board_x, "y": board_y, "net": net }))
         })
         .collect();
@@ -1884,6 +1894,7 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
@@ -2201,6 +2212,7 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
@@ -2451,5 +2463,115 @@ mod field_placement_tests {
         let placement = extract_field_placement("(footprint \"bare\")");
         assert_eq!(placement.reference_at, None);
         assert_eq!(placement.value_at, None);
+    }
+}
+
+#[cfg(test)]
+mod pad_net_shape_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    async fn pads_of(board: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result = handle_get_component_pads(
+            &json!({ "board": path.to_str().unwrap(), "reference": "R1" }),
+            &test_ctx(),
+        )
+        .await
+        .expect("handler should succeed");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&body).unwrap()
+    }
+
+    fn board_with_pads(pads: &str) -> String {
+        format!(
+            "(kicad_pcb\n\t(version 20260206)\n\t(footprint \"TestPad\"\n\t\t(layer \"F.Cu\")\n\t\t(at 100 100)\n\
+             \t\t(property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\"))\n{pads}\t)\n)\n"
+        )
+    }
+
+    /// The reported bug: KiCad 10 puts the name at index 1, the old reader
+    /// took index 2, and `.unwrap_or("")` turned that miss into a plausible
+    /// empty string — so a fully connected pad looked exactly like an
+    /// unconnected one.
+    #[tokio::test]
+    async fn kicad_10_pads_report_their_net_names() {
+        let pads = pads_of(&board_with_pads(
+            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net \"GND\"))\n\
+             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net \"VCC\"))\n",
+        ))
+        .await;
+        assert_eq!(pads["pads"][0]["net"], json!("GND"));
+        assert_eq!(pads["pads"][1]["net"], json!("VCC"));
+    }
+
+    #[tokio::test]
+    async fn legacy_pads_still_report_their_net_names() {
+        let pads = pads_of(&board_with_pads(
+            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 1 \"GND\"))\n\
+             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net 2 \"VCC\"))\n",
+        ))
+        .await;
+        assert_eq!(pads["pads"][0]["net"], json!("GND"));
+        assert_eq!(pads["pads"][1]["net"], json!("VCC"));
+    }
+
+    /// A pad with no net node is genuinely unconnected, and "" says so. This
+    /// is the one case where the empty string is the right answer, which is
+    /// why the unreadable case must not share it.
+    #[tokio::test]
+    async fn a_pad_with_no_net_node_reports_an_empty_name() {
+        let pads = pads_of(&board_with_pads(
+            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1))\n",
+        ))
+        .await;
+        assert_eq!(pads["pads"][0]["net"], json!(""));
+    }
+
+    /// Present but unreadable is now loud. A bare `(net 1)` reference names no
+    /// net, and null forces a caller to notice rather than concluding the pad
+    /// is floating.
+    #[tokio::test]
+    async fn a_net_node_we_cannot_read_reports_null_not_empty() {
+        let pads = pads_of(&board_with_pads(
+            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 1))\n\
+             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net))\n",
+        ))
+        .await;
+        assert_eq!(pads["pads"][0]["net"], serde_json::Value::Null);
+        assert_eq!(pads["pads"][1]["net"], serde_json::Value::Null);
+    }
+
+    /// The unconnected pseudo-net is named, and its name is empty — that is a
+    /// real answer, not a failure, so it must not become null.
+    #[tokio::test]
+    async fn the_unconnected_pseudo_net_reports_an_empty_name() {
+        let pads = pads_of(&board_with_pads(
+            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 0 \"\"))\n",
+        ))
+        .await;
+        assert_eq!(pads["pads"][0]["net"], json!(""));
     }
 }

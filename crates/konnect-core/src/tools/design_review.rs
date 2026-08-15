@@ -7,14 +7,18 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     parser::parse_sexp,
-    schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
+    schematic::{
+        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
+        find_lib_symbol, pin_endpoint, read_schematic,
+    },
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -87,6 +91,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_design_review",
             "Run all available audit checks and produce a consolidated design review report. \
+             Audits every reachable schematic sheet and reports status, coverage, and diagnostics. \
+             Returns an INCOMPLETE verdict instead of approval when coverage is partial or failed. \
              This is the tool to call when the user asks 'is my board ready?' or 'review my design'.",
             json!({
                 "type": "object",
@@ -155,9 +161,7 @@ async fn handle_audit_decoupling(
 
     // For each IC (non-passive, non-connector component), check power pins
     for inst in &instances {
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(&lib_syms, inst);
         let lib_sym = match lib_sym {
             Some(s) => s,
             None => continue,
@@ -255,10 +259,7 @@ async fn handle_audit_connections(
     let mut findings = Vec::new();
 
     for inst in &instances {
-        let lib_sym = match lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        {
+        let lib_sym = match find_lib_symbol(&lib_syms, inst) {
             Some(s) => s,
             None => continue,
         };
@@ -522,6 +523,227 @@ async fn handle_audit_manufacturing(
 
 // ─── Unified design review ───────────────────────────────────────────────────
 
+#[derive(Default)]
+struct SchematicReviewCoverage {
+    sheet_instances: usize,
+    schematic_files: usize,
+    symbol_instances: usize,
+    resolved_symbols: usize,
+    unresolved_symbols: usize,
+    named_nets: usize,
+    multi_unit_symbols: usize,
+}
+
+#[derive(Default)]
+struct BoardReviewCoverage {
+    footprints: usize,
+    pads: usize,
+    named_nets: usize,
+}
+
+struct AuditAggregate {
+    name: &'static str,
+    requested: usize,
+    completed: usize,
+    failed: usize,
+    findings: Vec<Value>,
+}
+
+impl AuditAggregate {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            requested: 0,
+            completed: 0,
+            failed: 0,
+            findings: Vec::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        source: &Path,
+        result: anyhow::Result<CallToolResult>,
+        diagnostics: &mut Vec<Value>,
+    ) {
+        self.requested += 1;
+        match result {
+            Ok(result) => match extract_findings(&result) {
+                Ok(findings) => {
+                    self.completed += 1;
+                    self.findings
+                        .extend(findings.into_iter().map(|mut finding| {
+                            finding["audit"] = json!(self.name);
+                            finding["source"] = json!(source.display().to_string());
+                            finding
+                        }));
+                }
+                Err(reason) => {
+                    self.failed += 1;
+                    diagnostics.push(json!({
+                        "code": "invalid_audit_result",
+                        "audit": self.name,
+                        "source": source.display().to_string(),
+                        "message": reason
+                    }));
+                }
+            },
+            Err(error) => {
+                self.failed += 1;
+                diagnostics.push(json!({
+                    "code": "audit_failed",
+                    "audit": self.name,
+                    "source": source.display().to_string(),
+                    "message": error.to_string()
+                }));
+            }
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if self.failed == 0 {
+            "complete"
+        } else if self.completed > 0 {
+            "partial"
+        } else {
+            "failed"
+        }
+    }
+
+    fn summary(&self) -> Value {
+        json!({
+            "status": self.status(),
+            "requested": self.requested,
+            "completed": self.completed,
+            "failed": self.failed,
+            "findings": self.findings.len()
+        })
+    }
+}
+
+fn collect_hierarchy_paths(
+    path: &Path,
+    node: &Value,
+    sheet_instances: &mut usize,
+    seen_files: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+    diagnostics: &mut Vec<Value>,
+) {
+    *sheet_instances += 1;
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if seen_files.insert(canonical) {
+        files.push(path.to_path_buf());
+    }
+
+    if let Some(error) = node.get("error").and_then(Value::as_str) {
+        diagnostics.push(json!({
+            "code": "hierarchy_error",
+            "source": path.display().to_string(),
+            "message": error
+        }));
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            let Some(file) = child.get("file").and_then(Value::as_str) else {
+                diagnostics.push(json!({
+                    "code": "hierarchy_error",
+                    "source": path.display().to_string(),
+                    "message": "hierarchy entry has no child file"
+                }));
+                continue;
+            };
+            collect_hierarchy_paths(
+                &parent.join(file),
+                child,
+                sheet_instances,
+                seen_files,
+                files,
+                diagnostics,
+            );
+        }
+    }
+}
+
+fn inspect_schematic_coverage(
+    path: &Path,
+    coverage: &mut SchematicReviewCoverage,
+    diagnostics: &mut Vec<Value>,
+) {
+    let (_, tree) = match read_schematic(path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            diagnostics.push(json!({
+                "code": "schematic_parse_failed",
+                "source": path.display().to_string(),
+                "message": error.to_string()
+            }));
+            return;
+        }
+    };
+
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    coverage.symbol_instances += instances.len();
+    coverage.named_nets += extract_labels(&tree)
+        .into_iter()
+        .map(|label| label.net)
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut multi_unit_references = HashSet::new();
+    for instance in &instances {
+        let Some(lib_symbol) = find_lib_symbol(&lib_syms, instance) else {
+            coverage.unresolved_symbols += 1;
+            diagnostics.push(json!({
+                "code": "unresolved_library_symbol",
+                "source": path.display().to_string(),
+                "reference": instance.reference,
+                "library_symbol": instance.lib_symbol_name(),
+                "message": "symbol was skipped by one or more design-review audits"
+            }));
+            continue;
+        };
+        coverage.resolved_symbols += 1;
+
+        // The design-review call sites tracked by #182 still use the
+        // unit-agnostic extractor. Until that issue lands, surface every such
+        // component as partial coverage rather than pretending it was audited.
+        if extract_lib_pins(lib_symbol).len()
+            > extract_lib_pins_for_unit(lib_symbol, instance.unit).len()
+            && multi_unit_references.insert(instance.reference.clone())
+        {
+            coverage.multi_unit_symbols += 1;
+            diagnostics.push(json!({
+                "code": "multi_unit_review_incomplete",
+                "source": path.display().to_string(),
+                "reference": instance.reference,
+                "message": "design-review pin analysis is not unit-aware yet; tracked by issue #182"
+            }));
+        }
+    }
+}
+
+fn inspect_board_coverage(path: &Path) -> anyhow::Result<BoardReviewCoverage> {
+    let content = std::fs::read_to_string(path)?;
+    let tree = parse_sexp(&content)?;
+    Ok(BoardReviewCoverage {
+        footprints: tree.find_all("footprint").len(),
+        pads: tree.find_all("pad").len(),
+        named_nets: konnect_sexp::net::count_distinct_nets(&tree),
+    })
+}
+
+fn args_for_schematic(args: &Value, path: &Path) -> Value {
+    let mut sheet_args = args.clone();
+    sheet_args["schematic"] = json!(path.display().to_string());
+    sheet_args
+}
+
 async fn handle_run_design_review(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -534,59 +756,120 @@ async fn handle_run_design_review(
         _ => 0,
     };
 
-    let mut all_findings: Vec<serde_json::Value> = Vec::new();
-    let mut audit_results = Vec::new();
+    let root_path = get_path(args, "schematic")?;
+    let project_name = project_name_for(&root_path);
+    let mut hierarchy_visited = HashSet::new();
+    let hierarchy =
+        sch_hierarchy::build_hierarchy_node(&root_path, &project_name, 0, &mut hierarchy_visited)?;
 
-    // Run schematic audits
-    if args["schematic"].is_string() {
-        let decoupling = handle_audit_decoupling(args, ctx).await?;
-        audit_results.push(("decoupling", extract_findings(&decoupling)));
+    let mut diagnostics = Vec::new();
+    let mut schematic_coverage = SchematicReviewCoverage::default();
+    let mut schematic_files = Vec::new();
+    let mut seen_files = HashSet::new();
+    collect_hierarchy_paths(
+        &root_path,
+        &hierarchy,
+        &mut schematic_coverage.sheet_instances,
+        &mut seen_files,
+        &mut schematic_files,
+        &mut diagnostics,
+    );
+    schematic_coverage.schematic_files = schematic_files.len();
 
-        let connections = handle_audit_connections(args, ctx).await?;
-        audit_results.push(("connections", extract_findings(&connections)));
+    let mut audits = vec![
+        AuditAggregate::new("decoupling"),
+        AuditAggregate::new("connections"),
+        AuditAggregate::new("power_rails"),
+        AuditAggregate::new("bom_health"),
+    ];
 
-        let power = handle_audit_power_rails(args, ctx).await?;
-        audit_results.push(("power_rails", extract_findings(&power)));
+    for schematic_path in &schematic_files {
+        inspect_schematic_coverage(schematic_path, &mut schematic_coverage, &mut diagnostics);
+        let sheet_args = args_for_schematic(args, schematic_path);
 
-        let bom = handle_check_bom_health(args, ctx).await?;
-        audit_results.push(("bom_health", extract_findings(&bom)));
+        let result = handle_audit_decoupling(&sheet_args, ctx).await;
+        audits[0].record(schematic_path, result, &mut diagnostics);
+        let result = handle_audit_connections(&sheet_args, ctx).await;
+        audits[1].record(schematic_path, result, &mut diagnostics);
+        let result = handle_audit_power_rails(&sheet_args, ctx).await;
+        audits[2].record(schematic_path, result, &mut diagnostics);
+        let result = handle_check_bom_health(&sheet_args, ctx).await;
+        audits[3].record(schematic_path, result, &mut diagnostics);
     }
 
-    // Run PCB audits
-    if args["board"].is_string() {
-        let dfm = handle_audit_manufacturing(args, ctx).await?;
-        audit_results.push(("manufacturing", extract_findings(&dfm)));
+    if schematic_coverage.symbol_instances == 0 {
+        diagnostics.push(json!({
+            "code": "zero_symbol_instances",
+            "source": root_path.display().to_string(),
+            "message": "no symbol instances were found in the schematic hierarchy"
+        }));
     }
+    if schematic_coverage.named_nets == 0 {
+        diagnostics.push(json!({
+            "code": "zero_named_nets",
+            "source": root_path.display().to_string(),
+            "message": "no named nets were found in the schematic hierarchy"
+        }));
+    }
+
+    let mut board_coverage = None;
+    if let Some(board) = args["board"].as_str() {
+        let board_path = PathBuf::from(board);
+        match inspect_board_coverage(&board_path) {
+            Ok(coverage) => {
+                if coverage.footprints == 0 {
+                    diagnostics.push(json!({
+                        "code": "zero_footprints",
+                        "source": board_path.display().to_string(),
+                        "message": "the supplied board contains no footprints"
+                    }));
+                }
+                board_coverage = Some(coverage);
+            }
+            Err(error) => diagnostics.push(json!({
+                "code": "board_parse_failed",
+                "source": board_path.display().to_string(),
+                "message": error.to_string()
+            })),
+        }
+
+        let mut manufacturing = AuditAggregate::new("manufacturing");
+        let result = handle_audit_manufacturing(args, ctx).await;
+        manufacturing.record(&board_path, result, &mut diagnostics);
+        audits.push(manufacturing);
+    }
+
+    let audit_summaries = audits
+        .iter()
+        .map(|audit| (audit.name.to_string(), audit.summary()))
+        .collect::<serde_json::Map<_, _>>();
+    let completed_audits = audits.iter().map(|audit| audit.completed).sum::<usize>();
+    let failed_audits = audits.iter().map(|audit| audit.failed).sum::<usize>();
+    let mut all_findings = audits
+        .iter()
+        .flat_map(|audit| audit.findings.iter().cloned())
+        .collect::<Vec<_>>();
 
     // Collect and filter findings
     let mut error_count = 0;
     let mut warning_count = 0;
     let mut info_count = 0;
 
-    for (audit_name, findings) in &audit_results {
-        for finding in findings {
-            let sev = finding["severity"].as_str().unwrap_or("info");
-            let rank = match sev {
-                "error" => {
-                    error_count += 1;
-                    2
-                }
-                "warning" => {
-                    warning_count += 1;
-                    1
-                }
-                _ => {
-                    info_count += 1;
-                    0
-                }
-            };
-            if rank >= min_rank {
-                let mut f = finding.clone();
-                f["audit"] = json!(audit_name);
-                all_findings.push(f);
-            }
+    for finding in &all_findings {
+        match finding["severity"].as_str().unwrap_or("info") {
+            "error" => error_count += 1,
+            "warning" => warning_count += 1,
+            _ => info_count += 1,
         }
     }
+    all_findings.retain(|finding| {
+        let rank = match finding["severity"].as_str().unwrap_or("info") {
+            "error" => 2,
+            "warning" => 1,
+            _ => 0,
+        };
+        rank >= min_rank
+    });
 
     // Sort by severity (errors first)
     all_findings.sort_by(|a, b| {
@@ -603,7 +886,16 @@ async fn handle_run_design_review(
         rank_a.cmp(&rank_b)
     });
 
-    let verdict = if error_count > 0 {
+    let status = if completed_audits == 0 {
+        "failed"
+    } else if failed_audits > 0 || !diagnostics.is_empty() {
+        "partial"
+    } else {
+        "complete"
+    };
+    let verdict = if status != "complete" {
+        "INCOMPLETE — review could not evaluate the full design"
+    } else if error_count > 0 {
         "NOT READY — critical issues must be fixed before manufacturing"
     } else if warning_count > 0 {
         "NEEDS ATTENTION — review warnings before manufacturing"
@@ -614,12 +906,31 @@ async fn handle_run_design_review(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "design_review": {
+                "status": status,
                 "verdict": verdict,
                 "errors": error_count,
                 "warnings": warning_count,
                 "info": info_count,
                 "severity_filter": severity_filter,
-                "findings": all_findings
+                "findings": all_findings,
+                "audits": audit_summaries,
+                "coverage": {
+                    "schematic": {
+                        "sheet_instances": schematic_coverage.sheet_instances,
+                        "schematic_files": schematic_coverage.schematic_files,
+                        "symbol_instances": schematic_coverage.symbol_instances,
+                        "resolved_symbols": schematic_coverage.resolved_symbols,
+                        "unresolved_symbols": schematic_coverage.unresolved_symbols,
+                        "named_nets": schematic_coverage.named_nets,
+                        "multi_unit_symbols": schematic_coverage.multi_unit_symbols
+                    },
+                    "board": board_coverage.map(|coverage| json!({
+                        "footprints": coverage.footprints,
+                        "pads": coverage.pads,
+                        "named_nets": coverage.named_nets
+                    }))
+                },
+                "diagnostics": diagnostics
             }
         }))
         .unwrap(),
@@ -759,9 +1070,7 @@ fn collect_capacitor_nets(
         if !inst.reference.starts_with('C') || inst.reference.starts_with("CN") {
             continue; // Only capacitors
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             for pin in &pins {
@@ -803,9 +1112,7 @@ fn collect_bulk_cap_nets(
             continue;
         }
 
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             for pin in &pins {
@@ -919,9 +1226,7 @@ fn has_pull_up_on_net(
         if !inst.reference.starts_with('R') {
             continue;
         }
-        let lib_sym = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+        let lib_sym = find_lib_symbol(lib_syms, inst);
         if let Some(sym) = lib_sym {
             let pins = extract_lib_pins(sym);
             let pin_nets: Vec<Option<String>> = pins
@@ -1059,13 +1364,327 @@ fn find_design_rule_value(content: &str, rule_name: &str) -> Option<f64> {
     after[..end].trim().parse().ok()
 }
 
-fn extract_findings(result: &CallToolResult) -> Vec<serde_json::Value> {
-    if let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-            if let Some(findings) = parsed["findings"].as_array() {
-                return findings.clone();
-            }
-        }
+fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
+    let text = match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+        Some(_) => return Err("audit returned non-text content".to_string()),
+        None => return Err("audit returned no content".to_string()),
+    };
+    if result.is_error {
+        return Err(format!("audit returned an error result: {text}"));
     }
-    Vec::new()
+
+    let parsed = serde_json::from_str::<Value>(text)
+        .map_err(|error| format!("audit result was not valid JSON: {error}"))?;
+    let findings = parsed
+        .get("findings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "audit result did not contain a findings array".to_string())?;
+    if findings.iter().any(|finding| !finding.is_object()) {
+        return Err("audit findings must be JSON objects".to_string());
+    }
+    Ok(findings.clone())
+}
+
+#[cfg(test)]
+mod review_completion_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use konnect_sexp::schematic::HierarchicalSheetSpec;
+    use konnect_sexp::schematic::{format_blank_schematic, format_hierarchical_sheet};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn single_unit_schematic(footprint: &str) -> String {
+        format!(
+            r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:R"
+      (property "Reference" "R" (at 0 0 0))
+      (property "Value" "R" (at 0 0 0))
+      (symbol "R_1_1"
+        (pin passive line (at 0 0 0) (length 2.54) (name "~") (number "1"))
+      )
+    )
+  )
+  (label "SIG" (at 20 20 0) (uuid "22222222-2222-4222-8222-222222222222"))
+  (symbol
+    (lib_id "Device:R")
+    (at 20 20 0)
+    (unit 1)
+    (in_bom yes)
+    (on_board yes)
+    (dnp no)
+    (uuid "33333333-3333-4333-8333-333333333333")
+    (property "Reference" "R1" (at 20 20 0))
+    (property "Value" "10k" (at 20 20 0))
+    (property "Footprint" "{footprint}" (at 20 20 0))
+    (pin "1" (uuid "44444444-4444-4444-8444-444444444444"))
+  )
+)
+"#
+        )
+    }
+
+    fn multi_unit_schematic() -> String {
+        r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Logic:DUAL"
+      (property "Reference" "U" (at 0 0 0))
+      (property "Value" "DUAL" (at 0 0 0))
+      (symbol "DUAL_1_1"
+        (pin input line (at 0 0 0) (length 2.54) (name "A") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 0 0 0) (length 2.54) (name "Y") (number "2"))
+      )
+    )
+  )
+  (label "SIG" (at 20 20 0) (uuid "22222222-2222-4222-8222-222222222222"))
+  (symbol
+    (lib_id "Logic:DUAL")
+    (at 20 20 0)
+    (unit 1)
+    (in_bom yes)
+    (on_board yes)
+    (dnp no)
+    (uuid "33333333-3333-4333-8333-333333333333")
+    (property "Reference" "U1" (at 20 20 0))
+    (property "Value" "DUAL" (at 20 20 0))
+    (property "Footprint" "Package_DIP:DIP-8_W7.62mm" (at 20 20 0))
+    (property "MPN" "TEST-DUAL" (at 20 20 0))
+    (pin "1" (uuid "44444444-4444-4444-8444-444444444444"))
+  )
+)
+"#
+        .to_string()
+    }
+
+    fn unresolved_symbol_schematic() -> String {
+        r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols)
+  (label "SIG" (at 20 20 0) (uuid "22222222-2222-4222-8222-222222222222"))
+  (symbol
+    (lib_id "Missing:Part")
+    (at 20 20 0)
+    (unit 1)
+    (in_bom yes)
+    (on_board yes)
+    (dnp no)
+    (uuid "33333333-3333-4333-8333-333333333333")
+    (property "Reference" "R1" (at 20 20 0))
+    (property "Value" "10k" (at 20 20 0))
+    (property "Footprint" "Resistor_SMD:R_0603_1608Metric" (at 20 20 0))
+  )
+)
+"#
+        .to_string()
+    }
+
+    fn root_with_child(file: &str) -> String {
+        let mut root = format_blank_schematic();
+        let insert_at = root.rfind(')').expect("blank schematic has a root close");
+        let block = format_hierarchical_sheet(HierarchicalSheetSpec {
+            name: "Power",
+            file,
+            x: 20.0,
+            y: 20.0,
+            width: 80.0,
+            height: 50.0,
+            project_name: "root",
+            parent_instance_path: "/11111111-1111-4111-8111-111111111111",
+            page: "2",
+        });
+        root.insert_str(insert_at, &block);
+        root
+    }
+
+    fn review_json(result: CallToolResult) -> Value {
+        assert!(
+            !result.is_error,
+            "incomplete review is a verdict, not a tool error"
+        );
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("review result must be text JSON")
+        };
+        serde_json::from_str(text).expect("review result must be valid JSON")
+    }
+
+    async fn review(schematic: &Path, board: Option<&Path>) -> Value {
+        let mut args = json!({"schematic": schematic.display().to_string()});
+        if let Some(board) = board {
+            args["board"] = json!(board.display().to_string());
+        }
+        review_json(handle_run_design_review(&args, &test_ctx()).await.unwrap())
+    }
+
+    #[test]
+    fn audit_errors_and_shape_mismatches_are_not_empty_successes() {
+        assert!(extract_findings(&CallToolResult::error("boom")).is_err());
+        assert!(extract_findings(&CallToolResult::text("{}"))
+            .unwrap_err()
+            .contains("findings array"));
+        assert!(
+            extract_findings(&CallToolResult::text(r#"{"findings":["not an object"]}"#))
+                .unwrap_err()
+                .contains("JSON objects")
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_schematic_is_incomplete_instead_of_looking_good() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("blank.kicad_sch");
+        std::fs::write(&root, format_blank_schematic()).unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "partial");
+        assert_eq!(
+            report["verdict"],
+            "INCOMPLETE — review could not evaluate the full design"
+        );
+        assert_eq!(report["coverage"]["schematic"]["symbol_instances"], 0);
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "zero_symbol_instances"));
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "zero_named_nets"));
+    }
+
+    #[tokio::test]
+    async fn hierarchical_child_is_included_in_coverage_and_audits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("power.kicad_sch");
+        std::fs::write(&root, root_with_child("power.kicad_sch")).unwrap();
+        std::fs::write(&child, single_unit_schematic("")).unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["schematic"]["sheet_instances"], 2);
+        assert_eq!(report["coverage"]["schematic"]["schematic_files"], 2);
+        assert_eq!(report["coverage"]["schematic"]["symbol_instances"], 1);
+        assert_ne!(report["verdict"], "LOOKS GOOD — no critical issues found");
+        assert!(report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["source"] == child.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn clean_single_sheet_can_still_look_good() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["verdict"], "LOOKS GOOD — no critical issues found");
+        assert_eq!(report["coverage"]["schematic"]["symbol_instances"], 1);
+        assert_eq!(report["coverage"]["schematic"]["named_nets"], 1);
+    }
+
+    #[tokio::test]
+    async fn multi_unit_symbol_is_partial_until_issue_182_lands() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("multi.kicad_sch");
+        std::fs::write(&root, multi_unit_schematic()).unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "partial");
+        assert_eq!(report["coverage"]["schematic"]["multi_unit_symbols"], 1);
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "multi_unit_review_incomplete"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_library_symbol_is_reported_as_partial_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("unresolved.kicad_sch");
+        std::fs::write(&root, unresolved_symbol_schematic()).unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "partial");
+        assert_eq!(report["coverage"]["schematic"]["unresolved_symbols"], 1);
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "unresolved_library_symbol"));
+    }
+
+    #[tokio::test]
+    async fn supplied_board_with_zero_footprints_is_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("empty.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(
+            &board,
+            "(kicad_pcb (version 20250610) (generator pcbnew) (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))",
+        )
+        .unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "partial");
+        assert_eq!(report["coverage"]["board"]["footprints"], 0);
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "zero_footprints"));
+    }
 }

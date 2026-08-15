@@ -9,11 +9,12 @@
 //!   - get_project_info → file system read
 //!   - snapshot_project → kicad-cli export PDF
 
-use crate::mcp::protocol::CallToolResult;
+use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
 use crate::tools::{get_path, opt_str, require_str, ToolContext, ToolDef};
+use konnect_sexp::{commit_file_transaction, FileTransition, SexpError};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -21,7 +22,7 @@ pub fn tools() -> Vec<ToolDef> {
             "create_project",
             "Create a new KiCAD project at the given path. Creates the directory, \
              a blank .kicad_pro file, an empty .kicad_sch schematic, and a blank \
-             .kicad_pcb board file.",
+             .kicad_pcb board file. Refuses to replace any existing project file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -133,6 +134,52 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+fn existing_project_paths(paths: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
+    let mut existing = Vec::new();
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => existing.push(path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(existing)
+}
+
+fn project_conflict(paths: Vec<PathBuf>) -> CallToolResult {
+    let paths: Vec<String> = paths
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: paths.clone(),
+        },
+        format!(
+            "Project creation would replace existing path(s): {}",
+            paths.join(", ")
+        ),
+    )
+}
+
+fn create_project_files(
+    project_dir: &Path,
+    name: &str,
+    pro_path: &Path,
+    sch_path: &Path,
+    pcb_path: &Path,
+) -> Result<(), SexpError> {
+    commit_file_transaction(
+        project_dir,
+        vec![
+            FileTransition::create(pro_path, blank_kicad_pro(name)),
+            FileTransition::create(sch_path, blank_kicad_sch()),
+            FileTransition::create(pcb_path, blank_kicad_pcb()),
+        ],
+    )?;
+    Ok(())
+}
+
 async fn handle_create_project(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -143,18 +190,38 @@ async fn handle_create_project(
         Err(e) => return Ok(e),
     };
 
-    tokio::fs::create_dir_all(&path).await?;
-
     let pro_path = path.join(format!("{}.kicad_pro", name));
     let sch_path = path.join(format!("{}.kicad_sch", name));
     let pcb_path = path.join(format!("{}.kicad_pcb", name));
+    let project_paths = vec![pro_path.clone(), sch_path.clone(), pcb_path.clone()];
 
-    // Write blank project file
-    tokio::fs::write(&pro_path, blank_kicad_pro(&name)).await?;
-    // Write blank schematic
-    tokio::fs::write(&sch_path, blank_kicad_sch()).await?;
-    // Write blank PCB
-    tokio::fs::write(&pcb_path, blank_kicad_pcb()).await?;
+    let existing = tokio::task::spawn_blocking({
+        let project_paths = project_paths.clone();
+        move || existing_project_paths(&project_paths)
+    })
+    .await??;
+    if !existing.is_empty() {
+        return Ok(project_conflict(existing));
+    }
+
+    tokio::fs::create_dir_all(&path).await?;
+
+    let transaction = tokio::task::spawn_blocking({
+        let project_dir = path.clone();
+        let name = name.clone();
+        let pro_path = pro_path.clone();
+        let sch_path = sch_path.clone();
+        let pcb_path = pcb_path.clone();
+        move || create_project_files(&project_dir, &name, &pro_path, &sch_path, &pcb_path)
+    })
+    .await?;
+    match transaction {
+        Ok(()) => {}
+        Err(SexpError::TransactionConflict { path, .. }) => {
+            return Ok(project_conflict(vec![path]));
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     Ok(CallToolResult::json(&json!({
         "created": true,
@@ -409,6 +476,7 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -482,6 +550,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_rejects_a_partially_populated_directory_without_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing_path = dir.path().join("widget.kicad_sch");
+        tokio::fs::write(&existing_path, b"existing schematic")
+            .await
+            .unwrap();
+        let ctx = test_ctx();
+        let args = json!({
+            "path": dir.path().to_str().unwrap(),
+            "name": "widget"
+        });
+
+        let result = handle_create_project(&args, &ctx)
+            .await
+            .expect("handler should return a structured conflict");
+
+        assert!(result.is_error);
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+        let body = response_json(&result);
+        assert_eq!(
+            body["error"]["paths"],
+            json!([existing_path.display().to_string()])
+        );
+        assert_eq!(
+            tokio::fs::read(&existing_path).await.unwrap(),
+            b"existing schematic"
+        );
+        assert!(!dir.path().join("widget.kicad_pro").exists());
+        assert!(!dir.path().join("widget.kicad_pcb").exists());
+    }
+
+    #[tokio::test]
+    async fn create_project_rejects_a_completed_project_without_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = test_ctx();
+        let args = json!({
+            "path": dir.path().to_str().unwrap(),
+            "name": "widget"
+        });
+        handle_create_project(&args, &ctx)
+            .await
+            .expect("initial creation should succeed");
+        let paths = [
+            dir.path().join("widget.kicad_pro"),
+            dir.path().join("widget.kicad_sch"),
+            dir.path().join("widget.kicad_pcb"),
+        ];
+        let before = [
+            tokio::fs::read(&paths[0]).await.unwrap(),
+            tokio::fs::read(&paths[1]).await.unwrap(),
+            tokio::fs::read(&paths[2]).await.unwrap(),
+        ];
+
+        let result = handle_create_project(&args, &ctx)
+            .await
+            .expect("repeat creation should return a conflict");
+
+        assert!(result.is_error);
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+        let body = response_json(&result);
+        assert_eq!(body["error"]["paths"].as_array().unwrap().len(), 3);
+        for (path, original) in paths.iter().zip(before) {
+            assert_eq!(tokio::fs::read(path).await.unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
     async fn create_project_missing_name_returns_structured_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_ctx();
@@ -543,5 +678,12 @@ mod tests {
             extract_error_kind(&result).as_deref(),
             Some("file_not_found")
         );
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
     }
 }

@@ -54,7 +54,12 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 Follow this sequence for a clean PCB workflow:
 
 1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry
-2. **Import netlist** — sync with schematic (update_pcb_from_schematic)
+2. **Import netlist** — there is no Konnect tool for this. KiCad 10 removed
+   `kicad-cli pcb sync`, so the user must open the board in KiCAD and run
+   **Tools > Update PCB from Schematic** themselves. Say so and wait; do not
+   substitute another tool, and do not proceed as though the netlist arrived.
+   `validate_for_manufacturing` reports "No footprints found on the board" when
+   this step has been skipped.
 3. **Place components** — position all footprints
 4. **Route traces** — connect all nets
 5. **Copper pour** — add ground/power zones last

@@ -12,7 +12,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.2"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -49,6 +49,7 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # SQLite (JLCPCB database)
 rusqlite = { version = "0.40", features = ["bundled"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Error handling
 anyhow = "1"
@@ -67,10 +68,10 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 
 # Platform directories (home dir, config dir)
-dirs = "5"
+dirs = "6"
 
 # SVG parsing (import_svg_logo)
-usvg = "0.47"
+usvg = "0.48"
 
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }

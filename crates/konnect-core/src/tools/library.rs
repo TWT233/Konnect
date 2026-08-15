@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{find_balanced_block, find_block_starts, write_atomic};
 use serde_json::json;
@@ -704,7 +705,10 @@ async fn handle_edit_footprint_pad(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "footprint_path")?;
-    let pad_number = require_str(args, "pad_number").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let pad_number = match require_str(args, "pad_number") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&path).await?;
 
@@ -838,6 +842,119 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
+/// Directory of the nearest ancestor of `file` that holds a `.kicad_pro`,
+/// falling back to the file's own directory when it belongs to no project — a
+/// loose schematic keeps resolving against the tables beside it.
+///
+/// The project file is found by scanning for the extension rather than by name:
+/// a sheet's filename says nothing about what the project is called.
+///
+/// A library table sitting beside `file` ends the search before it starts. The
+/// ancestor walk is unbounded, so without that it can leave the file's own
+/// directory and latch onto an unrelated `.kicad_pro` further up — a project
+/// nested inside another project's folder, or a stray file in a shared parent —
+/// and then resolve every library against the wrong `KIPRJMOD`. A directory
+/// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
+/// libraries come from, and that is the more specific answer.
+fn project_root_for(file: &Path) -> Option<PathBuf> {
+    let start = file.parent()?;
+    if holds_lib_table(start) {
+        return Some(start.to_path_buf());
+    }
+    start
+        .ancestors()
+        .find(|dir| holds_kicad_pro(dir))
+        .map(Path::to_path_buf)
+        .or_else(|| Some(start.to_path_buf()))
+}
+
+/// Whether `dir` carries a library table of its own.
+fn holds_lib_table(dir: &Path) -> bool {
+    dir.join("sym-lib-table").is_file() || dir.join("fp-lib-table").is_file()
+}
+
+/// Whether `dir` contains a `.kicad_pro`. An unreadable directory holds none.
+fn holds_kicad_pro(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("kicad_pro"))
+        })
+    })
+}
+
+/// Symbol libraries resolved as KiCad does: project `sym-lib-table` (shadowing
+/// same-nickname global entries), then global, then the conventional
+/// `<nickname>.kicad_symdir` / `.kicad_sym` layout. Same order as
+/// [`resolve_footprint_path`]; the last step covers a missing global table.
+///
+/// Both the flattened tables and the install dirs are memoised: placing one
+/// component asks for candidates at least twice, and the default global table
+/// is a `(type "Table")` indirection to ~200 bundled entries, each of which
+/// re-probes the install roots when `${KICAD*_DIR}` is unset.
+pub(crate) struct KiCadSymbolSource {
+    project_dir: Option<PathBuf>,
+    tables: std::sync::OnceLock<Vec<serde_json::Value>>,
+    install_dirs: std::sync::OnceLock<Vec<PathBuf>>,
+}
+
+impl KiCadSymbolSource {
+    pub(crate) fn new(project_dir: Option<PathBuf>) -> Self {
+        Self {
+            project_dir,
+            tables: std::sync::OnceLock::new(),
+            install_dirs: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// For a `.kicad_sch` or `.kicad_pcb` — `sym-lib-table` sits at the project
+    /// root, which is the nearest ancestor holding a `.kicad_pro`. A
+    /// hierarchical sheet under `<proj>/sheets/` therefore still resolves
+    /// against `<proj>/sym-lib-table`: KiCad anchors `KIPRJMOD` at the project,
+    /// not at the sheet.
+    pub(crate) fn for_file(file: &Path) -> Self {
+        Self::new(project_root_for(file))
+    }
+
+    /// Project entries first so they shadow same-nickname global ones.
+    fn tables(&self) -> &[serde_json::Value] {
+        self.tables.get_or_init(|| {
+            let mut libs = Vec::new();
+            if let Some(dir) = &self.project_dir {
+                libs.extend(read_flat_lib_table(&dir.join("sym-lib-table")));
+            }
+            libs.extend(read_flat_lib_table(&global_sym_lib_table()));
+            libs
+        })
+    }
+}
+
+impl konnect_schematic_editor::library::SymbolLibrarySource for KiCadSymbolSource {
+    fn candidates(&self, nickname: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+
+        for lib in self
+            .tables()
+            .iter()
+            .filter(|l| l["nickname"].as_str() == Some(nickname))
+        {
+            if let Some(path) = lib["path"].as_str() {
+                out.push(PathBuf::from(path));
+            }
+        }
+
+        let install_dirs = self
+            .install_dirs
+            .get_or_init(|| super::find_kicad_library_dirs("symbols"));
+        for base in install_dirs {
+            out.push(base.join(format!("{}.kicad_symdir", nickname)));
+            out.push(base.join(format!("{}.kicad_sym", nickname)));
+        }
+        out
+    }
+}
+
 /// Parse a lib-table S-expression and return list of (nickname, uri, type) tuples.
 ///
 /// Indentation-agnostic: KiCad's own writers emit tab-indented, CRLF-terminated
@@ -874,6 +991,33 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
 /// `${KICAD10_FOOTPRINT_DIR}/Resistor_SMD.pretty`. An exported environment
 /// variable wins; otherwise the variable's kind is inferred from its name and
 /// the known install locations are searched.
+/// User path variables from `kicad_common.json` (Preferences → Configure
+/// Paths).
+///
+/// These are KiCad's own variables, not process environment variables — KiCad
+/// stores them in its config and substitutes them itself when reading a
+/// lib-table, so `std::env::var` never finds them. A table written against one
+/// is perfectly normal and is the recommended way to keep a table portable
+/// across machines.
+fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(super::kicad_config_dir().join("kicad_common.json"))
+    else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return std::collections::HashMap::new();
+    };
+    json.get("environment")
+        .and_then(|e| e.get("vars"))
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
         return (!uri.is_empty()).then(|| PathBuf::from(uri));
@@ -896,6 +1040,19 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     // var_os, not var: `var` treats a non-Unicode value as absent, which would
     // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
     if let Some(base) = std::env::var_os(var) {
+        let p = PathBuf::from(base).join(tail);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // User path variables (Preferences → Configure Paths) are stored in
+    // kicad_common.json and are NOT process environment variables, so the
+    // var_os lookup above can never see them. They are the normal way to write
+    // a portable lib-table — `${MY_PARTS}/house.kicad_sym` — and without this
+    // every such entry resolved to None and the library was invisible.
+    // Credit to @JYPochez (#172) for finding this.
+    if let Some(base) = kicad_user_path_vars().get(var) {
         let p = PathBuf::from(base).join(tail);
         if p.exists() {
             return Some(p);
@@ -1075,8 +1232,8 @@ pub(crate) fn footprint_lib_nickname_for_dir(dir: &Path) -> Option<String> {
 /// registers. The `.pretty` fallback covers a stock install whose global
 /// table is missing or unreadable.
 ///
-/// (`resolve_symbol_lib_path` still searches global-first for symbols; that
-/// asymmetry is pre-existing and noted on that function.)
+/// Symbols resolve the same way and in the same order, via
+/// [`KiCadSymbolSource`] and `resolve_symbol_lib_path`.
 pub(crate) fn resolve_footprint_path(
     reference: &str,
     project_dir: Option<&Path>,
@@ -1182,36 +1339,32 @@ async fn handle_register_footprint_library(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
-    let table_path = if scope == "global" {
-        global_fp_lib_table()
-    } else if let Some(proj) = args["project"].as_str() {
-        PathBuf::from(proj)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("fp-lib-table")
-    } else {
-        return Ok(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
-        ));
+    let (table_path, uri) = match lib_table_target(
+        scope,
+        args["project"].as_str(),
+        &lib_path,
+        global_fp_lib_table(),
+        "fp-lib-table",
+    ) {
+        Ok(target) => target,
+        Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
-            "table": table_path.to_str().unwrap_or("")
+            "table": table_path.to_str().unwrap_or(""),
+            "repaired_table_root": repaired_root
         }))
         .unwrap(),
     ))
@@ -1260,41 +1413,119 @@ async fn handle_list_footprint_libraries(
     ))
 }
 
+/// A lib-table path written the way KiCad writes one: forward slashes on every
+/// platform, and without the Windows verbatim prefix.
+///
+/// `canonicalize` on Windows returns `\\?\C:\…`. That prefix is an OS-level
+/// escape for the 260-character limit, not part of the path — KiCad neither
+/// writes nor expects it, and a table carrying one is not portable. Backslashes
+/// are normalised for the same reason: a URI written on Windows has to still
+/// resolve when the project is opened on Linux or macOS.
+/// Credit to @anyn99 (#163), whose PR carried this and the lexical fallback
+/// below.
+fn portable_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    stripped.replace('\\', "/")
+}
+
+/// A lib-table URI for `lib_path`: `${KIPRJMOD}/…` when it lives inside the
+/// project, so the project survives being moved or cloned. Anything outside
+/// keeps its absolute path.
+fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
+    // An empty table dir must never reach `strip_prefix`: it succeeds and
+    // returns the whole path, which would emit a `${KIPRJMOD}//abs/path` that
+    // resolves nowhere on read.
+    if table_dir.as_os_str().is_empty() {
+        return portable_uri(lib_path);
+    }
+
+    let relative = |rel: &Path| format!("${{KIPRJMOD}}/{}", portable_uri(rel));
+
+    // Canonicalising both sides is the accurate comparison — it resolves
+    // symlinks, `..` and case differences — but it only works for paths that
+    // already exist. Registering a library before creating it is normal, so a
+    // failure here falls through to a lexical compare rather than giving up on
+    // portability.
+    if let (Ok(lib), Ok(dir)) = (
+        std::fs::canonicalize(lib_path),
+        std::fs::canonicalize(table_dir),
+    ) {
+        if let Ok(rel) = lib.strip_prefix(&dir) {
+            return relative(rel);
+        }
+        // Canonicalised and genuinely outside the project.
+        return portable_uri(&lib);
+    }
+
+    match lib_path.strip_prefix(table_dir) {
+        Ok(rel) => relative(rel),
+        Err(_) => portable_uri(lib_path),
+    }
+}
+
+/// Which lib-table a `register_*` call writes to, and the URI it records.
+///
+/// Shared by the symbol and footprint registrars so the two cannot drift: both
+/// need the same `${KIPRJMOD}` portability and the same empty-parent guard.
+fn lib_table_target(
+    scope: &str,
+    project: Option<&str>,
+    lib_path: &Path,
+    global_table: PathBuf,
+    table_filename: &str,
+) -> Result<(PathBuf, String), CallToolResult> {
+    if scope == "global" {
+        return Ok((global_table, portable_uri(lib_path)));
+    }
+    let Some(proj) = project else {
+        return Err(CallToolResult::error(
+            "For project scope, provide 'project' path to .kicad_pro file",
+        ));
+    };
+    // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path, not
+    // None — so the `.` default needs an explicit emptiness check.
+    let table_dir = PathBuf::from(proj)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let uri = project_relative_uri(lib_path, &table_dir);
+    Ok((table_dir.join(table_filename), uri))
+}
+
 async fn handle_register_symbol_library(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let nickname = require_str(args, "nickname").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let scope = args["scope"].as_str().unwrap_or("project");
 
-    let table_path = if scope == "global" {
-        global_sym_lib_table()
-    } else if let Some(proj) = args["project"].as_str() {
-        PathBuf::from(proj)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("sym-lib-table")
-    } else {
-        return Ok(CallToolResult::error(
-            "For project scope, provide 'project' path to .kicad_pro file",
-        ));
+    let (table_path, uri) = match lib_table_target(
+        scope,
+        args["project"].as_str(),
+        &lib_path,
+        global_sym_lib_table(),
+        "sym-lib-table",
+    ) {
+        Ok(target) => target,
+        Err(e) => return Ok(e),
     };
 
-    register_in_lib_table(
-        &table_path,
-        nickname,
-        lib_path.to_str().unwrap_or(""),
-        "KiCad",
-    )
-    .await?;
+    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "success": true,
             "nickname": nickname,
             "scope": scope,
-            "table": table_path.to_str().unwrap_or("")
+            "table": table_path.to_str().unwrap_or(""),
+            "uri": uri,
+            "repaired_table_root": repaired_root
         }))
         .unwrap(),
     ))
@@ -1361,26 +1592,73 @@ fn table_root_element(table_path: &Path) -> &'static str {
     }
 }
 
+/// Correct a lib-table whose root element is the wrong kind, returning the
+/// content and whether anything changed.
+///
+/// A `sym-lib-table` whose root says `(fp_lib_table` — or the reverse — is
+/// rejected outright: *"Library table … has type FOOTPRINT but expected SYMBOL;
+/// skipping"*. #54 stopped Konnect from **creating** such a file, but a table
+/// an older build already wrote stays broken forever, because every later
+/// registration appends into whatever root it finds. Repairing on write is what
+/// makes the earlier fix reach existing projects.
+///
+/// Only a root element is rewritten: the wrong token has to be the first thing
+/// in the file, so the same words appearing inside a `(descr …)` are left alone.
+fn repair_table_root(content: String, expected_root: &str) -> (String, bool) {
+    let wrong_root = if expected_root == "sym_lib_table" {
+        "fp_lib_table"
+    } else {
+        "sym_lib_table"
+    };
+    let opening = format!("({wrong_root}");
+    match content.find(&opening) {
+        Some(pos) if content[..pos].trim().is_empty() => {
+            let repaired = format!(
+                "{}({expected_root}{}",
+                &content[..pos],
+                &content[pos + opening.len()..]
+            );
+            (repaired, true)
+        }
+        _ => (content, false),
+    }
+}
+
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
-/// Creates the file with minimal scaffolding if it doesn't exist.
+/// Creates the file with minimal scaffolding if it doesn't exist, and repairs a
+/// mismatched root element on an existing one.
+///
+/// Returns whether the root element had to be repaired.
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
     uri: &str,
     lib_type: &str,
-) -> anyhow::Result<()> {
-    let content = if table_path.exists() {
-        tokio::fs::read_to_string(table_path).await?
+) -> anyhow::Result<bool> {
+    // The root element must match the table kind: a sym-lib-table with an
+    // (fp_lib_table root is rejected by KiCad. Decide from the filename, which
+    // is fixed by convention.
+    let root = table_root_element(table_path);
+    let (content, repaired_root) = if table_path.exists() {
+        repair_table_root(tokio::fs::read_to_string(table_path).await?, root)
     } else {
-        // The scaffold's root element must match the table kind: a
-        // sym-lib-table created with an (fp_lib_table root is rejected by
-        // KiCad. Decide from the filename, which is fixed by convention.
-        format!("({}\n  (version 7)\n)\n", table_root_element(table_path))
+        (format!("({root}\n  (version 7)\n)\n"), false)
     };
+    if repaired_root {
+        tracing::warn!(
+            "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
+            table_path.display()
+        );
+    }
 
     // Check if nickname already registered
     if content.contains(&format!("(name \"{}\")", nickname)) {
-        return Ok(()); // already registered, idempotent
+        // Idempotent — but a repaired root still has to reach disk, or a table
+        // that already lists this nickname stays rejected forever.
+        if repaired_root {
+            write_atomic(table_path, &content)?;
+        }
+        return Ok(repaired_root);
     }
 
     // Find closing paren of the root expression
@@ -1396,18 +1674,19 @@ async fn register_in_lib_table(
         tokio::fs::create_dir_all(parent).await?;
     }
     write_atomic(table_path, &new_content)?;
-    Ok(())
+    Ok(repaired_root)
 }
 
 // ─── Symbol library tools ─────────────────────────────────────────────────────
 
 /// Minimal pin geometry for deriving the symbol body.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PinGeom {
     x: f64,
     y: f64,
     angle: f64,
     length: f64,
+    name: String,
 }
 
 /// The point where a pin meets the symbol body. In KiCAD symbols the pin's
@@ -1420,12 +1699,44 @@ fn pin_root(x: f64, y: f64, angle_deg: f64, length: f64) -> (f64, f64) {
     (x + length * a.cos(), y + length * a.sin())
 }
 
+/// The body edge a pin attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinEdge {
+    Left,
+    Right,
+    Bottom,
+    Top,
+}
+
+/// Which edge a pin sits on, from its orientation (Y up): a pin pointing right
+/// (0) sits on the left edge, left (180) on the right edge, up (90) on the
+/// bottom edge, down (270) on the top edge. A degree of tolerance absorbs
+/// callers whose 360 arithmetic lands just off. `None` for anything diagonal.
+fn pin_edge(angle_deg: f64) -> Option<PinEdge> {
+    let a = angle_deg.rem_euclid(360.0);
+    let near = |t: f64| {
+        let d = (a - t).abs();
+        !(1.0..=359.0).contains(&d)
+    };
+    if near(0.0) {
+        Some(PinEdge::Left)
+    } else if near(180.0) {
+        Some(PinEdge::Right)
+    } else if near(90.0) {
+        Some(PinEdge::Bottom)
+    } else if near(270.0) {
+        Some(PinEdge::Top)
+    } else {
+        None
+    }
+}
+
 /// Body rectangle `(min_x, min_y, max_x, max_y)` for a symbol: edges that pins
 /// attach to pass through those pins' roots (so each pin's far end touches the
 /// border and its connection bulb sits outside), and edges with no pins are
 /// pushed out by a margin so there is clear spacing beyond the outermost pins.
 /// `None` when there are no pins.
-fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
+fn symbol_body_rect(pins: &[PinGeom], show_names: bool) -> Option<(f64, f64, f64, f64)> {
     if pins.is_empty() {
         return None;
     }
@@ -1444,24 +1755,15 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
         max_y = max_y.max(y);
     }
 
-    // Which edges have pins attaching, by orientation (Y up): a pin pointing
-    // right (0) sits on the left edge, left (180) on the right edge, up (90) on
-    // the bottom edge, down (270) on the top edge.
-    let norm = |a: f64| ((a % 360.0) + 360.0) % 360.0;
-    let near = |a: f64, t: f64| {
-        let d = (norm(a) - t).abs();
-        !(1.0..=359.0).contains(&d)
-    };
+    // Which edges have pins attaching.
     let (mut has_left, mut has_right, mut has_bottom, mut has_top) = (false, false, false, false);
     for p in pins {
-        if near(p.angle, 0.0) {
-            has_left = true;
-        } else if near(p.angle, 180.0) {
-            has_right = true;
-        } else if near(p.angle, 90.0) {
-            has_bottom = true;
-        } else if near(p.angle, 270.0) {
-            has_top = true;
+        match pin_edge(p.angle) {
+            Some(PinEdge::Left) => has_left = true,
+            Some(PinEdge::Right) => has_right = true,
+            Some(PinEdge::Bottom) => has_bottom = true,
+            Some(PinEdge::Top) => has_top = true,
+            None => {}
         }
     }
 
@@ -1492,7 +1794,82 @@ fn symbol_body_rect(pins: &[PinGeom]) -> Option<(f64, f64, f64, f64)> {
         min_y = c - min_size / 2.0;
         max_y = c + min_size / 2.0;
     }
+
+    // A box that only touches the pin roots is too small for the names KiCad
+    // draws inside it: with long names the two columns run into each other.
+    if show_names {
+        grow_to(&mut min_x, &mut max_x, names_span(pins, Axis::Horizontal));
+        grow_to(&mut min_y, &mut max_y, names_span(pins, Axis::Vertical));
+    }
     Some((min_x, min_y, max_x, max_y))
+}
+
+/// The pair of facing edges a name span is measured across.
+#[derive(Debug, Clone, Copy)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// Outer size needed so the pin names on two facing edges never meet.
+///
+/// Pins level with each other share a row, which needs both names plus a gap.
+/// Horizontally that pairs the left and right edges with rows keyed by Y;
+/// vertically the bottom and top edges with rows keyed by X.
+fn names_span(pins: &[PinGeom], axis: Axis) -> f64 {
+    let (a, b) = match axis {
+        Axis::Horizontal => (PinEdge::Left, PinEdge::Right),
+        Axis::Vertical => (PinEdge::Bottom, PinEdge::Top),
+    };
+    let mut rows: std::collections::HashMap<i64, (f64, f64)> = std::collections::HashMap::new();
+    for p in pins {
+        let Some(edge) = pin_edge(p.angle).filter(|e| *e == a || *e == b) else {
+            continue;
+        };
+        let w = pin_name_width(&p.name, PIN_TEXT);
+        if w == 0.0 {
+            continue;
+        }
+        let across = match axis {
+            Axis::Horizontal => p.y,
+            Axis::Vertical => p.x,
+        };
+        let row = rows
+            .entry((across * 1000.0).round() as i64)
+            .or_insert((0.0, 0.0));
+        let col = if edge == a { &mut row.0 } else { &mut row.1 };
+        *col = col.max(w);
+    }
+    let widest = rows
+        .values()
+        .map(|&(a, b)| {
+            if a > 0.0 && b > 0.0 {
+                a + b + PIN_NAME_GAP
+            } else {
+                a + b
+            }
+        })
+        .fold(0.0, f64::max);
+    if widest == 0.0 {
+        0.0
+    } else {
+        widest + 2.0 * PIN_NAME_OFFSET
+    }
+}
+
+/// Widen `lo..hi` symmetrically to at least `needed`, keeping the new edges on
+/// the schematic grid so pins pushed out to meet them stay on it too.
+fn grow_to(lo: &mut f64, hi: &mut f64, needed: f64) {
+    if needed <= *hi - *lo {
+        return;
+    }
+    let centre = (*lo + *hi) / 2.0;
+    let half = needed / 2.0;
+    // Snap each edge outwards on its own: rounding the half-extent instead only
+    // lands on the grid when the centre already does. `+ 0.0` turns the `-0.0`
+    // floor/ceil produce at the origin back into `0`.
+    *lo = ((centre - half) / SYMBOL_GRID).floor() * SYMBOL_GRID + 0.0;
+    *hi = ((centre + half) / SYMBOL_GRID).ceil() * SYMBOL_GRID + 0.0;
 }
 
 /// KiCAD's 12 valid pin electrical types — the first token of a
@@ -1696,8 +2073,35 @@ const PIN_TEXT: f64 = 1.27;
 /// them without enlarging the body and breaking the library-matching shape.
 const GLYPH_PIN_NAME_TEXT: f64 = 0.762;
 
+/// Average advance per character of KiCad's stroke font, as a multiple of the
+/// text height. Measured off a 400 dpi render of KiCad 10 output: an
+/// 18-character name at 1.27 mm spans 24.03 mm. The font is proportional, so
+/// this is an average — [`PIN_NAME_GAP`] absorbs the variance.
+const STROKE_ADVANCE_RATIO: f64 = 1.05;
+/// Clear space kept between the two columns of pin names inside a body.
+const PIN_NAME_GAP: f64 = 2.54;
+/// Gap KiCad leaves between the body outline and the start of a pin name,
+/// emitted as `(pin_names (offset …))`.
+const PIN_NAME_OFFSET: f64 = 1.016;
+/// Schematic grid. Body edges land on it so pins pushed out to meet them do too.
+const SYMBOL_GRID: f64 = 1.27;
+
+/// Width of a pin name as KiCad draws it. `~{FOO}` is an overbar rather than
+/// four extra glyphs, and a bare `~` means "unnamed" and draws nothing.
+fn pin_name_width(name: &str, size: f64) -> f64 {
+    if name == "~" {
+        return 0.0;
+    }
+    let glyphs = name.chars().filter(|c| !"~{}".contains(*c)).count();
+    glyphs as f64 * size * STROKE_ADVANCE_RATIO
+}
+
 /// One `(pin …)` S-expression. `name_font` sets the pin-name text height;
 /// numbers stay at the default (they sit outside the body and don't crowd).
+///
+/// Coordinates go through [`fmt_f64`] so binary floating-point artifacts stay
+/// out of the file: `25.4 + 5.08` is `30.479999999999997` and `{}` prints it in
+/// full.
 #[allow(clippy::too_many_arguments)]
 fn emit_pin(
     pin_type: &str,
@@ -1712,7 +2116,18 @@ fn emit_pin(
 ) -> String {
     format!(
         "\n    (pin {} {} (at {} {} {})\n      (length {})\n      (name \"{}\" (effects (font (size {} {}))))\n      (number \"{}\" (effects (font (size {} {}))))\n    )",
-        pin_type, style, x, y, angle, length, name, name_font, name_font, number, PIN_TEXT, PIN_TEXT
+        pin_type,
+        style,
+        fmt_f64(x),
+        fmt_f64(y),
+        fmt_f64(angle),
+        fmt_f64(length),
+        name,
+        name_font,
+        name_font,
+        number,
+        PIN_TEXT,
+        PIN_TEXT
     )
 }
 
@@ -2044,10 +2459,12 @@ fn build_glyph_unit(
 ///
 /// Errors (#55) when a pin's electrical type is not one of KiCAD's 12 valid
 /// values — the caller must not write anything to disk in that case.
+/// Glyph units keep their fixed library-matching shape, so `show_names` only
+/// reaches the rectangle path.
 fn build_symbol_unit(
     pins_val: &[serde_json::Value],
-    with_body: bool,
     glyph: Option<Glyph>,
+    show_names: bool,
 ) -> anyhow::Result<(String, SymbolRect, Option<String>)> {
     validate_pin_types(pins_val)?;
     if let Some(g) = glyph {
@@ -2055,46 +2472,58 @@ fn build_symbol_unit(
             match build_glyph_unit(pins_val, g) {
                 Ok((sexp, rect)) => return Ok((sexp, rect, None)),
                 Err(reason) => {
-                    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+                    let (sexp, rect) = build_rect_unit(pins_val, show_names);
                     return Ok((sexp, rect, Some(reason)));
                 }
             }
         }
     }
-    let (sexp, rect) = build_rect_unit(pins_val, with_body);
+    let (sexp, rect) = build_rect_unit(pins_val, show_names);
     Ok((sexp, rect, None))
 }
 
 /// The default rectangle body + caller-positioned pins. Pin types are assumed
 /// already validated by `build_symbol_unit`.
-fn build_rect_unit(pins_val: &[serde_json::Value], with_body: bool) -> (String, SymbolRect) {
-    let mut pins_sexp = String::new();
+fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String, SymbolRect) {
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
     for pin in pins_val {
-        let number = pin["number"].as_str().unwrap_or("1");
-        let pin_name = pin["name"].as_str().unwrap_or("~");
-        let pin_type = pin["type"].as_str().unwrap_or("passive");
-        let style = pin_style_token(pin["style"].as_str());
-        let x = pin["x"].as_f64().unwrap_or(0.0);
-        let y = pin["y"].as_f64().unwrap_or(0.0);
-        let angle = pin["angle"].as_f64().unwrap_or(0.0);
-        let length = pin["length"].as_f64().unwrap_or(2.54);
-
         pin_geoms.push(PinGeom {
-            x,
-            y,
-            angle,
-            length,
+            x: pin["x"].as_f64().unwrap_or(0.0),
+            y: pin["y"].as_f64().unwrap_or(0.0),
+            angle: pin["angle"].as_f64().unwrap_or(0.0),
+            length: pin["length"].as_f64().unwrap_or(2.54),
+            name: pin["name"].as_str().unwrap_or("~").to_string(),
         });
+    }
+    let body = symbol_body_rect(&pin_geoms, show_names);
+    // Fitting the names can push the body past the pins that defined it.
+    // Slide them back out, keeping the length the caller asked for.
+    if let Some((min_x, min_y, max_x, max_y)) = body {
+        for g in &mut pin_geoms {
+            match pin_edge(g.angle) {
+                Some(PinEdge::Left) => g.x = min_x - g.length,
+                Some(PinEdge::Right) => g.x = max_x + g.length,
+                Some(PinEdge::Bottom) => g.y = min_y - g.length,
+                Some(PinEdge::Top) => g.y = max_y + g.length,
+                None => {}
+            }
+        }
+    }
+
+    let mut pins_sexp = String::new();
+    for (pin, g) in pins_val.iter().zip(&pin_geoms) {
         pins_sexp.push_str(&emit_pin(
-            pin_type, style, x, y, angle, length, pin_name, number, PIN_TEXT,
+            pin["type"].as_str().unwrap_or("passive"),
+            pin_style_token(pin["style"].as_str()),
+            g.x,
+            g.y,
+            g.angle,
+            g.length,
+            &g.name,
+            pin["number"].as_str().unwrap_or("1"),
+            PIN_TEXT,
         ));
     }
-    let body = if with_body {
-        symbol_body_rect(&pin_geoms)
-    } else {
-        None
-    };
     let body_sexp = match body {
         Some((min_x, min_y, max_x, max_y)) => format!(
             "\n      (rectangle (start {:.4} {:.4}) (end {:.4} {:.4})\n        (stroke (width 0.254) (type default))\n        (fill (type background))\n      )",
@@ -2161,7 +2590,7 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let (inner1, body1, warn1) = match build_symbol_unit(&signal, true, sym_glyph) {
+            let (inner1, body1, warn1) = match build_symbol_unit(&signal, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2171,7 +2600,7 @@ async fn handle_create_symbol(
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, true, None) {
+            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2183,7 +2612,7 @@ async fn handle_create_symbol(
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let (inner, body, warn) = match build_symbol_unit(&pins_val, true, sym_glyph) {
+            let (inner, body, warn) = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2219,7 +2648,7 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let (inner, body, warn) = match build_symbol_unit(&unit_pins, true, unit_glyph) {
+            let (inner, body, warn) = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2239,7 +2668,7 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let (inner, _, _) = match build_symbol_unit(&power_pins, true, None) {
+            let (inner, _, _) = match build_symbol_unit(&power_pins, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
@@ -2263,8 +2692,16 @@ async fn handle_create_symbol(
     let names_vis = if show_names { "" } else { " hide" };
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset 1.016){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
-        name, numbers_vis, names_vis, ref_prefix, ref_y, value_str, value_y, units_sexp
+        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset {}){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
+        name,
+        numbers_vis,
+        fmt_f64(PIN_NAME_OFFSET),
+        names_vis,
+        ref_prefix,
+        ref_y,
+        value_str,
+        value_y,
+        units_sexp
     );
 
     // If file doesn't exist, create scaffold
@@ -2304,7 +2741,10 @@ async fn handle_delete_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let symbol_name = require_str(args, "symbol_name").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
@@ -2377,33 +2817,21 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Resolve a symbol library nickname to an on-disk `.kicad_sym` path.
-///
-/// Checks the **global** sym-lib-table first, then the **project** table at
-/// `project_dir/sym-lib-table` (if a project dir is supplied). Returns the first
-/// entry whose nickname matches and whose URI resolved to a path at all. Both
-/// tables are read with `read_flat_lib_table`, so nested `(type "Table")`
-/// references are followed and `${KICAD*_DIR}` URIs are expanded.
-///
-/// The returned path is *not* guaranteed to exist: `expand_lib_uri` checks
-/// existence only for `${KICAD*_DIR}` expansions, and takes a plain URI as
-/// written. A stale global entry therefore still shadows a working project one
-/// with the same nickname, and the caller's read is what discovers it.
-async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut tables = vec![global_sym_lib_table()];
-    if let Some(pd) = project_dir {
-        tables.push(pd.join("sym-lib-table"));
-    }
-    for table in tables {
-        for lib in read_flat_lib_table(&table) {
-            if lib["nickname"].as_str() == Some(nick) {
-                if let Some(path) = lib["path"].as_str() {
-                    return Some(PathBuf::from(path));
-                }
-            }
-        }
-    }
-    None
+/// The `.kicad_sym` file defining `nick:sym_name`, found exactly the way symbol
+/// placement finds it — via [`KiCadSymbolSource`], so a lookup here and a
+/// placement of the same lib_id can never disagree.
+fn resolve_symbol_lib_path(
+    nick: &str,
+    sym_name: &str,
+    project_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    use konnect_schematic_editor::library::SymbolLibrarySource;
+    KiCadSymbolSource::new(project_dir.map(Path::to_path_buf))
+        .candidates(nick)
+        .iter()
+        .find_map(|candidate| {
+            konnect_schematic_editor::library::symbol_file_in(candidate, sym_name)
+        })
 }
 
 /// Recursively collect every descendant `SexpNode::List` whose head matches
@@ -2572,8 +3000,10 @@ async fn handle_list_library_footprints(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let library_path_str =
-        require_str(args, "library_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let library_path_str = match require_str(args, "library_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let lib_dir = PathBuf::from(library_path_str);
 
     if !lib_dir.is_dir() {
@@ -2608,8 +3038,10 @@ async fn handle_get_footprint_info(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fp_path_str =
-        require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let fp_path_str = match require_str(args, "footprint_path") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     // Resolve "Library:Footprint" against the project's fp-lib-table as well
     // as the global one, when the caller says which project they mean.
@@ -2710,7 +3142,10 @@ async fn handle_get_symbol_info(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let lib_id = require_str(args, "lib_id").map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let lib_id = match require_str(args, "lib_id") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
 
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -2726,12 +3161,13 @@ async fn handle_get_symbol_info(
         .map(PathBuf::from)
         .or_else(|| ctx.config.project_dir.clone());
 
-    let lib_path = match resolve_symbol_lib_path(lib_nick, project_dir.as_deref()).await {
+    let lib_path = match resolve_symbol_lib_path(lib_nick, sym_name, project_dir.as_deref()) {
         Some(p) => p,
         None => {
             return Ok(CallToolResult::error(format!(
-                "Library '{}' not found in global or project sym-lib-table, or its uri uses an unresolved env var",
-                lib_nick
+                "Symbol '{}' not found: no library '{}' in the project or global \
+                 sym-lib-table, nor in the installed KiCad symbol libraries",
+                lib_id, lib_nick
             )));
         }
     };
@@ -2817,6 +3253,7 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3282,15 +3719,91 @@ mod tests {
     async fn registering_a_symbol_library_scaffolds_a_sym_root() {
         let tmp = tempfile::tempdir().unwrap();
         let table = tmp.path().join("sym-lib-table");
-        register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
+        let repaired = register_in_lib_table(&table, "MySyms", "${KIPRJMOD}/my.kicad_sym", "KiCad")
             .await
             .unwrap();
+        assert!(!repaired, "a fresh scaffold has nothing to repair");
         let content = std::fs::read_to_string(&table).unwrap();
         assert!(
             content.starts_with("(sym_lib_table"),
             "scaffold root must match the table kind, got: {content}"
         );
         assert!(content.contains("\"MySyms\""));
+    }
+
+    /// A sym-lib-table an older build wrote with an `(fp_lib_table` root is
+    /// rejected wholesale by KiCad ("has type FOOTPRINT but expected SYMBOL;
+    /// skipping"). #54 stopped new files being written that way; without a
+    /// repair the existing ones stay broken through every later registration.
+    const BROKEN_SYM_TABLE: &str = "(fp_lib_table\n  (version 7)\n  (lib (name \"Old\") (type \"KiCad\") (uri \"/abs/old.kicad_sym\") (options \"\") (descr \"\"))\n)\n";
+
+    #[tokio::test]
+    async fn an_existing_sym_table_with_an_fp_root_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        std::fs::write(&table, BROKEN_SYM_TABLE).unwrap();
+
+        let repaired = register_in_lib_table(&table, "MySyms", "/abs/my.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+
+        assert!(
+            repaired,
+            "the wrong root must be reported, not fixed mutely"
+        );
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(
+            content.starts_with("(sym_lib_table"),
+            "root must be repaired, got: {content}"
+        );
+        assert!(!content.contains("fp_lib_table"), "{content}");
+        assert!(
+            content.contains("\"Old\""),
+            "existing entry lost: {content}"
+        );
+        assert!(content.contains("\"MySyms\""), "{content}");
+    }
+
+    /// The idempotent "already registered" early return used to skip the write
+    /// entirely, so re-registering the same nickname left the bad root in place.
+    #[tokio::test]
+    async fn a_repair_still_lands_when_the_nickname_is_already_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("sym-lib-table");
+        std::fs::write(&table, BROKEN_SYM_TABLE).unwrap();
+
+        let repaired = register_in_lib_table(&table, "Old", "/abs/old.kicad_sym", "KiCad")
+            .await
+            .unwrap();
+
+        assert!(repaired);
+        let content = std::fs::read_to_string(&table).unwrap();
+        assert!(content.starts_with("(sym_lib_table"), "{content}");
+        assert_eq!(
+            content.matches("(lib ").count(),
+            1,
+            "an already-registered nickname must not be duplicated: {content}"
+        );
+    }
+
+    #[test]
+    fn a_correct_root_and_a_mention_inside_a_descr_are_left_alone() {
+        let ok = "(fp_lib_table\n  (version 7)\n)\n".to_string();
+        assert_eq!(
+            repair_table_root(ok.clone(), "fp_lib_table"),
+            (ok, false),
+            "a correct table must not be rewritten"
+        );
+
+        // The wrong token appears, but not as the root element.
+        let nested =
+            "(sym_lib_table\n  (lib (name \"X\") (descr \"copied from fp_lib_table\"))\n)\n"
+                .to_string();
+        assert_eq!(
+            repair_table_root(nested.clone(), "sym_lib_table"),
+            (nested, false),
+            "only the root element may be rewritten"
+        );
     }
 
     fn pad(number: &str, t: &str, x: f64, y: f64, w: f64, h: f64) -> PadGeom {
@@ -3396,42 +3909,30 @@ mod tests {
         assert!(ux.abs() < 1e-9 && (uy - -2.46).abs() < 1e-9, "up {ux},{uy}");
     }
 
+    /// A pin for the body-sizing tests. `"~"` is KiCAD's "unnamed" sentinel, so
+    /// it contributes no name width.
+    fn test_pin(x: f64, y: f64, angle: f64, length: f64, name: &str) -> PinGeom {
+        PinGeom {
+            x,
+            y,
+            angle,
+            length,
+            name: name.into(),
+        }
+    }
+
     #[test]
     fn symbol_body_rect_touches_side_pins_and_spaces_the_ends() {
+        let pin = |x, y, angle| test_pin(x, y, angle, 2.54, "~");
         // Three pins on the left (point right), two on the right (point left).
         let pins = vec![
-            PinGeom {
-                x: -10.16,
-                y: 2.54,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: -10.16,
-                y: 0.0,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: -10.16,
-                y: -2.54,
-                angle: 0.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: 10.16,
-                y: 2.54,
-                angle: 180.0,
-                length: 2.54,
-            },
-            PinGeom {
-                x: 10.16,
-                y: -2.54,
-                angle: 180.0,
-                length: 2.54,
-            },
+            pin(-10.16, 2.54, 0.0),
+            pin(-10.16, 0.0, 0.0),
+            pin(-10.16, -2.54, 0.0),
+            pin(10.16, 2.54, 180.0),
+            pin(10.16, -2.54, 180.0),
         ];
-        let (min_x, min_y, max_x, max_y) = symbol_body_rect(&pins).unwrap();
+        let (min_x, min_y, max_x, max_y) = symbol_body_rect(&pins, true).unwrap();
         // Left/right edges pass through the pin roots (pins touch the border).
         assert!((min_x - -7.62).abs() < 1e-9, "left edge {min_x}");
         assert!((max_x - 7.62).abs() < 1e-9, "right edge {max_x}");
@@ -3440,7 +3941,145 @@ mod tests {
         // Top/bottom edges have no pins → spacing beyond the outermost pins.
         assert!(max_y >= 2.54 + 2.5, "top spacing {max_y}");
         assert!(min_y <= -2.54 - 2.5, "bottom spacing {min_y}");
-        assert!(symbol_body_rect(&[]).is_none());
+        assert!(symbol_body_rect(&[], true).is_none());
+    }
+
+    /// A box that only touches the pin roots leaves the two columns of pin
+    /// names overlapping: here a 26-character name facing an 8-character one.
+    #[test]
+    fn body_widens_so_facing_pin_names_do_not_collide() {
+        let pin = |x, angle, name| test_pin(x, 0.0, angle, 5.08, name);
+        let pins = vec![
+            pin(-25.4, 0.0, "LONG/MULTI/FUNCTION/NAME/X"),
+            pin(25.4, 180.0, "SHORT/NM"),
+        ];
+        let roots_only = symbol_body_rect(&pins, false).unwrap();
+        assert!(
+            (roots_only.2 - roots_only.0 - 40.64).abs() < 1e-9,
+            "without names the body still hugs the pin roots: {roots_only:?}"
+        );
+
+        let (min_x, _, max_x, _) = symbol_body_rect(&pins, true).unwrap();
+        let inner = max_x - min_x - 2.0 * PIN_NAME_OFFSET;
+        let text = pin_name_width("LONG/MULTI/FUNCTION/NAME/X", PIN_TEXT)
+            + pin_name_width("SHORT/NM", PIN_TEXT);
+        assert!(
+            inner >= text + PIN_NAME_GAP,
+            "body {:.2} mm leaves {:.2} mm for {:.2} mm of names",
+            max_x - min_x,
+            inner,
+            text
+        );
+        // Edges stay on the schematic grid so the pins meeting them do too.
+        assert!(
+            (min_x / SYMBOL_GRID).fract().abs() < 1e-9,
+            "off grid {min_x}"
+        );
+    }
+
+    /// Name width counts drawn glyphs, not the markup around them.
+    #[test]
+    fn body_width_ignores_unnamed_and_overbar_markup() {
+        assert_eq!(pin_name_width("~", PIN_TEXT), 0.0);
+        // `~{RST}` is RST with an overbar: three glyphs, not six.
+        assert!(
+            (pin_name_width("~{RST}", PIN_TEXT) - pin_name_width("RST", PIN_TEXT)).abs() < 1e-9
+        );
+    }
+
+    /// A row with only one name needs room for that name, not for a gap too.
+    #[test]
+    fn a_row_with_one_name_reserves_no_column_gap() {
+        let name = "SOLO/PIN/NAME";
+        let one_sided = names_span(&[test_pin(-25.4, 0.0, 0.0, 5.08, name)], Axis::Horizontal);
+        assert!(
+            (one_sided - (pin_name_width(name, PIN_TEXT) + 2.0 * PIN_NAME_OFFSET)).abs() < 1e-9,
+            "one name reserved {one_sided} mm"
+        );
+        // The same two names on separate rows never share one, so neither does.
+        let staggered = names_span(
+            &[
+                test_pin(-25.4, 0.0, 0.0, 5.08, name),
+                test_pin(25.4, 2.54, 180.0, 5.08, name),
+            ],
+            Axis::Horizontal,
+        );
+        assert!(
+            (staggered - one_sided).abs() < 1e-9,
+            "staggered {staggered}"
+        );
+    }
+
+    /// Vertical pins get the same treatment on height — their names are drawn
+    /// across it just as horizontal pins' names are drawn across the width.
+    #[test]
+    fn body_widens_vertically_for_facing_top_and_bottom_names() {
+        let pins = vec![
+            test_pin(0.0, -25.4, 90.0, 5.08, "LONG/MULTI/FUNCTION/NAME/X"),
+            test_pin(0.0, 25.4, 270.0, 5.08, "SHORT/NM"),
+        ];
+        let (_, min_y, _, max_y) = symbol_body_rect(&pins, true).unwrap();
+        let inner = max_y - min_y - 2.0 * PIN_NAME_OFFSET;
+        let text = pin_name_width("LONG/MULTI/FUNCTION/NAME/X", PIN_TEXT)
+            + pin_name_width("SHORT/NM", PIN_TEXT);
+        assert!(
+            inner >= text + PIN_NAME_GAP,
+            "body {:.2} mm tall leaves {:.2} mm for {:.2} mm of names",
+            max_y - min_y,
+            inner,
+            text
+        );
+    }
+
+    /// `grow_to` snaps both edges to the grid even when the box it widens is
+    /// centred off it — otherwise the pins slid out to meet them land off grid.
+    #[test]
+    fn grow_to_lands_on_grid_from_an_off_grid_centre() {
+        let (mut lo, mut hi) = (-20.32, 16.51);
+        grow_to(&mut lo, &mut hi, 50.0);
+        assert!(hi - lo >= 50.0, "grew to {lo}..{hi}");
+        for edge in [lo, hi] {
+            assert!((edge / SYMBOL_GRID).fract().abs() < 1e-9, "off grid {edge}");
+        }
+    }
+
+    /// Pins that defined the original box must slide out to meet the widened
+    /// one, or they float inside the body, off its outline.
+    #[tokio::test]
+    async fn widening_the_body_slides_pins_out_to_meet_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("w.kicad_sym");
+        handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "WIDE",
+                "pins": [
+                    {"number":"1","name":"LONG/MULTI/FUNCTION/NAME/X","type":"bidirectional",
+                     "x":-25.4,"y":0.0,"angle":0,"length":5.08},
+                    {"number":"2","name":"SHORT/NM","type":"bidirectional",
+                     "x":25.4,"y":0.0,"angle":180,"length":5.08}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let out = std::fs::read_to_string(&lib).unwrap();
+        let tree = konnect_sexp::parse_sexp(&out).unwrap();
+        // kicad_symbol_lib → (symbol "WIDE") → (symbol "WIDE_0_1") → body + pins
+        let unit = tree.find("symbol").unwrap().find("symbol").unwrap();
+        let rect = unit.find("rectangle").unwrap();
+        let (sx, _) = konnect_sexp::schematic::parse_start(rect).unwrap();
+        let (ex, _) = konnect_sexp::schematic::parse_end(rect).unwrap();
+        for pin in unit.find_all("pin") {
+            let (px, _, angle) = konnect_sexp::schematic::parse_at(pin).unwrap();
+            let root = if angle == 0.0 { px + 5.08 } else { px - 5.08 };
+            let edge = if angle == 0.0 { sx } else { ex };
+            assert!(
+                (root - edge).abs() < 1e-6,
+                "pin at {px} (angle {angle}) roots at {root}, body edge is {edge}"
+            );
+        }
     }
 
     #[test]
@@ -4295,8 +4934,10 @@ mod tests {
         });
         handle_create_symbol(&args, &test_ctx()).await.unwrap();
         let rc = std::fs::read_to_string(&lib).unwrap();
+        // Position is not asserted: the body is sized to fit the pin name, which
+        // can slide the pin out to meet it (see symbol_body_rect).
         assert!(
-            rc.contains("(pin input inverted (at -7.62 0 0)"),
+            rc.contains("(pin input inverted (at "),
             "inverted style on a rectangle pin:\n{rc}"
         );
     }
@@ -4418,5 +5059,414 @@ mod tests {
             rc.contains("(name \"IN\" (effects (font (size 1.27 1.27))))"),
             "rectangle pin names keep the default 1.27 font:\n{rc}"
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_source_tests {
+    use super::*;
+    use konnect_schematic_editor::library::SymbolLibrarySource;
+
+    /// The bug this fixes: a library registered in the project table was
+    /// invisible to placement, which only scanned the KiCad install dirs.
+    #[test]
+    fn project_table_entry_is_offered_before_the_install_dirs() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("vendor-parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"MyParts\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let src = KiCadSymbolSource::new(Some(proj.path().to_path_buf()));
+        let candidates = src.candidates("MyParts");
+
+        assert_eq!(
+            candidates.first(),
+            Some(&file),
+            "the project table entry must be tried first, got {candidates:?}"
+        );
+    }
+
+    /// `${KIPRJMOD}` resolves against the table's own directory, not the env.
+    #[test]
+    fn kiprjmod_uri_resolves_against_the_project_dir() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Proj\") (type \"KiCad\") (uri \"${KIPRJMOD}/lib/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let src = KiCadSymbolSource::new(Some(proj.path().to_path_buf()));
+        assert!(
+            src.candidates("Proj").contains(&file),
+            "${{KIPRJMOD}} must expand to the project dir"
+        );
+    }
+
+    /// A stock install keeps working with no table entry at all. Points
+    /// KICAD10_SYMBOL_DIR at a tempdir rather than asserting against whatever
+    /// KiCad is installed — CI has none, so the fallback would have no
+    /// directory to derive from and the assertion would be vacuous at best.
+    #[test]
+    fn unregistered_nickname_falls_back_to_the_conventional_layout() {
+        let _env = crate::tools::KICAD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let install = tempfile::tempdir().unwrap();
+        std::env::set_var("KICAD10_SYMBOL_DIR", install.path());
+
+        let src = KiCadSymbolSource::new(None);
+        let candidates = src.candidates("Device");
+        assert!(
+            candidates.contains(&install.path().join("Device.kicad_symdir")),
+            "expected the symdir fallback, got {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&install.path().join("Device.kicad_sym")),
+            "expected the single-file fallback, got {candidates:?}"
+        );
+    }
+
+    /// Reported on #136: a sheet under `<proj>/sheets/` saw no project library,
+    /// because the table was looked for beside the sheet rather than at the
+    /// project root. `add_hierarchical_sheet` accepts such a `sheet_file`, so
+    /// this is reachable through Konnect alone.
+    #[test]
+    fn a_sheet_in_a_subdirectory_resolves_against_the_project_table() {
+        let proj = tempfile::tempdir().unwrap();
+        let file = proj.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(proj.path().join("board.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"MyLib\") (type \"KiCad\") (uri \"${KIPRJMOD}/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let sheets = proj.path().join("sheets");
+        std::fs::create_dir_all(&sheets).unwrap();
+        let child = sheets.join("child.kicad_sch");
+        std::fs::write(&child, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&child).candidates("MyLib");
+        assert!(
+            candidates.contains(&file),
+            "a sub-sheet must see the project table at the root, got {candidates:?}"
+        );
+    }
+
+    /// The fallback the walk must not break: a schematic belonging to no
+    /// project still resolves against the tables sitting beside it.
+    #[test]
+    fn a_schematic_with_no_project_falls_back_to_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Loose\") (type \"KiCad\") (uri \"${KIPRJMOD}/parts.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let sch = dir.path().join("loose.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Loose");
+        assert!(
+            candidates.contains(&file),
+            "a projectless schematic must still use the table beside it, got {candidates:?}"
+        );
+    }
+
+    /// The walk is unbounded, so an unrelated `.kicad_pro` in any ancestor used
+    /// to capture the search and send every lookup to the wrong `KIPRJMOD`. A
+    /// project nested inside another project's folder is the realistic case;
+    /// the one that actually bit was a stray `.kicad_pro` in the system temp
+    /// directory, which quietly defeated the hermetic fixtures of two tests —
+    /// they passed on CI, where temp is clean, and failed on any machine that
+    /// had accumulated one.
+    ///
+    /// A table beside the file is the more specific statement and must win.
+    #[test]
+    fn a_table_beside_the_file_beats_an_unrelated_project_further_up() {
+        let outer = tempfile::tempdir().unwrap();
+        // An unrelated project sitting above — the interloper.
+        std::fs::write(outer.path().join("Unrelated.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            outer.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/wrong.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let inner = outer.path().join("nested");
+        std::fs::create_dir(&inner).unwrap();
+        let want = inner.join("right.kicad_sym");
+        std::fs::write(&want, "(kicad_symbol_lib)\n").unwrap();
+        std::fs::write(
+            inner.join("sym-lib-table"),
+            "(sym_lib_table\n  (version 7)\n  (lib (name \"Shared\") (type \"KiCad\") (uri \"${KIPRJMOD}/right.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+        let sch = inner.join("nested.kicad_sch");
+        std::fs::write(&sch, "(kicad_sch)\n").unwrap();
+
+        let candidates = KiCadSymbolSource::for_file(&sch).candidates("Shared");
+        assert!(
+            candidates.contains(&want),
+            "the table beside the schematic must win, got {candidates:?}"
+        );
+        assert!(
+            !candidates.contains(&outer.path().join("wrong.kicad_sym")),
+            "the outer project's table must not be consulted, got {candidates:?}"
+        );
+    }
+
+    /// `Path::new("board.kicad_sch").parent()` is `Some("")`, not `None`. The
+    /// walk must leave that as-is so a bare relative path keeps resolving
+    /// against the working directory.
+    #[test]
+    fn a_bare_relative_schematic_keeps_an_empty_project_dir() {
+        assert_eq!(
+            project_root_for(Path::new("board.kicad_sch")),
+            Some(PathBuf::new())
+        );
+    }
+
+    #[test]
+    fn project_scoped_registration_writes_a_portable_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        assert_eq!(
+            project_relative_uri(&file, proj.path()),
+            "${KIPRJMOD}/lib/parts.kicad_sym"
+        );
+    }
+
+    /// `Path::new("board.kicad_pro").parent()` is `Some("")`, and
+    /// `strip_prefix("")` returns the whole path — which would emit
+    /// `${KIPRJMOD}//abs/path`, resolving nowhere on read.
+    #[test]
+    fn an_empty_table_dir_does_not_produce_a_rooted_kiprjmod_uri() {
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, Path::new(""));
+        assert!(
+            !uri.contains("KIPRJMOD"),
+            "empty project dir must fall back to an absolute uri: {uri}"
+        );
+        assert_eq!(uri, portable_uri(&file));
+    }
+
+    /// A library outside the project keeps an absolute URI, but still written
+    /// with forward slashes — a backslash URI does not survive the project
+    /// being opened on Linux or macOS.
+    #[test]
+    fn a_library_outside_the_project_stays_absolute_with_forward_slashes() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, proj.path());
+        assert!(!uri.contains("KIPRJMOD"), "outside the project: {uri}");
+        assert!(!uri.contains('\\'), "uri must be slash-separated: {uri}");
+    }
+
+    /// Global scope is never relativized, and never carries the Windows
+    /// verbatim prefix or backslashes.
+    #[test]
+    fn global_scope_writes_a_plain_forward_slash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("parts.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table, uri) = lib_table_target(
+            "global",
+            None,
+            &file,
+            PathBuf::from("/cfg/sym-lib-table"),
+            "sym-lib-table",
+        )
+        .expect("global scope needs no project");
+
+        assert_eq!(table, PathBuf::from("/cfg/sym-lib-table"));
+        assert!(!uri.contains("KIPRJMOD"), "global is never relative: {uri}");
+        assert!(!uri.starts_with(r"\\?\"), "verbatim prefix leaked: {uri}");
+        assert!(!uri.contains('\\'), "uri must be slash-separated: {uri}");
+    }
+
+    /// Registering a library before it exists on disk is normal — the file is
+    /// often created by the very next call. `canonicalize` fails for a path
+    /// that is not there yet, so without a lexical fallback the URI silently
+    /// came out absolute and the project stopped being portable.
+    #[test]
+    fn a_library_not_yet_on_disk_still_gets_a_portable_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let file = proj.path().join("lib").join("not-created-yet.kicad_sym");
+
+        assert_eq!(
+            project_relative_uri(&file, proj.path()),
+            "${KIPRJMOD}/lib/not-created-yet.kicad_sym"
+        );
+    }
+
+    /// Both registrars share one target helper, so footprints get the same
+    /// portable URI and the same empty-parent guard as symbols.
+    #[test]
+    fn both_registrars_agree_on_the_project_table_target() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let sym = lib.join("parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+        let fp = lib.join("parts.pretty");
+        std::fs::create_dir_all(&fp).unwrap();
+
+        let proj_file = proj.path().join("board.kicad_pro");
+        let proj_arg = proj_file.to_str();
+
+        let (sym_table, sym_uri) = lib_table_target(
+            "project",
+            proj_arg,
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("symbol target");
+        let (fp_table, fp_uri) = lib_table_target(
+            "project",
+            proj_arg,
+            &fp,
+            global_fp_lib_table(),
+            "fp-lib-table",
+        )
+        .expect("footprint target");
+
+        assert_eq!(sym_uri, "${KIPRJMOD}/lib/parts.kicad_sym");
+        assert_eq!(fp_uri, "${KIPRJMOD}/lib/parts.pretty");
+        assert_eq!(sym_table, proj.path().join("sym-lib-table"));
+        assert_eq!(fp_table, proj.path().join("fp-lib-table"));
+    }
+
+    #[test]
+    fn a_library_outside_the_project_keeps_its_absolute_uri() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("shared.kicad_sym");
+        std::fs::write(&file, "(kicad_symbol_lib)\n").unwrap();
+
+        let uri = project_relative_uri(&file, proj.path());
+        assert!(
+            !uri.contains("KIPRJMOD"),
+            "nothing portable to say about an out-of-project library: {uri}"
+        );
+    }
+}
+
+/// A missing argument must stay a structured `invalid_argument` naming the
+/// field, rather than collapsing into a generic `handler_error`.
+///
+/// Seven handlers here did `map_err(|e| anyhow!("{:?}", e))?` on the
+/// `CallToolResult` that `require_str` returns, debug-formatting a typed error
+/// into a string and losing the taxonomy on the way out. `pcb_components`
+/// already returned the result directly. This is what lets a caller tell "you
+/// forgot an argument" from "the tool tried and failed".
+#[cfg(test)]
+mod argument_error_kind_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn missing_required_arguments_report_invalid_argument_with_the_field() {
+        // (tool, args that satisfy everything *except* the field under test,
+        //  the field it should name)
+        //
+        // The args matter: several of these read a path through `get_path`
+        // first, which still returns an `anyhow::Error` and would fail the
+        // call before the `require_str` this test is about is ever reached.
+        let cases = [
+            ("get_symbol_info", json!({}), "lib_id"),
+            ("get_footprint_info", json!({}), "footprint_path"),
+            (
+                "register_footprint_library",
+                json!({ "library_path": "/tmp/x.pretty", "scope": "global" }),
+                "nickname",
+            ),
+            (
+                "register_symbol_library",
+                json!({ "library_path": "/tmp/x.kicad_sym", "scope": "global" }),
+                "nickname",
+            ),
+        ];
+
+        for (tool_name, args, field) in cases {
+            let def = tools()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is registered"));
+
+            // The old pattern turned this into an Err, so the unwrap itself is
+            // part of the assertion.
+            let result = (def.handler)(&args, ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{tool_name} must not bubble an anyhow error: {e}"));
+
+            assert!(result.is_error, "{tool_name}: missing argument must fail");
+
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool_name}: expected text, got {other:?}"),
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool_name}: {e}: {text}"));
+
+            assert_eq!(
+                parsed["error"]["kind"], "invalid_argument",
+                "{tool_name} must report a typed argument error, not a \
+                 debug-formatted handler_error: {text}"
+            );
+            assert_eq!(
+                parsed["error"]["field"], field,
+                "{tool_name} must name the missing field: {text}"
+            );
+        }
     }
 }

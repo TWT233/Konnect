@@ -23,6 +23,18 @@ that teach Claude KiCAD conventions out of the box.
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
 
+> ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
+>
+> [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
+> quality-scored Google search, clean webpage extraction, and deep multi-source
+> research. Design the board with Konnect while Nimrod pulls live parts availability, datasheets,
+> and errata — no more guessing from year-old training data
+>
+> - Works with claude.ai, Claude Desktop, Claude Code, VS Code, and any MCP client
+> - 1 credit = 1 search · extraction always free · free 50-credit trial, no card
+> - Official MCP Registry: [`ai.orchis/nimrod`](https://registry.modelcontextprotocol.io)
+
+
 ## Why Konnect exists
 
 Konnect is the successor to [KiCAD-MCP-Server](https://github.com/mixelpixx/KiCAD-MCP-Server),

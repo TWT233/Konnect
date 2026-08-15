@@ -7,8 +7,9 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, reembed_lib_symbols,
-    require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
+    find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
+    project_name_for, reembed_lib_symbols, require_f64, require_str, ReembedOutcome, ToolContext,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -16,7 +17,8 @@ use konnect_sexp::{
     geometry::snap_point,
     parse_sexp,
     schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
+        pin_outward_direction, read_schematic,
     },
     writer::{
         apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
@@ -197,7 +199,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "get_schematic_pin_locations",
             "Get the exact schematic-space (X,Y) coordinates of every pin on a symbol, \
-             accounting for rotation and mirroring. Uses the canonical pin transform.",
+             accounting for rotation and mirroring. Uses the canonical pin transform. \
+             Each pin also reports 'orientation_degrees', the direction leading away \
+             from the symbol body (0 = east) — a net label at the pin must read that \
+             way or its text runs back over the symbol's pin names — and 'length_mm'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -210,7 +215,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_get_schematic_pin_locations",
-            "Get pin locations for multiple components in a single file read.",
+            "Get pin locations for multiple components in a single file read. Reports the \
+             same per-pin fields as get_schematic_pin_locations, including \
+             'orientation_degrees' and 'length_mm'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -278,7 +285,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Re-embed placed symbols' definitions from their libraries, like KiCad's \
              'Update Symbols from Library'. A schematic carries its own copy of every \
              symbol, so editing one in its library leaves the sheet drawing the old \
-             shape — this refreshes it. Pin positions can move as a result.",
+             shape — this refreshes it. A symbol whose pins moved or disappeared in \
+             the library is refused (reported in pins_moved) unless allow_pin_moves \
+             is set, because wires and labels attach at pin coordinates.",
             json!({
                 "type": "object",
                 "properties": {
@@ -289,7 +298,9 @@ pub fn tools() -> Vec<ToolDef> {
                         "items": { "type": "string" }
                     },
                     "dry_run": { "type": "boolean", "default": false,
-                        "description": "Report what would change without writing." }
+                        "description": "Report what would change without writing." },
+                    "allow_pin_moves": { "type": "boolean", "default": false,
+                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." }
                 },
                 "required": ["schematic"]
             }),
@@ -372,6 +383,7 @@ async fn handle_add_schematic_component(
         ref_str,
         value,
         unit,
+        &crate::tools::library::KiCadSymbolSource::for_file(&sch_path),
     ) {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -408,20 +420,21 @@ pub(crate) fn place_one_component(
     reference: &str,
     value: Option<&str>,
     unit: u32,
+    src: &dyn cse::library::SymbolLibrarySource,
 ) -> Result<serde_json::Value, CallToolResult> {
     // Snap to 1.27mm grid
     let (x, y) = snap_point(x, y, 1.27);
     let val_str = value.unwrap_or(lib_id.split(':').next_back().unwrap_or("?"));
 
     // Embed the library symbol definition
-    if !cse::library::ensure_lib_symbol(sch, lib_id) {
-        return Err(crate::tools::lib_symbol_not_found_error(lib_id));
+    if !cse::library::ensure_lib_symbol(sch, lib_id, src) {
+        return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
     // netlister mis-assigns its pins (#35).
-    let unit_count = cse::library::symbol_unit_count(lib_id).unwrap_or(1);
+    let unit_count = cse::library::symbol_unit_count(lib_id, src).unwrap_or(1);
     if unit < 1 || unit > unit_count {
         return Err(CallToolResult::error(format!(
             "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
@@ -434,25 +447,48 @@ pub(crate) fn place_one_component(
     sym.at.rotation = Some(rotation);
     sym.unit = unit;
 
-    // Reference above the component, Value below; Footprint/Datasheet hidden.
+    // Reference and Value go where the library anchors them, carried through
+    // the placement transform so they follow a rotated body (#101);
+    // Footprint/Datasheet stay hidden at the origin.
     // Power symbols get their Reference hidden too, matching eeschema: a
     // #PWR designator is never shown on the sheet.
     let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
+    let anchors = cse::library::field_anchors(sch, lib_id);
+    let t = konnect_sexp::geometry::PinTransform {
+        comp_x: x,
+        comp_y: y,
+        rotation_deg: rotation,
+        mirror_x: false,
+        mirror_y: false,
+    };
+    let (ref_x, ref_y, ref_rot) =
+        crate::tools::field_at(anchors.reference_at, crate::tools::FALLBACK_REFERENCE_AT, t);
+    let (val_x, val_y, val_rot) =
+        crate::tools::field_at(anchors.value_at, crate::tools::FALLBACK_VALUE_AT, t);
     let positioned = crate::tools::positioned_property;
+    let centred = cse::library::FieldJustify::default();
     sym.properties.push(positioned(
         "Reference",
         reference,
-        x,
-        y - 3.81,
-        0.0,
+        ref_x,
+        ref_y,
+        ref_rot,
         hide_reference,
+        anchors.reference_justify,
+    ));
+    sym.properties.push(positioned(
+        "Value",
+        val_str,
+        val_x,
+        val_y,
+        val_rot,
+        false,
+        anchors.value_justify,
     ));
     sym.properties
-        .push(positioned("Value", val_str, x, y + 3.81, 0.0, false));
+        .push(positioned("Footprint", "", x, y, 0.0, true, centred));
     sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true));
+        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -493,6 +529,124 @@ async fn handle_delete_schematic_component(
             reference
         ))),
     }
+}
+
+/// Properties this tool exposes as first-class parameters. Routing one of them
+/// through `fields` too would let a single call set the same property twice
+/// with different values, and for Reference it would skip the instances-path
+/// rewrite entirely — a rename that the netlist ignores (#157).
+fn is_reserved_property(name: &str) -> bool {
+    matches!(name, "Reference" | "Value" | "Footprint" | "Datasheet")
+}
+
+/// Does `reference`'s symbol block already carry a `name` property?
+fn property_exists(content: &str, reference: &str, name: &str) -> bool {
+    find_symbol_instance_block(content, reference).is_some_and(|(start, end)| {
+        content[start..end].contains(&format!(r#"(property "{name}" ""#))
+    })
+}
+
+/// Append a new `(property …)` to `reference`'s symbol block.
+///
+/// Anchored at the symbol's own `(at …)` and written hidden: a custom field is
+/// data, not something to draw over the sheet, and KiCad 10's canonical
+/// instance form puts `(hide yes)` as a sibling before `(effects …)` (#96).
+/// The `(at …)` is mandatory — a property written without one is defaulted to
+/// the sheet origin, which is how every `#PWR` reference once piled up in the
+/// top-left corner (#95).
+fn append_property(
+    content: &str,
+    reference: &str,
+    name: &str,
+    value: &str,
+) -> Result<String, String> {
+    let (start, end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+    let block = &content[start..end];
+
+    // The symbol's placement, to anchor the new property on.
+    let (x, y) = block
+        .find("(at ")
+        .and_then(|at| {
+            let rest = &block[at + 4..];
+            let close = rest.find(')')?;
+            let mut parts = rest[..close].split_whitespace();
+            Some((
+                parts.next()?.parse::<f64>().ok()?,
+                parts.next()?.parse::<f64>().ok()?,
+            ))
+        })
+        .ok_or_else(|| format!("'{reference}' has no readable (at …) placement"))?;
+
+    // Match the block's own indentation rather than assuming: eeschema saves
+    // with tabs, this crate's writer uses two spaces.
+    let indent = block
+        .find("(property ")
+        .map(|p| {
+            let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
+            block[line_start..p].to_string()
+        })
+        .unwrap_or_else(|| "\t\t".to_string());
+
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let prop = format!(
+        "\n{indent}(property \"{name}\" \"{escaped}\"\n{indent}\t(at {x} {y} 0)\n\
+         {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
+         (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
+    );
+
+    // Insert before the block's closing paren so the property stays inside it.
+    let close = content[..end]
+        .rfind(')')
+        .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
+    Ok(format!(
+        "{}{}{}",
+        &content[..close],
+        prop,
+        &content[close..]
+    ))
+}
+
+/// Rewrite the `(reference "…")` inside every unit's `(instances …)` block.
+///
+/// Returns the updated content and how many were rewritten. A multi-unit part
+/// is placed once per unit and each placement carries its own instances block,
+/// so a rename has to reach all of them or the units disagree about their own
+/// designator.
+fn rewrite_instance_references(
+    content: &str,
+    old_ref: &str,
+    new_ref: &str,
+) -> Result<(String, usize), String> {
+    let blocks = find_all_symbol_instance_blocks(content, new_ref);
+    if blocks.is_empty() {
+        return Err(format!("symbol '{old_ref}' not found after the rename"));
+    }
+
+    let search = format!(r#"(reference "{old_ref}")"#);
+    let replacement = format!(r#"(reference "{new_ref}")"#);
+    let mut edits = Vec::new();
+    for (start, end) in &blocks {
+        let block = &content[*start..*end];
+        let mut from = 0usize;
+        while let Some(rel) = block[from..].find(&search) {
+            let at = *start + from + rel;
+            edits.push(SexpEdit::replace(
+                at,
+                at + search.len(),
+                replacement.clone(),
+            ));
+            from += rel + search.len();
+        }
+    }
+    if edits.is_empty() {
+        return Err(format!(
+            "'{new_ref}' has no (reference \"{old_ref}\") in its instances path — \
+             the property was renamed but the netlist still reads the old designator"
+        ));
+    }
+    let count = edits.len();
+    Ok((apply_edits(content.to_string(), edits), count))
 }
 
 async fn handle_edit_schematic_component(
@@ -536,31 +690,88 @@ async fn handle_edit_schematic_component(
         };
 
     let mut errors: Vec<String> = Vec::new();
-    let mut apply = |content: &mut String, field: &str, new_val: &str| match update_field(
-        content, &reference, field, new_val,
-    ) {
-        Ok(updated) => {
-            *content = updated;
-            changed.push(format!("{} → {}", field, new_val));
-        }
-        Err(why) => errors.push(format!("{field}: {why}")),
-    };
+    // A macro rather than a closure: the body also needs `changed`/`errors`
+    // between calls (the instances rewrite below, and the custom-field loop),
+    // and a closure capturing them mutably would lock both for its lifetime.
+    macro_rules! apply {
+        ($field:expr, $new_val:expr) => {
+            match update_field(&content, &reference, $field, $new_val) {
+                Ok(updated) => {
+                    content = updated;
+                    changed.push(format!("{} → {}", $field, $new_val));
+                }
+                Err(why) => errors.push(format!("{}: {}", $field, why)),
+            }
+        };
+    }
 
     if let Some(new_ref) = opt_str(args, "new_reference") {
-        apply(&mut content, "Reference", new_ref);
+        apply!("Reference", new_ref);
+        // A designator lives in TWO places. The (property "Reference" …) is
+        // what renders; the (reference …) inside (instances …) is what KiCad
+        // reads when it builds the netlist. Rewriting only the property leaves
+        // the netlist on the old designator, so the rename appears to work in
+        // eeschema and is ignored everywhere it matters (#157).
+        match rewrite_instance_references(&content, &reference, new_ref) {
+            Ok((updated, count)) => {
+                content = updated;
+                changed.push(format!("instances reference → {new_ref} ({count})"));
+            }
+            Err(why) => errors.push(format!("instances reference: {why}")),
+        }
     }
     if let Some(val) = opt_str(args, "value") {
-        apply(&mut content, "Value", val);
+        apply!("Value", val);
     }
     if let Some(fp) = opt_str(args, "footprint") {
-        apply(&mut content, "Footprint", fp);
+        apply!("Footprint", fp);
     }
     if let Some(ds) = opt_str(args, "datasheet") {
-        apply(&mut content, "Datasheet", ds);
+        apply!("Datasheet", ds);
+    }
+
+    // `fields` has been in this tool's schema since it shipped and the handler
+    // never read it, so custom properties were dropped and the call still
+    // reported success (#158). An existing property is updated in place; a new
+    // one is appended to the symbol block.
+    let custom_fields = args["fields"].as_object();
+    if let Some(fields) = custom_fields {
+        for (name, value) in fields {
+            let Some(value) = value.as_str() else {
+                errors.push(format!("{name}: field values must be strings"));
+                continue;
+            };
+            if is_reserved_property(name) {
+                errors.push(format!(
+                    "{name}: set this through the '{}' parameter, not 'fields'",
+                    name.to_ascii_lowercase()
+                ));
+                continue;
+            }
+            if property_exists(&content, &reference, name) {
+                apply!(name.as_str(), value);
+            } else {
+                match append_property(&content, &reference, name, value) {
+                    Ok(updated) => {
+                        content = updated;
+                        changed.push(format!("{name} → {value} (added)"));
+                    }
+                    Err(why) => errors.push(format!("{name}: {why}")),
+                }
+            }
+        }
     }
 
     // A request that changed nothing is a failure, not a success — silently
-    // reporting `"changes": []` is what let the tab-indentation bug hide.
+    // reporting `"changes": []` is what let the tab-indentation bug hide, and
+    // what made a fields-only call report success while dropping every field
+    // (#158): with `fields` unread, both `changed` and `errors` came back
+    // empty and this guard never fired.
+    if changed.is_empty() && custom_fields.is_some_and(|f| !f.is_empty()) && errors.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No fields were updated on '{reference}'"
+        )));
+    }
     if changed.is_empty() && !errors.is_empty() {
         return Ok(CallToolResult::error(format!(
             "No fields were updated on '{}': {}",
@@ -824,9 +1035,7 @@ async fn handle_get_schematic_pin_locations(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let lib_sym = lib_syms
-        .iter()
-        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+    let lib_sym = find_lib_symbol(&lib_syms, inst);
 
     // A missing embedded definition is an error, not an empty pin list —
     // silently returning [] hid every bad-lib_id component until wiring or
@@ -838,7 +1047,8 @@ async fn handle_get_schematic_pin_locations(
              doesn't exist in the installed libraries, so it is invisible to \
              KiCAD's netlister. Re-add it with a valid lib_id \
              (delete_schematic_component + add_schematic_component).",
-            reference, inst.lib_id
+            reference,
+            inst.lib_symbol_name()
         )));
     };
     // Unit-aware: only this instance's unit (plus _0_1 commons), not every
@@ -857,7 +1067,10 @@ async fn handle_get_schematic_pin_locations(
                  part). Re-add the component (delete_schematic_component + \
                  add_schematic_component) so the definition is embedded in \
                  full, or place the parent symbol '{}' directly.",
-                reference, inst.lib_id, parent, parent
+                reference,
+                inst.lib_symbol_name(),
+                parent,
+                parent
             )));
         }
     }
@@ -870,7 +1083,12 @@ async fn handle_get_schematic_pin_locations(
                 "number": p.number,
                 "name": p.name,
                 "x": sx,
-                "y": sy
+                "y": sy,
+                // Which way the pin faces away from the body (0 = east). A
+                // label here should read that way, or it runs back over the
+                // symbol's pin names.
+                "orientation_degrees": pin_outward_direction(p, t),
+                "length_mm": p.length
             })
         })
         .collect();
@@ -912,9 +1130,7 @@ async fn handle_batch_get_pin_locations(
                 Some(i) => i,
                 None => return json!({ "reference": reference, "error": "not found" }),
             };
-            let lib_sym = lib_syms
-                .iter()
-                .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+            let lib_sym = find_lib_symbol(&lib_syms, inst);
             // Per-entry error rather than a silent empty pin list (#34).
             let Some(sym) = lib_sym else {
                 return json!({
@@ -922,7 +1138,7 @@ async fn handle_batch_get_pin_locations(
                     "error": format!(
                         "no embedded definition for '{}' in lib_symbols — \
                          likely added with a nonexistent lib_id",
-                        inst.lib_id
+                        inst.lib_symbol_name()
                     )
                 });
             };
@@ -937,7 +1153,7 @@ async fn handle_batch_get_pin_locations(
                             "embedded definition for '{}' is an (extends \"{}\") \
                              stub with no pins — re-add the component so it is \
                              embedded in full",
-                            inst.lib_id, parent
+                            inst.lib_symbol_name(), parent
                         )
                     });
                 }
@@ -947,7 +1163,14 @@ async fn handle_batch_get_pin_locations(
                 .iter()
                 .map(|p| {
                     let (sx, sy) = pin_endpoint(p, t);
-                    json!({ "number": p.number, "name": p.name, "x": sx, "y": sy })
+                    json!({
+                        "number": p.number,
+                        "name": p.name,
+                        "x": sx,
+                        "y": sy,
+                        "orientation_degrees": pin_outward_direction(p, t),
+                        "length_mm": p.length
+                    })
                 })
                 .collect();
             json!({ "reference": reference, "x": inst.x, "y": inst.y, "pins": pins })
@@ -1129,6 +1352,7 @@ async fn handle_update_symbols_from_library(
             .collect()
     });
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let allow_pin_moves = args["allow_pin_moves"].as_bool().unwrap_or(false);
 
     let (mut content, tree) = read_schematic(&sch_path)?;
     let expected = content.clone();
@@ -1160,12 +1384,18 @@ async fn handle_update_symbols_from_library(
 
     let mut updated = Vec::new();
     let mut unchanged = Vec::new();
+    let mut pins_moved = Vec::new();
     let mut errors = Vec::new();
-    let outcomes = reembed_lib_symbols(&mut content, &lib_ids);
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let outcomes = reembed_lib_symbols(&mut content, &lib_ids, allow_pin_moves, &src);
     for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
         match outcome {
             ReembedOutcome::Updated => updated.push(lib_id.clone()),
             ReembedOutcome::Unchanged => unchanged.push(lib_id.clone()),
+            ReembedOutcome::PinsMoved(pins) => pins_moved.push(json!({
+                "lib_id": lib_id,
+                "pins": pins,
+            })),
             ReembedOutcome::Unresolved => errors.push(format!(
                 "'{}' no longer resolves in any registered library — the \
                  embedded copy is left as it is",
@@ -1181,13 +1411,22 @@ async fn handle_update_symbols_from_library(
         write_atomic_if_unchanged(&sch_path, &expected, &content)?;
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut body = json!({
         "updated": updated,
         "updated_count": updated.len(),
         "unchanged": unchanged,
+        "pins_moved": pins_moved,
         "errors": errors,
         "dry_run": dry_run
-    })))
+    });
+    if !pins_moved.is_empty() {
+        body["hint"] = json!(
+            "Symbols listed in pins_moved were left untouched: the library moved or \
+             removed pins, and wires and labels attach at pin coordinates. Pass \
+             allow_pin_moves: true to update them anyway, then reconnect."
+        );
+    }
+    Ok(CallToolResult::json(&body))
 }
 
 async fn handle_replace_component(
@@ -1251,8 +1490,9 @@ async fn handle_replace_component(
 
     // Optional unit change, validated against the NEW symbol's unit count
     // (#35). Applied before the embed so all edits land in one write.
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
     if let Some(unit) = new_unit {
-        let unit_count = cse::library::symbol_unit_count(&new_lib_id).unwrap_or(1);
+        let unit_count = cse::library::symbol_unit_count(&new_lib_id, &src).unwrap_or(1);
         if unit < 1 || unit > unit_count {
             return Ok(CallToolResult::error(format!(
                 "Invalid unit {} for '{}': the symbol has {} unit(s) (valid: 1..={}).",
@@ -1285,8 +1525,8 @@ async fn handle_replace_component(
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
     // a replace that can't embed its definition would leave the component
     // netlist-invisible (#34).
-    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
+    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id, &src) {
+        return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id, &src));
     }
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
@@ -1300,6 +1540,14 @@ async fn handle_replace_component(
 
 // Library symbol resolution moved to tools/mod.rs (shared with sch_wiring.rs)
 
+// `stub_symbol_dir` returns a MutexGuard that the async tests then hold across
+// their `.await`s, which is what `await_holding_lock` warns about. It is
+// deliberate and safe here: the lock serialises process-wide `KICAD*_DIR`
+// environment variables, which the awaited calls read, so releasing it early
+// would defeat its only purpose. cargo runs each test on its own OS thread with
+// its own current-thread runtime, and each runtime drives exactly one task, so
+// there is no second task that could contend for the guard and deadlock.
+#[allow(clippy::await_holding_lock)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,17 +1564,26 @@ mod tests {
                 project_dir: None,
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
+                eager_toolsets: false,
             },
             Arc::new(ToolRouter::new()),
         )
     }
 
-    /// Serializes tests that set KICAD10_SYMBOL_DIR (process-wide env).
-    static SYMBOL_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that set KICAD10_SYMBOL_DIR (process-wide env), shared
+    /// with every other module that does so.
+    use crate::tools::KICAD_ENV_LOCK as SYMBOL_DIR_ENV;
+
+    /// Only the stub carries this, so asserting on it proves a placement
+    /// resolved the fixture and not a KiCad library installed on the machine.
+    const STUB_MARKER: &str = "stub://device";
 
     /// A stub symbol library so component adds resolve without an installed
-    /// KiCAD (CI has none): Device:R and Device:C_Polarized in the KiCAD 10
-    /// symdir layout. Returns (tempdir guard, env lock).
+    /// KiCad (CI has none): Device:R and Device:C_Polarized in the KiCad 10
+    /// symdir layout, plus a `sym-lib-table` registering them.
+    ///
+    /// The returned tempdir doubles as the project directory — put the test's
+    /// schematic in it, so the project table is the one consulted.
     fn stub_symbol_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
         let guard = SYMBOL_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -1334,7 +1591,7 @@ mod tests {
         std::fs::create_dir_all(&symdir).unwrap();
         let symbol = |name: &str| {
             format!(
-                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
+                "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"{name}\"\n\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t(property \"Value\" \"{name}\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"{STUB_MARKER}\" (at 0 0 0))\n\t\t(symbol \"{name}_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t\t(pin passive line (at 0 -3.81 90) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"2\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n"
             )
         };
         std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
@@ -1365,6 +1622,18 @@ mod tests {
             "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"OPAMP_DERIVED\"\n\t\t(extends \"OPAMP_DUAL\")\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"OPAMP_DERIVED\" (at 0 0 0))\n\t)\n)\n",
         )
         .unwrap();
+        // A project sym-lib-table, checked before the global one, is what
+        // makes this hermetic: KICAD10_SYMBOL_DIR alone is not enough, because
+        // the global table's own `Device` entry resolves to whatever KiCad the
+        // developer has installed and would shadow the stub.
+        std::fs::write(
+            dir.path().join("sym-lib-table"),
+            format!(
+                "(sym_lib_table\n  (version 7)\n  (lib (name \"Device\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                symdir.display()
+            ),
+        )
+        .unwrap();
         std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
         (dir, guard)
     }
@@ -1389,8 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_writes_eeschema_style_instance_path() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("amp.kicad_sch");
         let ctx = test_ctx();
 
@@ -1410,6 +1678,15 @@ mod tests {
         .unwrap();
         assert!(!result.is_error);
 
+        // Guards the fixture itself: the project sym-lib-table must win over
+        // any real Device library the developer has installed, or these tests
+        // silently stop exercising the stub they set up.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(STUB_MARKER),
+            "Device:R must resolve from the stub, not an installed KiCad library"
+        );
+
         let sch = cse::Schematic::load(&path).unwrap();
         let root_uuid = sch.uuid.clone().expect("root uuid present");
         let sym = sch.symbols.by_reference("R1").unwrap();
@@ -1423,8 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_writes_requested_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("multi.kicad_sch");
         let ctx = test_ctx();
 
@@ -1464,8 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_rejects_out_of_range_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("units.kicad_sch");
         let ctx = test_ctx();
 
@@ -1522,8 +1797,7 @@ mod tests {
     async fn pin_locations_are_unit_aware() {
         // The #35 repro: an LM2904-style dual op-amp placed as unit 1 and as
         // unit 2 must report DISJOINT pin sets, not all units superimposed.
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("dual.kicad_sch");
         let ctx = test_ctx();
 
@@ -1653,9 +1927,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_component_sets_validated_unit() {
-        let (_symdir, _env) = stub_symbol_dir();
+    async fn pin_locations_resolve_through_lib_name_not_lib_id() {
+        // eeschema stores a locally edited library symbol under a derived name
+        // and points the instance at it with (lib_name …). Resolving on lib_id
+        // alone picks the *base* definition, whose pins sit elsewhere — the
+        // wrong answer is returned silently, and every wire placed from it
+        // lands off-pin (#143).
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(symbol \"R_1_1\"\n\t\t\t\t(pin passive line (at 0 3.81 270) (length 1.27) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t\t(symbol \"R_1\"\n\t\t\t(symbol \"R_1_1_1\"\n\t\t\t\t(pin passive line (at 0 6.35 270) (length 1.27) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t\t(symbol \"C_1\"\n\t\t\t(symbol \"C_1_1_1\"\n\t\t\t\t(pin passive line (at 0 3.81 270) (length 3.048) (name \"~\") (number \"1\"))\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_name \"R_1\")\n\t\t(lib_id \"Device:R\")\n\t\t(at 88.9 63.5 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-000000000001\")\n\t\t(property \"Reference\" \"R2\" (at 91.44 62.23 0))\n\t)\n\t(symbol\n\t\t(lib_name \"C_1\")\n\t\t(lib_id \"Device:C\")\n\t\t(at 139.7 63.5 0)\n\t\t(unit 1)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-000000000002\")\n\t\t(property \"Reference\" \"C1\" (at 142.24 62.23 0))\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let res = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "R2" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{}", content_text(&res));
+        let out: serde_json::Value = serde_json::from_str(&content_text(&res)).unwrap();
+        // R_1's pin sits at local +6.35 => 63.5 - 6.35; Device:R's would be
+        // 63.5 - 3.81 = 59.69.
+        assert_eq!(out["pins"][0]["y"].as_f64().unwrap(), 57.15);
+
+        // Device:C is not embedded at all — only the derived C_1 is. Matching
+        // on lib_id reported "no embedded definition ... nonexistent lib_id",
+        // which is both wrong and dangerous advice.
+        let batch = handle_batch_get_pin_locations(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["C1"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&content_text(&batch)).unwrap();
+        assert!(
+            out["components"][0]["error"].is_null(),
+            "C1 must resolve through C_1: {out}"
+        );
+        assert_eq!(
+            out["components"][0]["pins"][0]["y"].as_f64().unwrap(),
+            59.69
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_component_sets_validated_unit() {
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("swap.kicad_sch");
         let ctx = test_ctx();
 
@@ -1720,8 +2044,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_repairs_legacy_file_without_root_uuid() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("legacy.kicad_sch");
         // File shape produced by Konnect before root UUIDs were written.
         std::fs::write(
@@ -1752,8 +2075,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_with_nonexistent_lib_id_errors_with_suggestion() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("ghost.kicad_sch");
         let ctx = test_ctx();
 
@@ -1788,8 +2110,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_component_with_unknown_library_says_so() {
-        let (_symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, _env) = stub_symbol_dir();
         let path = dir.path().join("nolib.kicad_sch");
         let ctx = test_ctx();
 
@@ -1843,6 +2164,148 @@ mod tests {
         let msg = format!("{:?}", result.content);
         assert!(msg.contains("Device:CP"));
         assert!(msg.contains("no embedded definition"));
+    }
+
+    /// Fields follow the library anchor through the instance rotation (#101).
+    /// `Device:R` anchors Reference beside the body at (2.032, 0) rotated 90°,
+    /// so an upright resistor labels its right-hand side vertically and a
+    /// 90°-rotated one labels above, horizontally — a fixed ±3.81 offset at 0°
+    /// put both beside the wrong edge.
+    async fn place_rotated_resistor(rotation: f64) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rot.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                // Already on the 1.27mm grid the placement snaps to, so the
+                // expected field coordinates are the anchors plus the origin.
+                "x": 101.6,
+                "y": 50.8,
+                "rotation": rotation,
+                "reference": "R1",
+                "value": "10k"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .expect("placed resistor");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        (field("Reference"), field("Value"))
+    }
+
+    /// An anchor without its justification collides: this symbol anchors
+    /// Reference and Value on the same row and relies on `justify left` to
+    /// keep `U2` off `AP2112K-3.3`. Device:R, which the tests above place,
+    /// justifies nothing — centred stays spelled as no `(justify …)`.
+    #[tokio::test]
+    async fn placement_carries_the_librarys_field_justification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("justify.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Regulator_Linear:AP2112K-3.3\"\n      (property \"Reference\" \"U\" (at -5.08 5.715 0) (effects (font (size 1.27 1.27)) (justify left)))\n      (property \"Value\" \"AP2112K-3.3\" (at 0 5.715 0) (effects (font (size 1.27 1.27)) (justify left)))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Regulator_Linear:AP2112K-3.3",
+                "x": 101.6,
+                "y": 50.8,
+                "reference": "U2",
+                "value": "AP2112K-3.3"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("U2"))
+            .expect("placed regulator");
+        let field = |name: &str| {
+            cse::sexp::writer::write(
+                &sym.properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .to_sexp(),
+            )
+        };
+        for name in ["Reference", "Value"] {
+            let written = field(name);
+            assert!(
+                written.contains("(justify left)"),
+                "{name} must keep the library's justification: {written}"
+            );
+        }
+        // Hidden fields have no library anchor here, so they stay centred.
+        assert!(!field("Footprint").contains("justify"));
+
+        let (reference, _) = place_rotated_resistor(0.0).await;
+        assert!(
+            !reference.contains("justify"),
+            "a centred library field must not gain a justify: {reference}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrotated_symbol_takes_the_librarys_field_anchors() {
+        let (reference, value) = place_rotated_resistor(0.0).await;
+        // Same numbers eeschema writes for this library symbol at (100, 50).
+        assert!(
+            reference.contains("(at 103.632 50.8 90)"),
+            "Reference belongs beside the body, rotated: {reference}"
+        );
+        assert!(
+            value.contains("(at 101.6 50.8 90)"),
+            "Value belongs on the body's axis, rotated: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_symbol_carries_its_fields_around_with_it() {
+        let (reference, value) = place_rotated_resistor(90.0).await;
+        // The anchor rotates with the body: 2.032mm to the right of the
+        // origin becomes 2.032mm above it. The stored angle stays at the
+        // library's 90° — KiCad adds the symbol's rotation when it draws, so
+        // this renders horizontally above the now-horizontal body.
+        assert!(
+            reference.contains("(at 101.6 48.768 90)"),
+            "Reference must follow the rotated body: {reference}"
+        );
+        assert!(
+            value.contains("(at 101.6 50.8 90)"),
+            "Value must follow the rotated body: {value}"
+        );
     }
 
     #[tokio::test]
@@ -1995,5 +2458,270 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_error, "{result:?}");
+    }
+
+    /// Wires and labels attach at pin coordinates, so a library edit that
+    /// moved a pin would silently orphan them. The update is refused and
+    /// reported instead, unless the caller opts in with allow_pin_moves
+    /// (grafted from #177 by @JYPochez).
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_a_moved_pin_unless_allowed() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guarded.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+
+        // Move pin 2 in the library: (at 0 -3.81 90) → (at 0 -5.08 90).
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib)
+            .unwrap()
+            .replace("(at 0 -3.81 90)", "(at 0 -5.08 90)");
+        std::fs::write(&lib, edited).unwrap();
+
+        let refused = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0), "{body}");
+        assert_eq!(body["pins_moved"][0]["lib_id"], json!("Device:R"), "{body}");
+        let detail = body["pins_moved"][0]["pins"][0].as_str().unwrap();
+        assert!(detail.contains("pin 2"), "{detail}");
+        assert!(
+            detail.contains("-3.81") && detail.contains("-5.08"),
+            "{detail}"
+        );
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("-5.08"),
+            "a refused update must not touch the schematic"
+        );
+
+        // The explicit opt-in updates it.
+        let forced = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &forced.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(body["pins_moved"], json!([]), "{body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 0 -5.08 90)"), "{after}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// A removed pin is as dangerous as a moved one — whatever attached to it
+    /// dangles. Same guard, different message.
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_a_removed_pin() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shrunk.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Delete pin 2 from the library definition entirely.
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let start = content.find("(pin passive line (at 0 -3.81 90)").unwrap();
+        // Cut up to the unit subsymbol's closer, "\n\t\t)" — the pin's own
+        // closer is "\n\t\t\t)", which this pattern cannot match early.
+        let end = start + content[start..].find("\n\t\t)").unwrap();
+        let mut edited = content;
+        edited.replace_range(start..end, "");
+        std::fs::write(&lib, edited).unwrap();
+
+        let refused = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0), "{body}");
+        let detail = body["pins_moved"][0]["pins"][0].as_str().unwrap();
+        assert!(
+            detail.contains("pin 2") && detail.contains("removed"),
+            "{detail}"
+        );
+    }
+}
+
+/// `edit_schematic_component` had two independent defects, both of which
+/// reported success: `fields` was declared in the schema and never read
+/// (#158), and `new_reference` rewrote only the rendered property, leaving the
+/// instances path — which is where KiCad reads the designator for the netlist
+/// — on the old value (#157).
+#[cfg(test)]
+mod edit_component_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// One R1, with an instances path, as eeschema writes it.
+    const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 50 60 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 52 58 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 52 62 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"proj\"\n\t\t\t\t(path \"/root\"\n\t\t\t\t\t(reference \"R1\") (unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
+
+    async fn edit(args: serde_json::Value) -> (String, String) {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let mut args = args;
+        args["schematic"] = json!(f.path().to_str().unwrap());
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "edit_schematic_component")
+            .unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let res = (def.handler)(&args, ctx).await.unwrap();
+        let reply = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        (std::fs::read_to_string(f.path()).unwrap(), reply)
+    }
+
+    /// #157: the rename must reach the instances path, not just the property.
+    #[tokio::test]
+    async fn renaming_a_reference_rewrites_the_instances_path() {
+        let (out, _) = edit(json!({ "reference": "R1", "new_reference": "R7" })).await;
+        assert!(
+            out.contains("(property \"Reference\" \"R7\""),
+            "property renamed:\n{out}"
+        );
+        assert!(
+            out.contains("(reference \"R7\")"),
+            "instances path must carry the new designator, or the netlist \
+             ignores the rename:\n{out}"
+        );
+        assert!(
+            !out.contains("(reference \"R1\")"),
+            "no instances entry may keep the old designator:\n{out}"
+        );
+    }
+
+    /// #158: a custom field that does not exist yet must be created.
+    #[tokio::test]
+    async fn a_new_custom_field_is_written_into_the_symbol() {
+        let (out, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "MPN": "RC0402FR-0710KL" }
+        }))
+        .await;
+        assert!(
+            out.contains("(property \"MPN\" \"RC0402FR-0710KL\""),
+            "custom field must land in the file:\n{out}"
+        );
+        assert!(
+            out.contains("(hide yes)"),
+            "a custom field is data, not sheet artwork:\n{out}"
+        );
+        assert!(reply.contains("MPN"), "the reply must report it: {reply}");
+        // Anchored on the symbol, not defaulted to the sheet origin (#95).
+        assert!(
+            !out.contains("(property \"MPN\" \"RC0402FR-0710KL\"\n\t\t\t(at 0 0 0)"),
+            "must not land at the sheet origin:\n{out}"
+        );
+    }
+
+    /// #158: an existing custom field is updated rather than duplicated.
+    #[tokio::test]
+    async fn an_existing_custom_field_is_updated_not_duplicated() {
+        let (out, _) = edit(json!({ "reference": "R1", "fields": { "MPN": "first" } })).await;
+        assert_eq!(out.matches("(property \"MPN\"").count(), 1);
+
+        // Value is a first-class parameter, so it must be updated in place.
+        let (out2, _) = edit(json!({ "reference": "R1", "value": "22k" })).await;
+        assert_eq!(out2.matches("(property \"Value\"").count(), 1, "{out2}");
+        assert!(out2.contains("(property \"Value\" \"22k\""), "{out2}");
+    }
+
+    /// The defect that made #158 invisible: with `fields` unread, both
+    /// `changed` and `errors` came back empty, so the no-op guard never fired
+    /// and the call reported success having done nothing.
+    #[tokio::test]
+    async fn a_fields_only_call_no_longer_reports_an_empty_success() {
+        let (_, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "MPN": "RC0402FR-0710KL" }
+        }))
+        .await;
+        assert!(
+            !reply.contains("\"changes\":[]"),
+            "a fields-only call must not report an empty change set: {reply}"
+        );
+    }
+
+    /// Reserved names belong to their own parameters — routing Reference
+    /// through `fields` would skip the instances rewrite and silently
+    /// reintroduce #157.
+    #[tokio::test]
+    async fn reserved_names_are_refused_inside_fields() {
+        let (out, reply) = edit(json!({
+            "reference": "R1",
+            "fields": { "Reference": "R9" }
+        }))
+        .await;
+        assert!(
+            out.contains("(property \"Reference\" \"R1\""),
+            "the designator must be untouched:\n{out}"
+        );
+        assert!(
+            reply.contains("Reference"),
+            "the refusal is reported: {reply}"
+        );
     }
 }
