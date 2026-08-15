@@ -1,4 +1,8 @@
 use konnect_schematic_editor::types::fmt_f64;
+use konnect_sexp::writer::{
+    apply_edits, find_balanced_block, find_block_with_leading_whitespace, find_direct_child_blocks,
+    SexpEdit,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -54,6 +58,29 @@ enum FootprintGraphic {
         stroke_width_mm: f64,
         fill: Fill,
     },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum GraphicsMode {
+    Append,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FootprintGraphicsError {
+    #[error("invalid {field}: {reason}")]
+    InvalidArgument { field: String, reason: String },
+    #[error("{0}")]
+    Conflict(String),
+}
+
+#[derive(Debug)]
+struct PreparedMutation {
+    replacement: String,
+    matched_count: usize,
+    added_count: usize,
 }
 
 fn parse_graphics(value: &serde_json::Value) -> Result<Vec<FootprintGraphic>, String> {
@@ -273,10 +300,215 @@ fn serialize_graphics(layer: &str, graphics: &[FootprintGraphic], indent: &str) 
     output
 }
 
+fn invalid(field: &str, reason: impl Into<String>) -> FootprintGraphicsError {
+    FootprintGraphicsError::InvalidArgument {
+        field: field.to_string(),
+        reason: reason.into(),
+    }
+}
+
+fn is_supported_graphic(tag: &str) -> bool {
+    matches!(
+        tag,
+        "fp_line" | "fp_arc" | "fp_rect" | "fp_circle" | "fp_poly"
+    )
+}
+
+fn child_indent(source: &str, start: usize) -> String {
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    let indent = &source[line_start..start];
+    if !indent.is_empty()
+        && indent
+            .chars()
+            .all(|character| matches!(character, ' ' | '\t'))
+    {
+        indent.to_string()
+    } else {
+        "  ".to_string()
+    }
+}
+
+fn prepare_mutation(
+    source: &str,
+    layer: &str,
+    mode: GraphicsMode,
+    graphics: &[FootprintGraphic],
+) -> Result<PreparedMutation, FootprintGraphicsError> {
+    if !konnect_sexp::layers::is_canonical_name(layer) {
+        return Err(invalid("selector.layer", "not a canonical KiCad layer"));
+    }
+    let tree = konnect_sexp::parse_sexp(source)
+        .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
+    if tree.head() != Some("footprint") {
+        return Err(invalid("footprint_path", "file root must be a footprint"));
+    }
+
+    let direct_children = find_direct_child_blocks(source, "footprint");
+    let mut selected = Vec::new();
+    let mut group_members = Vec::new();
+    let mut insertion_anchor = None;
+    for (start, end) in direct_children {
+        let block = &source[start..end];
+        let Ok(node) = konnect_sexp::parse_sexp(block) else {
+            return Err(invalid(
+                "footprint_path",
+                "contains an invalid top-level item",
+            ));
+        };
+        let Some(tag) = node.head() else {
+            continue;
+        };
+        if insertion_anchor.is_none() && matches!(tag, "pad" | "group" | "model") {
+            insertion_anchor =
+                find_block_with_leading_whitespace(source, start).map(|range| range.0);
+        }
+        if tag == "group" {
+            if let Some(members) = node.find("members").and_then(|members| members.children()) {
+                group_members.extend(
+                    members
+                        .iter()
+                        .skip(1)
+                        .filter_map(|member| member.as_str())
+                        .map(str::to_string),
+                );
+            }
+        }
+        if is_supported_graphic(tag) && node.find_str("layer") == Some(layer) {
+            let range = find_block_with_leading_whitespace(source, start)
+                .ok_or_else(|| invalid("footprint_path", "contains an unbalanced graphic"))?;
+            let item_id = node
+                .find_str("uuid")
+                .or_else(|| node.find_str("tstamp"))
+                .map(str::to_string);
+            selected.push((range, item_id));
+        }
+    }
+
+    if !matches!(mode, GraphicsMode::Append) {
+        if let Some(item_id) = selected
+            .iter()
+            .filter_map(|(_, item_id)| item_id.as_deref())
+            .find(|item_id| group_members.iter().any(|member| member == item_id))
+        {
+            return Err(FootprintGraphicsError::Conflict(format!(
+                "selected graphic '{item_id}' is referenced by a footprint group"
+            )));
+        }
+    }
+
+    let indent = selected
+        .first()
+        .map(|(range, _)| {
+            let block_start = find_balanced_block(source, range.0)
+                .map(|range| range.0)
+                .unwrap_or(range.0);
+            child_indent(source, block_start)
+        })
+        .or_else(|| {
+            insertion_anchor.map(|anchor| {
+                let block_start = find_balanced_block(source, anchor)
+                    .map(|range| range.0)
+                    .unwrap_or(anchor);
+                child_indent(source, block_start)
+            })
+        })
+        .unwrap_or_else(|| "  ".to_string());
+    let serialized = serialize_graphics(layer, graphics, &indent);
+    let matched_count = selected.len();
+    let added_count = if matches!(mode, GraphicsMode::Delete) {
+        0
+    } else {
+        graphics.len()
+    };
+
+    let mut edits = Vec::new();
+    match mode {
+        GraphicsMode::Replace => {
+            if let Some((first, rest)) = selected.split_first() {
+                let (first_range, _) = first;
+                edits.push(SexpEdit::replace(first_range.0, first_range.1, serialized));
+                edits.extend(
+                    rest.iter()
+                        .map(|(range, _)| SexpEdit::delete(range.0, range.1)),
+                );
+            } else if !serialized.is_empty() {
+                let root_end = find_balanced_block(source, 0)
+                    .map(|range| range.1 - 1)
+                    .ok_or_else(|| invalid("footprint_path", "unbalanced footprint root"))?;
+                edits.push(SexpEdit::insert(
+                    insertion_anchor.unwrap_or(root_end),
+                    serialized,
+                ));
+            }
+        }
+        GraphicsMode::Append => {
+            if !serialized.is_empty() {
+                let root_end = find_balanced_block(source, 0)
+                    .map(|range| range.1 - 1)
+                    .ok_or_else(|| invalid("footprint_path", "unbalanced footprint root"))?;
+                let offset = selected
+                    .last()
+                    .map(|(range, _)| range.1)
+                    .or(insertion_anchor)
+                    .unwrap_or(root_end);
+                edits.push(SexpEdit::insert(offset, serialized));
+            }
+        }
+        GraphicsMode::Delete => {
+            edits.extend(
+                selected
+                    .iter()
+                    .map(|(range, _)| SexpEdit::delete(range.0, range.1)),
+            );
+        }
+    }
+
+    let replacement = apply_edits(source.to_string(), edits);
+    let parsed = konnect_sexp::parse_sexp(&replacement)
+        .map_err(|error| invalid("graphics", format!("replacement does not parse: {error}")))?;
+    if parsed.head() != Some("footprint") {
+        return Err(FootprintGraphicsError::Conflict(
+            "replacement changed the footprint root".to_string(),
+        ));
+    }
+
+    Ok(PreparedMutation {
+        replacement,
+        matched_count,
+        added_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const OLD_FOOTPRINT: &str = r#"(footprint "Fixture" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (fp_line (start -1 -1) (end 1 -1)
+    (stroke (width 0.1) (type solid)) (layer "F.SilkS")
+    (tstamp 10000000-0000-4000-8000-000000000001))
+  (fp_poly
+    (pts (xy 0 0) (xy 2 0) (xy 2 2))
+    (stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd")
+    (tstamp 20000000-0000-4000-8000-000000000001))
+  (fp_text user "KEEP ON B.CrtYd" (at 0 0) (layer "B.CrtYd")
+    (effects (font (size 1 1)))
+    (tstamp 30000000-0000-4000-8000-000000000001))
+  (fp_poly
+    (pts (xy 3 3) (xy 4 3) (xy 4 4))
+    (stroke (width 0.05) (type solid)) (fill none) (layer "B.CrtYd")
+    (tstamp 20000000-0000-4000-8000-000000000002))
+  (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask")
+    (tstamp 40000000-0000-4000-8000-000000000001))
+  (model "KEEP.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#;
 
     #[test]
     fn serializes_every_supported_primitive_as_a_footprint_graphic() {
@@ -430,5 +662,194 @@ mod tests {
 
         let output = serialize_graphics("B.CrtYd", &graphics, "  ");
         assert_eq!(output.matches("(xy 0 0)").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn replace_changes_only_supported_graphics_on_the_selected_layer() {
+        let graphics = parse_graphics(&json!([{
+            "type": "poly",
+            "points": [
+                {"x": -8.695, "y": 3.615},
+                {"x": -8.690, "y": 3.566},
+                {"x": -8.650, "y": 3.500}
+            ],
+            "stroke_width_mm": 0.05,
+            "fill": "none"
+        }]))
+        .unwrap();
+
+        let prepared =
+            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Replace, &graphics).unwrap();
+
+        assert_eq!(prepared.matched_count, 2);
+        assert_eq!(prepared.added_count, 1);
+        assert_eq!(prepared.replacement.matches("(fp_poly").count(), 1);
+        assert!(!prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000001"));
+        assert!(!prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000002"));
+        for unchanged in [
+            r#"(fp_line (start -1 -1) (end 1 -1)
+    (stroke (width 0.1) (type solid)) (layer "F.SilkS")
+    (tstamp 10000000-0000-4000-8000-000000000001))"#,
+            r#"(fp_text user "KEEP ON B.CrtYd" (at 0 0) (layer "B.CrtYd")
+    (effects (font (size 1 1)))
+    (tstamp 30000000-0000-4000-8000-000000000001))"#,
+            r#"(pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask")
+    (tstamp 40000000-0000-4000-8000-000000000001))"#,
+            r#"(model "KEEP.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))"#,
+        ] {
+            assert!(
+                prepared.replacement.contains(unchanged),
+                "changed unrelated block:\n{unchanged}\n---\n{}",
+                prepared.replacement
+            );
+        }
+        assert!(konnect_sexp::parse_sexp(&prepared.replacement).is_ok());
+    }
+
+    #[test]
+    fn append_preserves_existing_graphics_and_accepts_two_polygons() {
+        let graphics = parse_graphics(&json!([
+            {
+                "type": "poly",
+                "points": [
+                    {"x": 10.0, "y": 10.0},
+                    {"x": 12.0, "y": 10.0},
+                    {"x": 12.0, "y": 12.0}
+                ],
+                "stroke_width_mm": 0.05,
+                "fill": "none"
+            },
+            {
+                "type": "poly",
+                "points": [
+                    {"x": -10.0, "y": -10.0},
+                    {"x": -12.0, "y": -10.0},
+                    {"x": -12.0, "y": -12.0}
+                ],
+                "stroke_width_mm": 0.05,
+                "fill": "none"
+            }
+        ]))
+        .unwrap();
+
+        let prepared =
+            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Append, &graphics).unwrap();
+
+        assert_eq!(prepared.matched_count, 2);
+        assert_eq!(prepared.added_count, 2);
+        assert_eq!(prepared.replacement.matches("(fp_poly").count(), 4);
+        assert!(prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000001"));
+        assert!(prepared
+            .replacement
+            .contains("20000000-0000-4000-8000-000000000002"));
+        assert!(konnect_sexp::parse_sexp(&prepared.replacement).is_ok());
+    }
+
+    #[test]
+    fn delete_removes_only_selected_supported_graphics() {
+        let prepared =
+            prepare_mutation(OLD_FOOTPRINT, "B.CrtYd", GraphicsMode::Delete, &[]).unwrap();
+
+        assert_eq!(prepared.matched_count, 2);
+        assert_eq!(prepared.added_count, 0);
+        assert!(!prepared.replacement.contains("(fp_poly"));
+        assert!(prepared
+            .replacement
+            .contains(r#"(fp_text user "KEEP ON B.CrtYd""#));
+        assert!(prepared.replacement.contains("(pad \"1\""));
+        assert!(prepared.replacement.contains("(model \"KEEP.step\""));
+        assert!(konnect_sexp::parse_sexp(&prepared.replacement).is_ok());
+    }
+
+    #[test]
+    fn replace_without_a_match_inserts_before_pads_and_models() {
+        let source = r#"(footprint "NoGraphics" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (pad "1" thru_hole circle (at 0 0) (size 1.8 1.8) (drill 1)
+    (layers "*.Cu" "*.Mask"))
+  (model "KEEP.step")
+)
+"#;
+        let graphics = parse_graphics(&json!([{
+            "type": "circle",
+            "center": {"x": 0.0, "y": 0.0},
+            "radius_mm": 2.0,
+            "stroke_width_mm": 0.05,
+            "fill": "none"
+        }]))
+        .unwrap();
+
+        let prepared =
+            prepare_mutation(source, "B.CrtYd", GraphicsMode::Replace, &graphics).unwrap();
+
+        assert_eq!(prepared.matched_count, 0);
+        assert!(
+            prepared.replacement.find("(fp_circle").unwrap()
+                < prepared.replacement.find("(pad \"1\"").unwrap(),
+            "{}",
+            prepared.replacement
+        );
+        assert!(konnect_sexp::parse_sexp(&prepared.replacement).is_ok());
+    }
+
+    #[test]
+    fn grouped_selected_graphics_are_not_deleted_in_old_or_new_syntax() {
+        let old_group = OLD_FOOTPRINT.replace(
+            "  (model \"KEEP.step\"",
+            r#"  (group "owned" (id 50000000-0000-4000-8000-000000000001)
+    (members
+      20000000-0000-4000-8000-000000000001
+    )
+  )
+  (model "KEEP.step""#,
+        );
+        let new_group = OLD_FOOTPRINT.replace(
+            "  (model \"KEEP.step\"",
+            r#"  (group "owned"
+    (uuid "50000000-0000-4000-8000-000000000001")
+    (members "20000000-0000-4000-8000-000000000002")
+  )
+  (model "KEEP.step""#,
+        );
+
+        for source in [old_group, new_group] {
+            let error =
+                prepare_mutation(&source, "B.CrtYd", GraphicsMode::Delete, &[]).unwrap_err();
+            assert!(
+                matches!(error, FootprintGraphicsError::Conflict(_)),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_footprint_roots_and_noncanonical_layers() {
+        let graphics = parse_graphics(&json!([{
+            "type": "line",
+            "start": {"x": 0.0, "y": 0.0},
+            "end": {"x": 1.0, "y": 1.0},
+            "stroke_width_mm": 0.05
+        }]))
+        .unwrap();
+
+        for (source, layer) in [
+            ("(kicad_pcb (version 20240108))", "B.CrtYd"),
+            (OLD_FOOTPRINT, "BottomCourtyard"),
+        ] {
+            assert!(matches!(
+                prepare_mutation(source, layer, GraphicsMode::Replace, &graphics),
+                Err(FootprintGraphicsError::InvalidArgument { .. })
+            ));
+        }
     }
 }
