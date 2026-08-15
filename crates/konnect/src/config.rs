@@ -43,6 +43,19 @@ pub struct Config {
     /// context growth -- opt in only if that trade is worth it for your client.
     #[serde(default)]
     pub auto_load_toolsets: bool,
+
+    /// Pre-load every toolset at startup so the very first `tools/list` is
+    /// complete. Off by default: a full listing costs roughly 25K tokens
+    /// against the ~2K baseline, which is the whole reason the router exists.
+    ///
+    /// Turn it on for an MCP client that caches the initial tool list and does
+    /// not act on `notifications/tools/list_changed`. For those clients a tool
+    /// missing from the first listing can never be called at all --
+    /// `load_toolset` reports the names it loaded but returns no schemas, so
+    /// there is nothing for the client to invoke, and `auto_load_toolsets`
+    /// cannot help because it only fires once a call is actually attempted.
+    #[serde(default)]
+    pub eager_toolsets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -150,6 +163,7 @@ impl Default for Config {
             jlcpcb_db_path: None,
             log_level: default_log_level(),
             auto_load_toolsets: false,
+            eager_toolsets: false,
         }
     }
 }
