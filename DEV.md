@@ -28,6 +28,27 @@ Schematic-viewer build notes (Windows):
 - Close any running viewer window before rebuilding — Windows locks a running
   `.exe`, so the link step fails while the app is open.
 
+### Nix
+
+A `flake.nix` provides a reproducible build and dev shell on Linux
+(`x86_64`/`aarch64`), contributed in #198:
+
+```bash
+nix build .#konnect   # build the server binary
+nix run  .#konnect    # build and run it
+nix develop           # shell with the pinned toolchain, protoc, kicad-small
+```
+
+The flake pins its own toolchain from `rust-toolchain.toml` and reads the
+version from the workspace `Cargo.toml`, so those stay in step automatically.
+What it does *not* track automatically is the build itself: `cargoBuildFlags`
+names `-p konnect --bin konnect`, and `preCheck` exports `KONNECT_STATE_DIR`
+for the tests that need a writable state dir. **Renaming the binary, adding a
+workspace member the server depends on, or introducing a test that needs
+another environment variable will break the Nix build without breaking any
+other job** — the `Nix flake` CI job exists to catch exactly that, so treat a
+failure there as a real break rather than a Nix-user problem.
+
 ## Architecture
 
 ```

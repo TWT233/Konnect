@@ -1,4 +1,6 @@
 /target/
+/result
+/result-*
 crates/*/target/
 crates/schematic-viewer/target/
 *.exe
