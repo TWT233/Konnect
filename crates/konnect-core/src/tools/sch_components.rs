@@ -8,7 +8,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
-    project_name_for, require_f64, require_str, ToolContext, ToolDef,
+    project_name_for, reembed_lib_symbols, require_f64, require_str, ReembedOutcome, ToolContext,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -278,6 +279,32 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference", "new_lib_id"]
             }),
             |args, ctx| async move { handle_replace_component(args, ctx).await }
+        ),
+        tool!(
+            "update_symbols_from_library",
+            "Re-embed placed symbols' definitions from their libraries, like KiCad's \
+             'Update Symbols from Library'. A schematic carries its own copy of every \
+             symbol, so editing one in its library leaves the sheet drawing the old \
+             shape — this refreshes it. A symbol whose pins moved or disappeared in \
+             the library is refused (reported in pins_moved) unless allow_pin_moves \
+             is set, because wires and labels attach at pin coordinates.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "references": {
+                        "type": "array",
+                        "description": "Component references to update (e.g. ['U1']). Omit to update every symbol in the schematic.",
+                        "items": { "type": "string" }
+                    },
+                    "dry_run": { "type": "boolean", "default": false,
+                        "description": "Report what would change without writing." },
+                    "allow_pin_moves": { "type": "boolean", "default": false,
+                        "description": "Update symbols even when the library moved or removed pins. Wires and labels attached at the old pin positions are NOT moved with them — reconnect them afterwards." }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_update_symbols_from_library(args, ctx).await }
         ),
         tool!(
             "get_schematic_view",
@@ -1314,6 +1341,94 @@ async fn handle_group_components(
     })))
 }
 
+async fn handle_update_symbols_from_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let only: Option<Vec<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let allow_pin_moves = args["allow_pin_moves"].as_bool().unwrap_or(false);
+
+    let (mut content, tree) = read_schematic(&sch_path)?;
+    let expected = content.clone();
+
+    let instances = extract_symbol_instances(&tree);
+    if let Some(refs) = &only {
+        if let Some(missing) = refs
+            .iter()
+            .find(|r| !instances.iter().any(|i| &i.reference == *r))
+        {
+            return Ok(CallToolResult::error(format!(
+                "Component '{}' not found in {}",
+                missing,
+                sch_path.display()
+            )));
+        }
+    }
+
+    // One definition serves every instance of a lib_id, so refresh each once.
+    let mut lib_ids: Vec<String> = Vec::new();
+    for inst in instances {
+        if only.as_ref().is_some_and(|r| !r.contains(&inst.reference)) {
+            continue;
+        }
+        if !lib_ids.contains(&inst.lib_id) {
+            lib_ids.push(inst.lib_id);
+        }
+    }
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut pins_moved = Vec::new();
+    let mut errors = Vec::new();
+    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
+    let outcomes = reembed_lib_symbols(&mut content, &lib_ids, allow_pin_moves, &src);
+    for (lib_id, outcome) in lib_ids.iter().zip(outcomes) {
+        match outcome {
+            ReembedOutcome::Updated => updated.push(lib_id.clone()),
+            ReembedOutcome::Unchanged => unchanged.push(lib_id.clone()),
+            ReembedOutcome::PinsMoved(pins) => pins_moved.push(json!({
+                "lib_id": lib_id,
+                "pins": pins,
+            })),
+            ReembedOutcome::Unresolved => errors.push(format!(
+                "'{}' no longer resolves in any registered library — the \
+                 embedded copy is left as it is",
+                lib_id
+            )),
+            ReembedOutcome::NotEmbedded => {
+                errors.push(format!("'{}' has no embedded definition to update", lib_id))
+            }
+        }
+    }
+
+    if !updated.is_empty() && !dry_run {
+        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    }
+
+    let mut body = json!({
+        "updated": updated,
+        "updated_count": updated.len(),
+        "unchanged": unchanged,
+        "pins_moved": pins_moved,
+        "errors": errors,
+        "dry_run": dry_run
+    });
+    if !pins_moved.is_empty() {
+        body["hint"] = json!(
+            "Symbols listed in pins_moved were left untouched: the library moved or \
+             removed pins, and wires and labels attach at pin coordinates. Pass \
+             allow_pin_moves: true to update them anyway, then reconnect."
+        );
+    }
+    Ok(CallToolResult::json(&body))
+}
+
 async fn handle_replace_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2248,6 +2363,224 @@ mod tests {
         assert!(
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
+        );
+    }
+
+    /// A schematic keeps its own copy of every symbol, so editing the library
+    /// leaves the sheet drawing the old shape — what KiCad reports as
+    /// "doesn't match copy in library".
+    #[tokio::test]
+    async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("WIDENED"));
+
+        // Edit the library out from under the schematic.
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib).unwrap().replace(
+            "(property \"Value\" \"R\"",
+            "(property \"Value\" \"WIDENED\"",
+        );
+        std::fs::write(&lib, edited).unwrap();
+
+        // A dry run reports the stale copy without touching the file.
+        let dry = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "dry_run": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &dry.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]));
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("WIDENED"),
+            "dry_run must not write"
+        );
+
+        let done = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!done.is_error, "{done:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("WIDENED"), "{after}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+
+        // Idempotent: a second run finds nothing to do.
+        let again = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &again.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0));
+        assert_eq!(body["unchanged"], json!(["Device:R"]));
+    }
+
+    #[tokio::test]
+    async fn update_symbols_from_library_rejects_an_unknown_reference() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let result = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "references": ["U9"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+    }
+
+    /// Wires and labels attach at pin coordinates, so a library edit that
+    /// moved a pin would silently orphan them. The update is refused and
+    /// reported instead, unless the caller opts in with allow_pin_moves
+    /// (grafted from #177 by @JYPochez).
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_a_moved_pin_unless_allowed() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guarded.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let placed = handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{placed:?}");
+
+        // Move pin 2 in the library: (at 0 -3.81 90) → (at 0 -5.08 90).
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let edited = std::fs::read_to_string(&lib)
+            .unwrap()
+            .replace("(at 0 -3.81 90)", "(at 0 -5.08 90)");
+        std::fs::write(&lib, edited).unwrap();
+
+        let refused = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0), "{body}");
+        assert_eq!(body["pins_moved"][0]["lib_id"], json!("Device:R"), "{body}");
+        let detail = body["pins_moved"][0]["pins"][0].as_str().unwrap();
+        assert!(detail.contains("pin 2"), "{detail}");
+        assert!(
+            detail.contains("-3.81") && detail.contains("-5.08"),
+            "{detail}"
+        );
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("-5.08"),
+            "a refused update must not touch the schematic"
+        );
+
+        // The explicit opt-in updates it.
+        let forced = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string(), "allow_pin_moves": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &forced.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated"], json!(["Device:R"]), "{body}");
+        assert_eq!(body["pins_moved"], json!([]), "{body}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(at 0 -5.08 90)"), "{after}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    /// A removed pin is as dangerous as a moved one — whatever attached to it
+    /// dangles. Same guard, different message.
+    #[tokio::test]
+    async fn update_symbols_from_library_refuses_a_removed_pin() {
+        let (symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shrunk.kicad_sch");
+        let ctx = test_ctx();
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "lib_id": "Device:R",
+                     "reference": "R1", "x": 100.0, "y": 100.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Delete pin 2 from the library definition entirely.
+        let lib = symdir
+            .path()
+            .join("Device.kicad_symdir")
+            .join("R.kicad_sym");
+        let content = std::fs::read_to_string(&lib).unwrap();
+        let start = content.find("(pin passive line (at 0 -3.81 90)").unwrap();
+        // Cut up to the unit subsymbol's closer, "\n\t\t)" — the pin's own
+        // closer is "\n\t\t\t)", which this pattern cannot match early.
+        let end = start + content[start..].find("\n\t\t)").unwrap();
+        let mut edited = content;
+        edited.replace_range(start..end, "");
+        std::fs::write(&lib, edited).unwrap();
+
+        let refused = handle_update_symbols_from_library(
+            &json!({ "schematic": path.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &refused.content[0] else {
+            panic!("expected text")
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["updated_count"], json!(0), "{body}");
+        let detail = body["pins_moved"][0]["pins"][0].as_str().unwrap();
+        assert!(
+            detail.contains("pin 2") && detail.contains("removed"),
+            "{detail}"
         );
     }
 }
