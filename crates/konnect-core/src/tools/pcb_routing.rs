@@ -760,12 +760,15 @@ async fn handle_create_netclass(
 
     // KiCad keys classes by name; a second entry with the same name is
     // undefined in its dialog, so an existing class is updated in place.
+    let mut changed = true;
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
+        let before = class.clone();
         for (key, arg, _) in FIELDS {
             if let Some(value) = opt_f64(args, arg) {
                 class[key] = json!(value);
             }
         }
+        changed = *class != before;
         true
     } else {
         let mut class = json!({ "name": name, "priority": 0 });
@@ -782,7 +785,13 @@ async fn handle_create_netclass(
         .find(|c| c["name"] == json!(name))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    save_project_settings(&pro, &settings)?;
+    // Naming no value at all leaves the class exactly as it was, and so does
+    // passing the values it already holds. Saving anyway would rewrite the
+    // whole project file — the serialiser re-emits the document rather than
+    // patching it — for a call that decided nothing.
+    if changed {
+        save_project_settings(&pro, &settings)?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "created_netclass": name,
@@ -1222,6 +1231,44 @@ mod netclass_tests {
         let echoed: serde_json::Value = serde_json::from_str(&text_of(&second)).unwrap();
         assert_eq!(echoed["clearance"], json!(1.5));
         assert_eq!(echoed["trace_width"], json!(0.9));
+    }
+
+    /// With the defaults gone from the update path, a call that names no value
+    /// decides nothing — so it must not write. `save_project_settings`
+    /// re-serialises the whole document rather than patching it, so saving
+    /// anyway rewrites every line of the project file for a call that is, in
+    /// effect, a read.
+    #[tokio::test]
+    async fn a_call_that_changes_nothing_leaves_the_project_file_untouched() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+
+        // Re-written by hand in a shape the serialiser would not produce, so
+        // any save at all is visible in the bytes.
+        let pro = board.with_extension("kicad_pro");
+        let compact = serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&pro).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&pro, &compact).unwrap();
+
+        // Naming no value at all: a read.
+        let result = create(&board, json!({ "name": "HV" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(std::fs::read_to_string(&pro).unwrap(), compact);
+        // It still reports what the class holds.
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(echoed["clearance"], json!(1.5));
+        assert_eq!(echoed["updated_existing"], json!(true));
+
+        // Naming the values it already holds: also nothing to decide.
+        create(&board, json!({ "name": "HV", "clearance": 1.5 })).await;
+        assert_eq!(std::fs::read_to_string(&pro).unwrap(), compact);
+
+        // A real change still writes.
+        create(&board, json!({ "name": "HV", "clearance": 0.9 })).await;
+        assert_ne!(std::fs::read_to_string(&pro).unwrap(), compact);
     }
 
     /// A new class still gets the documented defaults for whatever the caller
