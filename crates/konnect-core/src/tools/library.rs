@@ -11,7 +11,7 @@ use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, read_consistent,
-    write_atomic, write_atomic_if_unchanged, SexpEdit,
+    write_atomic, write_atomic_if_unchanged, write_new_atomic, SexpEdit,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -136,7 +136,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" }
+                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "replace_existing": {
+                        "type": "boolean",
+                        "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
+                        "default": false
+                    }
                 },
                 "required": ["library_path", "nickname"]
             }),
@@ -1422,6 +1427,18 @@ async fn handle_register_footprint_library(
         Err(e) => return Ok(e),
     };
     let scope = args["scope"].as_str().unwrap_or("project");
+    let replace_existing = match args.get("replace_existing") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_library_argument(
+                    "replace_existing",
+                    "must be a boolean when supplied",
+                ))
+            }
+        },
+    };
 
     let (table_path, uri) = match lib_table_target(
         scope,
@@ -1434,7 +1451,18 @@ async fn handle_register_footprint_library(
         Err(e) => return Ok(e),
     };
 
-    let repaired_root = register_in_lib_table(&table_path, nickname, &uri, "KiCad").await?;
+    let registration = match register_in_lib_table_with_policy(
+        &table_path,
+        nickname,
+        &uri,
+        "KiCad",
+        replace_existing,
+    )
+    .await?
+    {
+        Ok(registration) => registration,
+        Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
+    };
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
@@ -1442,7 +1470,9 @@ async fn handle_register_footprint_library(
             "nickname": nickname,
             "scope": scope,
             "table": table_path.to_str().unwrap_or(""),
-            "repaired_table_root": repaired_root
+            "uri": uri,
+            "state": registration.state.as_str(),
+            "repaired_table_root": registration.repaired_root
         }))
         .unwrap(),
     ))
@@ -1542,6 +1572,61 @@ fn project_relative_uri(lib_path: &Path, table_dir: &Path) -> String {
     }
 }
 
+fn repository_relative_uri(
+    lib_path: &Path,
+    table_dir: &Path,
+    project_path: &Path,
+) -> Option<String> {
+    if !project_path.is_file()
+        || project_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("kicad_pro")
+    {
+        return None;
+    }
+    let repository = table_dir
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())?;
+    let repository = std::fs::canonicalize(repository).ok()?;
+    let table_dir = std::fs::canonicalize(table_dir).ok()?;
+    let library = std::fs::canonicalize(lib_path).ok()?;
+    if !table_dir.starts_with(&repository) || !library.starts_with(&repository) {
+        return None;
+    }
+    let relative = lexical_relative_path(&table_dir, &library)?;
+    Some(format!("${{KIPRJMOD}}/{}", portable_uri(&relative)))
+}
+
+fn lexical_relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+    if from_components.first() != to_components.first() {
+        return None;
+    }
+    let common = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &from_components[common..] {
+        if matches!(component, Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    for component in &to_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
 /// Which lib-table a `register_*` call writes to, and the URI it records.
 ///
 /// Shared by the symbol and footprint registrars so the two cannot drift: both
@@ -1569,6 +1654,11 @@ fn lib_table_target(
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let uri = project_relative_uri(lib_path, &table_dir);
+    let uri = if uri.starts_with("${KIPRJMOD}") {
+        uri
+    } else {
+        repository_relative_uri(lib_path, &table_dir, Path::new(proj)).unwrap_or(uri)
+    };
     Ok((table_dir.join(table_filename), uri))
 }
 
@@ -1702,57 +1792,216 @@ fn repair_table_root(content: String, expected_root: &str) -> (String, bool) {
     }
 }
 
-/// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
-/// Creates the file with minimal scaffolding if it doesn't exist, and repairs a
-/// mismatched root element on an existing one.
-///
-/// Returns whether the root element had to be repaired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibTableRegistrationState {
+    Inserted,
+    Unchanged,
+    Updated,
+}
+
+impl LibTableRegistrationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Unchanged => "unchanged",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibTableRegistration {
+    state: LibTableRegistrationState,
+    repaired_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibTableRegistrationError {
+    field: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedLibTableRegistration {
+    content: String,
+    registration: LibTableRegistration,
+}
+
 async fn register_in_lib_table(
     table_path: &Path,
     nickname: &str,
     uri: &str,
     lib_type: &str,
 ) -> anyhow::Result<bool> {
-    // The root element must match the table kind: a sym-lib-table with an
-    // (fp_lib_table root is rejected by KiCad. Decide from the filename, which
-    // is fixed by convention.
+    let registration =
+        register_in_lib_table_with_policy(table_path, nickname, uri, lib_type, false)
+            .await?
+            .map_err(|error| anyhow::anyhow!(error.reason))?;
+    Ok(registration.repaired_root)
+}
+
+async fn register_in_lib_table_with_policy(
+    table_path: &Path,
+    nickname: &str,
+    uri: &str,
+    lib_type: &str,
+    replace_existing: bool,
+) -> anyhow::Result<Result<LibTableRegistration, LibTableRegistrationError>> {
     let root = table_root_element(table_path);
-    let (content, repaired_root) = if table_path.exists() {
-        repair_table_root(tokio::fs::read_to_string(table_path).await?, root)
+    let existing = table_path.exists();
+    let source = if existing {
+        read_consistent(table_path)?
     } else {
-        (format!("({root}\n  (version 7)\n)\n"), false)
+        format!("({root}\n  (version 7)\n)\n")
     };
-    if repaired_root {
+    let prepared = match prepare_lib_table_registration(
+        &source,
+        root,
+        nickname,
+        uri,
+        lib_type,
+        replace_existing,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(Err(error)),
+    };
+    if prepared.registration.repaired_root {
         tracing::warn!(
             "Repaired the root element of {} — it declared the wrong table kind, so KiCad was skipping the whole table",
             table_path.display()
         );
     }
 
-    // Check if nickname already registered
-    if content.contains(&format!("(name \"{}\")", nickname)) {
-        // Idempotent — but a repaired root still has to reach disk, or a table
-        // that already lists this nickname stays rejected forever.
-        if repaired_root {
-            write_atomic(table_path, &content)?;
+    if prepared.content != source {
+        if let Some(parent) = table_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        return Ok(repaired_root);
+        if existing {
+            persist_lib_table_registration(table_path, &source, &prepared.content)?;
+        } else {
+            write_new_atomic(table_path, &prepared.content)?;
+        }
+    }
+    Ok(Ok(prepared.registration))
+}
+
+fn prepare_lib_table_registration(
+    source: &str,
+    expected_root: &str,
+    nickname: &str,
+    uri: &str,
+    lib_type: &str,
+    replace_existing: bool,
+) -> Result<PreparedLibTableRegistration, LibTableRegistrationError> {
+    let (content, repaired_root) = repair_table_root(source.to_string(), expected_root);
+    let parsed = parse_sexp(&content).map_err(|error| LibTableRegistrationError {
+        field: "table".to_string(),
+        reason: format!("invalid library table S-expression: {error}"),
+    })?;
+    if parsed.head() != Some(expected_root) {
+        return Err(LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: format!("root must be {expected_root}"),
+        });
     }
 
-    // Find closing paren of the root expression
-    let insert_pos = content.rfind(')').unwrap_or(content.len());
-    let entry = format!(
-        "\n  (lib (name \"{}\") (type \"{}\") (uri \"{}\") (options \"\") (descr \"\"))",
-        nickname, lib_type, uri
-    );
-
-    let new_content = format!("{}{}\n)", &content[..insert_pos], entry);
-
-    if let Some(parent) = table_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let mut matches = Vec::new();
+    for (start, end) in find_direct_child_blocks(&content, expected_root) {
+        let block = &content[start..end];
+        let node = parse_sexp(block).map_err(|_| LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: "contains a malformed direct child".to_string(),
+        })?;
+        if node.head() == Some("lib") && node.find_str("name") == Some(nickname) {
+            matches.push((start, end));
+        }
     }
-    write_atomic(table_path, &new_content)?;
-    Ok(repaired_root)
+    if matches.len() > 1 {
+        return Err(LibTableRegistrationError {
+            field: "nickname".to_string(),
+            reason: format!("library table contains duplicate nickname '{nickname}'"),
+        });
+    }
+
+    let (content, state) = if let Some((start, end)) = matches.first().copied() {
+        if !replace_existing {
+            (content, LibTableRegistrationState::Unchanged)
+        } else {
+            let block = &content[start..end];
+            let current_uri = parse_sexp(block)
+                .ok()
+                .and_then(|node| node.find_str("uri").map(str::to_string))
+                .ok_or_else(|| LibTableRegistrationError {
+                    field: "table".to_string(),
+                    reason: format!("entry '{nickname}' has no valid uri"),
+                })?;
+            if current_uri == uri {
+                (content, LibTableRegistrationState::Unchanged)
+            } else {
+                let uri_range = find_direct_child_blocks(block, "lib")
+                    .into_iter()
+                    .find(|(child_start, child_end)| {
+                        parse_sexp(&block[*child_start..*child_end])
+                            .is_ok_and(|node| node.head() == Some("uri"))
+                    })
+                    .ok_or_else(|| LibTableRegistrationError {
+                        field: "table".to_string(),
+                        reason: format!("entry '{nickname}' has no uri block"),
+                    })?;
+                let replacement = format!("(uri {})", quote_lib_table_string(uri));
+                let updated = apply_edits(
+                    content,
+                    vec![SexpEdit::replace(
+                        start + uri_range.0,
+                        start + uri_range.1,
+                        replacement,
+                    )],
+                );
+                (updated, LibTableRegistrationState::Updated)
+            }
+        }
+    } else {
+        let root_end = find_balanced_block(&content, 0)
+            .map(|range| range.1 - 1)
+            .ok_or_else(|| LibTableRegistrationError {
+                field: "table".to_string(),
+                reason: "unbalanced library table root".to_string(),
+            })?;
+        let entry = format!(
+            "\n  (lib (name {}) (type {}) (uri {}) (options \"\") (descr \"\"))",
+            quote_lib_table_string(nickname),
+            quote_lib_table_string(lib_type),
+            quote_lib_table_string(uri)
+        );
+        (
+            apply_edits(content, vec![SexpEdit::insert(root_end, entry)]),
+            LibTableRegistrationState::Inserted,
+        )
+    };
+
+    parse_sexp(&content).map_err(|error| LibTableRegistrationError {
+        field: "table".to_string(),
+        reason: format!("updated library table does not parse: {error}"),
+    })?;
+    Ok(PreparedLibTableRegistration {
+        content,
+        registration: LibTableRegistration {
+            state,
+            repaired_root,
+        },
+    })
+}
+
+fn quote_lib_table_string(value: &str) -> String {
+    format!("\"{}\"", escape_library_string(value))
+}
+
+fn persist_lib_table_registration(
+    table_path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), konnect_sexp::SexpError> {
+    write_atomic_if_unchanged(table_path, expected, replacement)
 }
 
 // ─── Symbol library tools ─────────────────────────────────────────────────────
@@ -3886,6 +4135,129 @@ mod tests {
             1,
             "an already-registered nickname must not be duplicated: {content}"
         );
+    }
+
+    #[test]
+    fn register_footprint_library_schema_exposes_opt_in_replacement() {
+        let registration = tools()
+            .into_iter()
+            .find(|tool| tool.name == "register_footprint_library")
+            .expect("library must expose register_footprint_library");
+        let replace = &registration.input_schema["properties"]["replace_existing"];
+
+        assert_eq!(replace["type"], "boolean");
+        assert_eq!(replace["default"], false);
+        assert_eq!(
+            registration.input_schema["required"],
+            json!(["library_path", "nickname"])
+        );
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_keeps_existing_uri_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        let table = project.parent().unwrap().join("fp-lib-table");
+        let original = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.pretty\") (options \"keep=1\") (descr \"keep me\"))\n)\n";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": tmp.path().join("lib").join("Parts.pretty"),
+                "nickname": "Parts",
+                "project": project
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "unchanged");
+        assert_eq!(std::fs::read_to_string(table).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_replaces_uri_portably_and_preserves_entry_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let project = tmp.path().join("test").join("board.kicad_pro");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "{}").unwrap();
+        let library = tmp.path().join("lib").join("Parts.pretty");
+        std::fs::create_dir_all(&library).unwrap();
+        let table = project.parent().unwrap().join("fp-lib-table");
+        let original = "(fp_lib_table\n\t(version 7)\n\t(lib (name \"Other\") (type \"KiCad\") (uri \"${KIPRJMOD}/other.pretty\") (options \"\") (descr \"other\"))\n\t(lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.pretty\") (options \"keep=1\") (descr \"keep me\"))\n)\n";
+        std::fs::write(&table, original).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["state"], "updated");
+        assert_eq!(output["uri"], "${KIPRJMOD}/../lib/Parts.pretty");
+
+        let updated = std::fs::read_to_string(table).unwrap();
+        assert!(updated.starts_with("(fp_lib_table\n\t(version 7)"));
+        assert!(updated
+            .contains("(name \"Other\") (type \"KiCad\") (uri \"${KIPRJMOD}/other.pretty\")"));
+        assert!(updated.contains("(name \"Parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/../lib/Parts.pretty\") (options \"keep=1\") (descr \"keep me\")"));
+        assert!(!updated.contains("C:/stale"));
+    }
+
+    #[tokio::test]
+    async fn register_footprint_library_rejects_duplicate_nicknames_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("board.kicad_pro");
+        let table = tmp.path().join("fp-lib-table");
+        let duplicate = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/one\") (options \"\") (descr \"\"))\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/two\") (options \"\") (descr \"\"))\n)\n";
+        std::fs::write(&table, duplicate).unwrap();
+
+        let result = handle_register_footprint_library(
+            &json!({
+                "library_path": tmp.path().join("Parts.pretty"),
+                "nickname": "Parts",
+                "project": project,
+                "replace_existing": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .expect("a malformed table is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let output: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "nickname");
+        assert_eq!(std::fs::read_to_string(table).unwrap(), duplicate);
+    }
+
+    #[test]
+    fn stale_library_table_source_is_rejected_without_overwriting_newer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("fp-lib-table");
+        let original = "(fp_lib_table\n  (version 7)\n)\n";
+        std::fs::write(&table, original).unwrap();
+        let prepared = "(fp_lib_table\n  (version 7)\n  (lib (name \"Parts\") (type \"KiCad\") (uri \"/parts\") (options \"\") (descr \"\"))\n)\n";
+        let newer = "(fp_lib_table\n  (version 7)\n  (lib (name \"Other\") (type \"KiCad\") (uri \"/other\") (options \"\") (descr \"\"))\n)\n";
+        std::fs::write(&table, newer).unwrap();
+
+        let error = persist_lib_table_registration(&table, original, prepared)
+            .expect_err("a stale expected table must conflict");
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(table).unwrap(), newer);
     }
 
     const DUPLICATE_PAD_FOOTPRINT: &str = r#"(footprint "DualSocket"

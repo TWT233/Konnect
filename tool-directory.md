@@ -275,7 +275,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `set_footprint_graphics` | Atomically append, replace, or delete line, arc, rectangle, circle, and polygon primitives on one footprint layer. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
-| `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. |
+| `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |

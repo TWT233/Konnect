@@ -248,6 +248,11 @@ register_symbol_library(name, path, scope)
 register_footprint_library(name, path, scope)
 ```
 
+- Registration is idempotent by default: an existing nickname is left unchanged.
+- Set `replace_existing=true` to update a stale URI for that nickname in place.
+- Project-local and same-repository sibling libraries are written as portable
+  `${KIPRJMOD}` URIs; existing options, descriptions, and unrelated entries are preserved.
+
 ### Scope
 
 | Scope       | Location                        | Visible To           |
