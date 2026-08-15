@@ -84,6 +84,8 @@ Konnect/
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 12 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
+│   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
+│   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 13 tools (IPC real-time + safe headless single-placement fallback)
@@ -136,7 +138,9 @@ Konnect/
 │   └── resources/                    # PCM package resources (icon.png)
 │
 └── .github/workflows/
-    ├── ci.yml                        # Check + test + clippy on 3 platforms
+    ├── ci.yml                        # Check + test + clippy on 3 platforms, plus the
+    │                                 # Python plugin and the Nix flake — both cover
+    │                                 # code `cargo --workspace` never sees
     ├── e2e-kicad.yml                 # End-to-end tests against a real KiCAD install
     └── release.yml                   # Build binaries + GitHub Release on tag push
 ```
