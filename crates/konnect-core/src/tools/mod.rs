@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod design_review;
 mod footprint_graphics;
+mod footprint_metadata;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;

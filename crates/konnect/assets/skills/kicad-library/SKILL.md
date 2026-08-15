@@ -20,7 +20,8 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 
 ```
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
-                           # set_footprint_graphics, get_footprint_info, register_symbol_library,
+                           # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
+                           # get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info
 ```
 
@@ -184,6 +185,29 @@ set_footprint_graphics(
   first point at the end is optional.
 - Use `get_footprint_info` with graphics inclusion enabled and a layer filter to verify
   the resulting type, geometry, stroke width, fill, and item ID.
+
+### Existing Footprint Metadata
+
+Use `set_footprint_metadata` to replace a footprint description, search tags, or
+KiCad footprint attributes without changing pads, graphics, properties, groups, or
+3D models.
+
+```text
+set_footprint_metadata(
+  footprint_path=".../Part.kicad_mod",
+  description="Optional replacement",
+  tags=["keyboard", "hot_swap"],
+  attributes=["exclude_from_pos_files"]
+)
+```
+
+- Supply at least one metadata field.
+- Only supplied fields change.
+- Empty `tags` or `attributes` removes the corresponding block.
+- `exclude_from_pos_files` omits the footprint from pick-and-place output without
+  implicitly adding `exclude_from_bom`.
+- Use `edit_footprint_pad` with `new_number` and optional `match_all=true` to
+  renumber one or every matching direct-child pad atomically.
 
 ---
 
