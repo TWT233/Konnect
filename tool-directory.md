@@ -207,7 +207,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `place_component` | Place a footprint on the PCB at a given position and layer via KiCAD IPC. |
+| `place_component` | Place a footprint through live KiCAD IPC when reachable, or use a revision-aware file fallback when no KiCAD process can hold the board open. The fallback preserves complete footprint content and rejects duplicate references. |
 | `move_component` | Move a placed footprint to a new X/Y position via KiCAD IPC. |
 | `rotate_component` | Set the rotation angle of a placed footprint via KiCAD IPC. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |

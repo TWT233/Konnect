@@ -11,7 +11,8 @@ use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
-    apply_edits, find_balanced_block, find_block_starts, new_uuid, write_atomic,
+    apply_edits, find_balanced_block, find_block_starts, new_uuid, read_consistent,
+    write_atomic_if_unchanged,
 };
 use konnect_sexp::SexpEdit;
 use serde_json::json;
@@ -147,6 +148,15 @@ fn replace_quoted_after(source: &mut String, marker: &str, value: &str) -> anyho
     Ok(())
 }
 
+fn replace_reference(source: &mut String, reference: &str) -> anyhow::Result<()> {
+    for marker in ["(property \"Reference\" \"", "(fp_text reference \""] {
+        if source.contains(marker) {
+            return replace_quoted_after(source, marker, reference);
+        }
+    }
+    anyhow::bail!("footprint library data has no Reference property or fp_text")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_footprint_source(
     source: &str,
@@ -170,7 +180,7 @@ fn prepare_footprint_source(
     }
     let mut prepared = source.to_string();
     replace_quoted_after(&mut prepared, "(footprint \"", lib_id)?;
-    replace_quoted_after(&mut prepared, "(property \"Reference\" \"", reference)?;
+    replace_reference(&mut prepared, reference)?;
     if let Some(value) = value {
         replace_quoted_after(&mut prepared, "(property \"Value\" \"", value)?;
     }
@@ -545,7 +555,7 @@ fn board_footprint_sexp(
         out = apply_rotation_to_children(&out, rotation);
     }
     if let Some(reference) = reference {
-        out = replace_property_value(&out, "Reference", reference);
+        replace_reference(&mut out, reference).map_err(|error| error.to_string())?;
     }
     if layer != "F.Cu" {
         out = replace_footprint_layer(&out, layer);
@@ -715,32 +725,6 @@ fn quote_sexp_string(value: &str) -> String {
     format!("\"{}\"", escape_sexp_string(value))
 }
 
-/// Replace the value of the first `(property "<key>" "<value>" …)` entry.
-fn replace_property_value(content: &str, key: &str, value: &str) -> String {
-    let needle = format!("(property \"{key}\"");
-    let Some(prop) = find_block_starts(content, "property")
-        .into_iter()
-        .find(|&i| content[i..].starts_with(&needle))
-    else {
-        return content.to_string();
-    };
-    let after_key = prop + needle.len();
-    let Some(rel) = content[after_key..].find('"') else {
-        return content.to_string();
-    };
-    let vstart = after_key + rel;
-    let Some(rel_end) = content[vstart + 1..].find('"') else {
-        return content.to_string();
-    };
-    let vend = vstart + 1 + rel_end + 1;
-
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..vstart]);
-    out.push_str(&quote_sexp_string(value));
-    out.push_str(&content[vend..]);
-    out
-}
-
 /// Replace the footprint's own `(layer "…")` — the first `layer` block that is a
 /// direct child of the footprint, not one belonging to a pad or graphic.
 ///
@@ -782,7 +766,21 @@ fn replace_footprint_layer(content: &str, layer: &str) -> String {
 /// `.kicad_pcb`, and no reader in this workspace understands them either, so
 /// the assumption is at least consistent.
 fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(board_path)?;
+    let content = read_consistent(board_path)?;
+    let existing_references = footprint_references(&content)?;
+    let mut inserted_references = HashSet::new();
+    for block in blocks {
+        for reference in footprint_references(block)? {
+            if existing_references.contains(&reference)
+                || !inserted_references.insert(reference.clone())
+            {
+                anyhow::bail!(
+                    "Footprint reference '{}' already exists on the board",
+                    reference
+                );
+            }
+        }
+    }
     // KiCad writes these files CRLF on Windows — its bundled .kicad_mod
     // libraries are CRLF throughout — so an inserted block joined with bare LF
     // would leave the board with two conventions in it.
@@ -796,7 +794,7 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
         .iter()
         .map(|b| format!("{eol}{}", indent_block(b.trim_end(), "\t", eol)))
         .collect();
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, joined)]);
+    let new_content = apply_edits(content.clone(), vec![SexpEdit::insert(close_pos, joined)]);
 
     if let Err(why) = check_single_board_form(&new_content) {
         anyhow::bail!(
@@ -806,8 +804,66 @@ fn insert_into_board(board_path: &Path, blocks: &[String]) -> anyhow::Result<()>
         );
     }
 
-    write_atomic(board_path, &new_content)?;
+    persist_board_replacement(board_path, &content, &new_content)?;
     Ok(())
+}
+
+fn footprint_references(content: &str) -> anyhow::Result<HashSet<String>> {
+    let root = konnect_sexp::parse_sexp(content)?;
+    let footprints: Vec<&konnect_sexp::SexpNode> = if root.head() == Some("footprint") {
+        vec![&root]
+    } else if root.head() == Some("kicad_pcb") {
+        root.find_all("footprint")
+    } else {
+        anyhow::bail!("expected a footprint or kicad_pcb root");
+    };
+
+    Ok(footprints
+        .into_iter()
+        .filter_map(footprint_reference)
+        .collect())
+}
+
+fn board_contains_reference(board_path: &Path, reference: &str) -> anyhow::Result<bool> {
+    let content = read_consistent(board_path)?;
+    if let Err(reason) = check_single_board_form(&content) {
+        anyhow::bail!(
+            "Refusing to read {}: {}. The board file is not balanced and was left untouched.",
+            board_path.display(),
+            reason
+        );
+    }
+    Ok(footprint_references(&content)?.contains(reference))
+}
+
+fn footprint_reference(footprint: &konnect_sexp::SexpNode) -> Option<String> {
+    footprint
+        .find_all("property")
+        .into_iter()
+        .find(|property| {
+            property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference")
+        })
+        .and_then(|property| property.get(2))
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .or_else(|| {
+            footprint
+                .find_all("fp_text")
+                .into_iter()
+                .find(|text| {
+                    text.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("reference")
+                })
+                .and_then(|text| text.get(2))
+                .and_then(konnect_sexp::SexpNode::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn persist_board_replacement(
+    board_path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), konnect_sexp::SexpError> {
+    write_atomic_if_unchanged(board_path, expected, replacement)
 }
 
 /// Verify `content` is exactly one `(kicad_pcb …)` form and nothing else.
@@ -863,7 +919,8 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "place_component",
-            "Place a footprint on the PCB at the given position and layer via KiCAD IPC.",
+            "Place a footprint on the PCB. Uses live KiCAD IPC when reachable; otherwise safely \
+             edits a closed board file with revision checks.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1156,6 +1213,17 @@ async fn handle_place_component(
         Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
             // No live KiCad on the other end of this transport: fall back to
             // editing the board file directly.
+            if board_contains_reference(&board, &reference)? {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "reference".to_string(),
+                        reason: format!(
+                            "footprint reference '{reference}' already exists on the board"
+                        ),
+                    },
+                    format!("Footprint reference '{reference}' already exists on the board"),
+                ));
+            }
             let sexp = match board_footprint_sexp(
                 &footprint,
                 x,
@@ -1970,6 +2038,38 @@ mod tests {
         board
     }
 
+    fn legacy_fallback_fixture(dir: &Path) -> std::path::PathBuf {
+        let pretty = dir.join("Legacy.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(
+            pretty.join("Socket.kicad_mod"),
+            r#"(footprint "Socket" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (attr exclude_from_pos_files)
+  (fp_text reference "REF**" (at 0 -8.5) (layer "F.SilkS"))
+  (fp_text value "Socket" (at 0 8.5) (layer "F.Fab"))
+  (pad "1" thru_hole circle (at 0 0) (size 4 4) (drill 3) (layers "*.Cu" "*.Mask"))
+  (model "../models/Socket.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"Legacy\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                pretty.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let board = dir.join("legacy.kicad_pcb");
+        std::fs::write(&board, EMPTY_BOARD).unwrap();
+        board
+    }
+
     /// Net paren depth, ignoring anything inside quoted strings.
     fn count_parens(s: &str) -> i32 {
         let (mut depth, mut in_str, mut esc) = (0i32, false, false);
@@ -2041,6 +2141,91 @@ mod tests {
             0,
             "board is no longer balanced:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_replaces_legacy_fp_text_reference_and_preserves_models_and_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = legacy_fallback_fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Legacy:Socket",
+            "reference": "SW1",
+            "x": 20.0,
+            "y": 30.0,
+        });
+
+        let result = handle_place_component(&args, &test_ctx()).await.unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let written = std::fs::read_to_string(&board).unwrap();
+        assert!(written.contains("(fp_text reference \"SW1\""), "{written}");
+        assert!(!written.contains("REF**"), "{written}");
+        assert!(
+            written.contains("(attr exclude_from_pos_files)"),
+            "{written}"
+        );
+        assert!(
+            written.contains("(model \"../models/Socket.step\""),
+            "{written}"
+        );
+        assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fallback_rejects_a_duplicate_reference_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "footprint": "Resistor_SMD:R_0805_2012Metric",
+            "reference": "R1",
+            "x": 10.0,
+            "y": 20.0,
+        });
+        let first = handle_place_component(&args, &test_ctx()).await.unwrap();
+        assert!(!first.is_error, "{:?}", first.content);
+        let before_duplicate = std::fs::read_to_string(&board).unwrap();
+
+        let duplicate = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Resistor_SMD:R_0805_2012Metric",
+                "reference": "R1",
+                "x": 30.0,
+                "y": 40.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(duplicate.is_error);
+        assert!(
+            result_text(&duplicate).contains("already exists"),
+            "{:?}",
+            duplicate.content
+        );
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before_duplicate);
+    }
+
+    #[test]
+    fn stale_board_source_is_rejected_without_overwriting_newer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_BOARD).unwrap();
+        let replacement = EMPTY_BOARD.replace(
+            "\n)\n",
+            "\n\t(footprint \"Legacy:Socket\" (layer \"F.Cu\"))\n)\n",
+        );
+        let newer = EMPTY_BOARD.replace("(net 0 \"\")", "(net 0 \"\")\n\t(net 1 \"GND\")");
+        std::fs::write(&board, &newer).unwrap();
+
+        let error = persist_board_replacement(&board, EMPTY_BOARD, &replacement)
+            .expect_err("a stale expected board must conflict");
+
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), newer);
     }
 
     #[tokio::test]
@@ -2383,7 +2568,8 @@ mod tests {
 
     #[test]
     fn reference_substitution_targets_the_reference_property_only() {
-        let out = replace_property_value(&library_footprint(), "Reference", "R42");
+        let mut out = library_footprint();
+        replace_reference(&mut out, "R42").unwrap();
         assert!(out.contains("(property \"Reference\" \"R42\""), "{out}");
         assert!(
             out.contains("(property \"Value\" \"R_0805_2012Metric\""),

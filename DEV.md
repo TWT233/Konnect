@@ -65,7 +65,7 @@ Konnect/
 │   │           ├── sch_export.rs     # 6 tools (SVG/PDF/netlist/ERC)
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 13 tools (IPC real-time via NNG+protobuf)
+│   │           ├── pcb_components.rs # 13 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
