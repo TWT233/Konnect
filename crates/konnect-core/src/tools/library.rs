@@ -3079,27 +3079,67 @@ async fn handle_create_symbol(
         None => (2.54, -2.54),
     };
 
-    let numbers_vis = if show_numbers { "" } else { " hide" };
-    let names_vis = if show_names { "" } else { " hide" };
+    let numbers = if show_numbers {
+        String::new()
+    } else {
+        "\n    (pin_numbers hide)".to_string()
+    };
+    let names = if show_names {
+        format!(
+            "\n    (pin_names\n      (offset {}))",
+            fmt_f64(PIN_NAME_OFFSET)
+        )
+    } else {
+        format!(
+            "\n    (pin_names\n      (offset {})\n      (hide yes))",
+            fmt_f64(PIN_NAME_OFFSET)
+        )
+    };
+    let visible_property = |name: &str, value: &str, y: f64| {
+        format!(
+            "\n    (property \"{name}\" \"{value}\" (at 0 {y:.4} 0) \
+             (show_name no) (do_not_autoplace no) \
+             (effects (font (size 1.27 1.27))))"
+        )
+    };
+    let hidden_property = |name: &str, value: &str| {
+        format!(
+            "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
+             (show_name no) (do_not_autoplace no) (hide yes) \
+             (effects (font (size 1.27 1.27))))"
+        )
+    };
 
     let symbol_sexp = format!(
-        "\n  (symbol \"{}\"\n    (pin_numbers{})\n    (pin_names (offset {}){})\n    (in_bom yes)\n    (on_board yes)\n    (property \"Reference\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Value\" \"{}\" (at 0 {:.4} 0) (effects (font (size 1.27 1.27))))\n    (property \"Footprint\" \"\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n    (property \"Datasheet\" \"~\" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)){}\n  )",
+        "\n  (symbol \"{}\"{}{}\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (in_pos_files yes)\n    (duplicate_pin_numbers_are_jumpers no){}{}{}{}{}{}\n    (embedded_fonts no)\n  )",
         name,
-        numbers_vis,
-        fmt_f64(PIN_NAME_OFFSET),
-        names_vis,
-        ref_prefix,
-        ref_y,
-        value_str,
-        value_y,
+        numbers,
+        names,
+        visible_property("Reference", ref_prefix, ref_y),
+        visible_property("Value", value_str, value_y),
+        hidden_property("Footprint", ""),
+        hidden_property("Datasheet", ""),
+        hidden_property("Description", ""),
         units_sexp
     );
 
     // If file doesn't exist, create scaffold
     let content = if lib_path.exists() {
-        tokio::fs::read_to_string(&lib_path).await?
+        let mut content = tokio::fs::read_to_string(&lib_path).await?;
+        content = content.replace("(version 20240108)", "(version 20251024)");
+        if !content.contains("(generator_version ") {
+            if let Some(position) = content.find("(generator \"") {
+                if let Some(end) = content[position..].find(')') {
+                    let insert_at = position + end + 1;
+                    content.insert_str(insert_at, "\n  (generator_version \"10.0\")");
+                }
+            }
+        }
+        content
     } else {
-        "(kicad_symbol_lib\n  (version 20240108)\n  (generator \"konnect\")\n)\n".to_string()
+        "(kicad_symbol_lib\n  (version 20251024)\n  (generator \"konnect\")\n  \
+         (generator_version \"10.0\")\n)\n"
+            .to_string()
     };
 
     // Insert before closing paren of root expression
@@ -5065,12 +5105,49 @@ mod tests {
             c.contains("(generator \"konnect\")"),
             "stale generator string"
         );
-        assert!(c.contains("(pin_numbers)"), "pin numbers should be shown");
-        assert!(!c.contains("(pin_numbers hide)"));
+        assert!(
+            !c.contains("(pin_numbers hide)"),
+            "KiCad 10 shows pin numbers by omitting the hide override"
+        );
         assert!(
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
         );
+    }
+
+    #[tokio::test]
+    async fn create_symbol_emits_kicad10_library_match_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("modern.kicad_sym");
+        let args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "Modern",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0}
+            ]
+        });
+
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let output = std::fs::read_to_string(&lib).unwrap();
+
+        assert!(output.contains("(version 20251024)"), "{output}");
+        assert!(output.contains("(generator_version \"10.0\")"), "{output}");
+        assert!(output.contains("(exclude_from_sim no)"), "{output}");
+        assert!(output.contains("(in_pos_files yes)"), "{output}");
+        assert!(
+            output.contains("(duplicate_pin_numbers_are_jumpers no)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("(property \"Description\" \"\""),
+            "{output}"
+        );
+        assert!(output.contains("(show_name no)"), "{output}");
+        assert!(output.contains("(do_not_autoplace no)"), "{output}");
+        assert!(output.contains("(hide yes)"), "{output}");
+        assert!(output.contains("(embedded_fonts no)"), "{output}");
     }
 
     #[tokio::test]
