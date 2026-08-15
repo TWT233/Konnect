@@ -173,7 +173,16 @@ pub struct ServerConfig {
     /// Auto-load a tool's toolset on call instead of returning
     /// `toolset_not_loaded`. Off by default (see `konnect::Config::auto_load_toolsets`).
     pub auto_load_toolsets: bool,
+    /// Pre-load every toolset at startup so the first `tools/list` is
+    /// complete. Off by default (see `konnect::Config::eager_toolsets`).
+    pub eager_toolsets: bool,
 }
+
+/// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at
+/// call time by `find_kicad_library_dirs`, so two such tests running
+/// concurrently see each other's directories.
+#[cfg(test)]
+pub(crate) static KICAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod query_cache_tests {
@@ -328,33 +337,118 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
     }
 }
 
-/// All symbol pin connection points in a parsed schematic tree.
+/// Every pin placed on the sheet, paired with the transform that put it there.
 ///
 /// Unit-aware: a multi-unit library symbol superimposes every unit's pins on
 /// one placement, so an instance of unit 1 must not report unit 2's pins (#35).
-/// These coordinates drive junction insertion, and a dot dropped on a phantom
-/// pin where two wires cross would short them.
-pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
+pub(crate) fn placed_pins(
+    tree: &konnect_sexp::SexpNode,
+) -> Vec<(
+    konnect_sexp::schematic::LibPin,
+    konnect_sexp::geometry::PinTransform,
+)> {
     use konnect_sexp::schematic::{
-        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint,
+        extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
     };
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut pts = Vec::new();
+    let mut pins = Vec::new();
     for inst in extract_symbol_instances(tree) {
-        if let Some(sym) = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
-                pts.push(pin_endpoint(&pin, t));
-            }
+        // find_lib_symbol, not a lib_id match: an instance carrying a
+        // (lib_name …) is a sheet-local derived symbol whose pins can sit
+        // elsewhere than the base definition's (#143).
+        let Some(sym) = find_lib_symbol(&lib_syms, &inst) else {
+            continue;
+        };
+        let t = inst.pin_transform();
+        pins.extend(
+            extract_lib_pins_for_unit(sym, inst.unit)
+                .into_iter()
+                .map(|p| (p, t)),
+        );
+    }
+    pins
+}
+
+/// All symbol pin connection points in a parsed schematic tree. These drive
+/// junction insertion, and a dot dropped on a phantom pin where two wires
+/// cross would short them — hence [`placed_pins`]' unit-awareness.
+pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
+    placed_pins(tree)
+        .into_iter()
+        .map(|(p, t)| konnect_sexp::schematic::pin_endpoint(&p, t))
+        .collect()
+}
+
+/// The direction leading away from the symbol body at `(x, y)`. `None` when
+/// no pin sits there, or when stacked pins disagree about which way is out.
+pub(crate) fn pin_outward_at(tree: &konnect_sexp::SexpNode, x: f64, y: f64) -> Option<f64> {
+    use konnect_sexp::geometry::points_coincident;
+    use konnect_sexp::schematic::{pin_endpoint, pin_outward_direction};
+    let mut found: Option<f64> = None;
+    for (pin, t) in placed_pins(tree) {
+        let (px, py) = pin_endpoint(&pin, t);
+        if !points_coincident(px, py, x, y, 0.01) {
+            continue;
+        }
+        let outward = pin_outward_direction(&pin, t);
+        match found {
+            Some(d) if d != outward => return None,
+            _ => found = Some(outward),
         }
     }
-    pts
+    found
+}
+
+/// The stub directions, as name, unit offset, and the angle that offset points
+/// along. Schematic Y grows downward, so "up" is negative. `"right"` leads:
+/// it is the fallback for an unknown name and for an unresolvable `"auto"`.
+const STUB_DIRECTIONS: [(&str, f64, f64, f64); 4] = [
+    ("right", 1.0, 0.0, 0.0),
+    ("up", 0.0, -1.0, 90.0),
+    ("left", -1.0, 0.0, 180.0),
+    ("down", 0.0, 1.0, 270.0),
+];
+
+/// A resolved stub direction: which way the wire leaves the anchor, and how to
+/// orient the label at its far end.
+pub(crate) struct StubDirection {
+    pub name: &'static str,
+    /// Unit offset in schematic space (Y grows downward).
+    pub dx: f64,
+    pub dy: f64,
+    pub label_rotation: f64,
+}
+
+/// Resolve a `direction` argument against an already-known outward direction.
+/// `"auto"` follows `outward`, falling back to `"right"` — the default before
+/// `"auto"` existed — when the caller could not determine one.
+pub(crate) fn stub_direction(direction: &str, outward: Option<f64>) -> StubDirection {
+    use konnect_sexp::schematic::horizontal_label_rotation;
+    let row = match direction {
+        // Outward angles are snapped to quadrants, so this compares exactly.
+        "auto" => outward.and_then(|d| STUB_DIRECTIONS.iter().find(|r| r.3 == d)),
+        name => STUB_DIRECTIONS.iter().find(|r| r.0 == name),
+    }
+    .unwrap_or(&STUB_DIRECTIONS[0]);
+    StubDirection {
+        name: row.0,
+        dx: row.1,
+        dy: row.2,
+        label_rotation: horizontal_label_rotation(row.3),
+    }
+}
+
+/// [`stub_direction`] for a caller holding only a coordinate. Naming a pin is
+/// exact; matching one by position gives up when stacked pins there disagree.
+pub(crate) fn resolve_stub_direction(
+    direction: &str,
+    anchor: (f64, f64),
+    tree: &konnect_sexp::SexpNode,
+) -> StubDirection {
+    stub_direction(direction, pin_outward_at(tree, anchor.0, anchor.1))
 }
 
 /// Add junction dots for pins of `reference` that land mid-segment on a wire.
@@ -368,7 +462,7 @@ pub(crate) fn add_pin_midwire_junctions(
     use konnect_sexp::geometry::{point_on_segment, points_coincident};
     use konnect_sexp::schematic::{
         extract_junctions, extract_lib_pins_for_unit, extract_symbol_instances, extract_wires,
-        pin_endpoint, read_schematic,
+        find_lib_symbol, pin_endpoint, read_schematic,
     };
     let tol = 0.01;
     let (_, tree) = read_schematic(sch_path)?;
@@ -386,10 +480,7 @@ pub(crate) fn add_pin_midwire_junctions(
         .iter()
         .filter(|i| i.reference == reference)
     {
-        let Some(sym) = lib_syms
-            .iter()
-            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
-        else {
+        let Some(sym) = find_lib_symbol(&lib_syms, inst) else {
             continue;
         };
         let t = inst.pin_transform();
@@ -429,6 +520,11 @@ pub(crate) fn add_pin_midwire_junctions(
 /// Hidden properties get KiCAD 10's property-level `(hide yes)` — a sibling
 /// before `(effects)`, exactly as eeschema writes instances (PR #96); the
 /// legacy hide-inside-effects form renders the same but round-trips dirty.
+///
+/// `justify` comes from the library field and is written through unchanged,
+/// like the angle in [`field_at`]: it is expressed in the text's own frame, so
+/// it stays true however the instance is rotated. Centred fields write no
+/// `(justify …)`, which is how KiCad spells centred.
 pub(crate) fn positioned_property(
     name: &str,
     value: &str,
@@ -436,6 +532,7 @@ pub(crate) fn positioned_property(
     y: f64,
     rotation: f64,
     hide: bool,
+    justify: konnect_schematic_editor::library::FieldJustify,
 ) -> konnect_schematic_editor::Property {
     use konnect_schematic_editor::sexp::{atom, SexpNode};
     use konnect_schematic_editor::types::fmt_f64;
@@ -451,15 +548,61 @@ pub(crate) fn positioned_property(
         prop.sub_nodes
             .push(SexpNode::List(vec![atom("hide"), atom("yes")]));
     }
-    prop.sub_nodes.push(SexpNode::List(vec![
+    let mut effects = vec![
         atom("effects"),
         SexpNode::List(vec![
             atom("font"),
             SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
         ]),
-    ]));
+    ];
+    let tokens = justify.tokens();
+    if !tokens.is_empty() {
+        let mut node = vec![atom("justify")];
+        node.extend(tokens.into_iter().map(atom));
+        effects.push(SexpNode::List(node));
+    }
+    prop.sub_nodes.push(SexpNode::List(effects));
     prop
 }
+
+/// Sheet-space `(x, y, rotation)` for one instance field, from its library
+/// anchor (#101).
+///
+/// The two halves are stored differently, which is easy to get backwards:
+///
+/// - **Position is absolute.** The anchor is library space (Y-up), the file
+///   wants sheet space (Y-down), so it goes through the same
+///   flip-rotate-mirror-translate as a pin —
+///   [`transform_pin`](konnect_sexp::geometry::transform_pin) is that math.
+///   This is what carries a label around with a rotated body instead of
+///   leaving it beside the wrong edge.
+/// - **Angle is relative.** KiCad adds the symbol's own rotation to a field's
+///   stored angle when it draws, so the library value is written through
+///   unchanged. Rotating it here too would double-count: verified by
+///   rendering a 90°-rotated `Device:R` with `kicad-cli sch export svg` —
+///   stored 0° draws the reference *vertically* over the horizontal body,
+///   stored 90° (the library's own value) draws it horizontally above it.
+///
+/// `fallback` is a library-space anchor too, used when the library defines
+/// none, so both halves behave identically either way.
+///
+/// The angle folds into 0°..180°: a field is horizontal or vertical, never
+/// upside down.
+pub(crate) fn field_at(
+    anchor: Option<(f64, f64, f64)>,
+    fallback: (f64, f64, f64),
+    t: konnect_sexp::geometry::PinTransform,
+) -> (f64, f64, f64) {
+    let (ax, ay, arot) = anchor.unwrap_or(fallback);
+    let (x, y) = konnect_sexp::geometry::transform_pin(ax, ay, t);
+    (x, y, arot.rem_euclid(180.0))
+}
+
+/// Library-space fallback anchors matching the pre-#101 hardcoded placement:
+/// Reference 3.81mm above the origin, Value 3.81mm below. Y is negated on the
+/// way to sheet coords, hence the sign flip against the old literals.
+pub(crate) const FALLBACK_REFERENCE_AT: (f64, f64, f64) = (0.0, 3.81, 0.0);
+pub(crate) const FALLBACK_VALUE_AT: (f64, f64, f64) = (0.0, -3.81, 0.0);
 
 // ─── Schematic text helpers ──────────────────────────────────────────────────
 
@@ -472,7 +615,24 @@ pub(crate) fn positioned_property(
 /// a hand-authored library sets) but never a `lib_id`. Only placed instances
 /// have one, so that's the discriminator.
 pub fn find_symbol_instance_block(content: &str, reference: &str) -> Option<(usize, usize)> {
+    find_all_symbol_instance_blocks(content, reference)
+        .into_iter()
+        .next()
+}
+
+/// Byte ranges of *every* placed `(symbol …)` block whose Reference property is
+/// `reference`, in file order.
+///
+/// A multi-unit part is placed as one instance **per unit**, and every instance
+/// repeats the same reference — a 74HC14 is seven `U6` blocks. Anything the
+/// units share rather than own (a field value, the part's very existence) has to
+/// be applied to all of them: eeschema writes a field edit into every unit, and
+/// deleting one unit's block leaves the rest behind as orphans. Use this rather
+/// than [`find_symbol_instance_block`] wherever the operation is about the
+/// *component*; the singular form is for operations about one placement.
+pub fn find_all_symbol_instance_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
     let ref_search = format!(r#"(property "Reference" "{reference}""#);
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut from = 0usize;
 
     while let Some(rel) = content[from..].find(&ref_search) {
@@ -480,13 +640,16 @@ pub fn find_symbol_instance_block(content: &str, reference: &str) -> Option<(usi
         if let Some((start, end)) =
             konnect_sexp::writer::find_enclosing_block(content, "symbol", ref_pos)
         {
-            if content[start..end].contains("(lib_id ") {
-                return Some((start, end));
+            // Skip lib_symbols definitions: they carry a Reference property of
+            // their own but never a lib_id.
+            if content[start..end].contains("(lib_id ") && !blocks.iter().any(|&(s, _)| s == start)
+            {
+                blocks.push((start, end));
             }
         }
         from = ref_pos + ref_search.len();
     }
-    None
+    blocks
 }
 
 #[cfg(test)]
@@ -625,117 +788,33 @@ fn kicad_config_base() -> std::path::PathBuf {
     }
 }
 
-// ─── KiCAD symbol library resolution ────────────────────────────────────────
-
-/// Resolve a lib_id like "Device:R" to the full symbol S-expression definition.
-/// KiCAD 10 stores symbols in .kicad_symdir directories, one .kicad_sym file per symbol.
-/// Returns the symbol block with the lib_id prefix (e.g. "Device:R") as the symbol name.
-pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
-    let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        tracing::warn!(
-            "[BETA] Cannot resolve lib_id '{}' — expected 'Library:Symbol' format",
-            lib_id
-        );
-        return None;
-    }
-    let (library_name, symbol_name) = (parts[0], parts[1]);
-
-    let sym_dirs = find_kicad_symbol_dirs();
-
-    for base_dir in &sym_dirs {
-        // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
-        let symdir_path = base_dir.join(format!("{}.kicad_symdir", library_name));
-        let sym_file = symdir_path.join(format!("{}.kicad_sym", symbol_name));
-
-        if sym_file.exists() {
-            tracing::debug!("[BETA] Found symbol file: {}", sym_file.display());
-            match std::fs::read_to_string(&sym_file) {
-                Ok(content) => {
-                    if let Some(sym_block) = extract_symbol_block(&content, symbol_name) {
-                        let renamed = sym_block.replacen(
-                            &format!("(symbol \"{}\"", symbol_name),
-                            &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                            1,
-                        );
-                        return Some(renamed);
-                    }
-                }
-                Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", sym_file.display(), e),
-            }
-        }
-
-        // Fallback: KiCAD 8/9 format — Library.kicad_sym (single file)
-        let legacy_path = base_dir.join(format!("{}.kicad_sym", library_name));
-        if legacy_path.exists() {
-            match std::fs::read_to_string(&legacy_path) {
-                Ok(content) => {
-                    if let Some(sym_block) = extract_symbol_block(&content, symbol_name) {
-                        let renamed = sym_block.replacen(
-                            &format!("(symbol \"{}\"", symbol_name),
-                            &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                            1,
-                        );
-                        return Some(renamed);
-                    }
-                }
-                Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", legacy_path.display(), e),
-            }
-        }
-    }
-
-    tracing::warn!(
-        "[BETA] Symbol '{}' not found in any library directory",
-        lib_id
-    );
-    None
-}
-
-/// Extract a top-level (symbol "NAME" ...) block from a .kicad_sym file.
-fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
-    let pattern = format!("(symbol \"{}\"", symbol_name);
-    let start = content.find(&pattern)?;
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if end > start {
-        Some(content[start..end].to_string())
-    } else {
-        None
-    }
-}
+// ─── lib_symbols embedding ──────────────────────────────────────────────────
 
 /// Structured "this lib_id doesn't exist" error, with did-you-mean hints —
 /// silently accepting an unresolvable lib_id writes a netlist-invisible
 /// component with an empty pin list (#34).
-pub fn lib_symbol_not_found_error(lib_id: &str) -> CallToolResult {
+pub fn lib_symbol_not_found_error(
+    lib_id: &str,
+    src: &dyn konnect_schematic_editor::library::SymbolLibrarySource,
+) -> CallToolResult {
     let library = lib_id.split(':').next().unwrap_or(lib_id);
-    let mut msg = if !konnect_schematic_editor::library::library_exists(library) {
+    let mut msg = if !konnect_schematic_editor::library::library_exists(library, src) {
+        // Naming only KICAD10_SYMBOL_DIR misleads when the library *is*
+        // registered — the tables are the primary source.
         format!(
-            "Library '{}' not found in the installed KiCAD symbol libraries \
-             (lib_id '{}'). Check the library name, the KiCAD install, or \
-             KICAD10_SYMBOL_DIR.",
-            library, lib_id
+            "Library '{}' not found in the project or global sym-lib-table, nor as \
+             '{}.kicad_symdir'/'{}.kicad_sym' in the installed KiCad symbol \
+             libraries (lib_id '{}'). Register it with register_symbol_library, \
+             or set KICAD10_SYMBOL_DIR for a non-standard install.",
+            library, library, library, lib_id
         )
     } else {
         format!(
-            "Library symbol '{}' not found in the installed KiCAD libraries.",
-            lib_id
+            "Library symbol '{}' not found in library '{}'.",
+            lib_id, library
         )
     };
-    let suggestions = konnect_schematic_editor::library::suggest_symbols(lib_id, 3);
+    let suggestions = konnect_schematic_editor::library::suggest_symbols(lib_id, 3, src);
     if !suggestions.is_empty() {
         msg.push_str(&format!(
             " Did you mean: {}? (KiCAD 10 renamed several older symbol names)",
@@ -751,19 +830,20 @@ pub fn lib_symbol_not_found_error(lib_id: &str) -> CallToolResult {
 /// Returns `false` when `lib_id` cannot be resolved — callers must surface
 /// that as an error rather than writing a definition-less instance (#34).
 #[must_use]
-pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> bool {
+pub fn ensure_lib_symbol_in_schematic(
+    content: &mut String,
+    lib_id: &str,
+    src: &dyn konnect_schematic_editor::library::SymbolLibrarySource,
+) -> bool {
     // Check if already present
     let lib_id_check = format!("(symbol \"{}\"", lib_id);
     if content.contains(&lib_id_check) {
         return true;
     }
 
-    // Resolve the symbol from KiCAD libraries. Prefer the flattened resolver:
-    // derived symbols ((extends "Parent")) must be embedded with the parent's
-    // units copied in, not as a stub kicad-cli can't netlist (#35). Fall back
-    // to the local raw resolver for parity with the pre-flattening behavior.
-    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
-        .or_else(|| resolve_lib_symbol(lib_id))
+    // Flattened: a derived symbol must be embedded with its parent's units
+    // copied in, not as a stub kicad-cli can't netlist (#35).
+    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id, src)
     {
         Some(s) => s,
         None => return false,
@@ -793,20 +873,181 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
                 _ => {}
             }
         }
-        let indented = sym_def
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    String::new()
-                } else {
-                    format!("\t\t{}", l)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        content.insert_str(ls_end, &format!("\n{}\n\t", indented));
+        content.insert_str(ls_end, &format!("\n{}\n\t", indent_lib_symbol(&sym_def)));
     }
     true
+}
+
+/// A resolved library definition indented to sit inside `lib_symbols`. Shared
+/// so an embedded copy can be compared against the library it came from.
+fn indent_lib_symbol(sym_def: &str) -> String {
+    sym_def
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("\t\t{}", l)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Outcome of re-embedding one symbol definition.
+pub(crate) enum ReembedOutcome {
+    Updated,
+    /// The embedded copy already matches the library.
+    Unchanged,
+    /// The library no longer resolves this lib_id.
+    Unresolved,
+    /// The schematic has no embedded copy to replace.
+    NotEmbedded,
+    /// The library moved or removed pin anchors, so the update was refused:
+    /// wires and labels attach at pin coordinates, and refreshing the
+    /// definition under them would silently orphan them (#177). Carries a
+    /// human-readable description per affected pin.
+    PinsMoved(Vec<String>),
+}
+
+/// Replace each embedded definition in `lib_ids` with the library's current
+/// one, returning an outcome per entry in the same order.
+///
+/// [`ensure_lib_symbol_in_schematic`] deliberately leaves an existing copy
+/// alone, so a symbol edited in its library keeps rendering from the stale
+/// copy — what KiCad reports as "doesn't match copy in library". This is the
+/// explicit refresh, mirroring eeschema's "Update Symbols from Library".
+///
+/// Takes the whole batch so `lib_symbols` is located once rather than per
+/// symbol, and so the edits can be applied back to front against offsets that
+/// stay valid.
+pub(crate) fn reembed_lib_symbols(
+    content: &mut String,
+    lib_ids: &[String],
+    allow_pin_moves: bool,
+    src: &dyn konnect_schematic_editor::library::SymbolLibrarySource,
+) -> Vec<ReembedOutcome> {
+    let blocks = konnect_sexp::writer::find_direct_child_blocks(content, "lib_symbols");
+    let mut outcomes = Vec::with_capacity(lib_ids.len());
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for lib_id in lib_ids {
+        let Some(&(start, end)) = blocks
+            .iter()
+            .find(|&&(s, e)| lib_symbol_name(&content[s..e]) == Some(lib_id.as_str()))
+        else {
+            outcomes.push(ReembedOutcome::NotEmbedded);
+            continue;
+        };
+        // Flattened, same as the embed path: a derived symbol's copy must
+        // carry its parent's units, not an (extends …) stub (#35).
+        let Some(sym_def) =
+            konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id, src)
+        else {
+            outcomes.push(ReembedOutcome::Unresolved);
+            continue;
+        };
+        // The leading indentation is already in place before `start`.
+        let indented = indent_lib_symbol(&sym_def);
+        let fresh = indented.trim_start();
+        // Compare parsed, not byte for byte: the two embed paths lay a
+        // definition out differently, and reflowing one is not an update worth
+        // writing. A block that won't parse counts as changed — and forfeits
+        // the pin guard below, which needs both trees to compare anchors.
+        if let (Ok(embedded), Ok(library)) = (
+            konnect_sexp::parse_sexp(&content[start..end]),
+            konnect_sexp::parse_sexp(fresh),
+        ) {
+            if embedded == library {
+                outcomes.push(ReembedOutcome::Unchanged);
+                continue;
+            }
+            if !allow_pin_moves {
+                let moved = moved_pin_anchors(&embedded, &library);
+                if !moved.is_empty() {
+                    outcomes.push(ReembedOutcome::PinsMoved(moved));
+                    continue;
+                }
+            }
+        }
+        edits.push((start, end, fresh.to_string()));
+        outcomes.push(ReembedOutcome::Updated);
+    }
+
+    edits.sort_by_key(|&(start, ..)| std::cmp::Reverse(start));
+    for (start, end, fresh) in edits {
+        content.replace_range(start..end, &fresh);
+    }
+    outcomes
+}
+
+/// The quoted name in a `(symbol "Lib:Name" …)` definition.
+///
+/// The name may sit on the same line as `(symbol` or on the next one depending
+/// on which embed path wrote it, so this skips whitespace rather than
+/// pattern-matching a single layout.
+fn lib_symbol_name(block: &str) -> Option<&str> {
+    block
+        .strip_prefix("(symbol")?
+        .trim_start()
+        .strip_prefix('"')?
+        .split('"')
+        .next()
+}
+
+/// Every pin anchor in a symbol definition: `(number, x, y)` from each
+/// `(pin … (at x y angle) … (number "N"))`, at any nesting depth so both
+/// single- and multi-unit bodies are covered. Duplicates are kept — stacked
+/// power pins share a number, and losing one of them is still a move.
+fn pin_anchors(def: &konnect_sexp::SexpNode) -> Vec<(String, f64, f64)> {
+    let mut anchors = Vec::new();
+    let mut stack = vec![def];
+    while let Some(node) = stack.pop() {
+        for pin in node.find_all("pin") {
+            let Some(at) = pin.find("at") else { continue };
+            let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) else {
+                continue;
+            };
+            let number = pin
+                .find("number")
+                .and_then(|n| n.get(1))
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            anchors.push((number, x, y));
+        }
+        stack.extend(node.find_all("symbol"));
+    }
+    anchors
+}
+
+/// Anchors present in `old_def` that `new_def` no longer has, as
+/// human-readable descriptions. Empty means every existing pin kept its
+/// position — the safe case for an in-place refresh, since wires and labels
+/// attach at pin coordinates. New pins are not moves: nothing attaches to a
+/// pin that didn't exist.
+fn moved_pin_anchors(
+    old_def: &konnect_sexp::SexpNode,
+    new_def: &konnect_sexp::SexpNode,
+) -> Vec<String> {
+    let mut remaining = pin_anchors(new_def);
+    let mut moves = Vec::new();
+    for (number, x, y) in pin_anchors(old_def) {
+        if let Some(i) = remaining
+            .iter()
+            .position(|(n, nx, ny)| *n == number && (nx - x).abs() < 1e-6 && (ny - y).abs() < 1e-6)
+        {
+            remaining.swap_remove(i);
+            continue;
+        }
+        match remaining.iter().find(|(n, ..)| *n == number) {
+            Some((_, nx, ny)) => moves.push(format!(
+                "pin {number} moved from ({x}, {y}) to ({nx}, {ny})"
+            )),
+            None => moves.push(format!("pin {number} at ({x}, {y}) was removed")),
+        }
+    }
+    moves
 }
 
 /// Roots under which KiCAD ships its bundled libraries — the directory that
@@ -922,9 +1163,4 @@ fn kicad_env_suffix(kind: &str) -> Option<&'static str> {
         "3dmodels" => Some("3DMODEL_DIR"),
         _ => None,
     }
-}
-
-/// Find directories where KiCAD symbol libraries are stored.
-fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
-    find_kicad_library_dirs("symbols")
 }

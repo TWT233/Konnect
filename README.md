@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**187 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
+**190 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -22,6 +22,18 @@ that teach Claude KiCAD conventions out of the box.
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
 > [naming conventions](docs/NAMING_CONVENTIONS.md).
+
+> ## Add realtime research to KiCAD MCP and Konnect. Introducing Nimrod
+>
+> [**Nimrod**](https://nimrod.orchis.ai) is our web-research MCP server:
+> quality-scored Google search, clean webpage extraction, and deep multi-source
+> research. Design the board with Konnect while Nimrod pulls live parts availability, datasheets,
+> and errata — no more guessing from year-old training data
+>
+> - Works with claude.ai, Claude Desktop, Claude Code, VS Code, and any MCP client
+> - 1 credit = 1 search · extraction always free · free 50-credit trial, no card
+> - Official MCP Registry: [`ai.orchis/nimrod`](https://registry.modelcontextprotocol.io)
+
 
 ## Why Konnect exists
 

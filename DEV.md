@@ -54,11 +54,11 @@ Konnect/
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
 │   │       │   └── meta_tools.rs    # 6 always-visible meta-tools
 │   │       └── tools/
-│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
+│   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
 │   │           ├── svg_import.rs     # SVG parsing + Bezier flattening for import_svg_logo (usvg-backed)
-│   │           ├── project.rs        # 6 tools (incl. open_schematic_viewer)
-│   │           ├── sch_components.rs # 17 tools (component placement with lib_symbols embedding)
+│   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
+│   │           ├── sch_components.rs # 19 tools (component placement with lib_symbols embedding)
 │   │           ├── sch_wiring.rs     # 19 tools (incl. connect_pins, power symbol embedding)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 12 tools (single-read/single-write atomic operations)
@@ -206,7 +206,7 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 187 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 190 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
 ## Observability
 
@@ -227,13 +227,15 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 187 tools (193 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 190 tools (196 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is ~19 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 - **`auto_load_toolsets` (config key, default `false`)**: when set, a miss in `dispatch_tool` loads the owning toolset and executes the call in the same hop instead of returning `toolset_not_loaded` -- fewer round trips, at the cost of toolsets accumulating monotonically for the rest of the session (`unload_toolset` still prunes, but a tool call reloads its toolset right back). Off by default because the router's whole point is keeping `tools/list` small; turn it on only if your client would rather eat the context growth than handle one recoverable error per miss. Set via `konnect.toml`/`settings.json` (`auto_load_toolsets = true`) or the equivalent `ServerConfig` field when embedding.
+
+- **`eager_toolsets` (config key, default `false`)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed` — for those, a tool absent from the first listing can never be called at all, because `load_toolset` reports the names it loaded but returns no schemas and the client has nothing to invoke (#134, #169). Note `auto_load_toolsets` does **not** cover this case: it fires on a tool *call*, so it only helps a caller that already knows the tool name. Costs ~25K tokens per listing against the ~2K baseline, which is the router's entire reason for existing — hence off by default.
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
@@ -244,10 +246,18 @@ The router is defined in `crates/konnect-core/src/router/mod.rs`.
   version IS the MSRV: bump it deliberately, in its own commit, after running the full
   local gate on the new version.
 - `protoc` binary (for protobuf code generation in konnect-ipc crate)
-  - Set `PROTOC` environment variable, or leave it unset and `konnect-ipc/build.rs`
-    falls back to `protoc` found on PATH
-  - Well-known-type includes are derived from `<PROTOC>/../../include` (i.e. a standard
-    protoc release layout with `bin/protoc` next to `include/`) when that directory exists
+  - Set `PROTOC` to the binary, or leave it unset and `konnect-ipc/build.rs` resolves
+    `protoc` from PATH
+  - Well-known-type includes (`google/protobuf/any.proto`) are derived from
+    `<protoc>/../../include` after the binary is resolved to an absolute path. This
+    covers both the upstream release layout (`bin/protoc` beside `include/`) and system
+    packages (`/usr/bin/protoc` → `/usr/include`). Set `PROTOC_INCLUDE` to override when
+    the binary and its protos live in unrelated prefixes — notably Chocolatey and scoop,
+    whose shared shim directory is not the package prefix.
+  - Some distributions ship the well-known `.proto` files separately from the compiler.
+    Debian/Ubuntu need `protobuf-compiler` **and** `libprotobuf-dev`; Fedora needs
+    `protobuf-compiler` and `protobuf-devel`. Missing them fails the build with
+    `google/protobuf/any.proto: File not found`.
   - Download: https://github.com/protocolbuffers/protobuf/releases
 - For schematic-viewer (built separately from the workspace — see Quick Start):
   - Rust toolchain on PATH (Windows: `set PATH=%PATH%;%USERPROFILE%\.cargo\bin` if `cargo`
@@ -289,9 +299,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 187 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 190 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 193 tools (187 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 196 tools (190 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)
