@@ -58,19 +58,25 @@ macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let addr = $ctx.config.ipc_address.clone();
         let requested_board = get_path($args, "board")?;
-        match with_ipc(addr, move |$c| {
+        match with_ipc_classified(addr, move |$c| {
             $c.ensure_board_is_active(&requested_board)?;
             $body
         })
         .await?
         {
             Ok(v) => v,
-            Err(msg) => {
+            // Only an unreachable transport justifies "KiCAD must be running".
+            // This used to say it for every failure, so a tool that refused a
+            // request on its merits — "a polygon needs at least 3 points" —
+            // told the reader to start a KiCad that was already running, with
+            // the actual reason parenthesised after a false statement.
+            Err(konnect_ipc::IpcFailure::Unreachable(msg)) => {
                 return Ok(CallToolResult::error(format!(
                     "KiCAD must be running with the board loaded (IPC error: {})",
                     msg
                 )))
             }
+            Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
         }
     }};
 }
