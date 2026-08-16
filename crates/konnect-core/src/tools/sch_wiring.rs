@@ -6,7 +6,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
+    get_path, opt_f64, opt_str, project_name_for, require_array, require_f64, require_str,
+    ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -612,7 +613,10 @@ async fn handle_batch_add_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let wires = args["wires"].as_array().cloned().unwrap_or_default();
+    let wires = match require_array(args, "wires") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
+    };
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
@@ -813,12 +817,13 @@ async fn handle_batch_delete_wire(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let uuids: Vec<String> = args["uuids"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
+    let uuids: Vec<String> = match require_array(args, "uuids") {
+        Ok(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        Err(e) => return Ok(e),
+    };
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
@@ -1355,7 +1360,10 @@ async fn handle_batch_rotate_labels(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let labels = args["labels"].as_array().cloned().unwrap_or_default();
+    let labels = match require_array(args, "labels") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
+    };
     let mut rotated = 0usize;
     for label_arg in &labels {
         let full_args = json!({
@@ -1612,7 +1620,10 @@ async fn handle_batch_delete_no_connect(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let positions = args["positions"].as_array().cloned().unwrap_or_default();
+    let positions = match require_array(args, "positions") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
+    };
 
     // One read, collect every range, one write — matching batch_delete_wire.
     // The old loop delegated to the single-item handler and counted `.is_ok()`,
@@ -1683,7 +1694,10 @@ async fn handle_batch_add_junction(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let positions = args["positions"].as_array().cloned().unwrap_or_default();
+    let positions = match require_array(args, "positions") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
+    };
     let mut sch = cse::Schematic::load(&sch_path)?;
     for pos in &positions {
         let x = pos["x"].as_f64().unwrap_or(0.0);

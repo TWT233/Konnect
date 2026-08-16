@@ -546,14 +546,21 @@ async fn handle_search_jlcpcb_parts(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    // Arguments before environment: a missing `query` is the caller's
+    // mistake and is theirs to fix, whereas a missing database is transient
+    // and unrelated. Checking the database first told someone who had simply
+    // forgotten the query to go and download a 2.5M-part catalogue (#218).
+    let query = match require_str(args, "query") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
     let db_path = resolve_db_path(args, ctx);
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
         ));
     }
-
-    let query = args["query"].as_str().unwrap_or("").to_string();
     let basic_only = args["basic_only"].as_bool().unwrap_or(false);
     let in_stock = args["in_stock"].as_bool().unwrap_or(true);
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -690,14 +697,22 @@ async fn handle_suggest_alternatives(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    // Arguments before environment — see `handle_search_jlcpcb_parts`.
+    let value = match require_str(args, "value") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let footprint = match require_str(args, "footprint") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
     let db_path = resolve_db_path(args, ctx);
     if !db_path.exists() {
         return Ok(CallToolResult::error(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
         ));
     }
-    let value = args["value"].as_str().unwrap_or("").to_string();
-    let footprint = args["footprint"].as_str().unwrap_or("").to_string();
     let max_price = args["max_price_usd"].as_f64();
     let limit = args["limit"].as_u64().unwrap_or(5) as usize;
 

@@ -3449,7 +3449,10 @@ async fn handle_search_symbols(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let query = args["query"].as_str().unwrap_or("").to_lowercase();
+    let query = match require_str(args, "query") {
+        Ok(v) => v.to_lowercase(),
+        Err(e) => return Ok(e),
+    };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     let project_dir = args["project_dir"]
@@ -3623,7 +3626,10 @@ async fn handle_search_footprints(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let query = args["query"].as_str().unwrap_or("").to_lowercase();
+    let query = match require_str(args, "query") {
+        Ok(v) => v.to_lowercase(),
+        Err(e) => return Ok(e),
+    };
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     // Walk global fp-lib-table

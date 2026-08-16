@@ -8,8 +8,8 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_f64, require_str,
-    ToolDef,
+    find_all_symbol_instance_blocks, get_path, opt_str, project_name_for, require_array,
+    require_f64, require_str, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -751,7 +751,10 @@ async fn handle_bulk_move(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let refs = args["references"].as_array().cloned().unwrap_or_default();
+    let refs = match require_array(args, "references") {
+        Ok(a) => a.clone(),
+        Err(e) => return Ok(e),
+    };
     let dx = match require_f64(args, "dx") {
         Ok(v) => v,
         Err(e) => return Ok(e),

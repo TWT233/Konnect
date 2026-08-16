@@ -460,3 +460,132 @@ mod path_argument_taxonomy_tests {
         );
     }
 }
+
+/// Every tool that declares an argument required must refuse the call when it
+/// is absent — not substitute a value, do the work, and report success.
+///
+/// Driven through the dispatch so one table can cover tools from eight
+/// different modules. The read-only half of #218: none of these damaged a
+/// file, but each returned a confident answer to a question nobody asked.
+/// `search_symbols` with no query returned the first 50 symbols across every
+/// installed library; `suggest_jlcpcb_alternatives` with neither `value` nor
+/// `footprint` returned the five cheapest in-stock parts in the whole JLCPCB
+/// database as "alternatives" for a component that was never named.
+#[cfg(test)]
+mod required_argument_dispatch_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    #[tokio::test]
+    async fn a_missing_required_argument_is_refused_by_name() {
+        let handler = handler().await;
+        // (tool, args supplying everything except the one under test, field).
+        // A path argument is supplied where the handler reads one first, so
+        // the assertion is about the field named rather than whichever
+        // argument happens to be checked earliest.
+        let sch = std::env::temp_dir().join("konnect-218.kicad_sch");
+        let s = sch.display().to_string();
+        let cases: Vec<(&str, Value, &str)> = vec![
+            ("search_symbols", json!({}), "query"),
+            ("search_footprints", json!({}), "query"),
+            ("search_jlcpcb_parts", json!({}), "query"),
+            ("search_templates", json!({}), "query"),
+            (
+                "suggest_jlcpcb_alternatives",
+                json!({ "footprint": "0402" }),
+                "value",
+            ),
+            (
+                "suggest_jlcpcb_alternatives",
+                json!({ "value": "10k" }),
+                "footprint",
+            ),
+            (
+                "batch_delete_schematic_wire",
+                json!({ "schematic": s }),
+                "uuids",
+            ),
+            ("batch_add_wire", json!({ "schematic": s }), "wires"),
+            ("batch_add_junction", json!({ "schematic": s }), "positions"),
+            (
+                "batch_delete_no_connect",
+                json!({ "schematic": s }),
+                "positions",
+            ),
+            ("batch_rotate_labels", json!({ "schematic": s }), "labels"),
+            (
+                "bulk_move_schematic_components",
+                json!({ "schematic": s, "dx": 1.0, "dy": 1.0 }),
+                "references",
+            ),
+            (
+                "batch_get_schematic_pin_locations",
+                json!({ "schematic": s }),
+                "references",
+            ),
+        ];
+
+        for (tool, args, field) in cases {
+            let (result, _, kind) = handler.dispatch_tool(tool, &args).await;
+            assert!(result.is_error, "{tool}: a missing {field} must be refused");
+            assert_eq!(
+                kind.as_deref(),
+                Some("invalid_argument"),
+                "{tool}: must record an argument error, not handler_error"
+            );
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("{tool}: expected text, got {other:?}"),
+            };
+            let parsed: Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}"));
+            assert_eq!(parsed["error"]["kind"], "invalid_argument", "{tool}");
+            assert_eq!(
+                parsed["error"]["field"], field,
+                "{tool} must name the argument it wanted: {text}"
+            );
+        }
+    }
+
+    /// An explicitly empty list is a coherent request — "operate on nothing" —
+    /// and must stay distinguishable from forgetting to say what to operate
+    /// on. Refusing both would trade one conflated pair for another.
+    #[tokio::test]
+    async fn an_explicitly_empty_list_is_not_an_argument_error() {
+        let handler = handler().await;
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("empty.kicad_sch");
+        std::fs::write(
+            &sch,
+            "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t\
+             (uuid \"r\")\n\t(paper \"A4\")\n\t(lib_symbols)\n)\n",
+        )
+        .unwrap();
+
+        let (_, _, kind) = handler
+            .dispatch_tool(
+                "batch_delete_schematic_wire",
+                &json!({ "schematic": sch.display().to_string(), "uuids": [] }),
+            )
+            .await;
+        assert_ne!(
+            kind.as_deref(),
+            Some("invalid_argument"),
+            "an empty uuids list is a request to delete nothing, not a mistake"
+        );
+    }
+}
