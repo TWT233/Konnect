@@ -299,14 +299,52 @@ pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()
 }
 
+/// A required argument was absent or the wrong type.
+///
+/// Carried inside the `anyhow::Error` that [`get_path`] returns so the MCP
+/// dispatch layer can report `invalid_argument` naming the field, the same as
+/// [`require_str`], without `get_path`'s 171 call sites changing shape.
+///
+/// Classify by downcasting, never by matching the message — the same rule
+/// `konnect_ipc::TransportUnreachable` follows (#194).
+#[derive(Debug)]
+pub struct MissingArgument {
+    pub field: String,
+}
+
+impl std::fmt::Display for MissingArgument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Missing required argument: '{}'", self.field)
+    }
+}
+
+impl std::error::Error for MissingArgument {}
+
+impl MissingArgument {
+    /// The field named by the first [`MissingArgument`] in `error`'s chain.
+    pub fn field_in(error: &anyhow::Error) -> Option<&str> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<Self>())
+            .map(|missing| missing.field.as_str())
+    }
+}
+
 /// Extract a required path string and return it as a PathBuf, using
 /// `anyhow::Error`. Use this variant with `?` inside handlers that return
-/// `anyhow::Result`. The surrounding dispatch will stringify the error and
-/// surface it as `ToolErrorKind::HandlerError`.
+/// `anyhow::Result`.
+///
+/// A missing or non-string argument carries [`MissingArgument`], which the
+/// dispatch layer reports as `invalid_argument` naming the field. A path that
+/// is present but unusable — absent on disk, wrong extension — is not this
+/// error: that is the handler trying and failing, and stays a handler error or
+/// a `FileNotFound` (#194).
 pub fn get_path(args: &Value, key: &str) -> anyhow::Result<std::path::PathBuf> {
-    let s = args[key]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing required argument: '{}'", key))?;
+    let s = args[key].as_str().ok_or_else(|| {
+        anyhow::Error::new(MissingArgument {
+            field: key.to_string(),
+        })
+    })?;
     Ok(std::path::PathBuf::from(s))
 }
 

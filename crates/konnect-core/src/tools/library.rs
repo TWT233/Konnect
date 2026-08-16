@@ -6597,9 +6597,14 @@ mod argument_error_kind_tests {
         // (tool, args that satisfy everything *except* the field under test,
         //  the field it should name)
         //
-        // The args matter: several of these read a path through `get_path`
-        // first, which still returns an `anyhow::Error` and would fail the
-        // call before the `require_str` this test is about is ever reached.
+        // The path arguments are still supplied deliberately: this test is
+        // about `require_str`, and a handler that reads a path first would
+        // otherwise fail on that instead, making the assertion vacuous. Since
+        // #194 those path failures are themselves `invalid_argument`, so the
+        // wrong one would still *pass* the kind check while naming a different
+        // field — which is exactly why the field is asserted too. Path
+        // arguments get their own coverage in
+        // `mcp::handler::path_argument_taxonomy_tests`.
         let cases = [
             ("get_symbol_info", json!({}), "lib_id"),
             ("get_footprint_info", json!({}), "footprint_path"),

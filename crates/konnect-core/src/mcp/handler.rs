@@ -259,6 +259,30 @@ impl McpHandler {
                     let error_kind = extract_error_kind(&result);
                     (result, status, error_kind)
                 }
+                // A missing argument is the caller's mistake, not the tool
+                // failing, and the two call for different reactions: retry with
+                // the argument, versus conclude the operation is broken. The
+                // `require_*` helpers already draw that line; `get_path` could
+                // not, because returning a structured result would change 171
+                // call sites — so it carries the distinction in the error chain
+                // instead, and this is where it is read back out (#194).
+                Err(e) if crate::tools::MissingArgument::field_in(&e).is_some() => {
+                    let field = crate::tools::MissingArgument::field_in(&e)
+                        .expect("guard matched")
+                        .to_string();
+                    let reason = "missing or not a string".to_string();
+                    (
+                        CallToolResult::error_kind(
+                            ToolErrorKind::InvalidArgument {
+                                field: field.clone(),
+                                reason: reason.clone(),
+                            },
+                            format!("Argument '{field}' is invalid: {reason}"),
+                        ),
+                        CallStatus::Error,
+                        Some("invalid_argument".to_string()),
+                    )
+                }
                 Err(e) => {
                     warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
                     let kind = ToolErrorKind::HandlerError {
@@ -344,4 +368,95 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+/// A missing *path* argument must reach the caller as `invalid_argument`
+/// naming the field, exactly as a missing string argument does.
+///
+/// These assertions live here rather than beside the tools because the
+/// distinction is made here: `get_path` returns an `anyhow::Error` (171 call
+/// sites depend on that shape), carrying `MissingArgument` for the dispatch to
+/// read back out. A test that calls a handler directly cannot see this — it
+/// only sees the `Err` — which is why `library.rs`'s argument tests could not
+/// cover path arguments and had to supply them to reach the assertion they
+/// wanted (#194).
+#[cfg(test)]
+mod path_argument_taxonomy_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    fn error_json(result: &CallToolResult) -> Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_argument_is_invalid_argument_naming_the_field() {
+        let handler = handler().await;
+        // One per family, and each argument name differs, so this cannot pass
+        // by a single handler happening to be well behaved. 150 registered
+        // tools read a path through `get_path` before anything else, so this
+        // is the common shape of a mistyped call, not an edge case.
+        for (tool, field) in [
+            ("list_symbols_in_library", "library_path"),
+            ("get_board_info", "board"),
+            ("list_schematic_components", "schematic"),
+            ("get_project_info", "path"),
+        ] {
+            let (result, status, kind) = handler.dispatch_tool(tool, &json!({})).await;
+            assert!(result.is_error, "{tool}: a missing path must fail");
+            assert!(matches!(status, CallStatus::Error), "{tool}");
+            assert_eq!(
+                kind.as_deref(),
+                Some("invalid_argument"),
+                "{tool}: observability must record the argument error, not \
+                 handler_error — that is the field a caller filters on"
+            );
+            let parsed = error_json(&result);
+            assert_eq!(parsed["error"]["kind"], "invalid_argument", "{tool}");
+            assert_eq!(
+                parsed["error"]["field"], field,
+                "{tool} must name the path argument it wanted"
+            );
+        }
+    }
+
+    /// The other half of the contract: a path that is *present* but unusable is
+    /// the handler trying and failing, and must not be relabelled as the
+    /// caller's mistake. Collapsing these two would make "you forgot an
+    /// argument" indistinguishable from "that file is not there".
+    #[tokio::test]
+    async fn a_present_but_unusable_path_is_not_an_argument_error() {
+        let handler = handler().await;
+        let missing_file = std::env::temp_dir().join("konnect-194-does-not-exist.kicad_pcb");
+        let (result, _, kind) = handler
+            .dispatch_tool(
+                "get_board_info",
+                &json!({ "board": missing_file.display().to_string() }),
+            )
+            .await;
+        assert!(result.is_error, "a missing file must still fail");
+        assert_ne!(
+            kind.as_deref(),
+            Some("invalid_argument"),
+            "the argument was supplied and well formed; the file is what is wrong"
+        );
+    }
 }
