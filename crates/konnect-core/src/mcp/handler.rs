@@ -247,6 +247,30 @@ impl McpHandler {
         }
 
         if let Some(tool_def) = tool_def {
+            // Nothing validated `required` before this: the schema is
+            // advertised to the client and was never enforced server-side, so
+            // a handler reading an absent argument with `unwrap_or` ran with a
+            // substituted value and reported success. 25 sites across 18 tools
+            // did exactly that (#218); each is now fixed in its own handler,
+            // and this stops the next one being written.
+            //
+            // Presence only. A wrong *type* still reaches the handler, which
+            // is where the `require_*` helpers name the field — this is a net
+            // beneath them, not a replacement for them.
+            if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
+                let reason = "missing".to_string();
+                return (
+                    CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: missing.clone(),
+                            reason: reason.clone(),
+                        },
+                        format!("Argument '{missing}' is invalid: {reason}"),
+                    ),
+                    CallStatus::Error,
+                    Some("invalid_argument".to_string()),
+                );
+            }
             return match (tool_def.handler)(args, self.ctx.clone()).await {
                 Ok(result) => {
                     let status = if result.is_error {
@@ -359,6 +383,22 @@ impl McpHandler {
 /// Sum of content bytes in a `CallToolResult` — used for observability size
 /// accounting. Images are counted by their (already-base64-encoded) data len,
 /// which matches what the client sees over the wire.
+/// The first name in a schema's `"required"` list that `args` does not carry,
+/// in the order the schema lists them.
+///
+/// A JSON `null` counts as absent: `{"query": null}` is a caller who has not
+/// supplied a query, and every `as_str()`/`as_array()` read would treat it the
+/// same way.
+fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
+    schema
+        .get("required")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|key| args.get(*key).map(Value::is_null).unwrap_or(true))
+        .map(str::to_string)
+}
+
 fn result_content_bytes(result: &CallToolResult) -> usize {
     result
         .content
@@ -587,5 +627,155 @@ mod required_argument_dispatch_tests {
             Some("invalid_argument"),
             "an empty uuids list is a request to delete nothing, not a mistake"
         );
+    }
+}
+
+/// Every registered tool refuses a call that omits its required arguments.
+///
+/// Exhaustive rather than a sample, and safe to be exhaustive *because of* the
+/// check it tests: with every required argument absent the dispatch refuses
+/// before the handler runs, so no tool touches a file, a board, or the
+/// network. Removing the check would make this both fail and unsafe, which is
+/// the right relationship between a guard and its test.
+///
+/// The per-handler `require_*` calls remain the primary defence — they name
+/// the field for a wrong *type*, which presence-checking cannot see. This
+/// asserts the floor beneath them: a tool added tomorrow that reads a required
+/// argument with `unwrap_or` still cannot run with a substituted value (#218).
+#[cfg(test)]
+mod every_tool_enforces_its_required_arguments {
+    use super::*;
+    use crate::router::registry;
+    use crate::tools::ServerConfig;
+
+    #[tokio::test]
+    async fn calling_any_tool_with_no_arguments_names_its_first_required_one() {
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+
+        let mut checked = 0usize;
+        let mut wrong = Vec::new();
+
+        for toolset in registry::ALL_TOOLSETS {
+            for def in registry::tools_for(toolset.name).unwrap_or_default() {
+                let Some(first) = def.input_schema["required"]
+                    .as_array()
+                    .and_then(|r| r.first())
+                    .and_then(|v| v.as_str())
+                else {
+                    continue; // no required arguments to omit
+                };
+
+                let (result, _, kind) = handler.dispatch_tool(def.name, &json!({})).await;
+                checked += 1;
+
+                if !result.is_error || kind.as_deref() != Some("invalid_argument") {
+                    wrong.push(format!(
+                        "{}: expected invalid_argument naming '{first}', got kind={:?} \
+                         is_error={}",
+                        def.name, kind, result.is_error
+                    ));
+                    continue;
+                }
+                let text = match result.content.first() {
+                    Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                    other => {
+                        wrong.push(format!("{}: expected text, got {other:?}", def.name));
+                        continue;
+                    }
+                };
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(parsed) if parsed["error"]["field"] == json!(first) => {}
+                    Ok(parsed) => wrong.push(format!(
+                        "{}: named '{}', schema lists '{first}' first",
+                        def.name, parsed["error"]["field"]
+                    )),
+                    Err(e) => wrong.push(format!("{}: {e}: {text}", def.name)),
+                }
+            }
+        }
+
+        assert!(
+            checked > 150,
+            "expected to cover most of the catalogue, only checked {checked}"
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} of {checked} tools do not refuse a call with no arguments:\n  {}",
+            wrong.len(),
+            wrong.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod first_missing_required_tests {
+    use super::*;
+
+    fn schema(required: Value) -> Value {
+        json!({ "type": "object", "required": required })
+    }
+
+    #[test]
+    fn names_them_in_schema_order_not_argument_order() {
+        let s = schema(json!(["board", "net_name", "layer"]));
+        assert_eq!(
+            first_missing_required(&s, &json!({ "layer": "F.Cu" })).as_deref(),
+            Some("board")
+        );
+        assert_eq!(
+            first_missing_required(&s, &json!({ "board": "b.kicad_pcb" })).as_deref(),
+            Some("net_name")
+        );
+    }
+
+    /// An explicit `null` is a caller who has not supplied the argument —
+    /// every `as_str()`/`as_array()` read would treat it that way, so the
+    /// check must too, or the two paths disagree.
+    #[test]
+    fn an_explicit_null_counts_as_absent() {
+        assert_eq!(
+            first_missing_required(&schema(json!(["board"])), &json!({ "board": null })).as_deref(),
+            Some("board")
+        );
+    }
+
+    #[test]
+    fn nothing_missing_when_all_are_present() {
+        assert_eq!(
+            first_missing_required(
+                &schema(json!(["board", "net_name"])),
+                &json!({ "board": "b", "net_name": "GND" })
+            ),
+            None
+        );
+    }
+
+    /// A value of the wrong type is still *present*. This check is about
+    /// presence; naming the field for a bad type is the handler's job.
+    #[test]
+    fn a_wrong_type_is_present_and_passes_through_to_the_handler() {
+        assert_eq!(
+            first_missing_required(&schema(json!(["query"])), &json!({ "query": 123 })),
+            None
+        );
+    }
+
+    #[test]
+    fn a_schema_with_no_required_list_never_reports_one() {
+        assert_eq!(
+            first_missing_required(&json!({ "type": "object" }), &json!({})),
+            None
+        );
+        assert_eq!(first_missing_required(&schema(json!([])), &json!({})), None);
     }
 }
