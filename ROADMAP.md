@@ -5,17 +5,15 @@ Opening an issue is the best way to influence priority.
 
 ## Platform
 
-- **Linux and macOS builds.** The code already carries `#[cfg]` branches and Unix
-  paths for both platforms, and CI checks all three OSes — what remains is release
-  packaging, per-platform QA against a running KiCAD, and macOS code signing /
-  notarization.
+- **Linux and macOS QA and signing.** The code carries `#[cfg]` branches and Unix
+  paths for both, CI checks all three OSes, and every release now ships a PCM
+  package per platform (macOS universal via `lipo`). What remains is per-platform
+  QA against a running KiCAD, and macOS code signing / notarization.
 - **KiCAD PCM publication** — submit the plugin to the official KiCAD addon
-  repository once the first tagged release is out.
+  repository.
 
 ## Tools
 
-- **Symbol & footprint creation** — author new library parts from scratch, not
-  just search and place existing ones.
 - **Eagle project import** — migrate legacy Eagle designs.
 
 ## Infrastructure
@@ -23,6 +21,13 @@ Opening an issue is the best way to influence priority.
 - **Deeper end-to-end tests** — tool-handler tests against a mocked IPC endpoint.
 
 ## Done
+
+- ~~Symbol & footprint creation~~ — `create_symbol` and `create_footprint` author
+  new library parts from scratch, alongside `edit_footprint_pad`,
+  `set_footprint_graphics`, `set_footprint_metadata` and `set_footprint_models`.
+- ~~Release packaging for all three platforms~~ — `release.yml` builds four
+  targets and assembles a PCM package for Windows, macOS (universal) and Linux,
+  each schema-validated before publish.
 
 - ~~HTTP transport~~ — Streamable HTTP (MCP spec 2025-06-18) available via
   `transport = "http"` (or `"both"`): POST + GET (SSE) on a single `/mcp`

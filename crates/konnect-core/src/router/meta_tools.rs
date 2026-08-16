@@ -1,7 +1,7 @@
 //! The 6 always-visible meta-tools.
 //!
 //! Discovery / routing:
-//!   list_toolboxes()          — show all 18 toolsets with descriptions and load state
+//!   list_toolboxes()          — show every toolset with descriptions and load state
 //!   load_toolset(name)        — activate a toolset, expose its tools in tools/list
 //!   unload_toolset(name)      — deactivate a toolset, remove its tools from tools/list
 //!   get_active_toolsets()     — list currently loaded toolsets

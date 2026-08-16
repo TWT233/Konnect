@@ -74,7 +74,7 @@ fn unknown_net_error(net_name: &str, board: &std::path::Path) -> CallToolResult 
         "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board a \
          zone must reference a declared net id — writing it anyway would attach the copper \
          to net 0, the unconnected pseudo-net (#192). Declare it first with add_net, or \
-         check the name with list_nets.",
+         check the name with get_nets_list.",
         board.display()
     ))
 }

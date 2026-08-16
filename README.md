@@ -53,8 +53,9 @@ Konnect, a tool call is a function call. One process, one language, no plumbing.
 **The dependency surface was enormous.** Running the original means carrying Node.js
 and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
 SWIG bindings — two package ecosystems plus a binding layer, every one of them a
-moving target that can break an install. Konnect is a single static binary, about
-5 MB. There is nothing to install alongside it and nothing to version-match.
+moving target that can break an install. Konnect is a single static binary —
+20–25 MB depending on platform, a ~9 MB download. There is nothing to install
+alongside it and nothing to version-match.
 
 **SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
 bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
@@ -205,9 +206,8 @@ Claude Desktop's config lives at
 
 For Claude Code, put the same snippet in a `.mcp.json` in your project root.
 
-Starting with the next release, the PCM package for macOS
-(`konnect-pcm-v<version>-macos.zip`) bundles a universal server binary; for
-v0.1.3 and earlier, install via a release tarball or a source build. The schematic
+The macOS PCM package (`konnect-pcm-v<version>-macos.zip`) bundles a universal
+server binary, so one download covers Apple Silicon and Intel. The schematic
 viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
 WebView2 is only a Windows requirement) but hasn't had the same mileage as
 the Windows build yet.
@@ -285,7 +285,7 @@ the architecture it proved, rebuilt for production:
 
 | | KiCAD-MCP-Server | Konnect |
 |---|---|---|
-| Runtime | Node.js + Python + SWIG bindings | Single static binary (~5 MB) |
+| Runtime | Node.js + Python + SWIG bindings | Single static binary (20–25 MB) |
 | Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
@@ -298,13 +298,20 @@ the architecture it proved, rebuilt for production:
 **Plugin doesn't appear in KiCAD** — install via the Plugin and Content Manager (not
 manual copy), then restart KiCAD.
 
-**PCB tools return "IPC connect failed"** — open KiCAD with your board file first;
-most PCB tools talk to the running PCB editor. `place_component` alone can fall
-back to a closed board file when no KiCAD process is reachable.
+**PCB tools return "KiCAD must be running with the board loaded"** — open KiCAD
+with that board first; most PCB tools talk to the running PCB editor. Only an
+unreachable KiCAD produces that message: if KiCAD is running and the tool
+refuses anyway, the error is the tool's own reason for refusing.
+`place_component` alone can fall back to a closed board file when no KiCAD
+process is reachable.
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
+that don't appear after `load_toolset`, and transaction recovery.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
-explicitly in the plugin settings dialog or your `konnect-settings.json` if yours
-is elsewhere.
+explicitly in the plugin settings dialog, in a `settings.json` beside the binary,
+or in a `konnect.toml` in the working directory. (A file under any other name
+works only when passed with `--config`.)
 
 ## Support
 

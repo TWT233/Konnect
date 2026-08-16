@@ -88,7 +88,7 @@ Konnect/
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 13 tools (IPC real-time + safe headless single-placement fallback)
+│   │           ├── pcb_components.rs # 15 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 17 tools (symbol/footprint library management)
@@ -107,7 +107,19 @@ Konnect/
 │   │       ├── parser.rs             # nom-based parser (handles empty strings)
 │   │       ├── writer.rs             # SexpEdit + apply_edits + write_atomic
 │   │       ├── schematic.rs          # SymbolInstance, LibPin, extract_*, pin_endpoint
-│   │       └── geometry.rs           # PinTransform, transform_pin (CANONICAL pin math)
+│   │       ├── geometry.rs           # PinTransform, transform_pin (CANONICAL pin math)
+│   │       ├── net.rs                # NetRef — KiCad-10 vs legacy net node forms
+│   │       ├── layers.rs             # Canonical layer names, copper stack queries
+│   │       ├── command.rs            # Reversible edit commands
+│   │       ├── transaction.rs        # Write-ahead journal for multi-file writes
+│   │       └── error.rs              # SexpError (incl. Conflict)
+│   │
+│   ├── konnect-schematic-editor/      # Typed schematic model (parse → mutate → write)
+│   │   └── src/
+│   │       ├── schematic/            # Schematic, symbol, wire, label, sheet, misc
+│   │       ├── sexp/                 # parser + writer (indent-preserving, see #210)
+│   │       ├── library.rs            # Library symbol lookup
+│   │       └── types.rs              # Shared value types (fmt_f64, …)
 │   │
 │   ├── konnect-ipc/                   # KiCAD 10 IPC API client
 │   │   ├── proto/                    # Protobuf definitions (copied from KiCAD v10 source)
@@ -116,6 +128,8 @@ Konnect/
 │   │       ├── gen.rs                # Generated protobuf Rust types
 │   │       ├── client.rs             # NNG req/rep client, all methods implemented
 │   │       ├── builders.rs           # Protobuf message construction helpers (mm→nm conversion)
+│   │       ├── transform.rs          # Rigid-body child transform — KiCAD 10 stores footprint
+│   │       │                         # children in ABSOLUTE board coords (#23)
 │   │       └── types.rs              # Public types (IpcFootprint, IpcTrack, etc.)
 │   │
 │   └── schematic-viewer/            # Tauri desktop app (separate from workspace)
@@ -138,11 +152,19 @@ Konnect/
 │   └── resources/                    # PCM package resources (icon.png)
 │
 └── .github/workflows/
-    ├── ci.yml                        # Check + test + clippy on 3 platforms, plus the
-    │                                 # Python plugin and the Nix flake — both cover
-    │                                 # code `cargo --workspace` never sees
-    ├── e2e-kicad.yml                 # End-to-end tests against a real KiCAD install
-    └── release.yml                   # Build binaries + GitHub Release on tag push
+    ├── ci.yml                        # 7 jobs: check+test (3-OS matrix), clippy and
+    │                                 # fmt (ubuntu only), schematic viewer, Python
+    │                                 # plugin, Nix flake, PCM packaging validation.
+    │                                 # The last four cover code `cargo --workspace`
+    │                                 # never sees. 9 check runs per PR — the matrix
+    │                                 # counts as three.
+    ├── e2e-kicad.yml                 # Real KiCAD 10.0.5: end-to-end suite, a
+    │                                 # conformance pass over KiCAD's demo corpus, and
+    │                                 # PCM assembly + schema validation. Weekly cron,
+    │                                 # manual dispatch, and `v*` tag push — not
+    │                                 # per-PR, and it does not gate release.yml
+    └── release.yml                   # 3 jobs: build (4 targets), pcm-package (3
+                                      # platforms, macOS universal via lipo), release
 ```
 
 ## KiCAD 10 Integration
@@ -191,7 +213,7 @@ transaction abandon` escape hatch documented in
 
 ### Plugin Installation
 - **PCM zip** is the correct install method
-- KiCAD installs to: `C:\KiCad\10.0\share\kicad\scripting\plugins\konnect\`
+- KiCAD installs to: `C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\`
 - Both `__init__.py` (SWIG ActionPlugin for PCB editor settings dialog) and `plugin.json` (IPC exec plugin) are included
 
 ## Structured Errors
@@ -219,6 +241,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `unknown_tool` | Tool name doesn't exist in any toolset |
 | `invalid_argument` | Required argument missing/malformed |
 | `file_not_found` | Referenced file doesn't exist |
+| `conflict` | The file changed after it was read, or a write would replace paths that already exist — carries them |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
 
 ### Producing structured errors in a handler
@@ -234,7 +257,19 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 202 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured, and so is **every missing-argument error**. Three mechanisms produce them, in the order a call meets them:
+
+1. **The schema gate.** Before a handler runs, `handler.rs::dispatch_tool` calls `first_missing_required(&tool_def.input_schema, args)` and refuses with `invalid_argument` naming the first absent entry of the tool's own `required` list, in schema order. Presence only — a value of the wrong *type* passes through to the handler. An explicit `null` counts as absent, because every `as_str()`/`as_array()` read treats it that way.
+
+2. **The `require_*` helpers**, in `tools/mod.rs`: `require_str`, `require_f64`, `require_array`, `require_u64`. Each returns a `CallToolResult` carrying `InvalidArgument { field, reason }`, so a handler propagates it with `Err(e) => return Ok(e)`. These name the field for a *wrong type*, which the schema gate cannot see, and they are what makes a handler correct when called directly — as most tests do.
+
+3. **`get_path`**, which returns `anyhow::Result<PathBuf>` so its 171 call sites can use `?`. Changing that signature was not worth it, so it attaches a `MissingArgument` marker to the error and `dispatch_tool` downcasts for it. Classify by downcasting, never by matching message text — the same rule `konnect_ipc::TransportUnreachable` follows.
+
+A path that is *present but unusable* — absent on disk, wrong extension — is deliberately **not** an argument error. That is the handler trying and failing, and it stays a `handler_error` or `FileNotFound`. Collapsing the two would make "you forgot an argument" and "that file is not there" indistinguishable.
+
+Why the gate exists: nothing validated `required` server-side, and `execute_tool` turns absent arguments into `{}`, so 25 sites across 18 tools read a required argument with `unwrap_or` and reported success on a substituted value (#218). Each is now fixed in its own handler; the gate is the floor beneath them. Guarded by `every_tool_enforces_its_required_arguments`, which calls every tool that declares a required argument with no arguments at all — safe to be exhaustive precisely because the gate refuses before any handler runs.
+
+Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
 ## Observability
 
@@ -257,7 +292,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 The server does NOT expose all 202 tools (208 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is ~19 tools ≈ 2K tokens.
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
@@ -306,11 +341,14 @@ Run all: `PROTOC=<path> cargo test --workspace --lib --tests`
 | `konnect-core` unit tests | Router load/unload, starter-kit, registry invariants, observability, error taxonomy, arg helpers |
 | `konnect-core` integration tests | Fixture files: parse, edit, write, observability, structured errors |
 | `konnect-schematic-editor` tests | Typed schematic model + round-tripping |
+| `konnect-ipc` unit tests | Protobuf builders, client message construction, rigid-body child transform |
+| `crates/konnect/tests/` | Protocol over stdio, doc/asset count guards, transaction CLI, `#[ignore]`d live-KiCAD tests |
 
 `schematic-viewer` is **excluded from the workspace** (`Cargo.toml`'s `[workspace] exclude`) since
-it's a Tauri app built separately — `cargo test --workspace` never touches it, and neither does
-CI (`.github/workflows/ci.yml` runs everything with `--workspace`). Run its tests explicitly:
-`cd crates/schematic-viewer && cargo test`. Its 20 unit tests cover the pure sheet-tree-walking,
+it's a Tauri app built separately, so `cargo test --workspace` never touches it. **CI does**: the
+dedicated `viewer` job in `.github/workflows/ci.yml` runs `cargo check` and `cargo test` against
+`crates/schematic-viewer/Cargo.toml`, because without it a viewer break ships silently. Run its
+tests locally with `cd crates/schematic-viewer && cargo test`. Its 20 unit tests cover the pure sheet-tree-walking,
 watch-directory, render-snapshot, event-debounce, and incremental-render-selection logic
 (`walk_sheet_tree`, `compute_watch_dirs`, `snapshot_tree`, `drain_until_quiet`,
 `files_needing_render`, `render_all`'s error handling) — the actual `kicad-cli` subprocess call
@@ -328,7 +366,7 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **19 toolsets, 202 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
+- Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
 - Full-catalog `tools/list` (all loaded): 208 tools (202 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**

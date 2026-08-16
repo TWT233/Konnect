@@ -79,8 +79,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "add_bus_entry",
             "Add a bus entry — the 45-degree tick that connects a wire to a bus. Required: a wire \
-             and a bus that merely touch are NOT connected without one. 'at' is the end on the \
-             wire side; 'direction' says which way the tick runs to reach the bus.",
+             and a bus that merely touch are NOT connected without one. 'x'/'y' are the end on \
+             the wire side; 'direction' says which way the tick runs to reach the bus.",
             json!({
                 "type": "object",
                 "properties": {

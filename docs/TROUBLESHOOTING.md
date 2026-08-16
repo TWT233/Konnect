@@ -42,16 +42,21 @@ Alternative: launching the server from within KiCAD sets `KICAD_API_SOCKET`
 automatically, and a `konnect-settings.json` passed via `--config` can carry
 `ipc_socket_path` directly.
 
-## PCB tools return "IPC connect failed" / "No PCB document is open"
+## PCB tools return "KiCAD must be running with the board loaded"
 
 The IPC tools talk to KiCAD's **running PCB editor**. Open your board file in
 KiCAD first, and make sure the API is enabled (previous section).
+
+That message means the transport was unreachable. If KiCAD *is* running with
+that board open and a tool still refuses, the error you get back is the tool's
+own reason — "a polygon needs at least 3 points", "requested board … is not open
+in KiCAD" — and it names what to change about the request.
 
 ## "kicad-cli not found"
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-or in `konnect-settings.json` (`kicad_cli`).
+in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. A file under any other name is only read when passed with `--config`.
 
 ## Transaction recovery is blocked by divergent content
 
@@ -128,7 +133,7 @@ The fix for those clients is to make the *first* listing complete:
 { "eager_toolsets": true }
 ```
 
-in `konnect-settings.json` (or `konnect.toml`). Every toolset is then loaded at
+in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
 startup, so `tools/list` carries all 208 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly

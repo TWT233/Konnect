@@ -39,7 +39,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 ## Project
 
 ### `project` · 7 tools
-**Purpose:** Create, open, save, snapshot KiCAD projects, and launch the live schematic viewer.
+**Purpose:** Create, open, save, rename, snapshot KiCAD projects, and launch the live schematic viewer.
 **Source:** [`crates/konnect-core/src/tools/project.rs`](crates/konnect-core/src/tools/project.rs)
 
 | Tool | Description |
@@ -56,8 +56,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Schematic
 
-### `sch_components` · 19 tools
-**Purpose:** Add, edit, move, rotate, and delete schematic symbols.
+### `sch_components` · 20 tools
+**Purpose:** Add, edit, move, rotate, and delete schematic symbols, and set the page size.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
 | Tool | Description |
@@ -118,7 +118,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 |---|---|
 | `add_bus` | Add a bus segment. Geometrically a wire; KiCad treats it as a bus, carrying the members named by the bus label (`NAME[1..6]` or `{A B C}`). Wires join it only through a bus entry. |
 | `batch_add_bus` | Add multiple bus segments in one file read/write cycle. |
-| `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `at` is the wire-side end; `dx`/`dy` give the signed offset to the bus side. |
+| `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `x`/`y` are the wire-side end; `direction` picks which corner the tick runs to (`down_right` default, `down_left`, `up_right`, `up_left`). |
 | `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
 
 ### `sch_analysis` · 15 tools
@@ -214,11 +214,11 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
-| `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
+| `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
 ### `pcb_components` · 15 tools
-**Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
+**Purpose:** Place, move, rotate, align and duplicate PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -237,7 +237,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
-| `get_board_2d_view` | Render the PCB as a 2D image using kicad-cli; returns base64 PNG. |
+| `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
 ### `pcb_routing` · 12 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs.
@@ -249,7 +249,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
-| `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. |
+| `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. Same net and board-open refusals as `add_zone`. |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
@@ -271,11 +271,11 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_bom` | Generate a Bill of Materials (BOM) CSV from the schematic's component data. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
-| `export_dxf` | Export the PCB to DXF, one file per layer, using kicad-cli. For mechanical CAD interchange. |
+| `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |
 | `export_gencad` | Export the PCB in GenCAD format using kicad-cli. |
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
-| `refill_zones` | Refill all copper pour zones using kicad-cli (`zone-fill`). |
+| `refill_zones` | Refill all copper pour zones over KiCAD IPC. Requires a running KiCAD with the board open — there is no kicad-cli fallback. |
 | `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
 
 ---
@@ -283,7 +283,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 ## Library
 
 ### `library` · 17 tools
-**Purpose:** Symbol libraries, footprint libraries, search and registration.
+**Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
 | Tool | Description |
@@ -331,18 +331,18 @@ Six tools, grouped into *discovery/routing* and *observability*.
 ## Verification
 
 ### `verification` · 8 tools
-**Purpose:** ERC, DRC, design rules, KiCAD UI control.
+**Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run the Design Rule Check on the PCB and return structured violation results. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the PCB file. |
-| `get_design_rules` | Return the current design rule constraints defined in the PCB file. |
+| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
+| `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `check_kicad_ui` | Check whether the KiCAD GUI application is running and responsive. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
-| `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) in board setup. |
+| `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
 | `check_clearance` | Check the physical clearance (distance) between two components on the PCB. |
 
 ---
@@ -435,7 +435,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 - The `tool!(name, description, input_schema, handler)` macro lives in `crates/konnect-core/src/tools/mod.rs` and produces a `ToolDef` inserted into each toolset's `tools()` vec.
 - Dispatch: `router::registry::tools_for(name)` maps each toolset string to its `tools::<mod>::tools()` vec; `handler.rs` looks up `tools/call` in the currently-loaded toolsets. If the tool exists but its toolset isn't loaded, the error names the owning toolset for single-hop recovery (`router::ToolRouter::find_toolset_for_tool`).
-- Some schematic handlers are mid-migration from raw `konnect-sexp` to the typed `konnect-schematic-editor` model (Phase 2 Waves 1–4, see commits `1314ed2`…`f92b3b1`). Tool names and semantics are unchanged; only the internal implementation is in flux.
+- Some schematic handlers are mid-migration from raw `konnect-sexp` to the typed `konnect-schematic-editor` model (Phase 2 Waves 1–4). Tool names and semantics are unchanged; only the internal implementation is in flux.
 
 ### Regenerating this doc
 

@@ -88,7 +88,7 @@ unload_toolset("name")  → Remove a toolset when done
 | Category | Toolsets |
 |----------|----------|
 | Project | project |
-| Schematic | sch_components, sch_wiring, sch_analysis, sch_batch, sch_export, sch_hierarchy |
+| Schematic | sch_components, sch_wiring, sch_bus, sch_analysis, sch_batch, sch_export, sch_hierarchy |
 | PCB | pcb_board, pcb_components, pcb_routing, pcb_export |
 | Library | library |
 | Integration | integration (JLCPCB parts, Freerouting, datasheets) |
@@ -126,7 +126,7 @@ unload_toolset("name")  → Remove a toolset when done
 3. add_schematic_component (repeat)        → place parts
 4. load_toolset("sch_wiring")              → activate wiring tools
 5. connect_pins / add_wire / add_schematic_net_label → wire the circuit
-6. load_toolset("verification")            → activate checks
+6. load_toolset(["sch_export", "design_review"]) → activate checks
 7. run_erc / run_design_review             → validate the design
 ```
 

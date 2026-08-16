@@ -53,10 +53,17 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
 
 - `cargo test --workspace --locked --lib --tests` passes
 - `cargo test --workspace --locked --doc` passes
-- `cargo clippy --workspace --locked -- -D warnings` is clean
+- `cargo clippy --workspace --locked --all-targets -- -D warnings` is clean
 - `cargo fmt --all -- --check` is clean
 - New names follow [the naming conventions](docs/NAMING_CONVENTIONS.md); public name
   changes include compatibility handling and migration notes
+- **Read required arguments through the helpers**, never `unwrap_or`:
+  `require_str`, `require_f64`, `require_array`, `require_u64` (each returns a
+  structured `invalid_argument` naming the field), or `get_path` for paths.
+  A handler that substitutes a default for a schema-required argument runs on a
+  value the caller never supplied and reports success — that was 25 sites across
+  18 tools in #218. The dispatch refuses a *missing* required argument before
+  your handler runs, but only the helpers catch a wrong *type*.
 - If you added or removed tools: update `tool_count` in `router/registry.rs`,
   regenerate the matching section of `tool-directory.md`, and update the total tool
   counts in DEV.md's "Current Stats" and the README — those three counts have
