@@ -299,6 +299,27 @@ pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()
 }
 
+/// Extract a required array argument. Returns a structured `InvalidArgument`
+/// error result if missing or not an array.
+///
+/// An *empty* array is accepted: `[]` is a caller saying "operate on nothing",
+/// which is a coherent request. Omitting the argument is not — that is the
+/// caller forgetting to say what to operate on, and the two must not look the
+/// same to a tool that then reports success (#218).
+pub fn require_array<'a>(args: &'a Value, key: &str) -> Result<&'a Vec<Value>, CallToolResult> {
+    args[key]
+        .as_array()
+        .ok_or_else(|| invalid_arg(key, "missing or not an array"))
+}
+
+/// Extract a required non-negative integer argument. Returns a structured
+/// `InvalidArgument` error result if missing or not one.
+pub fn require_u64(args: &Value, key: &str) -> Result<u64, CallToolResult> {
+    args[key]
+        .as_u64()
+        .ok_or_else(|| invalid_arg(key, "missing or not a non-negative integer"))
+}
+
 /// A required argument was absent or the wrong type.
 ///
 /// Carried inside the `anyhow::Error` that [`get_path`] returns so the MCP

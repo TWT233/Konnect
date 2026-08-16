@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
@@ -1632,7 +1632,15 @@ async fn handle_place_array(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let count_x = args["count_x"].as_u64().unwrap_or(1);
+    // `count_x` is schema-required and defaulted to 1, so a caller who meant a
+    // 10x10 grid and mistyped the key got a single column of real footprints
+    // committed to the live board, and `{"placed_count": N}` back. The zero
+    // guard below could never fire on that path either — 1 is not 0 — so it
+    // only ever caught an explicit zero, which it still does (#218).
+    let count_x = match require_u64(args, "count_x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let count_y = args["count_y"].as_u64().unwrap_or(1);
     let Some(total_count) = count_x.checked_mul(count_y) else {
         return Ok(CallToolResult::error("Array dimensions overflow."));
@@ -2990,5 +2998,97 @@ mod board_footprint_graphics_tests {
                 );
             }
         }
+    }
+}
+
+/// `place_component_array` declares `count_x` required and defaulted it to 1.
+/// A caller who meant a 10x10 grid and mistyped the key got a single column of
+/// real footprints committed to the live board over IPC, and `{"placed_count":
+/// N}` back. The `count_x == 0` guard below it could never fire on that path
+/// either, since the default was 1 (#218).
+#[cfg(test)]
+mod required_count_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// No IPC address configured, so any handler that reaches the IPC layer
+    /// fails with the socket-path error — a different error therefore proves
+    /// the handler refused before attempting anything.
+    fn test_ctx_arc() -> std::sync::Arc<ToolContext> {
+        std::sync::Arc::new(ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    fn def(name: &str) -> ToolDef {
+        tools()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+    }
+
+    fn error_of(result: &CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    #[tokio::test]
+    async fn place_component_array_refuses_a_missing_count_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20250610)\n)\n").unwrap();
+
+        let result = (def("place_component_array").handler)(
+            &json!({
+                "board": board.display().to_string(),
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "start_x": 10.0,
+                "start_y": 10.0,
+                "count_y": 10,
+                "spacing_x": 2.0,
+            }),
+            test_ctx_arc(),
+        )
+        .await
+        .expect("no anyhow");
+
+        assert!(result.is_error, "a missing count_x must be refused");
+        let parsed = error_of(&result);
+        assert_eq!(parsed["error"]["kind"], "invalid_argument");
+        assert_eq!(parsed["error"]["field"], "count_x");
+    }
+
+    /// The zero guard still applies to an argument that is present and zero —
+    /// it was only ever unreachable via the default.
+    #[tokio::test]
+    async fn an_explicit_zero_count_is_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb\n  (version 20250610)\n)\n").unwrap();
+
+        let result = (def("place_component_array").handler)(
+            &json!({
+                "board": board.display().to_string(),
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "start_x": 10.0, "start_y": 10.0,
+                "count_x": 0, "count_y": 10, "spacing_x": 2.0,
+            }),
+            test_ctx_arc(),
+        )
+        .await
+        .expect("no anyhow");
+        assert!(result.is_error, "an explicit zero must still be rejected");
     }
 }

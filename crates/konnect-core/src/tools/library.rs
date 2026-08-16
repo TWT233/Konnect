@@ -6,7 +6,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
@@ -677,10 +677,21 @@ async fn handle_create_footprint(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let output = get_path(args, "output")?;
-    let name = args["name"].as_str().unwrap_or("Footprint");
+    // Both are schema-required. Defaulting them meant a call with neither
+    // wrote `(footprint "Footprint" …)` with no pads, no courtyard, no
+    // silkscreen and no fab outline — through `write_atomic`, which replaces
+    // unconditionally — over whatever `.kicad_mod` was already at `output`,
+    // and returned `{"success": true, "pad_count": 0}` (#218).
+    let name = match require_str(args, "name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let description = args["description"].as_str().unwrap_or("");
 
-    let pads_val = args["pads"].as_array().cloned().unwrap_or_default();
+    let pads_val = match require_array(args, "pads") {
+        Ok(v) => v.clone(),
+        Err(e) => return Ok(e),
+    };
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
     for pad in &pads_val {
@@ -2989,8 +3000,17 @@ async fn handle_create_symbol(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let lib_path = get_path(args, "library_path")?;
-    let name = args["name"].as_str().unwrap_or("Symbol");
-    let ref_prefix = args["reference_prefix"].as_str().unwrap_or("U");
+    // Schema-required. Defaulting them appended `(symbol "Symbol" …)` with
+    // reference `U` to the library — and there is no duplicate-name guard, so
+    // repeated calls stacked identically-named entries in one file (#218).
+    let name = match require_str(args, "name") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let ref_prefix = match require_str(args, "reference_prefix") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
     let value_str = args["value"].as_str().unwrap_or(name);
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
@@ -4976,6 +4996,9 @@ mod tests {
             &json!({
                 "library_path": lib.to_string_lossy(),
                 "name": "WIDE",
+                // Required by the schema; this test predates its enforcement
+                // and relied on the handler's "U" default (#218).
+                "reference_prefix": "U",
                 "pins": [
                     {"number":"1","name":"LONG/MULTI/FUNCTION/NAME/X","type":"bidirectional",
                      "x":-25.4,"y":0.0,"angle":0,"length":5.08},
@@ -6651,5 +6674,151 @@ mod argument_error_kind_tests {
                 "{tool_name} must name the missing field: {text}"
             );
         }
+    }
+}
+
+/// A tool that declares an argument required must refuse the call when it is
+/// absent — not substitute a value, do the work, and report success.
+///
+/// `create_footprint` is the reason this module exists. With `pads` omitted it
+/// produced a footprint with no pads, no courtyard, no silkscreen and no fab
+/// outline, named `"Footprint"` because `name` defaulted too, and committed it
+/// with `write_atomic` — an unconditional replace with no if-unchanged check.
+/// Measured against a real 0402 resistor footprint: **805 bytes and 2 pads
+/// became 121 bytes and 0 pads**, and the call returned
+/// `{"success": true, "pad_count": 0}` (#218).
+#[cfg(test)]
+mod required_argument_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    fn error_field(result: &CallToolResult) -> String {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert_eq!(
+            parsed["error"]["kind"], "invalid_argument",
+            "must be a typed argument error: {text}"
+        );
+        parsed["error"]["field"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    async fn call(tool_name: &str, args: serde_json::Value) -> CallToolResult {
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} is registered"));
+        (def.handler)(&args, ctx())
+            .await
+            .unwrap_or_else(|e| panic!("{tool_name} must not bubble anyhow: {e}"))
+    }
+
+    /// The property that matters: a refused call leaves the target file exactly
+    /// as it was. Asserting only the error would still pass if the write
+    /// happened first.
+    #[tokio::test]
+    async fn create_footprint_without_pads_refuses_and_leaves_the_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("R_0402_1005Metric.kicad_mod");
+        let original = "(footprint \"R_0402_1005Metric\"\n\t(layer \"F.Cu\")\n\t\
+             (pad \"1\" smd roundrect (at -0.51 0) (size 0.54 0.64) \
+             (layers \"F.Cu\" \"F.Paste\" \"F.Mask\"))\n\t\
+             (pad \"2\" smd roundrect (at 0.51 0) (size 0.54 0.64) \
+             (layers \"F.Cu\" \"F.Paste\" \"F.Mask\"))\n)\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = call(
+            "create_footprint",
+            json!({ "output": path.display().to_string(), "name": "R_0402_1005Metric" }),
+        )
+        .await;
+
+        assert!(result.is_error, "a footprint with no pads must be refused");
+        assert_eq!(error_field(&result), "pads");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the existing footprint must survive a refused call untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_footprint_without_a_name_refuses_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.kicad_mod");
+        let result = call(
+            "create_footprint",
+            json!({ "output": path.display().to_string(), "pads": [] }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(error_field(&result), "name");
+        assert!(
+            !path.exists(),
+            "nothing should be created for a refused call"
+        );
+    }
+
+    /// An empty `pads` array is a different thing from an absent one: the
+    /// caller said "no pads", which is a coherent request for a mechanical
+    /// footprint. Only the absent case is a mistake.
+    #[tokio::test]
+    async fn an_explicitly_empty_pads_array_is_still_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mech.kicad_mod");
+        let result = call(
+            "create_footprint",
+            json!({ "output": path.display().to_string(), "name": "Mech", "pads": [] }),
+        )
+        .await;
+        assert!(!result.is_error, "an explicit empty pad list is a request");
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn create_symbol_refuses_a_missing_name_or_reference_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.kicad_sym");
+        std::fs::write(&path, "(kicad_symbol_lib\n)\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for (args, field) in [
+            (json!({ "reference_prefix": "R" }), "name"),
+            (json!({ "name": "MyPart" }), "reference_prefix"),
+        ] {
+            let mut args = args;
+            args["library_path"] = json!(path.display().to_string());
+            let result = call("create_symbol", args).await;
+            assert!(result.is_error, "must refuse when {field} is absent");
+            assert_eq!(error_field(&result), field);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "no symbol should have been appended"
+        );
     }
 }
