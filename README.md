@@ -236,7 +236,8 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
-  `place_component` can safely fall back to a closed board file when IPC is unreachable.
+  `place_component`, `move_component`, and `rotate_component` can safely fall
+  back to a closed board file when IPC is unreachable.
 
 ## License: free for the little guys
 
@@ -272,8 +273,9 @@ the architecture it proved, rebuilt for production:
 manual copy), then restart KiCAD.
 
 **PCB tools return "IPC connect failed"** — open KiCAD with your board file first;
-most PCB tools talk to the running PCB editor. `place_component` alone can fall
-back to a closed board file when no KiCAD process is reachable.
+most PCB tools talk to the running PCB editor. `place_component`, `move_component`,
+and `rotate_component` can fall back to a closed board file when no KiCAD process
+is reachable.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
 explicitly in the plugin settings dialog or your `konnect-settings.json` if yours
