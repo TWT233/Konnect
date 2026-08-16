@@ -1355,7 +1355,7 @@ fn normalized_items(
     definition: &kiapi::board::types::Footprint,
     suffix: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    definition
+    let mut items = definition
         .items
         .iter()
         .filter(|item| item.type_url.ends_with(suffix))
@@ -1392,11 +1392,13 @@ fn normalized_items(
                 Ok(item.value.clone())
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    items.sort();
+    Ok(items)
 }
 
 fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Vec<Vec<u8>>> {
-    definition
+    let mut graphics = definition
         .items
         .iter()
         .filter_map(|item| {
@@ -1407,22 +1409,43 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                             shape.id = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
-                            if let Some(stroke) = shape
-                                .shape
-                                .as_mut()
-                                .and_then(|shape| shape.attributes.as_mut())
-                                .and_then(|attributes| attributes.stroke.as_mut())
-                            {
-                                if matches!(
-                                    stroke.style(),
-                                    kiapi::common::types::StrokeLineStyle::SlsUnknown
-                                        | kiapi::common::types::StrokeLineStyle::SlsDefault
-                                        | kiapi::common::types::StrokeLineStyle::SlsSolid
-                                ) {
-                                    stroke.style =
-                                        kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                            if let Some(graphic) = shape.shape.as_mut() {
+                                if let Some(stroke) = graphic
+                                    .attributes
+                                    .as_mut()
+                                    .and_then(|attributes| attributes.stroke.as_mut())
+                                {
+                                    if matches!(
+                                        stroke.style(),
+                                        kiapi::common::types::StrokeLineStyle::SlsUnknown
+                                            | kiapi::common::types::StrokeLineStyle::SlsDefault
+                                            | kiapi::common::types::StrokeLineStyle::SlsSolid
+                                    ) {
+                                        stroke.style =
+                                            kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                                    }
+                                    stroke.color = None;
                                 }
-                                stroke.color = None;
+                                if let Some(
+                                    kiapi::common::types::graphic_shape::Geometry::Polygon(polyset),
+                                ) = graphic.geometry.as_mut()
+                                {
+                                    normalize_polyset(polyset);
+                                }
+                                if let Some(
+                                    kiapi::common::types::graphic_shape::Geometry::Rectangle(
+                                        rectangle,
+                                    ),
+                                ) = graphic.geometry.as_mut()
+                                {
+                                    if rectangle
+                                        .corner_radius
+                                        .as_ref()
+                                        .is_some_and(|radius| radius.value_nm == 0)
+                                    {
+                                        rectangle.corner_radius = None;
+                                    }
+                                }
                             }
                             shape.encode_to_vec()
                         },
@@ -1441,20 +1464,74 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                 None
             }
         })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    graphics.sort();
+    Ok(graphics)
+}
+
+fn normalize_polyset(polyset: &mut kiapi::common::types::PolySet) {
+    for polygon in &mut polyset.polygons {
+        if let Some(outline) = polygon.outline.as_mut() {
+            normalize_polyline(outline);
+        }
+        for hole in &mut polygon.holes {
+            normalize_polyline(hole);
+        }
+        polygon.holes.sort_by_key(prost::Message::encode_to_vec);
+    }
+    polyset.polygons.sort_by_key(prost::Message::encode_to_vec);
+}
+
+fn normalize_polyline(polyline: &mut kiapi::common::types::PolyLine) {
+    if !polyline.closed || polyline.nodes.len() < 2 {
+        return;
+    }
+    let candidates = [
+        polyline.nodes.clone(),
+        polyline.nodes.iter().cloned().rev().collect(),
+    ];
+    let mut best: Option<(Vec<u8>, Vec<kiapi::common::types::PolyLineNode>)> = None;
+    for nodes in candidates {
+        for offset in 0..nodes.len() {
+            let rotated = nodes[offset..]
+                .iter()
+                .chain(nodes[..offset].iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let encoded = rotated
+                .iter()
+                .flat_map(prost::Message::encode_to_vec)
+                .collect::<Vec<_>>();
+            if best
+                .as_ref()
+                .is_none_or(|(best_encoded, _)| encoded < *best_encoded)
+            {
+                best = Some((encoded, rotated));
+            }
+        }
+    }
+    if let Some((_, nodes)) = best {
+        polyline.nodes = nodes;
+    }
 }
 
 fn library_owned_attributes(
     attributes: Option<&kiapi::board::types::FootprintAttributes>,
 ) -> Option<(bool, bool, bool, bool, i32, bool)> {
     attributes.map(|attributes| {
+        let mounting_style = match attributes.mounting_style() {
+            kiapi::board::types::FootprintMountingStyle::FmsUnknown
+            | kiapi::board::types::FootprintMountingStyle::FmsUnspecified => {
+                kiapi::board::types::FootprintMountingStyle::FmsUnspecified as i32
+            }
+            style => style as i32,
+        };
         (
             attributes.exclude_from_position_files,
             attributes.exclude_from_bill_of_materials,
             attributes.exempt_from_courtyard_requirement,
             attributes.allow_soldermask_bridges,
-            attributes.mounting_style,
+            mounting_style,
             attributes.not_in_schematic,
         )
     })
@@ -1848,9 +1925,14 @@ mod tests {
             &BTreeSet::new(),
         )
         .unwrap();
-        let prepared =
+        let mut prepared =
             kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
         let mut roundtripped = prepared.clone();
+        roundtripped.definition.as_mut().unwrap().items.reverse();
+        roundtripped.attributes.as_mut().unwrap().mounting_style =
+            kiapi::board::types::FootprintMountingStyle::FmsUnspecified as i32;
+        prepared.attributes.as_mut().unwrap().mounting_style =
+            kiapi::board::types::FootprintMountingStyle::FmsUnknown as i32;
 
         for item in &mut roundtripped.definition.as_mut().unwrap().items {
             if item.type_url.ends_with("kiapi.board.types.Pad") {
@@ -1904,6 +1986,29 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .style = kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                if let Some(kiapi::common::types::graphic_shape::Geometry::Polygon(polyset)) =
+                    graphic
+                        .shape
+                        .as_mut()
+                        .and_then(|shape| shape.geometry.as_mut())
+                {
+                    if let Some(outline) = polyset
+                        .polygons
+                        .first_mut()
+                        .and_then(|polygon| polygon.outline.as_mut())
+                    {
+                        outline.nodes.rotate_left(1);
+                        outline.nodes.reverse();
+                    }
+                }
+                if let Some(kiapi::common::types::graphic_shape::Geometry::Rectangle(rectangle)) =
+                    graphic
+                        .shape
+                        .as_mut()
+                        .and_then(|shape| shape.geometry.as_mut())
+                {
+                    rectangle.corner_radius = Some(kiapi::common::types::Distance { value_nm: 0 });
+                }
                 *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
             }
         }
