@@ -1,6 +1,7 @@
 //! Skill and agent manifests embedded at compile time.
 //!
-//! The `init` subcommand installs these to `~/.claude/skills/` and `~/.claude/agents/`.
+//! The client-aware `init` subcommand installs shared skills for Claude or Codex.
+//! Claude-specific agents and hooks remain scoped to Claude's directories.
 //! Hook skills are also patched into `~/.claude/settings.json`.
 
 /// A skill to install to `~/.claude/skills/<name>/SKILL.md`.

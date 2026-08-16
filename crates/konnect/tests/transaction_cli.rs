@@ -16,6 +16,18 @@ fn transaction_help_is_advertised() {
 }
 
 #[test]
+fn client_scoped_installer_help_is_advertised() {
+    let output = konnect().arg("--help").output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("init [--client <client>]"));
+    assert!(stdout.contains("claude (default)"));
+    assert!(stdout.contains("codex"));
+    assert!(stdout.contains("~/.agents/skills"));
+}
+
+#[test]
 fn malformed_journal_requires_force_and_can_be_abandoned() {
     let project = tempfile::tempdir().unwrap();
     let active = project

@@ -136,6 +136,33 @@ Verify: open the **PCB Editor** → **Tools → External Plugins** → you shoul
 cargo build --release -p konnect
 ```
 
+### Install guidance for your AI client
+
+Konnect bundles shared KiCad skills for Claude and Codex. Select the client when
+installing, checking, or removing that guidance:
+
+```bash
+# Existing behavior remains the default: Claude skills, agents, and hooks
+konnect init
+
+# Codex installs only the shared skills under ~/.agents/skills
+konnect init --client codex
+konnect status --client codex
+konnect uninstall --client codex
+```
+
+Keep `--client codex` in the MCP server command so first-launch setup also stays
+inside Codex's directories. For example, register a standalone binary with the
+Codex CLI using:
+
+```bash
+codex mcp add konnect -- /path/to/konnect --client codex
+```
+
+Claude remains the default when `--client` is omitted. The installer tracks the
+two clients independently, and a Codex install does not create or modify
+`~/.claude`.
+
 ### macOS
 
 The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
