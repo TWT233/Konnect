@@ -1,14 +1,25 @@
+use crate::mcp::protocol::{CallToolResult, ToolContent};
+use crate::tool;
+use crate::tools::{
+    pcb_board::{attempt_ipc_write, BoardWrite},
+    ToolContext, ToolDef,
+};
 use anyhow::{bail, Context, Result};
 use konnect_ipc::gen::kiapi;
 use prost::Message;
 use serde::Serialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 struct LibraryFootprint {
     library_id: String,
     definition: kiapi::board::types::Footprint,
     attributes: kiapi::board::types::FootprintAttributes,
+    datasheet: Option<String>,
+    description_field: Option<String>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
@@ -30,6 +41,664 @@ struct PreparedUpdate {
     changed_domains: BTreeSet<ChangedDomain>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct UpdateFilters {
+    references: Option<BTreeSet<String>>,
+    library_ids: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArgumentError {
+    field: String,
+    reason: String,
+}
+
+impl std::fmt::Display for ArgumentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.field, self.reason)
+    }
+}
+
+impl std::error::Error for ArgumentError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlanStatus {
+    Ready,
+    Noop,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct CountPair {
+    planned: usize,
+    applied: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct UpdateCoverage {
+    selected: CountPair,
+    changed: CountPair,
+    unchanged: CountPair,
+    skipped_unlinked: CountPair,
+    conflicts: CountPair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PreservedState {
+    position: bool,
+    rotation: bool,
+    layer: bool,
+    locked: bool,
+    kiid: bool,
+    symbol_path: bool,
+    pad_nets: bool,
+    instance_overrides: bool,
+}
+
+impl Default for PreservedState {
+    fn default() -> Self {
+        Self {
+            position: true,
+            rotation: true,
+            layer: true,
+            locked: true,
+            kiid: true,
+            symbol_path: true,
+            pad_nets: true,
+            instance_overrides: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PlannedUpdate {
+    reference: String,
+    library_id: String,
+    changed_domains: BTreeSet<ChangedDomain>,
+    preserved: PreservedState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct UpdateDiagnostic {
+    code: String,
+    message: String,
+    reference: Option<String>,
+}
+
+#[derive(Debug)]
+struct UpdatePlan {
+    status: PlanStatus,
+    plan_revision: String,
+    coverage: UpdateCoverage,
+    changes: Vec<PlannedUpdate>,
+    diagnostics: Vec<UpdateDiagnostic>,
+    prepared_items: Vec<prost_types::Any>,
+}
+
+pub(crate) fn tool() -> ToolDef {
+    tool!(
+        "update_footprints_from_library",
+        "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
+         footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
+         exact plan revision. Preserves placed-instance state and pad nets while refreshing \
+         supported library-owned content.",
+        json!({
+            "type": "object",
+            "properties": {
+                "board": {
+                    "type": "string",
+                    "description": "Open .kicad_pcb path whose placed footprints will be refreshed"
+                },
+                "references": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional exact reference allowlist; omitted means all eligible footprints"
+                },
+                "library_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional exact Library:Footprint allowlist"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Plan and report changes without mutating the board"
+                },
+                "expected_plan_revision": {
+                    "type": "string",
+                    "description": "Required for apply; exact revision returned by the reviewed dry run"
+                }
+            },
+            "required": ["board"],
+            "additionalProperties": false
+        }),
+        |args, ctx| async move { handle_update_footprints_from_library(args, ctx).await }
+    )
+}
+
+pub(crate) async fn handle_update_footprints_from_library(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<CallToolResult> {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let board_path = crate::tools::get_path(args, "board")?;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    if !dry_run && expected_revision.is_none() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "expected_plan_revision".to_string(),
+                reason: "required when dry_run is false".to_string(),
+            },
+            "Apply requires the plan revision returned by a current dry run.",
+        ));
+    }
+    if !board_path.is_file() {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: board_path.display().to_string(),
+            },
+            format!("Board file not found: {}", board_path.display()),
+        ));
+    }
+    let filters = match parse_filters(args) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: error.field.clone(),
+                    reason: error.reason.clone(),
+                },
+                format!("Argument '{}' is invalid: {}", error.field, error.reason),
+            ))
+        }
+    };
+
+    let ipc_board_path = board_path.clone();
+    let planning_board_path = board_path.clone();
+    let operation = if dry_run {
+        "footprint library update dry run"
+    } else {
+        "footprint library update apply"
+    };
+    let result = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        operation,
+        move |client| {
+            let document = client.find_open_board(&ipc_board_path)?;
+            let footprint_items =
+                client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+            let nets = client.get_nets_in(document.clone())?;
+            let net_codes = nets
+                .into_iter()
+                .map(|net| (net.name, net.netcode))
+                .collect::<BTreeMap<_, _>>();
+            let routed_nets = snapshot_routed_nets(client, document.clone())?;
+            let mut plan = plan_updates(
+                &planning_board_path,
+                &footprint_items,
+                &net_codes,
+                &routed_nets,
+                &filters,
+            );
+
+            if dry_run || plan.status == PlanStatus::Conflict {
+                return Ok(plan_response(&plan, false));
+            }
+            if expected_revision.as_deref() != Some(plan.plan_revision.as_str()) {
+                plan.status = PlanStatus::Conflict;
+                plan.coverage.conflicts.planned += 1;
+                plan.diagnostics.push(UpdateDiagnostic {
+                    code: "stale_plan_revision".to_string(),
+                    message: "The live board, selected libraries, or filters changed; rerun dry run and apply its new plan revision."
+                        .to_string(),
+                    reference: None,
+                });
+                plan.changes.clear();
+                plan.prepared_items.clear();
+                return Ok(plan_response(&plan, false));
+            }
+            if plan.status == PlanStatus::Noop {
+                return Ok(plan_response(&plan, false));
+            }
+
+            let update_count = plan.prepared_items.len();
+            client.run_commit("Update footprints from libraries", |client| {
+                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
+            })?;
+            plan.coverage.selected.applied = plan.coverage.selected.planned;
+            plan.coverage.changed.applied = update_count;
+            plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
+            plan.coverage.skipped_unlinked.applied = plan.coverage.skipped_unlinked.planned;
+            Ok(plan_response(&plan, true))
+        },
+    )
+    .await?;
+
+    Ok(match result {
+        BoardWrite::Ipc(response) => response,
+        BoardWrite::File => preflight_conflict(
+            "KiCad IPC is unreachable. update_footprints_from_library is live-IPC-only and \
+             never edits the board file directly. Open the requested board in KiCad and retry.",
+        ),
+        BoardWrite::Refused(result) => {
+            let message = result
+                .content
+                .into_iter()
+                .find_map(|content| match content {
+                    ToolContent::Text { text } => Some(text),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "KiCad refused the footprint library update".to_string());
+            preflight_conflict(message)
+        }
+    })
+}
+
+fn snapshot_routed_nets(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: kiapi::common::types::DocumentSpecifier,
+) -> Result<BTreeSet<String>> {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let mut routed = BTreeSet::new();
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbTrace)? {
+        if let Ok(track) = kiapi::board::types::Track::decode(item.value.as_slice()) {
+            if let Some(net) = track.net.filter(|net| !net.name.is_empty()) {
+                routed.insert(net.name);
+            }
+        }
+    }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbArc)? {
+        if let Ok(arc) = kiapi::board::types::Arc::decode(item.value.as_slice()) {
+            if let Some(net) = arc.net.filter(|net| !net.name.is_empty()) {
+                routed.insert(net.name);
+            }
+        }
+    }
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbVia)? {
+        if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+            if let Some(net) = via.net.filter(|net| !net.name.is_empty()) {
+                routed.insert(net.name);
+            }
+        }
+    }
+    if !client
+        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
+        .is_empty()
+    {
+        routed.extend(
+            client
+                .get_nets_in(document)?
+                .into_iter()
+                .filter(|net| !net.name.is_empty())
+                .map(|net| net.name),
+        );
+    }
+    Ok(routed)
+}
+
+fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
+    CallToolResult::json(&json!({
+        "status": if applied {
+            "applied"
+        } else {
+            match plan.status {
+                PlanStatus::Ready => "ready",
+                PlanStatus::Noop => "noop",
+                PlanStatus::Conflict => "conflict",
+            }
+        },
+        "plan_revision": plan.plan_revision,
+        "coverage": {
+            "transport": "live_kicad_ipc",
+            "atomicity": "single_kicad_undo_commit",
+            "selected": plan.coverage.selected,
+            "changed": plan.coverage.changed,
+            "unchanged": plan.coverage.unchanged,
+            "skipped_unlinked": plan.coverage.skipped_unlinked,
+            "conflicts": plan.coverage.conflicts
+        },
+        "changes": plan.changes,
+        "diagnostics": plan.diagnostics,
+        "undo": if applied {
+            Some("Ctrl-Z reverses the whole footprint library update.")
+        } else {
+            None
+        }
+    }))
+}
+
+fn preflight_conflict(message: impl Into<String>) -> CallToolResult {
+    CallToolResult::json(&json!({
+        "status": "conflict",
+        "coverage": {
+            "transport": "live_kicad_ipc",
+            "atomicity": "single_kicad_undo_commit",
+            "selected": CountPair::default(),
+            "changed": CountPair::default(),
+            "unchanged": CountPair::default(),
+            "skipped_unlinked": CountPair::default(),
+            "conflicts": CountPair { planned: 1, applied: 0 }
+        },
+        "changes": [],
+        "diagnostics": [{
+            "code": "preflight_conflict",
+            "message": message.into()
+        }],
+        "undo": null
+    }))
+}
+
+fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters, ArgumentError> {
+    fn parse(
+        args: &serde_json::Value,
+        field: &str,
+    ) -> std::result::Result<Option<BTreeSet<String>>, ArgumentError> {
+        let Some(value) = args.get(field) else {
+            return Ok(None);
+        };
+        let values = value.as_array().ok_or_else(|| ArgumentError {
+            field: field.to_string(),
+            reason: "must be an array of strings when supplied".to_string(),
+        })?;
+        let parsed = values
+            .iter()
+            .map(|value| {
+                let value = value.as_str().ok_or_else(|| ArgumentError {
+                    field: field.to_string(),
+                    reason: "must contain only strings".to_string(),
+                })?;
+                if value.is_empty() {
+                    return Err(ArgumentError {
+                        field: field.to_string(),
+                        reason: "must not contain empty strings".to_string(),
+                    });
+                }
+                Ok(value.to_string())
+            })
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map(Some)?;
+        if field == "library_ids" {
+            if let Some(invalid) = parsed.as_ref().and_then(|values| {
+                values.iter().find(|value| {
+                    value.split_once(':').is_none_or(|(nickname, entry)| {
+                        nickname.is_empty()
+                            || entry.is_empty()
+                            || value.contains('/')
+                            || value.contains('\\')
+                    })
+                })
+            }) {
+                return Err(ArgumentError {
+                    field: field.to_string(),
+                    reason: format!(
+                        "'{invalid}' must use a non-empty Library:Footprint identifier"
+                    ),
+                });
+            }
+        }
+        Ok(parsed)
+    }
+
+    Ok(UpdateFilters {
+        references: parse(args, "references")?,
+        library_ids: parse(args, "library_ids")?,
+    })
+}
+
+fn plan_updates(
+    board_path: &Path,
+    footprint_items: &[prost_types::Any],
+    net_codes: &BTreeMap<String, i32>,
+    routed_nets: &BTreeSet<String>,
+    filters: &UpdateFilters,
+) -> UpdatePlan {
+    #[derive(Debug)]
+    struct Candidate {
+        reference: String,
+        library_id: String,
+        item: prost_types::Any,
+        instance: kiapi::board::types::FootprintInstance,
+    }
+
+    let mut coverage = UpdateCoverage::default();
+    let mut diagnostics = Vec::new();
+    let mut candidates = Vec::new();
+    let mut reference_counts = BTreeMap::<String, usize>::new();
+
+    for item in footprint_items {
+        let instance = match kiapi::board::types::FootprintInstance::decode(item.value.as_slice()) {
+            Ok(instance) => instance,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "invalid_board_footprint".to_string(),
+                    message: format!("KiCad returned an invalid footprint: {error}"),
+                    reference: None,
+                });
+                continue;
+            }
+        };
+        let reference = field_text(&instance.reference_field);
+        *reference_counts.entry(reference.clone()).or_insert(0) += 1;
+        let library_id = instance
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+            .unwrap_or_default();
+        candidates.push(Candidate {
+            reference,
+            library_id,
+            item: item.clone(),
+            instance,
+        });
+    }
+
+    if let Some(references) = filters.references.as_ref() {
+        for reference in references {
+            match reference_counts.get(reference).copied().unwrap_or(0) {
+                0 => diagnostics.push(UpdateDiagnostic {
+                    code: "reference_not_found".to_string(),
+                    message: format!("footprint reference '{reference}' was not found"),
+                    reference: Some(reference.clone()),
+                }),
+                count if count > 1 => diagnostics.push(UpdateDiagnostic {
+                    code: "duplicate_reference".to_string(),
+                    message: format!("footprint reference '{reference}' appears {count} times"),
+                    reference: Some(reference.clone()),
+                }),
+                _ => {}
+            }
+        }
+    } else {
+        for (reference, count) in &reference_counts {
+            if *count > 1 {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "duplicate_reference".to_string(),
+                    message: format!("footprint reference '{reference}' appears {count} times"),
+                    reference: Some(reference.clone()),
+                });
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        left.reference
+            .cmp(&right.reference)
+            .then_with(|| left.library_id.cmp(&right.library_id))
+    });
+    let selected = candidates
+        .into_iter()
+        .filter(|candidate| {
+            filters
+                .references
+                .as_ref()
+                .is_none_or(|references| references.contains(&candidate.reference))
+        })
+        .filter(|candidate| {
+            filters
+                .library_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&candidate.library_id))
+        })
+        .collect::<Vec<_>>();
+
+    coverage.skipped_unlinked.planned = selected
+        .iter()
+        .filter(|candidate| candidate.library_id.is_empty())
+        .count();
+    coverage.selected.planned = selected
+        .iter()
+        .filter(|candidate| !candidate.library_id.is_empty())
+        .count();
+    if filters.references.is_some() {
+        for candidate in selected
+            .iter()
+            .filter(|candidate| candidate.library_id.is_empty())
+        {
+            diagnostics.push(UpdateDiagnostic {
+                code: "unlinked_footprint".to_string(),
+                message: format!(
+                    "footprint '{}' has no resolvable Library:Footprint identifier",
+                    candidate.reference
+                ),
+                reference: Some(candidate.reference.clone()),
+            });
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
+    let mut changes = Vec::new();
+    let mut prepared_items = Vec::new();
+    for candidate in selected {
+        if candidate.library_id.is_empty() {
+            continue;
+        }
+        let Some((nickname, entry)) = candidate.library_id.split_once(':') else {
+            diagnostics.push(UpdateDiagnostic {
+                code: "invalid_library_id".to_string(),
+                message: format!(
+                    "footprint '{}' has malformed library id '{}'",
+                    candidate.reference, candidate.library_id
+                ),
+                reference: Some(candidate.reference),
+            });
+            continue;
+        };
+        if nickname.is_empty() || entry.is_empty() {
+            diagnostics.push(UpdateDiagnostic {
+                code: "invalid_library_id".to_string(),
+                message: format!(
+                    "footprint '{}' has malformed library id '{}'",
+                    candidate.reference, candidate.library_id
+                ),
+                reference: Some(candidate.reference),
+            });
+            continue;
+        }
+
+        let library_path = match super::library::resolve_footprint_path(
+            &candidate.library_id,
+            board_path.parent(),
+        ) {
+            Ok(path) => path,
+            Err(message) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_library_resolution_failed".to_string(),
+                    message,
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+        let source = match std::fs::read_to_string(&library_path) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "footprint_library_read_failed".to_string(),
+                    message: format!("failed to read {}: {error}", library_path.display()),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+        let library = match parse_library_footprint(&candidate.library_id, &source) {
+            Ok(library) => library,
+            Err(error) => {
+                diagnostics.push(UpdateDiagnostic {
+                    code: "unsupported_library_footprint".to_string(),
+                    message: format!("{error:#}"),
+                    reference: Some(candidate.reference),
+                });
+                continue;
+            }
+        };
+        let prepared =
+            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    diagnostics.push(UpdateDiagnostic {
+                        code: "footprint_update_conflict".to_string(),
+                        message: format!("{error:#}"),
+                        reference: Some(candidate.reference),
+                    });
+                    continue;
+                }
+            };
+
+        hasher.update(candidate.item.type_url.as_bytes());
+        hasher.update(&candidate.item.value);
+        hasher.update(candidate.library_id.as_bytes());
+        hasher.update(source.as_bytes());
+        if prepared.changed_domains.is_empty() {
+            coverage.unchanged.planned += 1;
+        } else {
+            coverage.changed.planned += 1;
+            changes.push(PlannedUpdate {
+                reference: candidate.reference,
+                library_id: candidate.library_id,
+                changed_domains: prepared.changed_domains,
+                preserved: PreservedState::default(),
+            });
+            prepared_items.push(prepared.item);
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        coverage.conflicts.planned = diagnostics.len();
+        changes.clear();
+        prepared_items.clear();
+        coverage.changed.planned = 0;
+        return UpdatePlan {
+            status: PlanStatus::Conflict,
+            plan_revision: format!("{:x}", hasher.finalize()),
+            coverage,
+            changes,
+            diagnostics,
+            prepared_items,
+        };
+    }
+
+    let status = if changes.is_empty() {
+        PlanStatus::Noop
+    } else {
+        PlanStatus::Ready
+    };
+    UpdatePlan {
+        status,
+        plan_revision: format!("{:x}", hasher.finalize()),
+        coverage,
+        changes,
+        diagnostics,
+        prepared_items,
+    }
+}
+
 fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFootprint> {
     let (library_nickname, entry_name) = library_id
         .split_once(':')
@@ -45,6 +714,8 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     let graphics = super::pcb_components::extract_graphic_definitions(source)?;
     let models = parse_models(&root)?;
     let attributes = parse_attributes(&root)?;
+    let datasheet = property_value(&root, "Datasheet");
+    let description_field = property_value(&root, "Description");
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
             library_nickname: library_nickname.to_string(),
@@ -62,10 +733,21 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         library_id: library_id.to_string(),
         definition,
         attributes,
+        datasheet,
+        description_field,
         pads,
         graphics,
         models,
     })
+}
+
+fn property_value(root: &konnect_sexp::SexpNode, name: &str) -> Option<String> {
+    root.find_all("property")
+        .into_iter()
+        .find(|property| property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some(name))
+        .and_then(|property| property.get(2))
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .map(str::to_string)
 }
 
 fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
@@ -407,6 +1089,14 @@ fn build_updated_instance(
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
     definition.description_field = current_definition.description_field.clone();
+    apply_field_value(
+        &mut definition.datasheet_field,
+        library.datasheet.as_deref(),
+    );
+    apply_field_value(
+        &mut definition.description_field,
+        library.description_field.as_deref(),
+    );
     definition.items.extend(
         library.models.iter().map(|model| {
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
@@ -439,6 +1129,11 @@ fn build_updated_instance(
         }
     }
     updated.definition = Some(definition);
+    apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
+    apply_field_value(
+        &mut updated.description_field,
+        library.description_field.as_deref(),
+    );
     let mut attributes = library.attributes.clone();
     if let Some(current_attributes) = current.attributes.as_ref() {
         attributes.not_in_schematic = current_attributes.not_in_schematic;
@@ -451,6 +1146,19 @@ fn build_updated_instance(
         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
         changed_domains,
     })
+}
+
+fn apply_field_value(field: &mut Option<kiapi::board::types::Field>, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    field
+        .get_or_insert_with(Default::default)
+        .text
+        .get_or_insert_with(Default::default)
+        .text
+        .get_or_insert_with(Default::default)
+        .text = value.to_string();
 }
 
 fn mirror_pad(pad: &konnect_ipc::IpcPadDefinition) -> Result<konnect_ipc::IpcPadDefinition> {
@@ -624,7 +1332,12 @@ fn changed_domains(
     {
         changed.insert(ChangedDomain::Models);
     }
-    if current_definition.attributes != updated_definition.attributes {
+    if current_definition.attributes != updated_definition.attributes
+        || field_text(&current_definition.datasheet_field)
+            != field_text(&updated_definition.datasheet_field)
+        || field_text(&current_definition.description_field)
+            != field_text(&updated_definition.description_field)
+    {
         changed.insert(ChangedDomain::Metadata);
     }
     if library_owned_attributes(current.attributes.as_ref())
@@ -745,6 +1458,8 @@ mod tests {
     (effects (font (size 1 1) (thickness 0.15))))
   (fp_text value "Socket" (at 0 4 0) (layer "F.Fab")
     (effects (font (size 1 1) (thickness 0.15))))
+  (property "Datasheet" "new-datasheet.pdf" (at 0 0) (layer "F.Fab") (hide yes))
+  (property "Description" "new field description" (at 0 0) (layer "F.Fab") (hide yes))
   (model "../models/Socket.step"
     (offset (xyz 1 2 3))
     (scale (xyz -1 1 1))
@@ -904,8 +1619,25 @@ mod tests {
         assert_eq!(updated.locked, current.locked);
         assert_eq!(updated.reference_field, current.reference_field);
         assert_eq!(updated.value_field, current.value_field);
-        assert_eq!(updated.datasheet_field, current.datasheet_field);
-        assert_eq!(updated.description_field, current.description_field);
+        assert_eq!(field_text(&updated.datasheet_field), "new-datasheet.pdf");
+        assert_eq!(
+            updated
+                .datasheet_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.attributes.as_ref()),
+            current
+                .datasheet_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .and_then(|text| text.attributes.as_ref())
+        );
+        assert_eq!(
+            field_text(&updated.description_field),
+            "new field description"
+        );
         let attributes = updated.attributes.as_ref().unwrap();
         let current_attributes = current.attributes.as_ref().unwrap();
         assert_eq!(
@@ -1058,5 +1790,622 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn plan_item(reference: &str, library_id: Option<&str>, kiid: &str) -> prost_types::Any {
+        let mut instance = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        instance.id = Some(kiapi::common::types::Kiid {
+            value: kiid.to_string(),
+        });
+        instance.reference_field = Some(field("Reference", reference, 101.0, 48.0, true));
+        if let Some(definition) = instance.definition.as_mut() {
+            definition.reference_field = instance.reference_field.clone();
+            definition.id = library_id.map(|library_id| {
+                let (nickname, entry) = library_id.split_once(':').unwrap();
+                kiapi::common::types::LibraryIdentifier {
+                    library_nickname: nickname.to_string(),
+                    entry_name: entry.to_string(),
+                }
+            });
+        }
+        builders::pack_any(&instance, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn plan_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<prost_types::Any>) {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let library_dir = temp.path().join("Test.pretty");
+        std::fs::create_dir(&library_dir).unwrap();
+        std::fs::write(library_dir.join("Socket.kicad_mod"), LIBRARY_FOOTPRINT).unwrap();
+        std::fs::write(
+            temp.path().join("fp-lib-table"),
+            "(fp_lib_table (lib (name \"Test\") (type \"KiCad\") (uri \"${KIPRJMOD}/Test.pretty\") (options \"\") (descr \"\")))",
+        )
+        .unwrap();
+        let items = vec![
+            plan_item("SW2", Some("Test:Socket"), "kiid-2"),
+            plan_item("TP1", None, "kiid-3"),
+            plan_item("SW1", Some("Test:Socket"), "kiid-1"),
+        ];
+        (temp, board, items)
+    }
+
+    #[test]
+    fn filters_are_normalized_and_supplied_empty_arrays_select_nothing() {
+        let filters = parse_filters(&serde_json::json!({
+            "references": ["SW2", "SW1", "SW2"],
+            "library_ids": ["Test:Socket", "Test:Socket"]
+        }))
+        .unwrap();
+        assert_eq!(
+            filters.references,
+            Some(BTreeSet::from(["SW1".to_string(), "SW2".to_string()]))
+        );
+        assert_eq!(
+            filters.library_ids,
+            Some(BTreeSet::from(["Test:Socket".to_string()]))
+        );
+
+        let (_, board, items) = plan_fixture();
+        let empty = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({ "references": [] })).unwrap(),
+        );
+        assert_eq!(empty.status, PlanStatus::Noop);
+        assert_eq!(empty.coverage.selected.planned, 0);
+        assert!(empty.changes.is_empty());
+
+        let malformed =
+            parse_filters(&serde_json::json!({ "library_ids": ["not-a-library-id"] })).unwrap_err();
+        assert_eq!(malformed.field, "library_ids");
+        assert!(malformed.reason.contains("Library:Footprint"));
+    }
+
+    #[test]
+    fn planner_selects_deterministically_and_intersects_filters() {
+        let (_temp, board, items) = plan_fixture();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let all = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+        assert_eq!(all.status, PlanStatus::Ready);
+        assert_eq!(all.coverage.selected.planned, 2);
+        assert_eq!(all.coverage.changed.planned, 2);
+        assert_eq!(all.coverage.skipped_unlinked.planned, 1);
+        assert_eq!(
+            all.changes
+                .iter()
+                .map(|change| change.reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SW1", "SW2"]
+        );
+
+        let intersection = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({
+                "references": ["SW2"],
+                "library_ids": ["Other:Socket"]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(intersection.status, PlanStatus::Noop);
+        assert_eq!(intersection.coverage.selected.planned, 0);
+    }
+
+    #[test]
+    fn planner_conflicts_on_missing_or_duplicate_selected_references() {
+        let (_temp, board, mut items) = plan_fixture();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let missing = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({ "references": ["SW404"] })).unwrap(),
+        );
+        assert_eq!(missing.status, PlanStatus::Conflict);
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "reference_not_found"));
+
+        items.push(plan_item("SW1", Some("Test:Socket"), "kiid-duplicate"));
+        let duplicate = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({ "references": ["SW1"] })).unwrap(),
+        );
+        assert_eq!(duplicate.status, PlanStatus::Conflict);
+        assert!(duplicate
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "duplicate_reference"));
+        assert!(duplicate.prepared_items.is_empty());
+    }
+
+    #[test]
+    fn explicitly_selected_unlinked_footprint_is_a_conflict() {
+        let (_temp, board, items) = plan_fixture();
+        let plan = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({ "references": ["TP1"] })).unwrap(),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unlinked_footprint"));
+        assert!(plan.prepared_items.is_empty());
+    }
+
+    #[test]
+    fn planner_returns_noop_after_the_prepared_update_is_applied() {
+        let (_temp, board, items) = plan_fixture();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let first = plan_updates(
+            &board,
+            &[items[2].clone()],
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+        assert_eq!(first.status, PlanStatus::Ready);
+
+        let second = plan_updates(
+            &board,
+            &first.prepared_items,
+            &net_codes,
+            &BTreeSet::new(),
+            &UpdateFilters::default(),
+        );
+
+        assert_eq!(second.status, PlanStatus::Noop);
+        assert_eq!(second.coverage.selected.planned, 1);
+        assert_eq!(second.coverage.changed.planned, 0);
+        assert_eq!(second.coverage.unchanged.planned, 1);
+        assert!(second.prepared_items.is_empty());
+    }
+
+    #[test]
+    fn datasheet_only_library_change_is_reported_as_metadata() {
+        let base = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let routed = BTreeSet::new();
+        let applied = build_updated_instance(&current, &base, &net_codes, &routed).unwrap();
+        let applied =
+            kiapi::board::types::FootprintInstance::decode(applied.item.value.as_slice()).unwrap();
+        let changed_source =
+            LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", "replacement-datasheet.pdf");
+        let changed = parse_library_footprint("Test:Socket", &changed_source).unwrap();
+
+        let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed).unwrap();
+
+        assert_eq!(
+            prepared.changed_domains,
+            BTreeSet::from([ChangedDomain::Metadata])
+        );
+    }
+
+    #[test]
+    fn plan_revision_tracks_selected_board_library_and_filter_inputs_only() {
+        let (_temp, board, mut items) = plan_fixture();
+        let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
+        let filters = parse_filters(&serde_json::json!({ "references": ["SW1"] })).unwrap();
+        let first = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        let identical = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        assert_eq!(first.plan_revision, identical.plan_revision);
+
+        items[0] = plan_item("SW2", Some("Test:Socket"), "unselected-changed");
+        let unrelated = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        assert_eq!(first.plan_revision, unrelated.plan_revision);
+
+        items[2] = plan_item("SW1", Some("Test:Socket"), "selected-changed");
+        let board_changed = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        assert_ne!(first.plan_revision, board_changed.plan_revision);
+
+        std::fs::write(
+            board.parent().unwrap().join("Test.pretty/Socket.kicad_mod"),
+            LIBRARY_FOOTPRINT.replace("updated description", "library changed"),
+        )
+        .unwrap();
+        let library_changed = plan_updates(&board, &items, &net_codes, &BTreeSet::new(), &filters);
+        assert_ne!(board_changed.plan_revision, library_changed.plan_revision);
+
+        let different_filter = plan_updates(
+            &board,
+            &items,
+            &net_codes,
+            &BTreeSet::new(),
+            &parse_filters(&serde_json::json!({ "references": ["SW2"] })).unwrap(),
+        );
+        assert_ne!(
+            library_changed.plan_revision,
+            different_filter.plan_revision
+        );
+    }
+
+    fn test_context(ipc_address: &str) -> crate::tools::ToolContext {
+        crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: ipc_address.to_string(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn result_json(result: &crate::mcp::protocol::CallToolResult) -> serde_json::Value {
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        serde_json::from_str(text).expect("tool result must be JSON")
+    }
+
+    #[test]
+    fn tool_schema_defaults_to_dry_run_and_requires_only_the_board() {
+        let definition = tool();
+
+        assert_eq!(definition.name, "update_footprints_from_library");
+        assert_eq!(
+            definition.input_schema["required"],
+            serde_json::json!(["board"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["dry_run"]["default"],
+            true
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["references"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["library_ids"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_without_a_reviewed_revision_is_rejected_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({ "board": board, "dry_run": false }),
+            &test_context(""),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let text = match result.content.first().unwrap() {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => unreachable!(),
+        };
+        assert!(text.contains("expected_plan_revision"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_ipc_returns_a_non_mutating_conflict_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        let before = "(kicad_pcb (version 20240108))";
+        std::fs::write(&board, before).unwrap();
+
+        let result = handle_update_footprints_from_library(
+            &serde_json::json!({ "board": board }),
+            &test_context(""),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let response = result_json(&result);
+        assert_eq!(response["status"], "conflict");
+        assert_eq!(response["coverage"]["transport"], "live_kicad_ipc");
+        assert!(response["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("live-IPC-only"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[derive(Default)]
+    struct MutationCapture {
+        begin_count: usize,
+        update_batches: Vec<usize>,
+        commit_actions: Vec<kiapi::common::commands::CommitAction>,
+    }
+
+    struct PlannerMock {
+        url: String,
+        capture: std::sync::Arc<std::sync::Mutex<MutationCapture>>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    fn api_ok() -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message: None,
+        }
+    }
+
+    fn api_reply(message: prost_types::Any) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            message: Some(message),
+            ..api_ok()
+        }
+    }
+
+    fn spawn_planner_mock(
+        board: &Path,
+        footprint: prost_types::Any,
+        fail_update: bool,
+    ) -> PlannerMock {
+        use nng::options::Options;
+
+        static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://footprint-update-{}",
+            NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).unwrap();
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        socket.listen(&url).unwrap();
+
+        let board_name = board.to_string_lossy().to_string();
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
+        let captured = capture.clone();
+        let thread = std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let message = request.message.expect("request message");
+                let response = if message.type_url.ends_with("GetOpenDocuments") {
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board_name.clone(),
+                                    ),
+                                ),
+                                project: None,
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if message.type_url.ends_with("GetItems") {
+                    let command =
+                        kiapi::common::commands::GetItems::decode(message.value.as_slice())
+                            .unwrap();
+                    let items = if command.types
+                        == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
+                    {
+                        vec![footprint.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else if message.type_url.ends_with("GetNets") {
+                    api_reply(builders::pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: vec![builders::net("ROW1", 11), builders::net("COL1", 12)],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ))
+                } else if message.type_url.ends_with("BeginCommit") {
+                    captured.lock().unwrap().begin_count += 1;
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "commit-1".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    ))
+                } else if message.type_url.ends_with("UpdateItems") {
+                    let update =
+                        kiapi::common::commands::UpdateItems::decode(message.value.as_slice())
+                            .unwrap();
+                    captured
+                        .lock()
+                        .unwrap()
+                        .update_batches
+                        .push(update.items.len());
+                    let updated_items = update
+                        .items
+                        .into_iter()
+                        .map(|item| kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: if fail_update {
+                                    kiapi::common::commands::ItemStatusCode::IscInvalidData as i32
+                                } else {
+                                    kiapi::common::commands::ItemStatusCode::IscOk as i32
+                                },
+                                error_message: if fail_update {
+                                    "mock update failure".to_string()
+                                } else {
+                                    String::new()
+                                },
+                            }),
+                            item: Some(item),
+                        })
+                        .collect();
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items,
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ))
+                } else if message.type_url.ends_with("EndCommit") {
+                    let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
+                        .unwrap();
+                    captured.lock().unwrap().commit_actions.push(end.action());
+                    api_reply(builders::pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                } else {
+                    panic!("unexpected mock request {}", message.type_url);
+                };
+                let response = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(response).is_err() {
+                    break;
+                }
+            }
+        });
+        PlannerMock {
+            url,
+            capture,
+            _thread: thread,
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_and_stale_revision_never_open_a_commit_or_send_updates() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        let context = test_context(&mock.url);
+
+        let dry_run =
+            handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
+                .await
+                .unwrap();
+        assert_eq!(result_json(&dry_run)["status"], "ready");
+
+        let stale = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": "stale"
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let stale = result_json(&stale);
+        assert_eq!(stale["status"], "conflict");
+        assert_eq!(stale["diagnostics"][0]["code"], "stale_plan_revision");
+
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 0);
+        assert!(capture.update_batches.is_empty());
+        assert!(capture.commit_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_sends_one_batch_in_one_commit() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        let context = test_context(&mock.url);
+        let dry_run =
+            handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
+                .await
+                .unwrap();
+        let revision = result_json(&dry_run)["plan_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let applied = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": revision
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let applied = result_json(&applied);
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["coverage"]["changed"]["applied"], 1);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 1);
+        assert_eq!(capture.update_batches, vec![1]);
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_update_drops_the_single_commit() {
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), true);
+        let context = test_context(&mock.url);
+        let dry_run =
+            handle_update_footprints_from_library(&serde_json::json!({ "board": board }), &context)
+                .await
+                .unwrap();
+        let revision = result_json(&dry_run)["plan_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let failed = handle_update_footprints_from_library(
+            &serde_json::json!({
+                "board": board,
+                "dry_run": false,
+                "expected_plan_revision": revision
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result_json(&failed)["status"], "conflict");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 1);
+        assert_eq!(capture.update_batches, vec![1]);
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaDrop]
+        );
     }
 }

@@ -74,9 +74,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, move, rotate, align, and duplicate PCB footprints",
+        description: "Place, refresh, move, rotate, align, and duplicate PCB footprints",
         category: "pcb",
-        tool_count: 15,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "pcb_routing",
