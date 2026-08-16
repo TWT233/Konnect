@@ -368,6 +368,17 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
     let library_id = "konnect-update-fixture:RefreshFixture";
 
     let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let mut mcp = McpProcess::spawn(&socket);
     mcp.tool(
         "load_toolset",

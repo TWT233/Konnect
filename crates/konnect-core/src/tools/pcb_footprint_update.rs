@@ -1320,11 +1320,14 @@ fn changed_domains(
         .as_ref()
         .context("missing updated definition")?;
 
-    if normalized_items(current_definition, "Pad")? != normalized_items(updated_definition, "Pad")?
-    {
+    let current_pads = normalized_items(current_definition, "Pad")?;
+    let updated_pads = normalized_items(updated_definition, "Pad")?;
+    if current_pads != updated_pads {
         changed.insert(ChangedDomain::Pads);
     }
-    if normalized_graphics(current_definition)? != normalized_graphics(updated_definition)? {
+    let current_graphics = normalized_graphics(current_definition)?;
+    let updated_graphics = normalized_graphics(updated_definition)?;
+    if current_graphics != updated_graphics {
         changed.insert(ChangedDomain::Graphics);
     }
     if normalized_items(current_definition, "Footprint3DModel")?
@@ -1361,6 +1364,29 @@ fn normalized_items(
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 pad.id = None;
                 pad.net = None;
+                pad.pad_to_die_length = None;
+                pad.symbol_pin = None;
+                pad.pad_to_die_delay = None;
+                if let Some(stack) = pad.pad_stack.as_mut() {
+                    stack.layers.sort_unstable();
+                    if stack.drill.as_ref().is_some_and(|drill| {
+                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
+                            && drill.end_layer
+                                == kiapi::board::types::BoardLayer::BlUndefined as i32
+                            && drill
+                                .diameter
+                                .as_ref()
+                                .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
+                    }) {
+                        stack.drill = None;
+                    }
+                    if stack.zone_settings.as_ref().is_some_and(|settings| {
+                        settings.zone_connection
+                            == kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
+                    }) {
+                        stack.zone_settings = None;
+                    }
+                }
                 Ok(pad.encode_to_vec())
             } else {
                 Ok(item.value.clone())
@@ -1379,6 +1405,25 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
                         |mut shape| {
                             shape.id = None;
+                            shape.net = None;
+                            shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                            if let Some(stroke) = shape
+                                .shape
+                                .as_mut()
+                                .and_then(|shape| shape.attributes.as_mut())
+                                .and_then(|attributes| attributes.stroke.as_mut())
+                            {
+                                if matches!(
+                                    stroke.style(),
+                                    kiapi::common::types::StrokeLineStyle::SlsUnknown
+                                        | kiapi::common::types::StrokeLineStyle::SlsDefault
+                                        | kiapi::common::types::StrokeLineStyle::SlsSolid
+                                ) {
+                                    stroke.style =
+                                        kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                                }
+                                stroke.color = None;
+                            }
                             shape.encode_to_vec()
                         },
                     ),
@@ -1790,6 +1835,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kicad_roundtrip_defaults_do_not_create_false_pad_or_graphic_changes() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let prepared = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let prepared =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let mut roundtripped = prepared.clone();
+
+        for item in &mut roundtripped.definition.as_mut().unwrap().items {
+            if item.type_url.ends_with("kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap();
+                pad.id = Some(kiapi::common::types::Kiid {
+                    value: format!("kicad-pad-{}", pad.number),
+                });
+                pad.net = Some(kiapi::board::types::Net::default());
+                pad.pad_to_die_length = Some(kiapi::common::types::Distance { value_nm: 0 });
+                pad.symbol_pin = Some(kiapi::board::types::SymbolPinInfo::default());
+                pad.pad_to_die_delay = Some(kiapi::common::types::Time { value_as: 0 });
+                let stack = pad.pad_stack.as_mut().unwrap();
+                stack.layers.reverse();
+                if stack.drill.is_none() {
+                    stack.drill = Some(kiapi::board::types::DrillProperties {
+                        start_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                        end_layer: kiapi::board::types::BoardLayer::BlUndefined as i32,
+                        diameter: Some(builders::vec2(0.0, 0.0)),
+                        shape: kiapi::board::types::DrillShape::DsUndefined as i32,
+                        ..Default::default()
+                    });
+                }
+                stack.zone_settings = Some(kiapi::board::types::ZoneConnectionSettings {
+                    zone_connection: kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+                    thermal_spokes: Some(kiapi::board::types::ThermalSpokeSettings {
+                        angle: Some(kiapi::common::types::Angle {
+                            value_degrees: 90.0,
+                        }),
+                        ..Default::default()
+                    }),
+                });
+                *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+            } else if item
+                .type_url
+                .ends_with("kiapi.board.types.BoardGraphicShape")
+            {
+                let mut graphic =
+                    kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).unwrap();
+                graphic.id = Some(kiapi::common::types::Kiid {
+                    value: "kicad-graphic".to_string(),
+                });
+                graphic.net = Some(kiapi::board::types::Net::default());
+                graphic
+                    .shape
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .as_mut()
+                    .unwrap()
+                    .stroke
+                    .as_mut()
+                    .unwrap()
+                    .style = kiapi::common::types::StrokeLineStyle::SlsSolid as i32;
+                *item = builders::pack_any(&graphic, "kiapi.board.types.BoardGraphicShape");
+            }
+        }
+
+        let roundtripped_pads = normalized_items(roundtripped.definition.as_ref().unwrap(), "Pad")
+            .unwrap()
+            .into_iter()
+            .map(|bytes| kiapi::board::types::Pad::decode(bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let prepared_pads = normalized_items(prepared.definition.as_ref().unwrap(), "Pad")
+            .unwrap()
+            .into_iter()
+            .map(|bytes| kiapi::board::types::Pad::decode(bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(roundtripped_pads, prepared_pads);
+        assert!(changed_domains(&roundtripped, &prepared)
+            .unwrap()
+            .is_empty());
     }
 
     fn plan_item(reference: &str, library_id: Option<&str>, kiid: &str) -> prost_types::Any {
