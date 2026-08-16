@@ -58,19 +58,25 @@ macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let addr = $ctx.config.ipc_address.clone();
         let requested_board = get_path($args, "board")?;
-        match with_ipc(addr, move |$c| {
+        match with_ipc_classified(addr, move |$c| {
             $c.ensure_board_is_active(&requested_board)?;
             $body
         })
         .await?
         {
             Ok(v) => v,
-            Err(msg) => {
+            // Only an unreachable transport justifies "KiCAD must be running".
+            // This used to say it for every failure, so a tool that refused a
+            // request on its merits — "a polygon needs at least 3 points" —
+            // told the reader to start a KiCad that was already running, with
+            // the actual reason parenthesised after a false statement.
+            Err(konnect_ipc::IpcFailure::Unreachable(msg)) => {
                 return Ok(CallToolResult::error(format!(
                     "KiCAD must be running with the board loaded (IPC error: {})",
                     msg
                 )))
             }
+            Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
         }
     }};
 }
@@ -99,6 +105,39 @@ pub(crate) fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Re
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
 /// footprint's geometry (pad X positions negate, every front layer swaps with
 /// its back counterpart per item). Until Konnect implements that mirror,
+/// Read a `[{x, y}, …]` argument into footprint-local millimetre pairs.
+///
+/// Each rejection names the offending index, because "each point needs a
+/// numeric 'x'" on a twelve-vertex courtyard tells the caller nothing about
+/// which vertex to fix.
+fn parse_points(value: &serde_json::Value) -> Result<Vec<(f64, f64)>, CallToolResult> {
+    let invalid = |field: &str, reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: reason.clone(),
+            },
+            format!("Argument '{field}' is invalid: {reason}"),
+        )
+    };
+
+    let array = value
+        .as_array()
+        .ok_or_else(|| invalid("points", "missing or not an array of {x, y}".to_string()))?;
+
+    let mut points = Vec::with_capacity(array.len());
+    for (i, p) in array.iter().enumerate() {
+        let x = p["x"]
+            .as_f64()
+            .ok_or_else(|| invalid("points", format!("point {i} has no numeric 'x'")))?;
+        let y = p["y"]
+            .as_f64()
+            .ok_or_else(|| invalid("points", format!("point {i} has no numeric 'y'")))?;
+        points.push((x, y));
+    }
+    Ok(points)
+}
+
 /// pretending to support `B.Cu` silently produces wrong copper, so the layer
 /// is refused up front — before anything is resolved, sent, or written.
 fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
@@ -1008,6 +1047,46 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_find_component(args, ctx).await }
         ),
         tool!(
+            "list_board_footprint_graphics",
+            "List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Points are footprint-local millimetres, as the .kicad_mod shows them. Each item reports 'editable', plus 'outlines' and 'holes' for polygons: 'points' covers the first outline only, so an item with more than one outline or any holes is reported but cannot be edited here. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'J2'" },
+                    "layer":     { "type": "string", "description": "Only list items on this layer, e.g. 'F.SilkS' (optional)" }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_list_board_footprint_graphics(args, ctx).await }
+        ),
+        tool!(
+            "edit_board_footprint_graphic",
+            "Replace the vertices of a polygon inside a footprint placed on the board, selected by UUID. Points are footprint-local millimetres, as the .kicad_mod shows them. Use this to bring one placed instance in line with a library change without re-placing the part. Only a single-outline polygon with no holes can be replaced; anything else is refused by name rather than flattened. Requires KiCAD running with the board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'J2'" },
+                    "uuid":      { "type": "string", "description": "UUID of the graphic item, from list_board_footprint_graphics" },
+                    "points": {
+                        "type": "array",
+                        "description": "Replacement vertices in footprint-local millimetres; at least 3.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": { "type": "number" },
+                                "y": { "type": "number" }
+                            },
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "required": ["board", "reference", "uuid", "points"]
+            }),
+            |args, ctx| async move { handle_edit_board_footprint_graphic(args, ctx).await }
+        ),
+        tool!(
             "get_component_pads",
             "Return the pad positions and net assignments for a footprint. \
              A pad's 'net' is its net name, \"\" if the pad carries no net node \
@@ -1274,6 +1353,65 @@ async fn handle_move_component(
     Ok(CallToolResult::json(
         &json!({ "moved": reference, "x": x, "y": y }),
     ))
+}
+
+async fn handle_list_board_footprint_graphics(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let layer_filter = args["layer"].as_str().map(|s| s.to_string());
+
+    let ref_ipc = reference.clone();
+    let graphics: Vec<konnect_ipc::types::IpcFootprintGraphic> =
+        ipc!(ctx, args, |c| c.list_footprint_graphics(&ref_ipc));
+
+    let graphics: Vec<_> = graphics
+        .into_iter()
+        .filter(|g| layer_filter.as_deref().is_none_or(|l| g.layer == l))
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": graphics.len(),
+        "reference": reference,
+        "graphics": graphics,
+    })))
+}
+
+async fn handle_edit_board_footprint_graphic(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    // A malformed `points` is the caller's mistake, so it gets the structured
+    // `invalid_argument` the rest of this file returns — bubbling `anyhow`
+    // here would surface it as a handler error with the offending field
+    // flattened into prose, which is the class #194 is open against.
+    let points = match parse_points(&args["points"]) {
+        Ok(p) => p,
+        Err(e) => return Ok(e),
+    };
+
+    let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
+    let kind: String = ipc!(ctx, args, |c| c
+        .set_footprint_graphic_points(&ref_ipc, &uuid_ipc, &pts));
+
+    Ok(CallToolResult::json(&json!({
+        "edited": reference,
+        "uuid": uuid,
+        "kind": kind,
+        "points": points.len(),
+    })))
 }
 
 async fn handle_rotate_component(
@@ -2761,5 +2899,96 @@ mod pad_net_shape_tests {
         ))
         .await;
         assert_eq!(pads["pads"][0]["net"], json!(""));
+    }
+}
+
+#[cfg(test)]
+mod board_footprint_graphics_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A malformed `points` is a caller mistake, so it must come back as a
+    /// structured `invalid_argument` naming the field — not as an
+    /// `anyhow`-flavoured handler error with the reason flattened into prose.
+    /// The handler used to bubble `?` here, which is the class #194 tracks.
+    #[test]
+    fn a_malformed_points_argument_is_a_structured_invalid_argument() {
+        let cases = [
+            (json!("not an array"), "not an array"),
+            (json!([{ "x": 1.0 }]), "point 0 has no numeric 'y'"),
+            (json!([{ "y": 1.0 }]), "point 0 has no numeric 'x'"),
+            (
+                json!([{ "x": 0.0, "y": 0.0 }, { "x": 1.0, "y": "two" }]),
+                "point 1 has no numeric 'y'",
+            ),
+        ];
+        for (value, expected) in cases {
+            let err = parse_points(&value).expect_err("must be refused");
+            assert!(err.is_error, "{value} should be an error result");
+            let text = format!("{:?}", err);
+            assert!(
+                text.contains("InvalidArgument") || text.contains("invalid_argument"),
+                "must be structured, got: {text}"
+            );
+            assert!(
+                text.contains(expected),
+                "the message must say which point is wrong.\nwant: {expected}\ngot:  {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_points_parse_in_order() {
+        let points = parse_points(&json!([
+            { "x": 0.0, "y": 0.0 },
+            { "x": 2.5, "y": -1.5 },
+            { "x": 2.5, "y": 2.5 }
+        ]))
+        .expect("valid");
+        assert_eq!(points, vec![(0.0, 0.0), (2.5, -1.5), (2.5, 2.5)]);
+    }
+
+    /// An integer in JSON is a number; rejecting it would refuse
+    /// `{"x": 0, "y": 0}`, which is what a caller writes for the origin.
+    #[test]
+    fn integer_coordinates_are_accepted() {
+        assert_eq!(
+            parse_points(&json!([{ "x": 0, "y": 0 }, { "x": 3, "y": 0 }, { "x": 3, "y": 3 }]))
+                .expect("valid"),
+            vec![(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)]
+        );
+    }
+
+    /// The two tools are registered, sit in `pcb_components`, and require the
+    /// arguments the handlers read. A schema that drifts from its handler is
+    /// the defect #217 was about, one layer up.
+    #[test]
+    fn both_board_graphics_tools_are_registered_with_the_arguments_they_read() {
+        let tools = tools();
+        for (name, required) in [
+            ("list_board_footprint_graphics", vec!["board", "reference"]),
+            (
+                "edit_board_footprint_graphic",
+                vec!["board", "reference", "uuid", "points"],
+            ),
+        ] {
+            let def = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let got: Vec<&str> = def.input_schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} declares no required list"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(got, required, "{name} required arguments");
+            for key in &required {
+                assert!(
+                    def.input_schema["properties"][key].is_object(),
+                    "{name} requires '{key}' but does not declare it"
+                );
+            }
+        }
     }
 }
