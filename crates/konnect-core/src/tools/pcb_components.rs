@@ -99,6 +99,39 @@ pub(crate) fn resolve_footprint_source(lib_id: &str, board: &Path) -> anyhow::Re
 /// Placing on the back is not a layer rename: KiCAD's flip mirrors the
 /// footprint's geometry (pad X positions negate, every front layer swaps with
 /// its back counterpart per item). Until Konnect implements that mirror,
+/// Read a `[{x, y}, …]` argument into footprint-local millimetre pairs.
+///
+/// Each rejection names the offending index, because "each point needs a
+/// numeric 'x'" on a twelve-vertex courtyard tells the caller nothing about
+/// which vertex to fix.
+fn parse_points(value: &serde_json::Value) -> Result<Vec<(f64, f64)>, CallToolResult> {
+    let invalid = |field: &str, reason: String| {
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: field.to_string(),
+                reason: reason.clone(),
+            },
+            format!("Argument '{field}' is invalid: {reason}"),
+        )
+    };
+
+    let array = value
+        .as_array()
+        .ok_or_else(|| invalid("points", "missing or not an array of {x, y}".to_string()))?;
+
+    let mut points = Vec::with_capacity(array.len());
+    for (i, p) in array.iter().enumerate() {
+        let x = p["x"]
+            .as_f64()
+            .ok_or_else(|| invalid("points", format!("point {i} has no numeric 'x'")))?;
+        let y = p["y"]
+            .as_f64()
+            .ok_or_else(|| invalid("points", format!("point {i} has no numeric 'y'")))?;
+        points.push((x, y));
+    }
+    Ok(points)
+}
+
 /// pretending to support `B.Cu` silently produces wrong copper, so the layer
 /// is refused up front — before anything is resolved, sent, or written.
 fn back_side_layer_error(layer: &str) -> Option<CallToolResult> {
@@ -1354,20 +1387,14 @@ async fn handle_edit_board_footprint_graphic(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let points: Vec<(f64, f64)> = args["points"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("'points' must be an array of {{x, y}}"))?
-        .iter()
-        .map(|p| {
-            let x = p["x"]
-                .as_f64()
-                .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'x'"))?;
-            let y = p["y"]
-                .as_f64()
-                .ok_or_else(|| anyhow::anyhow!("each point needs a numeric 'y'"))?;
-            Ok::<_, anyhow::Error>((x, y))
-        })
-        .collect::<Result<_, _>>()?;
+    // A malformed `points` is the caller's mistake, so it gets the structured
+    // `invalid_argument` the rest of this file returns — bubbling `anyhow`
+    // here would surface it as a handler error with the offending field
+    // flattened into prose, which is the class #194 is open against.
+    let points = match parse_points(&args["points"]) {
+        Ok(p) => p,
+        Err(e) => return Ok(e),
+    };
 
     let (ref_ipc, uuid_ipc, pts) = (reference.clone(), uuid.clone(), points.clone());
     let kind: String = ipc!(ctx, args, |c| c
@@ -2866,5 +2893,96 @@ mod pad_net_shape_tests {
         ))
         .await;
         assert_eq!(pads["pads"][0]["net"], json!(""));
+    }
+}
+
+#[cfg(test)]
+mod board_footprint_graphics_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A malformed `points` is a caller mistake, so it must come back as a
+    /// structured `invalid_argument` naming the field — not as an
+    /// `anyhow`-flavoured handler error with the reason flattened into prose.
+    /// The handler used to bubble `?` here, which is the class #194 tracks.
+    #[test]
+    fn a_malformed_points_argument_is_a_structured_invalid_argument() {
+        let cases = [
+            (json!("not an array"), "not an array"),
+            (json!([{ "x": 1.0 }]), "point 0 has no numeric 'y'"),
+            (json!([{ "y": 1.0 }]), "point 0 has no numeric 'x'"),
+            (
+                json!([{ "x": 0.0, "y": 0.0 }, { "x": 1.0, "y": "two" }]),
+                "point 1 has no numeric 'y'",
+            ),
+        ];
+        for (value, expected) in cases {
+            let err = parse_points(&value).expect_err("must be refused");
+            assert!(err.is_error, "{value} should be an error result");
+            let text = format!("{:?}", err);
+            assert!(
+                text.contains("InvalidArgument") || text.contains("invalid_argument"),
+                "must be structured, got: {text}"
+            );
+            assert!(
+                text.contains(expected),
+                "the message must say which point is wrong.\nwant: {expected}\ngot:  {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_points_parse_in_order() {
+        let points = parse_points(&json!([
+            { "x": 0.0, "y": 0.0 },
+            { "x": 2.5, "y": -1.5 },
+            { "x": 2.5, "y": 2.5 }
+        ]))
+        .expect("valid");
+        assert_eq!(points, vec![(0.0, 0.0), (2.5, -1.5), (2.5, 2.5)]);
+    }
+
+    /// An integer in JSON is a number; rejecting it would refuse
+    /// `{"x": 0, "y": 0}`, which is what a caller writes for the origin.
+    #[test]
+    fn integer_coordinates_are_accepted() {
+        assert_eq!(
+            parse_points(&json!([{ "x": 0, "y": 0 }, { "x": 3, "y": 0 }, { "x": 3, "y": 3 }]))
+                .expect("valid"),
+            vec![(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)]
+        );
+    }
+
+    /// The two tools are registered, sit in `pcb_components`, and require the
+    /// arguments the handlers read. A schema that drifts from its handler is
+    /// the defect #217 was about, one layer up.
+    #[test]
+    fn both_board_graphics_tools_are_registered_with_the_arguments_they_read() {
+        let tools = tools();
+        for (name, required) in [
+            ("list_board_footprint_graphics", vec!["board", "reference"]),
+            (
+                "edit_board_footprint_graphic",
+                vec!["board", "reference", "uuid", "points"],
+            ),
+        ] {
+            let def = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not registered"));
+            let got: Vec<&str> = def.input_schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} declares no required list"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(got, required, "{name} required arguments");
+            for key in &required {
+                assert!(
+                    def.input_schema["properties"][key].is_object(),
+                    "{name} requires '{key}' but does not declare it"
+                );
+            }
+        }
     }
 }

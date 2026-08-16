@@ -93,6 +93,95 @@ fn polygon_extent(geometry: &kiapi::common::types::graphic_shape::Geometry) -> (
     }
 }
 
+/// Refuse or rewrite `shape`'s outline, returning the kind it was.
+///
+/// Split out of [`KiCadIpcClient::set_footprint_graphic_points`] so the refusals
+/// can be tested. They previously sat inside the loop that walks a live
+/// footprint's items, so reaching any of them needed a running KiCad — which
+/// meant the only guarantee that a bad request writes nothing was that nobody
+/// had tried it. That is the shape #117 shipped in: an outbound message that
+/// encodes cleanly and is semantically wrong.
+///
+/// Every refusal happens before any mutation, so a caller that gets an `Err`
+/// here has an untouched shape and the caller sends no `UpdateItems`.
+fn replace_polygon_outline(
+    shape: &mut kiapi::board::types::BoardGraphicShape,
+    reference: &str,
+    uuid: &str,
+    points_mm: &[(f64, f64)],
+    anchor: (i64, i64),
+    to_board: &crate::transform::Xform,
+) -> Result<&'static str> {
+    let kind = shape
+        .shape
+        .as_ref()
+        .and_then(|s| s.geometry.as_ref())
+        .map(geometry_kind)
+        .unwrap_or("unknown");
+    if kind != "polygon" {
+        anyhow::bail!(
+            "graphic '{}' on '{}' is a {}; only polygons take a vertex list",
+            uuid,
+            reference,
+            kind
+        );
+    }
+    if points_mm.len() < 3 {
+        anyhow::bail!("a polygon needs at least 3 points, got {}", points_mm.len());
+    }
+    // The rebuild below emits one outline with no holes. Rejecting a shape that
+    // carries more is the difference between refusing the edit and silently
+    // deleting a cutout the caller never mentioned.
+    let (outlines, holes) = shape
+        .shape
+        .as_ref()
+        .and_then(|s| s.geometry.as_ref())
+        .map(polygon_extent)
+        .unwrap_or((0, 0));
+    if outlines > 1 || holes > 0 {
+        anyhow::bail!(
+            "polygon '{}' on '{}' carries {} outline(s) and {} hole(s); this tool \
+             replaces a single outline and would discard the rest, so it will not \
+             write it — edit this one in KiCad",
+            uuid,
+            reference,
+            outlines,
+            holes
+        );
+    }
+
+    let nodes = points_mm
+        .iter()
+        .map(|&(x, y)| {
+            let (rx, ry) =
+                to_board.point(crate::builders::mm_to_nm(x), crate::builders::mm_to_nm(y));
+            kiapi::common::types::PolyLineNode {
+                geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                    kiapi::common::types::Vector2 {
+                        x_nm: anchor.0 + rx,
+                        y_nm: anchor.1 + ry,
+                    },
+                )),
+            }
+        })
+        .collect();
+
+    if let Some(s) = shape.shape.as_mut() {
+        s.geometry = Some(kiapi::common::types::graphic_shape::Geometry::Polygon(
+            kiapi::common::types::PolySet {
+                polygons: vec![kiapi::common::types::PolygonWithHoles {
+                    outline: Some(kiapi::common::types::PolyLine {
+                        nodes,
+                        closed: true,
+                    }),
+                    holes: vec![],
+                }],
+            },
+        ));
+    }
+    Ok(kind)
+}
+
 /// The defining vertices of a graphic geometry, in absolute board nanometres.
 fn geometry_points(geometry: &kiapi::common::types::graphic_shape::Geometry) -> Vec<(i64, i64)> {
     use kiapi::common::types::graphic_shape::Geometry;
@@ -1142,73 +1231,8 @@ impl KiCadIpcClient {
                 continue;
             }
 
-            let kind = shape
-                .shape
-                .as_ref()
-                .and_then(|s| s.geometry.as_ref())
-                .map(geometry_kind)
-                .unwrap_or("unknown");
-            if kind != "polygon" {
-                anyhow::bail!(
-                    "graphic '{}' on '{}' is a {}; only polygons take a vertex list",
-                    uuid,
-                    reference,
-                    kind
-                );
-            }
-            if points_mm.len() < 3 {
-                anyhow::bail!("a polygon needs at least 3 points, got {}", points_mm.len());
-            }
-            // The rebuild below emits one outline with no holes. Rejecting a
-            // shape that carries more is the difference between refusing the
-            // edit and silently deleting a cutout the caller never mentioned.
-            let (outlines, holes) = shape
-                .shape
-                .as_ref()
-                .and_then(|s| s.geometry.as_ref())
-                .map(polygon_extent)
-                .unwrap_or((0, 0));
-            if outlines > 1 || holes > 0 {
-                anyhow::bail!(
-                    "polygon '{}' on '{}' carries {} outline(s) and {} hole(s); this tool \
-                     replaces a single outline and would discard the rest, so it will not \
-                     write it — edit this one in KiCad",
-                    uuid,
-                    reference,
-                    outlines,
-                    holes
-                );
-            }
-
-            let nodes = points_mm
-                .iter()
-                .map(|&(x, y)| {
-                    let (rx, ry) =
-                        to_board.point(crate::builders::mm_to_nm(x), crate::builders::mm_to_nm(y));
-                    kiapi::common::types::PolyLineNode {
-                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
-                            kiapi::common::types::Vector2 {
-                                x_nm: anchor.0 + rx,
-                                y_nm: anchor.1 + ry,
-                            },
-                        )),
-                    }
-                })
-                .collect();
-
-            if let Some(s) = shape.shape.as_mut() {
-                s.geometry = Some(kiapi::common::types::graphic_shape::Geometry::Polygon(
-                    kiapi::common::types::PolySet {
-                        polygons: vec![kiapi::common::types::PolygonWithHoles {
-                            outline: Some(kiapi::common::types::PolyLine {
-                                nodes,
-                                closed: true,
-                            }),
-                            holes: vec![],
-                        }],
-                    },
-                ));
-            }
+            let kind =
+                replace_polygon_outline(&mut shape, reference, uuid, points_mm, anchor, &to_board)?;
 
             *any = pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
             let packed = pack_any(&fp, "kiapi.board.types.FootprintInstance");
@@ -2260,6 +2284,28 @@ mod footprint_graphic_tests {
         };
         assert_eq!(of(&poly), "polygon");
         assert_eq!(of(&seg), "segment");
+        // The remaining names are not decoration: `replace_polygon_outline`
+        // interpolates this string into the refusal a caller reads when they
+        // aim a vertex list at the wrong graphic. A wrong name there sends
+        // someone looking for a shape that isn't the one they picked.
+        assert_eq!(
+            of(&builders::board_rectangle(
+                "F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, false
+            )),
+            "rectangle"
+        );
+        assert_eq!(
+            of(&builders::board_circle(
+                "F.SilkS", 0.1, 0.0, 0.0, 1.0, false
+            )),
+            "circle"
+        );
+        assert_eq!(
+            of(&builders::board_arc(
+                "F.SilkS", 0.1, 0.0, 0.0, 1.0, 1.0, 2.0, 0.0
+            )),
+            "arc"
+        );
         // Exhaustiveness is enforced by the match, not by listing every arm here.
         let _ = |g: &Geometry| geometry_kind(g);
     }
@@ -2398,5 +2444,174 @@ mod footprint_graphic_tests {
                 "round trip lost ({x_mm}, {y_mm})"
             );
         }
+    }
+    // ─── replace_polygon_outline: every refusal, and the rebuild ───────────
+    //
+    // These guards sit between a caller's request and an `UpdateItems` that
+    // KiCad applies to a live board. Until this module they were unreachable
+    // without a running KiCad, so nothing checked that a refused request
+    // leaves the shape alone — which is what a test has to prove, not just
+    // that an `Err` comes back.
+
+    fn no_rotation() -> Xform {
+        Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: 0.0,
+        }
+    }
+
+    fn square() -> Vec<(f64, f64)> {
+        vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+    }
+
+    /// The outline vertices of a polygon shape, in board nanometres.
+    fn outline_of(shape: &kiapi::board::types::BoardGraphicShape) -> Vec<(i64, i64)> {
+        geometry_points(shape.shape.as_ref().unwrap().geometry.as_ref().unwrap())
+    }
+
+    #[test]
+    fn a_non_polygon_is_refused_by_name_and_left_alone() {
+        let mut seg = builders::board_segment("F.SilkS", 0.1, 0.0, 0.0, 1.0, 0.0);
+        let before = seg.clone();
+
+        let err = replace_polygon_outline(&mut seg, "J2", "u-1", &square(), (0, 0), &no_rotation())
+            .expect_err("a segment must not take a vertex list");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("is a segment"),
+            "the refusal must name the kind it found, so the caller knows why: {message}"
+        );
+        assert_eq!(
+            seg, before,
+            "a refused edit must not mutate the shape — the caller still sends it"
+        );
+    }
+
+    #[test]
+    fn fewer_than_three_points_is_refused_and_leaves_the_outline_intact() {
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]);
+        let before = outline_of(&poly);
+
+        let err = replace_polygon_outline(
+            &mut poly,
+            "J2",
+            "u-1",
+            &[(0.0, 0.0), (1.0, 0.0)],
+            (0, 0),
+            &no_rotation(),
+        )
+        .expect_err("two points cannot be a polygon");
+
+        assert!(format!("{err:#}").contains("at least 3 points"), "{err:#}");
+        assert_eq!(
+            outline_of(&poly),
+            before,
+            "the original outline must survive a refused edit"
+        );
+    }
+
+    #[test]
+    fn a_second_outline_is_refused_rather_than_discarded() {
+        let mut poly = builders::board_polygon(
+            "F.SilkS",
+            0.1,
+            true,
+            &[square(), vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)]],
+        );
+        let before = poly.clone();
+
+        let err =
+            replace_polygon_outline(&mut poly, "J2", "u-1", &square(), (0, 0), &no_rotation())
+                .expect_err("two outlines cannot be rebuilt as one");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("2 outline(s)"), "{message}");
+        assert_eq!(
+            poly, before,
+            "refusing is the whole point: rebuilding would delete the second outline"
+        );
+    }
+
+    #[test]
+    fn a_hole_is_refused_rather_than_discarded() {
+        use kiapi::common::types::graphic_shape::Geometry;
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[square()]);
+        // `board_polygon` cannot build a hole, so inject one.
+        if let Some(Geometry::Polygon(ps)) = poly.shape.as_mut().and_then(|s| s.geometry.as_mut()) {
+            ps.polygons[0].holes.push(kiapi::common::types::PolyLine {
+                nodes: vec![],
+                closed: true,
+            });
+        }
+        let before = poly.clone();
+
+        let err =
+            replace_polygon_outline(&mut poly, "J2", "u-1", &square(), (0, 0), &no_rotation())
+                .expect_err("a cutout must not be silently dropped");
+
+        assert!(format!("{err:#}").contains("1 hole(s)"), "{err:#}");
+        assert_eq!(poly, before, "the cutout must still be there");
+    }
+
+    #[test]
+    fn the_rebuilt_outline_is_closed_and_anchored() {
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(9.0, 9.0)]]);
+        let anchor = (builders::mm_to_nm(100.0), builders::mm_to_nm(50.0));
+
+        let kind =
+            replace_polygon_outline(&mut poly, "J2", "u-1", &square(), anchor, &no_rotation())
+                .expect("a single-outline polygon is editable");
+        assert_eq!(kind, "polygon");
+
+        // Footprint-local mm in, absolute board nm out: anchor + local.
+        let expected: Vec<(i64, i64)> = square()
+            .iter()
+            .map(|&(x, y)| {
+                (
+                    anchor.0 + builders::mm_to_nm(x),
+                    anchor.1 + builders::mm_to_nm(y),
+                )
+            })
+            .collect();
+        assert_eq!(outline_of(&poly), expected);
+
+        use kiapi::common::types::graphic_shape::Geometry;
+        let Some(Geometry::Polygon(ps)) = poly.shape.as_ref().and_then(|s| s.geometry.as_ref())
+        else {
+            panic!("still a polygon");
+        };
+        assert_eq!(ps.polygons.len(), 1, "exactly one outline is written");
+        assert!(ps.polygons[0].holes.is_empty());
+        assert!(
+            ps.polygons[0].outline.as_ref().unwrap().closed,
+            "an open outline renders as a polyline, not a filled pour"
+        );
+    }
+
+    #[test]
+    fn the_rebuilt_outline_follows_the_footprints_rotation() {
+        let mut poly = builders::board_polygon("F.SilkS", 0.1, true, &[vec![(0.0, 0.0)]]);
+        let anchor = (builders::mm_to_nm(10.0), builders::mm_to_nm(20.0));
+        let rotate = Xform::Rotate {
+            cx_nm: 0,
+            cy_nm: 0,
+            delta_deg: 90.0,
+        };
+
+        replace_polygon_outline(&mut poly, "J2", "u-1", &square(), anchor, &rotate)
+            .expect("editable");
+
+        // A point 2mm along local +X lands 2mm along board -Y at 90 degrees.
+        // Getting this backwards mirrors the artwork, which reads as plausible
+        // silkscreen and is exactly what nobody would notice in a diff.
+        let got = outline_of(&poly);
+        assert_eq!(got[0], anchor, "the first vertex is the anchor itself");
+        assert_eq!(
+            got[1],
+            (anchor.0, anchor.1 - builders::mm_to_nm(2.0)),
+            "local +X must rotate to board -Y"
+        );
     }
 }
