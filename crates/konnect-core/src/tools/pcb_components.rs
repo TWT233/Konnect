@@ -11,8 +11,8 @@ use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext,
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
-    apply_edits, find_balanced_block, find_block_starts, new_uuid, read_consistent,
-    write_atomic_if_unchanged,
+    apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, new_uuid,
+    read_consistent, write_atomic_if_unchanged,
 };
 use konnect_sexp::SexpEdit;
 use serde_json::json;
@@ -907,6 +907,117 @@ fn persist_board_replacement(
     write_atomic_if_unchanged(board_path, expected, replacement)
 }
 
+enum FootprintPlacementUpdate {
+    Move { x: f64, y: f64 },
+    Rotate { rotation: f64 },
+}
+
+fn update_closed_board_footprint(
+    board_path: &Path,
+    reference: &str,
+    update: FootprintPlacementUpdate,
+) -> anyhow::Result<()> {
+    let content = read_consistent(board_path)?;
+    let updated = prepare_closed_board_footprint_update(&content, reference, update)?;
+    persist_board_replacement(board_path, &content, &updated)?;
+    Ok(())
+}
+
+fn prepare_closed_board_footprint_update(
+    content: &str,
+    reference: &str,
+    update: FootprintPlacementUpdate,
+) -> anyhow::Result<String> {
+    if let Err(reason) = check_single_board_form(content) {
+        anyhow::bail!(
+            "Refusing to edit the board: {}. The board file was left untouched.",
+            reason,
+        );
+    }
+
+    let mut matched = None;
+    for (start, end) in find_direct_child_blocks(content, "kicad_pcb") {
+        let block = &content[start..end];
+        let footprint = match konnect_sexp::parse_sexp(block) {
+            Ok(node) if node.head() == Some("footprint") => node,
+            _ => continue,
+        };
+        if footprint_reference(&footprint).as_deref() == Some(reference)
+            && matched.replace((start, end)).is_some()
+        {
+            anyhow::bail!(
+                "Footprint reference '{}' appears more than once on the board",
+                reference
+            );
+        }
+    }
+
+    let (start, end) = matched
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on the board", reference))?;
+    let replacement = update_footprint_placement(&content[start..end], update)?;
+    let updated = apply_edits(
+        content.to_string(),
+        vec![SexpEdit::replace(start, end, replacement)],
+    );
+    if let Err(reason) = check_single_board_form(&updated) {
+        anyhow::bail!(
+            "Refusing to write the board after updating '{}': {}. The board file was left untouched.",
+            reference,
+            reason
+        );
+    }
+    Ok(updated)
+}
+
+fn update_footprint_placement(
+    footprint: &str,
+    update: FootprintPlacementUpdate,
+) -> anyhow::Result<String> {
+    let at_ranges: Vec<_> = find_direct_child_blocks(footprint, "footprint")
+        .into_iter()
+        .filter(|(start, end)| {
+            konnect_sexp::parse_sexp(&footprint[*start..*end])
+                .ok()
+                .is_some_and(|node| node.head() == Some("at"))
+        })
+        .collect();
+    let [(at_start, at_end)] = at_ranges.as_slice() else {
+        anyhow::bail!("footprint must contain exactly one root placement (at ...) block");
+    };
+    let at = konnect_sexp::parse_sexp(&footprint[*at_start..*at_end])?;
+    let old_x = at
+        .get_f64(1)
+        .context("footprint root placement has an invalid X position")?;
+    let old_y = at
+        .get_f64(2)
+        .context("footprint root placement has an invalid Y position")?;
+    let old_rotation = at.get_f64(3).unwrap_or(0.0);
+
+    let (x, y, rotation, mut updated) = match update {
+        FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation, footprint.to_string()),
+        FootprintPlacementUpdate::Rotate { rotation } => (
+            old_x,
+            old_y,
+            rotation,
+            apply_rotation_to_children(footprint, rotation - old_rotation),
+        ),
+    };
+
+    updated = apply_edits(
+        updated,
+        vec![SexpEdit::replace(
+            *at_start,
+            *at_end,
+            format_at(x, y, rotation),
+        )],
+    );
+    let parsed = konnect_sexp::parse_sexp(&updated)?;
+    if parsed.head() != Some("footprint") {
+        anyhow::bail!("placement update changed the footprint root");
+    }
+    Ok(updated)
+}
+
 /// Verify `content` is exactly one `(kicad_pcb …)` form and nothing else.
 ///
 /// Checking only that *a* balanced block exists is too weak to back the promise
@@ -979,7 +1090,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_component",
-            "Move a placed footprint to a new X/Y position via KiCAD IPC.",
+            "Move a placed footprint to a new X/Y position. Uses live KiCAD IPC when reachable; \
+             otherwise safely edits a closed board file with revision checks.",
             json!({
                 "type": "object",
                 "properties": {
@@ -994,7 +1106,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "rotate_component",
-            "Set the rotation angle of a placed footprint via KiCAD IPC.",
+            "Set the rotation angle of a placed footprint. Uses live KiCAD IPC when reachable; \
+             otherwise safely edits a closed board file with revision checks.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1335,6 +1448,7 @@ async fn handle_move_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1348,11 +1462,42 @@ async fn handle_move_component(
         Err(e) => return Ok(e),
     };
 
+    let requested_board = board.clone();
     let ref_ipc = reference.clone();
-    ipc!(ctx, args, |c| c.move_footprint(&ref_ipc, x, y));
-    Ok(CallToolResult::json(
-        &json!({ "moved": reference, "x": x, "y": y }),
-    ))
+    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+        c.ensure_board_is_active(&requested_board)?;
+        c.move_footprint(&ref_ipc, x, y)
+    })
+    .await?;
+    match attempt {
+        Ok(()) => Ok(CallToolResult::json(
+            &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
+        )),
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
+            "KiCAD rejected the move over IPC: {message}. The board file was not modified — \
+             KiCAD is reachable and may hold this board open, so editing the file directly \
+             could be silently overwritten."
+        ))),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            match update_closed_board_footprint(
+                &board,
+                &reference,
+                FootprintPlacementUpdate::Move { x, y },
+            ) {
+                Ok(()) => Ok(CallToolResult::json(&json!({
+                    "moved": reference,
+                    "x": x,
+                    "y": y,
+                    "source": "file",
+                    "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
+                }))),
+                Err(error) if error.to_string().contains("not found on the board") => {
+                    Ok(CallToolResult::error(error.to_string()))
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
 }
 
 async fn handle_list_board_footprint_graphics(
@@ -1418,6 +1563,7 @@ async fn handle_rotate_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1427,11 +1573,43 @@ async fn handle_rotate_component(
         Err(e) => return Ok(e),
     };
 
+    let requested_board = board.clone();
     let ref_ipc = reference.clone();
-    ipc!(ctx, args, |c| c.rotate_footprint(&ref_ipc, rotation));
-    Ok(CallToolResult::json(
-        &json!({ "rotated": reference, "rotation": rotation }),
-    ))
+    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+        c.ensure_board_is_active(&requested_board)?;
+        c.rotate_footprint(&ref_ipc, rotation)
+    })
+    .await?;
+    match attempt {
+        Ok(()) => Ok(CallToolResult::json(&json!({
+            "rotated": reference,
+            "rotation": rotation,
+            "source": "ipc"
+        }))),
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
+            "KiCAD rejected the rotation over IPC: {message}. The board file was not modified — \
+             KiCAD is reachable and may hold this board open, so editing the file directly \
+             could be silently overwritten."
+        ))),
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            match update_closed_board_footprint(
+                &board,
+                &reference,
+                FootprintPlacementUpdate::Rotate { rotation },
+            ) {
+                Ok(()) => Ok(CallToolResult::json(&json!({
+                    "rotated": reference,
+                    "rotation": rotation,
+                    "source": "file",
+                    "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
+                }))),
+                Err(error) if error.to_string().contains("not found on the board") => {
+                    Ok(CallToolResult::error(error.to_string()))
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
 }
 
 async fn handle_delete_component(
@@ -2357,6 +2535,163 @@ mod tests {
         assert_eq!(std::fs::read_to_string(board).unwrap(), before_duplicate);
     }
 
+    async fn placed_fallback_fixture(dir: &Path) -> std::path::PathBuf {
+        let board = fallback_fixture(dir);
+        let placed = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Resistor_SMD:R_0805_2012Metric",
+                "reference": "R1",
+                "x": 10.0,
+                "y": 20.0,
+                "rotation": 30.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!placed.is_error, "{:?}", placed.content);
+        board
+    }
+
+    #[tokio::test]
+    async fn unreachable_ipc_moves_an_existing_footprint_in_the_board_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+
+        let moved = handle_move_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R1",
+                "x": 40.0,
+                "y": 50.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!moved.is_error, "{:?}", moved.content);
+        let result: serde_json::Value =
+            serde_json::from_str(&result_text(&moved)).expect("move result must be JSON");
+        assert_eq!(result["source"], "file");
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 40 50 30)"), "{written}");
+        assert!(written.contains("(pad \"1\" smd roundrect"), "{written}");
+        assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unreachable_ipc_rotates_an_existing_footprint_in_the_board_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+
+        let rotated = handle_rotate_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R1",
+                "rotation": 270.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!rotated.is_error, "{:?}", rotated.content);
+        let result: serde_json::Value =
+            serde_json::from_str(&result_text(&rotated)).expect("rotate result must be JSON");
+        assert_eq!(result["source"], "file");
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 10 20 270)"), "{written}");
+        assert!(written.contains("(at -0.9125 0 270)"), "{written}");
+        assert!(written.contains("(at 0 -1.65 90)"), "{written}");
+        assert!(konnect_sexp::parse_sexp(&written).is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_board_move_and_rotate_reject_a_missing_reference_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let moved = handle_move_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R404",
+                "x": 40.0,
+                "y": 50.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(moved.is_error);
+        assert!(result_text(&moved).contains("R404"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+
+        let rotated = handle_rotate_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R404",
+                "rotation": 90.0,
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(rotated.is_error);
+        assert!(result_text(&rotated).contains("R404"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn reachable_rejection_prevents_move_and_rotate_file_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+        let before = std::fs::read_to_string(&board).unwrap();
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: spawn_rejecting_kicad(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let moved = handle_move_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R1",
+                "x": 40.0,
+                "y": 50.0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(moved.is_error);
+        assert!(result_text(&moved).contains("not modified"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+
+        let rotated = handle_rotate_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "R1",
+                "rotation": 90.0,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(rotated.is_error);
+        assert!(result_text(&rotated).contains("not modified"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
     #[test]
     fn stale_board_source_is_rejected_without_overwriting_newer_content() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2371,6 +2706,27 @@ mod tests {
 
         let error = persist_board_replacement(&board, EMPTY_BOARD, &replacement)
             .expect_err("a stale expected board must conflict");
+
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn stale_closed_board_move_is_rejected_without_overwriting_newer_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = placed_fallback_fixture(tmp.path()).await;
+        let expected = std::fs::read_to_string(&board).unwrap();
+        let replacement = prepare_closed_board_footprint_update(
+            &expected,
+            "R1",
+            FootprintPlacementUpdate::Move { x: 40.0, y: 50.0 },
+        )
+        .unwrap();
+        let newer = expected.replace("(net 0 \"\")", "(net 0 \"\")\n\t(net 1 \"GND\")");
+        std::fs::write(&board, &newer).unwrap();
+
+        let error = persist_board_replacement(&board, &expected, &replacement)
+            .expect_err("a stale move source must conflict");
 
         assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
         assert_eq!(std::fs::read_to_string(board).unwrap(), newer);
