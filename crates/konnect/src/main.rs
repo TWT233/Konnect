@@ -18,9 +18,18 @@ async fn main() -> Result<()> {
 
     // ─── Subcommand dispatch (install, uninstall, status, skill) ────
     match args.get(1).map(String::as_str) {
-        Some("init") => return install::run_install(),
-        Some("uninstall") => return install::run_uninstall(),
-        Some("status") => return install::print_status(),
+        Some("init") => {
+            let client = install::client_from_args(&args[2..])?;
+            return install::run_install(client);
+        }
+        Some("uninstall") => {
+            let client = install::client_from_args(&args[2..])?;
+            return install::run_uninstall(client);
+        }
+        Some("status") => {
+            let client = install::client_from_args(&args[2..])?;
+            return install::print_status(client);
+        }
         Some("skill") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
             return install::print_skill_content(name);
@@ -44,9 +53,11 @@ async fn main() -> Result<()> {
         return install::run_double_click_install();
     }
 
+    let client = install::client_from_args(&args[1..])?;
+
     // ─── Auto-install on first MCP launch (safety net) ──────────────
-    if install::needs_install() {
-        let _ = install::run_install_silent();
+    if install::needs_install(client) {
+        let _ = install::run_install_silent(client);
     }
 
     // --config <path>: load config from specified file
@@ -120,17 +131,20 @@ async fn main() -> Result<()> {
 
 fn print_help() {
     println!("Konnect v{}", env!("CARGO_PKG_VERSION"));
-    println!("MCP server for KiCAD EDA with embedded skills and agents.\n");
+    println!("MCP server for KiCad EDA with embedded guidance.\n");
     println!("USAGE:");
     println!("  konnect                  Start MCP server (pipe) or install (TTY)");
-    println!("  konnect init             Install skills, agents, and hooks");
-    println!("  konnect uninstall        Remove all installed files");
-    println!("  konnect status           Show install state");
+    println!("  konnect [--client <client>] [--config <path>]");
+    println!("  konnect init [--client <client>]");
+    println!("  konnect uninstall [--client <client>]");
+    println!("  konnect status [--client <client>]");
     println!("  konnect skill <name>     Print skill content (for hooks)");
     println!("  konnect transaction status <project-dir>");
     println!("  konnect transaction recover <project-dir>");
     println!("  konnect transaction abandon <project-dir> <id> --force");
-    println!("  konnect --config <path>  Start server with config file");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");
+    println!("\nCLIENTS:");
+    println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
+    println!("  codex                    Skills under ~/.agents/skills");
 }
