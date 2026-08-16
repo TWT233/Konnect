@@ -502,7 +502,8 @@ pub(crate) fn extract_graphic_definitions(
         });
     }
     for text in footprint.find_all("fp_text") {
-        if text_hidden(text) {
+        let kind = text.get(1).and_then(konnect_sexp::SexpNode::as_str);
+        if matches!(kind, Some("reference" | "value")) || text_hidden(text) {
             continue;
         }
         let content = text
@@ -2082,6 +2083,23 @@ mod tests {
             Graphic::Text { text, layer, size, position, .. }
                 if text == "${REFERENCE}" && layer == "F.Fab" && *size == 0.26
                     && *position == (0.0, 1.17)
+        ));
+    }
+
+    #[test]
+    fn legacy_reference_and_value_text_are_not_duplicated_as_graphics() {
+        let source = r#"(footprint "Legacy"
+  (layer "F.Cu")
+  (fp_text reference "REF**" (at 0 -1) (layer "F.SilkS"))
+  (fp_text value "Legacy" (at 0 1) (layer "F.Fab"))
+  (fp_text user "visible" (at 0 0) (layer "F.Fab")))"#;
+
+        let graphics = extract_graphic_definitions(source).unwrap();
+
+        assert_eq!(graphics.len(), 1, "{graphics:?}");
+        assert!(matches!(
+            &graphics[0],
+            konnect_ipc::IpcGraphicDefinition::Text { text, .. } if text == "visible"
         ));
     }
 

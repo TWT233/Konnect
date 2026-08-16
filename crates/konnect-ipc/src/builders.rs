@@ -40,23 +40,76 @@ pub fn net(name: &str, code: i32) -> kiapi::board::types::Net {
 
 /// Map a layer name string to the BoardLayer enum value.
 pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
+    use kiapi::board::types::BoardLayer;
+
+    if let Some(number) = name
+        .strip_prefix("In")
+        .and_then(|value| value.strip_suffix(".Cu"))
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|number| (1..=30).contains(number))
+    {
+        return BoardLayer::try_from(BoardLayer::BlFCu as i32 + number)
+            .unwrap_or(BoardLayer::BlUndefined);
+    }
+    if let Some(number) = name
+        .strip_prefix("User.")
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|number| (1..=45).contains(number))
+    {
+        let value = if number <= 9 {
+            BoardLayer::BlUser1 as i32 + number - 1
+        } else {
+            BoardLayer::BlUser10 as i32 + number - 10
+        };
+        return BoardLayer::try_from(value).unwrap_or(BoardLayer::BlUndefined);
+    }
+
     match name {
-        "F.Cu" => kiapi::board::types::BoardLayer::BlFCu,
-        "B.Cu" => kiapi::board::types::BoardLayer::BlBCu,
-        "In1.Cu" => kiapi::board::types::BoardLayer::BlIn1Cu,
-        "In2.Cu" => kiapi::board::types::BoardLayer::BlIn2Cu,
-        "F.SilkS" | "F.Silkscreen" => kiapi::board::types::BoardLayer::BlFSilkS,
-        "B.SilkS" | "B.Silkscreen" => kiapi::board::types::BoardLayer::BlBSilkS,
-        "F.Mask" => kiapi::board::types::BoardLayer::BlFMask,
-        "B.Mask" => kiapi::board::types::BoardLayer::BlBMask,
-        "F.Paste" => kiapi::board::types::BoardLayer::BlFPaste,
-        "B.Paste" => kiapi::board::types::BoardLayer::BlBPaste,
-        "F.CrtYd" | "F.Courtyard" => kiapi::board::types::BoardLayer::BlFCrtYd,
-        "B.CrtYd" | "B.Courtyard" => kiapi::board::types::BoardLayer::BlBCrtYd,
-        "F.Fab" => kiapi::board::types::BoardLayer::BlFFab,
-        "B.Fab" => kiapi::board::types::BoardLayer::BlBFab,
-        "Edge.Cuts" => kiapi::board::types::BoardLayer::BlEdgeCuts,
-        _ => kiapi::board::types::BoardLayer::BlUndefined,
+        "F.Cu" => BoardLayer::BlFCu,
+        "B.Cu" => BoardLayer::BlBCu,
+        "F.Adhes" => BoardLayer::BlFAdhes,
+        "B.Adhes" => BoardLayer::BlBAdhes,
+        "F.SilkS" | "F.Silkscreen" => BoardLayer::BlFSilkS,
+        "B.SilkS" | "B.Silkscreen" => BoardLayer::BlBSilkS,
+        "F.Mask" => BoardLayer::BlFMask,
+        "B.Mask" => BoardLayer::BlBMask,
+        "F.Paste" => BoardLayer::BlFPaste,
+        "B.Paste" => BoardLayer::BlBPaste,
+        "F.CrtYd" | "F.Courtyard" => BoardLayer::BlFCrtYd,
+        "B.CrtYd" | "B.Courtyard" => BoardLayer::BlBCrtYd,
+        "F.Fab" => BoardLayer::BlFFab,
+        "B.Fab" => BoardLayer::BlBFab,
+        "Dwgs.User" => BoardLayer::BlDwgsUser,
+        "Cmts.User" => BoardLayer::BlCmtsUser,
+        "Eco1.User" => BoardLayer::BlEco1User,
+        "Eco2.User" => BoardLayer::BlEco2User,
+        "Edge.Cuts" => BoardLayer::BlEdgeCuts,
+        "Margin" => BoardLayer::BlMargin,
+        "Rescue" => BoardLayer::BlRescue,
+        _ => BoardLayer::BlUndefined,
+    }
+}
+
+/// Return the same physical layer on the opposite board side.
+pub fn opposite_layer(layer: kiapi::board::types::BoardLayer) -> kiapi::board::types::BoardLayer {
+    use kiapi::board::types::BoardLayer;
+
+    match layer {
+        BoardLayer::BlFCu => BoardLayer::BlBCu,
+        BoardLayer::BlBCu => BoardLayer::BlFCu,
+        BoardLayer::BlFAdhes => BoardLayer::BlBAdhes,
+        BoardLayer::BlBAdhes => BoardLayer::BlFAdhes,
+        BoardLayer::BlFPaste => BoardLayer::BlBPaste,
+        BoardLayer::BlBPaste => BoardLayer::BlFPaste,
+        BoardLayer::BlFSilkS => BoardLayer::BlBSilkS,
+        BoardLayer::BlBSilkS => BoardLayer::BlFSilkS,
+        BoardLayer::BlFMask => BoardLayer::BlBMask,
+        BoardLayer::BlBMask => BoardLayer::BlFMask,
+        BoardLayer::BlFCrtYd => BoardLayer::BlBCrtYd,
+        BoardLayer::BlBCrtYd => BoardLayer::BlFCrtYd,
+        BoardLayer::BlFFab => BoardLayer::BlBFab,
+        BoardLayer::BlBFab => BoardLayer::BlFFab,
+        other => other,
     }
 }
 
@@ -381,6 +434,40 @@ pub fn board_text(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn layer_mapping_covers_footprint_drawing_layers() {
+        use kiapi::board::types::BoardLayer;
+
+        assert_eq!(layer_from_name("Dwgs.User"), BoardLayer::BlDwgsUser);
+        assert_eq!(layer_from_name("Cmts.User"), BoardLayer::BlCmtsUser);
+        assert_eq!(layer_from_name("F.Adhes"), BoardLayer::BlFAdhes);
+        assert_eq!(layer_from_name("B.Adhes"), BoardLayer::BlBAdhes);
+        assert_eq!(layer_from_name("User.1"), BoardLayer::BlUser1);
+        assert_eq!(layer_from_name("User.45"), BoardLayer::BlUser45);
+    }
+
+    #[test]
+    fn opposite_layer_pairs_front_and_back_technical_layers() {
+        use kiapi::board::types::BoardLayer;
+
+        for (front, back) in [
+            (BoardLayer::BlFCu, BoardLayer::BlBCu),
+            (BoardLayer::BlFAdhes, BoardLayer::BlBAdhes),
+            (BoardLayer::BlFPaste, BoardLayer::BlBPaste),
+            (BoardLayer::BlFSilkS, BoardLayer::BlBSilkS),
+            (BoardLayer::BlFMask, BoardLayer::BlBMask),
+            (BoardLayer::BlFCrtYd, BoardLayer::BlBCrtYd),
+            (BoardLayer::BlFFab, BoardLayer::BlBFab),
+        ] {
+            assert_eq!(opposite_layer(front), back);
+            assert_eq!(opposite_layer(back), front);
+        }
+        assert_eq!(
+            opposite_layer(BoardLayer::BlDwgsUser),
+            BoardLayer::BlDwgsUser
+        );
+    }
 
     #[test]
     fn segment_populates_start_end_and_layer() {
