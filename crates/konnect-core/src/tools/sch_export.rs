@@ -10,8 +10,8 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        pin_endpoint, read_schematic,
+        extract_all_net_labels, extract_labels, extract_lib_pins, extract_symbol_instances,
+        extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
@@ -77,7 +77,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
-             components, their nets, pin counts. Does not require kicad-cli.",
+             components, their nets, pin counts. Nets come from labels and from \
+             power symbols. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
@@ -214,7 +215,7 @@ async fn handle_export_netlist_summary(
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -453,4 +454,94 @@ async fn handle_fix_connectivity(
         "dry_run": dry_run,
         "fixes": fixes
     })))
+}
+
+#[cfg(test)]
+mod netlist_summary_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// R1 with pin 2 wired to a `power:GND` symbol, and pin 1 on a plain label.
+    /// The rail is the case that used to disappear.
+    const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+
+    async fn summary(content: &str) -> serde_json::Value {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_export_netlist_summary(
+            &json!({ "schematic": f.path().to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn net_of(summary: &serde_json::Value, reference: &str, pin: &str) -> String {
+        summary["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["reference"] == reference)
+            .expect("component present")["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["number"] == pin)
+            .expect("pin present")["net"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The regression: nets came from labels alone, so a pin reached only
+    /// through a power symbol reported `"~"` and the rail was absent from
+    /// `nets` — the summary showed every power connection as unconnected.
+    #[tokio::test]
+    async fn a_rail_reached_through_a_power_symbol_is_named() {
+        let s = summary(SCH).await;
+        assert_eq!(net_of(&s, "R1", "2"), "GND");
+        assert_eq!(net_of(&s, "R1", "1"), "SIG");
+
+        let nets: Vec<&str> = s["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(nets, vec!["GND", "SIG"]);
+        assert_eq!(s["net_count"], 2);
+    }
+
+    /// The power symbol's own pin resolves too, so `#PWR01` is not reported as
+    /// a floating part.
+    #[tokio::test]
+    async fn the_power_symbol_pin_resolves_to_its_own_rail() {
+        let s = summary(SCH).await;
+        assert_eq!(net_of(&s, "#PWR01", "1"), "GND");
+    }
+
+    /// A rail with no wire on it is still a net: the symbol declares it.
+    #[tokio::test]
+    async fn an_unwired_power_symbol_still_declares_its_net() {
+        let sch = SCH.replace(
+            "(wire (pts (xy 100 103.81) (xy 100 110)) (uuid \"w1\"))",
+            "",
+        );
+        let s = summary(&sch).await;
+        assert_eq!(net_of(&s, "R1", "2"), "~");
+        assert!(s["nets"].as_array().unwrap().iter().any(|n| n == "GND"));
+    }
 }

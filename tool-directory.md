@@ -171,7 +171,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_schematic_svg` | Export a schematic sheet to an SVG file using kicad-cli. |
 | `export_schematic_pdf` | Export a schematic sheet to a PDF file using kicad-cli. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
-| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
+| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |
