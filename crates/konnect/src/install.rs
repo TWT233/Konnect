@@ -47,12 +47,33 @@ impl FromStr for InstallClient {
     }
 }
 
-/// Parse `--client <claude|codex>`. Claude remains the default for compatibility.
+/// Parse `--client <claude|codex>` from a subcommand's arguments, refusing any
+/// argument this build does not recognise. Claude remains the default for
+/// compatibility.
+///
+/// Skipping unrecognised arguments is how `konnect init --help` came to run the
+/// installer (#238): `--help` was not `--client`, so it was dropped on the
+/// floor, the client defaulted to Claude, and a command that looks like
+/// documentation rewrote `~/.claude`. A misspelled flag has the same shape —
+/// it changes nothing the caller asked for and everything they did not.
 pub fn client_from_args(args: &[String]) -> Result<InstallClient> {
+    client_from_args_allowing(args, &[])
+}
+
+/// As [`client_from_args`], for the server invocation — which also carries
+/// `--config <path>`, parsed elsewhere in `main`.
+pub fn client_from_server_args(args: &[String]) -> Result<InstallClient> {
+    client_from_args_allowing(args, &["--config"])
+}
+
+/// `also` names options that take a value and that this parser should step
+/// over rather than reject.
+fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallClient> {
     let mut selected = None;
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--client" {
+        let arg = args[index].as_str();
+        if arg == "--client" {
             if selected.is_some() {
                 bail!("--client may only be specified once");
             }
@@ -61,8 +82,10 @@ pub fn client_from_args(args: &[String]) -> Result<InstallClient> {
                 .context("--client requires 'claude' or 'codex'")?;
             selected = Some(value.parse()?);
             index += 2;
+        } else if also.contains(&arg) {
+            index += 2;
         } else {
-            index += 1;
+            bail!("unrecognised argument '{arg}'; run 'konnect --help' for usage");
         }
     }
     Ok(selected.unwrap_or_default())
@@ -560,6 +583,56 @@ mod tests {
     #[test]
     fn client_argument_defaults_to_claude() {
         assert_eq!(client_from_args(&[]).unwrap(), InstallClient::Claude);
+    }
+
+    /// An argument this build does not understand stops the command instead of
+    /// being skipped on the way to a default.
+    ///
+    /// The skipping is what made `konnect init --help` install (#238), and the
+    /// same hole means a typo — `--cleint codex` — silently installs for
+    /// Claude, which is the surprising outcome for someone mid-way through
+    /// setting up Codex.
+    #[test]
+    fn an_unrecognised_argument_stops_the_command() {
+        for argv in [
+            vec!["--help".to_string()],
+            vec!["-h".to_string()],
+            vec!["--cleint".to_string(), "codex".to_string()],
+            vec![
+                "--client".to_string(),
+                "codex".to_string(),
+                "extra".to_string(),
+            ],
+        ] {
+            let error = client_from_args(&argv)
+                .expect_err(&format!("{argv:?} must not resolve to a client"));
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("unrecognised argument") || message.contains("unsupported client"),
+                "{argv:?}: {message}"
+            );
+        }
+    }
+
+    /// The server invocation carries `--config <path>`, which the bundled
+    /// `examples/*.json` tell users to write, so it must still parse.
+    #[test]
+    fn server_arguments_accept_config_and_still_reject_the_unknown() {
+        let with_config = vec![
+            "--config".to_string(),
+            "C:/konnect.json".to_string(),
+            "--client".to_string(),
+            "codex".to_string(),
+        ];
+        assert_eq!(
+            client_from_server_args(&with_config).unwrap(),
+            InstallClient::Codex
+        );
+        assert_eq!(
+            client_from_server_args(&["--config".to_string(), "C:/k.json".to_string()]).unwrap(),
+            InstallClient::Claude
+        );
+        assert!(client_from_server_args(&["--nope".to_string()]).is_err());
     }
 
     #[test]
