@@ -1862,6 +1862,25 @@ mod tests {
     }
 
     #[test]
+    fn refresh_refuses_an_unrepresentable_layer_before_building_the_update() {
+        let unsupported = LIBRARY_FOOTPRINT.replace("(layer \"F.SilkS\"))", "(layer \"In99.Cu\"))");
+        let library = parse_library_footprint("Test:Socket", &unsupported).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+
+        let error = build_updated_instance(
+            &current,
+            &library,
+            &BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("In99.Cu"), "{message}");
+        assert!(message.contains("request was not sent"), "{message}");
+    }
+
+    #[test]
     fn parser_rejects_lossy_graphic_and_pad_clauses() {
         let dashed = LIBRARY_FOOTPRINT.replace(
             "(stroke (width 0.12) (type solid))",

@@ -283,7 +283,10 @@ async fn handle_search_templates(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let query = args["query"].as_str().unwrap_or("").to_lowercase();
+    let query = match require_str(args, "query") {
+        Ok(v) => v.to_lowercase(),
+        Err(e) => return Ok(e),
+    };
     let category_filter = args["category"].as_str().map(|s| s.to_lowercase());
 
     info!(query = %query, category = ?category_filter, "Searching templates");

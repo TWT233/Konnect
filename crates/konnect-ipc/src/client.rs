@@ -1399,6 +1399,38 @@ impl KiCadIpcClient {
         let (library_nickname, entry_name) = lib_id
             .split_once(':')
             .context("footprint identifier must use Library:Footprint syntax")?;
+
+        // Refuse an unrepresentable layer here, before a single child is built.
+        //
+        // KiCAD 10.0.5 does not validate the scalar layer field on an incoming
+        // item: it indexes its layer bitset with whatever value arrives, so a
+        // `BL_UNDEFINED` is answered with an access violation that kills the
+        // process and takes the user's unsaved board with it (#237). There is
+        // no error to catch downstream — the transport just times out — so the
+        // check has to happen while a refusal is still possible.
+        crate::builders::try_layer_from_name(layer)
+            .with_context(|| format!("footprint '{lib_id}' cannot be placed"))?;
+        for pad in pads {
+            for name in &pad.layers {
+                // `*.Cu`/`*.Mask`/`*.Paste` are KiCAD's own wildcards, expanded
+                // below rather than mapped.
+                if name.starts_with("*.") {
+                    continue;
+                }
+                crate::builders::try_layer_from_name(name).with_context(|| {
+                    format!("footprint '{lib_id}' pad '{}' cannot be placed", pad.number)
+                })?;
+            }
+        }
+        for graphic in graphics {
+            crate::builders::try_layer_from_name(graphic.layer()).with_context(|| {
+                format!(
+                    "footprint '{lib_id}' has a {} this build cannot place",
+                    graphic.kind()
+                )
+            })?;
+        }
+
         let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
             // Field text positions come footprint-local from the library and
             // are transformed exactly like pads, so the placed part keeps the
@@ -2231,6 +2263,140 @@ mod footprint_graphics_tests {
                 &format!("build_footprint_item pad on {layer}"),
             );
         }
+    }
+
+    /// A `Dwgs.User` graphic is ordinary, official-library content and must
+    /// place — this is the exact shape that terminated KiCAD 10.0.5 in #237,
+    /// via `Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal`
+    /// (two such children) and
+    /// `Connector:BJB_Pico_46.110.1001_Receptacle_Horizontal` (eight).
+    #[test]
+    fn user_layer_graphics_reach_kicad_on_their_real_layer() {
+        let graphics = vec![
+            IpcGraphicDefinition::Line {
+                start: (0.0, 0.0),
+                end: (1.0, 0.0),
+                layer: "Dwgs.User".to_string(),
+                width: 0.1,
+            },
+            IpcGraphicDefinition::Text {
+                text: "PCB Edge".to_string(),
+                position: (0.0, 3.1),
+                rotation: 0.0,
+                layer: "Dwgs.User".to_string(),
+                size: 1.0,
+            },
+        ];
+        let client = KiCadIpcClient::new("tcp://never-dialed");
+        let any = client
+            .build_footprint_item(
+                "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+                "J1",
+                "USB_C",
+                &[],
+                &graphics,
+                &crate::types::IpcFieldPlacement::default(),
+                100.0,
+                100.0,
+                0.0,
+                "F.Cu",
+            )
+            .expect("a Dwgs.User graphic must place");
+
+        let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+        let undefined = kiapi::board::types::BoardLayer::BlUndefined as i32;
+        let drawings = kiapi::board::types::BoardLayer::BlDwgsUser as i32;
+        let mut seen = 0;
+        for item in &fp.definition.as_ref().unwrap().items {
+            let layer = if item.type_url.ends_with("BoardGraphicShape") {
+                kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                    .unwrap()
+                    .layer
+            } else if item.type_url.ends_with("BoardText") {
+                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                    .unwrap()
+                    .layer
+            } else {
+                continue;
+            };
+            if layer == drawings {
+                seen += 1;
+            }
+            assert_ne!(
+                layer, undefined,
+                "no child may carry BL_UNDEFINED — KiCAD crashes on it, it does not refuse it"
+            );
+        }
+        assert_eq!(seen, 2, "both Dwgs.User children must survive");
+    }
+
+    /// And a layer this build genuinely cannot represent is refused before any
+    /// item is constructed, rather than silently downgraded to `BL_UNDEFINED`.
+    ///
+    /// Widening `layer_from_name` fixed the layers KiCAD 10 has today; this is
+    /// what stops the next one KiCAD adds from crashing it again.
+    #[test]
+    fn an_unmappable_layer_refuses_the_whole_footprint() {
+        let client = KiCadIpcClient::new("tcp://never-dialed");
+        let build = |pads: &[IpcPadDefinition], graphics: &[IpcGraphicDefinition], layer: &str| {
+            client.build_footprint_item(
+                "Lib:Fp",
+                "R1",
+                "R",
+                pads,
+                graphics,
+                &crate::types::IpcFieldPlacement::default(),
+                0.0,
+                0.0,
+                0.0,
+                layer,
+            )
+        };
+
+        let graphic = vec![IpcGraphicDefinition::Line {
+            start: (0.0, 0.0),
+            end: (1.0, 1.0),
+            layer: "In99.Cu".to_string(),
+            width: 0.1,
+        }];
+        let error = format!(
+            "{:#}",
+            build(&[], &graphic, "F.Cu").expect_err("graphic layer")
+        );
+        assert!(error.contains("In99.Cu"), "{error}");
+        assert!(error.contains("fp_line"), "{error}");
+
+        let pad = vec![IpcPadDefinition {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            x: 0.0,
+            y: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            layers: vec!["Nope.Cu".to_string()],
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            roundrect_ratio: 0.0,
+            rotation: 0.0,
+        }];
+        let error = format!("{:#}", build(&pad, &[], "F.Cu").expect_err("pad layer"));
+        assert!(error.contains("Nope.Cu"), "{error}");
+
+        let error = format!(
+            "{:#}",
+            build(&[], &[], "Middle.Cu").expect_err("root layer")
+        );
+        assert!(error.contains("Middle.Cu"), "{error}");
+
+        // The wildcards KiCAD itself writes are expanded, not mapped, so they
+        // must keep working.
+        let through_hole = vec![IpcPadDefinition {
+            layers: vec!["*.Cu".to_string(), "*.Mask".to_string()],
+            ..pad[0].clone()
+        }];
+        assert!(build(&through_hole, &[], "F.Cu").is_ok());
     }
 }
 

@@ -375,9 +375,15 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     let mut p = McpProcess::spawn_in_dir(Some(tmp.path()));
 
     // route_trace is in pcb_routing, not loaded at startup. With auto-load on,
-    // the toolset loads, a list_changed notification fires, and the call
-    // reaches the handler's own missing-argument check (net_name) instead of
-    // failing with toolset_not_loaded.
+    // the toolset loads, a list_changed notification fires, and the call gets
+    // as far as argument validation instead of failing with
+    // toolset_not_loaded — which is what this test is about.
+    //
+    // The field named is `board`, the first entry in route_trace's own
+    // `required` list. This used to be `net_name`, whichever argument the
+    // handler happened to read first; since #218 the dispatch checks
+    // `required` in schema order before the handler runs, which is the order
+    // the client was shown.
     let lines = p.call_tool_then_fence("route_trace", json!({}));
     let r = lines
         .iter()
@@ -387,7 +393,7 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
     assert_eq!(r["isError"], json!(true));
     let body = McpProcess::tool_body(&r);
     assert_eq!(body["error"]["kind"], "invalid_argument");
-    assert_eq!(body["error"]["field"], "net_name");
+    assert_eq!(body["error"]["field"], "board");
 
     let saw_notification = lines.iter().any(|v| {
         v.get("method").and_then(Value::as_str) == Some("notifications/tools/list_changed")

@@ -38,10 +38,23 @@ pub fn net(name: &str, code: i32) -> kiapi::board::types::Net {
     }
 }
 
-/// Map a layer name string to the BoardLayer enum value.
+/// Map a layer name string to the BoardLayer enum value, or `BlUndefined` when
+/// this build has no representation for it.
+///
+/// Covers every layer a KiCAD 10 board or footprint can legally draw on. It
+/// used to stop at `In2.Cu` and omit the four user layers, the two adhesive
+/// layers, `Margin` and `Rescue`, so an ordinary official footprint with a
+/// `Dwgs.User` outline serialised as `BL_UNDEFINED` (#237).
+///
+/// Callers building a message for KiCAD want [`try_layer_from_name`] instead:
+/// `BL_UNDEFINED` is not something KiCAD rejects, it is something it crashes
+/// on.
 pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
     use kiapi::board::types::BoardLayer;
 
+    // `In1.Cu`..=`In30.Cu` are contiguous from `BL_F_Cu`, which is why they are
+    // computed rather than listed: `BL_F_Cu = 3`, `BL_In1_Cu = 4`, …,
+    // `BL_In30_Cu = 33` (board_types.proto).
     if let Some(number) = name
         .strip_prefix("In")
         .and_then(|value| value.strip_suffix(".Cu"))
@@ -51,6 +64,10 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
         return BoardLayer::try_from(BoardLayer::BlFCu as i32 + number)
             .unwrap_or(BoardLayer::BlUndefined);
     }
+    // `User.1`..=`User.45` are contiguous in two runs: `BL_User_1 = 53` …
+    // `BL_User_9 = 61`, then `BL_Rescue = 62` interrupts, and `BL_User_10 = 63`
+    // … `BL_User_45 = 98`. Stepping over that hole is the whole reason for the
+    // split.
     if let Some(number) = name
         .strip_prefix("User.")
         .and_then(|value| value.parse::<i32>().ok())
@@ -67,8 +84,8 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
     match name {
         "F.Cu" => BoardLayer::BlFCu,
         "B.Cu" => BoardLayer::BlBCu,
-        "F.Adhes" => BoardLayer::BlFAdhes,
-        "B.Adhes" => BoardLayer::BlBAdhes,
+        "F.Adhes" | "F.Adhesive" => BoardLayer::BlFAdhes,
+        "B.Adhes" | "B.Adhesive" => BoardLayer::BlBAdhes,
         "F.SilkS" | "F.Silkscreen" => BoardLayer::BlFSilkS,
         "B.SilkS" | "B.Silkscreen" => BoardLayer::BlBSilkS,
         "F.Mask" => BoardLayer::BlFMask,
@@ -79,10 +96,10 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
         "B.CrtYd" | "B.Courtyard" => BoardLayer::BlBCrtYd,
         "F.Fab" => BoardLayer::BlFFab,
         "B.Fab" => BoardLayer::BlBFab,
-        "Dwgs.User" => BoardLayer::BlDwgsUser,
-        "Cmts.User" => BoardLayer::BlCmtsUser,
-        "Eco1.User" => BoardLayer::BlEco1User,
-        "Eco2.User" => BoardLayer::BlEco2User,
+        "Dwgs.User" | "User.Drawings" => BoardLayer::BlDwgsUser,
+        "Cmts.User" | "User.Comments" => BoardLayer::BlCmtsUser,
+        "Eco1.User" | "User.Eco1" => BoardLayer::BlEco1User,
+        "Eco2.User" | "User.Eco2" => BoardLayer::BlEco2User,
         "Edge.Cuts" => BoardLayer::BlEdgeCuts,
         "Margin" => BoardLayer::BlMargin,
         "Rescue" => BoardLayer::BlRescue,
@@ -90,26 +107,21 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
     }
 }
 
-/// Return the same physical layer on the opposite board side.
-pub fn opposite_layer(layer: kiapi::board::types::BoardLayer) -> kiapi::board::types::BoardLayer {
-    use kiapi::board::types::BoardLayer;
-
-    match layer {
-        BoardLayer::BlFCu => BoardLayer::BlBCu,
-        BoardLayer::BlBCu => BoardLayer::BlFCu,
-        BoardLayer::BlFAdhes => BoardLayer::BlBAdhes,
-        BoardLayer::BlBAdhes => BoardLayer::BlFAdhes,
-        BoardLayer::BlFPaste => BoardLayer::BlBPaste,
-        BoardLayer::BlBPaste => BoardLayer::BlFPaste,
-        BoardLayer::BlFSilkS => BoardLayer::BlBSilkS,
-        BoardLayer::BlBSilkS => BoardLayer::BlFSilkS,
-        BoardLayer::BlFMask => BoardLayer::BlBMask,
-        BoardLayer::BlBMask => BoardLayer::BlFMask,
-        BoardLayer::BlFCrtYd => BoardLayer::BlBCrtYd,
-        BoardLayer::BlBCrtYd => BoardLayer::BlFCrtYd,
-        BoardLayer::BlFFab => BoardLayer::BlBFab,
-        BoardLayer::BlBFab => BoardLayer::BlFFab,
-        other => other,
+/// As [`layer_from_name`], but refusing a name this build cannot represent.
+///
+/// Use this on every path that puts a layer into a message bound for KiCAD.
+/// KiCAD 10.0.5 does not validate a scalar layer field: it indexes its layer
+/// bitset with whatever arrives, so `BL_UNDEFINED` is not received as an error
+/// but as an access violation that terminates the process and discards the
+/// user's unsaved board (#237). An unrepresentable layer has to stop here,
+/// where it can still be reported, rather than downstream where it cannot.
+pub fn try_layer_from_name(name: &str) -> anyhow::Result<kiapi::board::types::BoardLayer> {
+    match layer_from_name(name) {
+        kiapi::board::types::BoardLayer::BlUndefined => anyhow::bail!(
+            "layer '{name}' has no KiCAD board layer this build can represent, so the \
+             request was not sent"
+        ),
+        layer => Ok(layer),
     }
 }
 
@@ -435,38 +447,70 @@ pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
 
+    /// Every layer a KiCAD 10 footprint may legally draw on has a `BoardLayer`.
+    ///
+    /// `Dwgs.User` is the one that mattered: two official library footprints
+    /// (`Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal`
+    /// and `Connector:BJB_Pico_46.110.1001_Receptacle_Horizontal`) carry
+    /// `Dwgs.User` children, this map returned `BL_UNDEFINED` for them, and
+    /// KiCAD 10.0.5 faults consuming that value rather than refusing the
+    /// message — taking the user's unsaved board with it (#237).
     #[test]
-    fn layer_mapping_covers_footprint_drawing_layers() {
+    fn every_footprint_drawing_layer_maps_to_a_real_board_layer() {
         use kiapi::board::types::BoardLayer;
 
-        assert_eq!(layer_from_name("Dwgs.User"), BoardLayer::BlDwgsUser);
-        assert_eq!(layer_from_name("Cmts.User"), BoardLayer::BlCmtsUser);
-        assert_eq!(layer_from_name("F.Adhes"), BoardLayer::BlFAdhes);
-        assert_eq!(layer_from_name("B.Adhes"), BoardLayer::BlBAdhes);
-        assert_eq!(layer_from_name("User.1"), BoardLayer::BlUser1);
-        assert_eq!(layer_from_name("User.45"), BoardLayer::BlUser45);
+        for (name, expected) in [
+            ("Dwgs.User", BoardLayer::BlDwgsUser),
+            ("Cmts.User", BoardLayer::BlCmtsUser),
+            ("Eco1.User", BoardLayer::BlEco1User),
+            ("Eco2.User", BoardLayer::BlEco2User),
+            ("F.Adhes", BoardLayer::BlFAdhes),
+            ("B.Adhes", BoardLayer::BlBAdhes),
+            ("Margin", BoardLayer::BlMargin),
+            ("Rescue", BoardLayer::BlRescue),
+        ] {
+            assert_eq!(layer_from_name(name), expected, "{name}");
+        }
     }
 
+    /// Inner copper and user layers are numbered, not enumerable by hand: a
+    /// board may have up to `In30.Cu`, and `User.1`–`User.45` exist too. The
+    /// enum is contiguous for both runs *except* that `BL_Rescue = 62` sits
+    /// between `BL_User_9 = 61` and `BL_User_10 = 63`.
     #[test]
-    fn opposite_layer_pairs_front_and_back_technical_layers() {
+    fn numbered_copper_and_user_layers_step_over_the_rescue_hole() {
         use kiapi::board::types::BoardLayer;
 
-        for (front, back) in [
-            (BoardLayer::BlFCu, BoardLayer::BlBCu),
-            (BoardLayer::BlFAdhes, BoardLayer::BlBAdhes),
-            (BoardLayer::BlFPaste, BoardLayer::BlBPaste),
-            (BoardLayer::BlFSilkS, BoardLayer::BlBSilkS),
-            (BoardLayer::BlFMask, BoardLayer::BlBMask),
-            (BoardLayer::BlFCrtYd, BoardLayer::BlBCrtYd),
-            (BoardLayer::BlFFab, BoardLayer::BlBFab),
-        ] {
-            assert_eq!(opposite_layer(front), back);
-            assert_eq!(opposite_layer(back), front);
+        assert_eq!(layer_from_name("In1.Cu"), BoardLayer::BlIn1Cu);
+        assert_eq!(layer_from_name("In3.Cu"), BoardLayer::BlIn3Cu);
+        assert_eq!(layer_from_name("In30.Cu"), BoardLayer::BlIn30Cu);
+        assert_eq!(layer_from_name("User.1"), BoardLayer::BlUser1);
+        assert_eq!(layer_from_name("User.9"), BoardLayer::BlUser9);
+        assert_eq!(layer_from_name("User.10"), BoardLayer::BlUser10);
+        assert_eq!(layer_from_name("User.45"), BoardLayer::BlUser45);
+
+        // Out of range on either side stays unrepresentable rather than
+        // wrapping onto an unrelated layer.
+        for out_of_range in ["In0.Cu", "In31.Cu", "User.0", "User.46"] {
+            assert_eq!(
+                layer_from_name(out_of_range),
+                BoardLayer::BlUndefined,
+                "{out_of_range}"
+            );
         }
-        assert_eq!(
-            opposite_layer(BoardLayer::BlDwgsUser),
-            BoardLayer::BlDwgsUser
-        );
+    }
+
+    /// A name with no `BoardLayer` is refused rather than converted to
+    /// `BL_UNDEFINED`, because nothing downstream of here can tell the two
+    /// apart and KiCAD does not validate the field.
+    #[test]
+    fn an_unrepresentable_layer_is_refused_not_silently_undefined() {
+        assert!(try_layer_from_name("F.Cu").is_ok());
+        assert!(try_layer_from_name("Dwgs.User").is_ok());
+
+        let error = try_layer_from_name("Not.A.Layer").expect_err("must refuse");
+        let message = format!("{error:#}");
+        assert!(message.contains("Not.A.Layer"), "{message}");
     }
 
     #[test]

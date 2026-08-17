@@ -42,16 +42,56 @@ Alternative: launching the server from within KiCAD sets `KICAD_API_SOCKET`
 automatically, and a `konnect-settings.json` passed via `--config` can carry
 `ipc_socket_path` directly.
 
-## PCB tools return "IPC connect failed" / "No PCB document is open"
+## PCB tools return "KiCAD must be running with the board loaded"
 
 The IPC tools talk to KiCAD's **running PCB editor**. Open your board file in
 KiCAD first, and make sure the API is enabled (previous section).
+
+That message means the transport was unreachable. If KiCAD *is* running with
+that board open and a tool still refuses, the error you get back is the tool's
+own reason — "a polygon needs at least 3 points", "requested board … is not open
+in KiCAD" — and it names what to change about the request.
+
+## "layer 'X' has no KiCAD board layer this build can represent"
+
+The footprint or request names a layer this build cannot map, so the request was
+refused before anything was sent. Nothing on the board changed.
+
+This refusal exists because the alternative is worse. KiCAD 10.0.5 does not
+validate the layer field on an incoming item, so an unrepresentable value used
+to reach it and **terminate the process**, discarding any unsaved board
+([#237](https://github.com/mixelpixx/Konnect/issues/237)). Konnect now stops at
+its own boundary instead.
+
+Every layer a KiCAD 10 footprint can legally draw on is supported, including
+`Dwgs.User`, `Cmts.User`, `Eco1/2.User`, `F/B.Adhes`, `Margin`, `Rescue`,
+`In1.Cu`–`In30.Cu` and `User.1`–`User.45`. If you hit this on stock library
+content, that is a bug worth reporting with the footprint name — the message
+names the layer and the item.
+
+**If you are on v0.6.0 or earlier**, placing
+`Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal` or
+`Connector:BJB_Pico_46.110.1001_Receptacle_Horizontal` can kill KiCAD outright.
+Update to v0.6.1 or later.
+
+## A closed-board edit landed after KiCAD crashed
+
+`place_component`, `move_component` and `rotate_component` edit the board file
+directly when the IPC transport is unreachable, which is safe when KiCAD was
+never running.
+
+They cannot currently tell that from "KiCAD died a second ago holding this
+board" — the transport looks identical
+([#240](https://github.com/mixelpixx/Konnect/issues/240)). If KiCAD crashes or
+is force-quit mid-session, the next such call may edit the file behind it and
+report success. Reopen the board and check before continuing, and prefer
+reopening KiCAD first.
 
 ## "kicad-cli not found"
 
 Common install paths are auto-detected (including the Windows registry). If
 your install is somewhere unusual, set the path in the plugin settings dialog
-or in `konnect-settings.json` (`kicad_cli`).
+in a `settings.json` beside the binary, or in a `konnect.toml` in the working directory (`kicad_cli`). Discovery order is `konnect.toml` and `settings.json` in the CWD, then `settings.json` next to the binary and one level up, then the platform config dir. A file under any other name is only read when passed with `--config`.
 
 ## Transaction recovery is blocked by divergent content
 
@@ -128,8 +168,9 @@ The fix for those clients is to make the *first* listing complete:
 { "eager_toolsets": true }
 ```
 
-in `konnect-settings.json` (or `konnect.toml`). Every toolset is then loaded at
-startup, so `tools/list` carries all 209 tools from the first call.
+in `konnect.toml` in the working directory, or a `settings.json` beside the
+binary. Every toolset is then loaded at startup, so `tools/list` carries all
+210 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
 25K tokens per listing instead of ~2K. Turn it on only if your client needs it.

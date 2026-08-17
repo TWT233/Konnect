@@ -6,7 +6,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, require_array, ToolContext, ToolDef};
 use serde_json::json;
 use tokio::task;
 
@@ -519,14 +519,19 @@ async fn handle_export_dxf(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let output_dir = get_path(args, "output_dir")?;
-    let layers: Vec<String> = args["layers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Required here, unlike `export_pdf`/`export_svg` where it is genuinely
+    // optional. An omitted `layers` became an empty vec, and `cli.rs` only
+    // passes `--layers` when the list is non-empty — so the flag vanished from
+    // the kicad-cli command line and kicad-cli applied its own default layer
+    // set. Files appeared in `output_dir` and the tool reported success for an
+    // export nobody specified (#218).
+    let layers: Vec<String> = match require_array(args, "layers") {
+        Ok(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        Err(e) => return Ok(e),
+    };
     let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_str()).collect();
 
     tokio::fs::create_dir_all(&output_dir).await?;
@@ -807,5 +812,91 @@ mod new_export_format_tests {
             "compression": "zip"
         });
         assert!(handle_export_odb(&args, &ctx).await.is_err());
+    }
+}
+
+/// `export_dxf` declares `layers` required and defaulted it to an empty list.
+/// `cli.rs` only passes `--layers` when the list is non-empty, so the flag
+/// vanished from the kicad-cli command line entirely and kicad-cli applied its
+/// own default layer set — a different export than the one asked for, reported
+/// as success (#218).
+///
+/// `export_pdf` and `export_svg` share the same reading code but declare
+/// `layers` optional, and must keep accepting its absence.
+#[cfg(test)]
+mod required_layers_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    fn schema_requires(tool_name: &str, key: &str) -> bool {
+        tools()
+            .into_iter()
+            .find(|t| t.name == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} is registered"))
+            .input_schema["required"]
+            .as_array()
+            .map(|r| r.iter().any(|v| v.as_str() == Some(key)))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn export_dxf_refuses_a_missing_layers_argument() {
+        assert!(schema_requires("export_dxf", "layers"));
+        let dir = tempfile::tempdir().unwrap();
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "export_dxf")
+            .expect("registered");
+        let result = (def.handler)(
+            &json!({
+                "board": dir.path().join("b.kicad_pcb").display().to_string(),
+                "output_dir": dir.path().join("out").display().to_string(),
+            }),
+            ctx(),
+        )
+        .await
+        .expect("no anyhow");
+
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(parsed["error"]["kind"], "invalid_argument");
+        assert_eq!(parsed["error"]["field"], "layers");
+        assert!(
+            !dir.path().join("out").exists(),
+            "a refused export must not create its output directory"
+        );
+    }
+
+    /// The neighbouring exporters read `layers` the same way but do not require
+    /// it. Requiring it there would break every caller that omits it today.
+    #[test]
+    fn export_pdf_and_svg_keep_layers_optional() {
+        for tool_name in ["export_pdf", "export_svg", "export_gerber"] {
+            assert!(
+                !schema_requires(tool_name, "layers"),
+                "{tool_name} must keep `layers` optional"
+            );
+        }
     }
 }

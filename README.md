@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**203 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
+**204 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -53,8 +53,9 @@ Konnect, a tool call is a function call. One process, one language, no plumbing.
 **The dependency surface was enormous.** Running the original means carrying Node.js
 and its npm tree, Python and its pip packages, wxPython, kicad-skip, and KiCAD's
 SWIG bindings — two package ecosystems plus a binding layer, every one of them a
-moving target that can break an install. Konnect is a single static binary, about
-5 MB. There is nothing to install alongside it and nothing to version-match.
+moving target that can break an install. Konnect is a single static binary —
+20–25 MB depending on platform, a ~9 MB download. There is nothing to install
+alongside it and nothing to version-match.
 
 **SWIG is a dead end.** The original's PCB backend depends on KiCAD's SWIG Python
 bindings, which KiCAD is deprecating in favor of its IPC API. SWIG also carried
@@ -69,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 203 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 204 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -163,6 +164,12 @@ Claude remains the default when `--client` is omitted. The installer tracks the
 two clients independently, and a Codex install does not create or modify
 `~/.claude`.
 
+`--help` on any subcommand prints that subcommand's usage and writes nothing —
+`konnect init --help` describes the installer rather than running it. An
+argument Konnect does not recognise is an error rather than being ignored, so a
+typo such as `--cleint codex` stops instead of quietly installing for the
+default client.
+
 ### macOS
 
 The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships
@@ -205,9 +212,8 @@ Claude Desktop's config lives at
 
 For Claude Code, put the same snippet in a `.mcp.json` in your project root.
 
-Starting with the next release, the PCM package for macOS
-(`konnect-pcm-v<version>-macos.zip`) bundles a universal server binary; for
-v0.1.3 and earlier, install via a release tarball or a source build. The schematic
+The macOS PCM package (`konnect-pcm-v<version>-macos.zip`) bundles a universal
+server binary, so one download covers Apple Silicon and Intel. The schematic
 viewer compiles and launches on macOS (Tauri 2 uses the system WKWebView —
 WebView2 is only a Windows requirement) but hasn't had the same mileage as
 the Windows build yet.
@@ -263,7 +269,10 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
-  `place_component` can safely fall back to a closed board file when IPC is unreachable.
+  `place_component`, `move_component`, and `rotate_component` can safely fall
+  back to a closed board file when IPC is unreachable. `flip_component`
+  intentionally requires a closed board because KiCAD IPC has no native
+  footprint-flip command.
 
 ## License: free for the little guys
 
@@ -285,7 +294,7 @@ the architecture it proved, rebuilt for production:
 
 | | KiCAD-MCP-Server | Konnect |
 |---|---|---|
-| Runtime | Node.js + Python + SWIG bindings | Single static binary (~5 MB) |
+| Runtime | Node.js + Python + SWIG bindings | Single static binary (20–25 MB) |
 | Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
 | Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
@@ -298,13 +307,21 @@ the architecture it proved, rebuilt for production:
 **Plugin doesn't appear in KiCAD** — install via the Plugin and Content Manager (not
 manual copy), then restart KiCAD.
 
-**PCB tools return "IPC connect failed"** — open KiCAD with your board file first;
-most PCB tools talk to the running PCB editor. `place_component` alone can fall
-back to a closed board file when no KiCAD process is reachable.
+**PCB tools return "KiCAD must be running with the board loaded"** — open KiCAD
+with that board first; most PCB tools talk to the running PCB editor. Only an
+unreachable KiCAD produces that message: if KiCAD is running and the tool
+refuses anyway, the error is the tool's own reason for refusing.
+`place_component`, `move_component`, and `rotate_component` can fall back to a
+closed board file when no KiCAD process is reachable; `flip_component`
+requires one, and refuses while KiCAD holds that board open.
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
+that don't appear after `load_toolset`, and transaction recovery.
 
 **"kicad-cli not found"** — common install paths are auto-detected; set the path
-explicitly in the plugin settings dialog or your `konnect-settings.json` if yours
-is elsewhere.
+explicitly in the plugin settings dialog, in a `settings.json` beside the binary,
+or in a `konnect.toml` in the working directory. (A file under any other name
+works only when passed with `--config`.)
 
 ## Support
 

@@ -200,6 +200,145 @@ fn counts_in(line: &str) -> Vec<usize> {
     out
 }
 
+/// No file quotes a stale **toolset** count.
+///
+/// The catalogue-total sweep above only looks at three-digit numbers, so a
+/// two-digit toolset count slips past it by construction. That is exactly how
+/// `packaging/metadata.json` and `router/meta_tools.rs` both sat at "18
+/// toolsets" through a release that shipped 19 — the number users read in the
+/// PCM description, and the number the router's own module doc claims.
+///
+/// Counted separately from tools because the plural noun differs, and because
+/// a toolset count is small enough that no digit-width heuristic can separate
+/// it from an unrelated number.
+#[test]
+fn no_file_quotes_a_stale_toolset_count() {
+    let (toolsets, _, _) = counts();
+
+    let mut stale = Vec::new();
+
+    // The router's own doc comments make this claim too — `meta_tools.rs` said
+    // "all 18 toolsets" — so sweep those sources alongside the documents.
+    for path in text_files(&repo_root()).into_iter().chain(rust_sources(
+        &repo_root().join("crates/konnect-core/src/router"),
+    )) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            for n in counts_before(line, "toolset") {
+                if n != toolsets {
+                    let rel = path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string()
+                        .replace('\\', "/");
+                    stale.push(format!(
+                        "{rel}:{}: says \"{n} toolset(s)\" — the registry defines {toolsets}",
+                        lineno + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "a file quotes a toolset count the registry does not support:\n  {}",
+        stale.join("\n  ")
+    );
+}
+
+/// Every `### \`toolset\` · N tools` heading in `tool-directory.md` matches that
+/// toolset's `tool_count`.
+///
+/// `sch_components` shipped a release reading "19 tools" over a table of 20
+/// rows. Both the file's own overview (202) and the registry (20) disagreed
+/// with it, and nothing noticed: the catalogue sweep ignores two-digit numbers,
+/// and `tool_directory_lists_every_registered_tool` only checks that each tool
+/// appears *somewhere* in the file, not that the section headings add up.
+#[test]
+fn tool_directory_section_headings_match_the_registry() {
+    let directory = read("tool-directory.md");
+    let mut wrong = Vec::new();
+    let mut seen = 0usize;
+
+    for (lineno, line) in directory.lines().enumerate() {
+        let Some(rest) = line.strip_prefix("### `") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once('`') else {
+            continue;
+        };
+        let Some(meta) = registry::ALL_TOOLSETS.iter().find(|ts| ts.name == name) else {
+            continue; // a heading that is not a toolset
+        };
+        seen += 1;
+        let claimed: Option<usize> = tail
+            .split_whitespace()
+            .find_map(|word| word.parse::<usize>().ok());
+        match claimed {
+            Some(n) if n == meta.tool_count => {}
+            Some(n) => wrong.push(format!(
+                "tool-directory.md:{}: `{name}` heading says {n} tools, registry says {}",
+                lineno + 1,
+                meta.tool_count
+            )),
+            None => wrong.push(format!(
+                "tool-directory.md:{}: `{name}` heading states no tool count",
+                lineno + 1
+            )),
+        }
+    }
+
+    assert_eq!(
+        seen,
+        registry::ALL_TOOLSETS.len(),
+        "tool-directory.md should have one section heading per toolset"
+    );
+    assert!(
+        wrong.is_empty(),
+        "tool-directory.md section headings disagree with the registry:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// `.rs` files under `dir`, for the doc-comment sweeps.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Numbers written immediately before `noun` (matching its plural too).
+fn counts_before(line: &str, noun: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (at, _) in line.match_indices(noun) {
+        let before = line[..at].trim_end();
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(n) = digits.chars().rev().collect::<String>().parse::<usize>() {
+            out.push(n);
+        }
+    }
+    out
+}
+
 /// The meta-tool count is quoted in prose too, and it moves far less often —
 /// which is exactly why a change to it is easy to forget. PR #176 proposes
 /// taking it from 6 to 7.

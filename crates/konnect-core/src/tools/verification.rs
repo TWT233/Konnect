@@ -5,7 +5,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -576,12 +576,22 @@ async fn handle_copy_routing_pattern(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let src_x1 = args["src_x1"].as_f64().unwrap_or(0.0);
-    let src_y1 = args["src_y1"].as_f64().unwrap_or(0.0);
-    let src_x2 = args["src_x2"].as_f64().unwrap_or(0.0);
-    let src_y2 = args["src_y2"].as_f64().unwrap_or(0.0);
-    let dest_x = args["dest_x"].as_f64().unwrap_or(0.0);
-    let dest_y = args["dest_y"].as_f64().unwrap_or(0.0);
+    // All six are schema-required and each defaulted to 0.0. Omitting them all
+    // was harmless — the source box collapsed to a point and matched nothing —
+    // but a *partial* omission was not: drop only `dest_x`/`dest_y` and the
+    // whole source region is duplicated onto the board origin and written to
+    // the .kicad_pcb, reported as `{"copied": N}` (#218).
+    let mut coords = [0.0f64; 6];
+    for (slot, key) in coords
+        .iter_mut()
+        .zip(["src_x1", "src_y1", "src_x2", "src_y2", "dest_x", "dest_y"])
+    {
+        match require_f64(args, key) {
+            Ok(v) => *slot = v,
+            Err(e) => return Ok(e),
+        }
+    }
+    let [src_x1, src_y1, src_x2, src_y2, dest_x, dest_y] = coords;
 
     let dx = dest_x - src_x1;
     let dy = dest_y - src_y1;
@@ -984,5 +994,84 @@ mod tests {
         assert!(rules.contains("(constraint clearance (min 0.25mm))"));
         assert!(rules.contains("(constraint track_width (min 0.25mm))"));
         assert!(rules.contains("(layer \"F.Cu\")"));
+    }
+}
+
+/// `copy_routing_pattern` declares all six coordinates required and defaulted
+/// each to 0.0. Omitting all six was harmless — the source box collapsed to a
+/// point and matched nothing — but omitting only the destination silently
+/// duplicated the whole source region onto the board origin and wrote it,
+/// reporting `{"copied": N}` (#218).
+#[cfg(test)]
+mod required_coordinate_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn ctx() -> Arc<ToolContext> {
+        Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn every_missing_coordinate_is_refused_by_name_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        let original = "(kicad_pcb\n  (version 20250610)\n  (generator \"konnect\")\n  \
+                        (paper \"A4\")\n  (net 0 \"\")\n)\n";
+        std::fs::write(&board, original).unwrap();
+
+        let all = [
+            ("src_x1", 1.0),
+            ("src_y1", 2.0),
+            ("src_x2", 3.0),
+            ("src_y2", 4.0),
+            ("dest_x", 5.0),
+            ("dest_y", 6.0),
+        ];
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "copy_routing_pattern")
+            .expect("registered");
+
+        // Leave out exactly one each time: the partial omission is the case
+        // that used to write.
+        for (omitted, _) in all {
+            let mut args = json!({ "board": board.display().to_string() });
+            for (key, value) in all {
+                if key != omitted {
+                    args[key] = json!(value);
+                }
+            }
+            let result = (def.handler)(&args, ctx()).await.expect("no anyhow");
+            assert!(result.is_error, "omitting {omitted} must be refused");
+
+            let text = match result.content.first() {
+                Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(parsed["error"]["kind"], "invalid_argument", "{omitted}");
+            assert_eq!(
+                parsed["error"]["field"], omitted,
+                "the refusal must name the coordinate that is missing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&board).unwrap(),
+                original,
+                "a refused copy must not touch the board"
+            );
+        }
     }
 }

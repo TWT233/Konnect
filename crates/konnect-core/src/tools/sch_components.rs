@@ -8,7 +8,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
     find_all_symbol_instance_blocks, find_symbol_instance_block, get_path, opt_f64, opt_str,
-    reembed_lib_symbols, require_f64, require_str, ReembedOutcome, ToolContext, ToolDef,
+    reembed_lib_symbols, require_array, require_f64, require_str, ReembedOutcome, ToolContext,
+    ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
@@ -1252,14 +1253,15 @@ async fn handle_batch_get_pin_locations(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let refs = args["references"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // Required by the schema. Defaulting it returned `{"components": []}` —
+    // indistinguishable from "none of your references exist" (#218).
+    let refs = match require_array(args, "references") {
+        Ok(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>(),
+        Err(e) => return Ok(e),
+    };
 
     let (_, tree) = read_schematic(&sch_path)?; // single read
     let instances = extract_symbol_instances(&tree);

@@ -8,7 +8,7 @@ use crate::tools::ToolDef;
 
 /// Toolsets auto-loaded when the server starts.
 ///
-/// Kept minimal so that baseline `tools/list` context stays small (~19 tools
+/// Kept minimal so that baseline `tools/list` context stays small (20 tools
 /// including meta-tools ≈ 2K tokens). The LLM expands its toolbelt on demand
 /// via `load_toolset(...)`.
 ///
@@ -74,9 +74,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, refresh, move, rotate, align, and duplicate PCB footprints",
+        description: "Place, refresh, move, rotate, flip, align and duplicate PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 16,
+        tool_count: 17,
     },
     ToolsetMeta {
         name: "pcb_routing",
@@ -92,7 +92,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library",
-        description: "Symbol libraries, footprint libraries, search and registration",
+        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
         tool_count: 17,
     },
@@ -104,7 +104,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "verification",
-        description: "ERC, DRC, design rules, KiCAD UI control",
+        description: "DRC, design rules, layer constraints, clearance checks, KiCAD UI control (ERC is in sch_export)",
         category: "verification",
         tool_count: 8,
     },
