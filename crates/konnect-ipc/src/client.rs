@@ -1158,6 +1158,9 @@ impl KiCadIpcClient {
             .map(|d| d.items.clone())
             .unwrap_or_default()
         {
+            if !crate::builders::any_is(any, "kiapi.board.types.BoardGraphicShape") {
+                continue;
+            }
             let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice())
             else {
                 continue;
@@ -1222,6 +1225,21 @@ impl KiCadIpcClient {
             .ok_or_else(|| anyhow::anyhow!("footprint '{}' carries no definition", reference))?;
 
         for any in definition.items.iter_mut() {
+            // Discriminate before decoding. A pad decodes happily as a
+            // `BoardGraphicShape`, so this loop was selecting candidates the
+            // same way `apply_footprint_fields` did when it destroyed every
+            // footprint's artwork (#244).
+            //
+            // Measured, so as not to overstate it: today the pad cannot
+            // actually reach the write. `Pad.id` is tag 1 and
+            // `BoardGraphicShape.id` is tag 4, so a pad's KIID does *not* land
+            // in `shape.id`, the uuid never matches, and the geometry guard
+            // would refuse it anyway. Both of those are accidents of the
+            // current schema. The check makes the safety a property of this
+            // code instead of of KiCad's field numbering.
+            if !crate::builders::any_is(any, "kiapi.board.types.BoardGraphicShape") {
+                continue;
+            }
             let Ok(mut shape) =
                 kiapi::board::types::BoardGraphicShape::decode(any.value.as_slice())
             else {

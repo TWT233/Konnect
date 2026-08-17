@@ -828,3 +828,141 @@ fn record_doc(
         }
     }
 }
+
+// --- #244: a pad must never be mistaken for a graphic --------------------
+
+/// A footprint carrying one pad and one silkscreen line, both with KIIDs, as
+/// KiCad would send it.
+fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_types::Any {
+    let client = KiCadIpcClient::new("inproc://not-connected");
+    let item = client
+        .build_footprint_item(
+            "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+            "U1",
+            "NE555",
+            &[konnect_ipc::IpcPadDefinition {
+                number: "1".to_string(),
+                pad_type: "smd".to_string(),
+                shape: "rect".to_string(),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                size_x: 1.0,
+                size_y: 1.0,
+                drill_x: None,
+                drill_y: None,
+                drill_oval: false,
+                layers: vec!["F.Cu".to_string()],
+                roundrect_ratio: 0.0,
+            }],
+            &[konnect_ipc::IpcGraphicDefinition::Poly {
+                points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
+                layer: "F.SilkS".to_string(),
+                width: 0.12,
+                filled: false,
+            }],
+            &konnect_ipc::IpcFieldPlacement::default(),
+            10.0,
+            10.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
+
+    let mut fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+    for child in &mut fp.definition.as_mut().unwrap().items {
+        let id = Some(kiapi::common::types::Kiid {
+            value: if builders::any_is(child, "kiapi.board.types.Pad") {
+                pad_uuid.to_string()
+            } else {
+                line_uuid.to_string()
+            },
+        });
+        if builders::any_is(child, "kiapi.board.types.Pad") {
+            let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+            pad.id = id;
+            *child = builders::pack_any(&pad, "kiapi.board.types.Pad");
+        } else if builders::any_is(child, "kiapi.board.types.BoardGraphicShape") {
+            let mut shape =
+                kiapi::board::types::BoardGraphicShape::decode(child.value.as_slice()).unwrap();
+            shape.id = id;
+            *child = builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape");
+        }
+    }
+    builders::pack_any(&fp, "kiapi.board.types.FootprintInstance")
+}
+
+/// Asking to edit a graphic by a *pad's* uuid must refuse, and must not send
+/// an UpdateItems — while the real graphic on the same footprint stays
+/// editable, so the refusal is selective and not a blanket failure.
+///
+/// Note what this does and does not prove. It passes with #244's type-URL
+/// check removed, because `Pad.id` is tag 1 and `BoardGraphicShape.id` is
+/// tag 4: a pad's KIID does not land in `shape.id`, so the uuid never matches
+/// and the pad is unreachable by this path today anyway. The type check is
+/// there so that stays true when KiCad renumbers a field, and this test pins
+/// the caller-visible contract rather than the guard.
+#[test]
+fn a_pads_uuid_is_never_accepted_as_a_graphic_to_edit() {
+    let updates: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let seen = updates.clone();
+    let mock = spawn_mock(move |request| {
+        let message = request.message.expect("request must pack a command");
+        if message.type_url.ends_with("GetOpenDocuments") {
+            return Some(open_board_response());
+        }
+        if message.type_url.ends_with("GetItems") {
+            let response = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: vec![footprint_with_a_pad_and_a_line("pad-kiid", "line-kiid")],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.GetItemsResponse",
+            )));
+        }
+        if message.type_url.ends_with("UpdateItems") {
+            *seen.lock().unwrap() += 1;
+            let response = kiapi::common::commands::UpdateItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: None,
+                }],
+            };
+            return Some(reply_with(builders::pack_any(
+                &response,
+                "kiapi.common.commands.UpdateItemsResponse",
+            )));
+        }
+        Some(ok_response())
+    });
+
+    let client = KiCadIpcClient::new(&mock.url);
+    let error = client
+        .set_footprint_graphic_points("U1", "pad-kiid", &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)])
+        .expect_err("a pad is not a graphic")
+        .to_string();
+
+    assert!(
+        error.contains("pad-kiid") && error.contains("not found"),
+        "must refuse by uuid: {error}"
+    );
+    assert_eq!(
+        *updates.lock().unwrap(),
+        0,
+        "a refused edit must not write to the board"
+    );
+
+    // The real graphic on the same footprint still resolves, so the guard
+    // refuses the pad rather than refusing everything.
+    client
+        .set_footprint_graphic_points("U1", "line-kiid", &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)])
+        .expect("the actual graphic is still editable");
+    assert_eq!(*updates.lock().unwrap(), 1);
+}

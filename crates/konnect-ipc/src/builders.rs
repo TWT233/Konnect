@@ -219,6 +219,33 @@ pub fn pack_any<M: prost::Message>(msg: &M, type_name: &str) -> prost_types::Any
     }
 }
 
+/// Whether a packed `Any` carries the named KiCAD message type.
+///
+/// A footprint definition keeps its pads, graphic shapes, text, fields and
+/// zones in **one** repeated `Any` field, so anything picking a particular kind
+/// out of that list has to discriminate first — and the only honest
+/// discriminator is the type URL.
+///
+/// Decoding is not a discriminator. proto3 skips field numbers it does not
+/// recognise instead of failing, so a `BoardGraphicShape` decodes cleanly as a
+/// near-empty `Pad`. Code that used `Pad::decode(...)` as its filter therefore
+/// accepted every graphic in the footprint and wrote each one back *as a pad*,
+/// which is how `update_pcb_from_schematic` silently destroyed the artwork of
+/// every footprint it touched (#244).
+pub fn any_is(item: &prost_types::Any, type_name: &str) -> bool {
+    any_type_name(item) == type_name
+}
+
+/// The fully-qualified message name a packed `Any` declares, without the
+/// `type.googleapis.com/` prefix.
+///
+/// Compare this for equality rather than testing the raw `type_url` with
+/// `ends_with`: a suffix test also accepts a differently-namespaced message
+/// whose qualified name happens to end the same way.
+pub fn any_type_name(item: &prost_types::Any) -> &str {
+    item.type_url.rsplit('/').next().unwrap_or("")
+}
+
 // --- Graphic primitive builders (BoardGraphicShape + BoardText) --------------
 //
 // All wrap a common `stroke(width_mm)` + `fill(filled)` into `GraphicAttributes`,
@@ -446,6 +473,38 @@ pub fn board_text(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    /// `any_is` compares the whole message name, not a suffix of the URL.
+    ///
+    /// A suffix test accepts anything whose qualified name merely *ends* the
+    /// same way — a different package with the same tail decodes as something
+    /// else entirely. Being exact costs nothing and removes the question.
+    #[test]
+    fn any_is_matches_the_whole_type_name_not_a_suffix() {
+        let pad = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+            value: Vec::new(),
+        };
+        assert!(any_is(&pad, "kiapi.board.types.Pad"));
+        assert!(!any_is(&pad, "kiapi.board.types.BoardGraphicShape"));
+        assert_eq!(any_type_name(&pad), "kiapi.board.types.Pad");
+
+        let other_package = prost_types::Any {
+            type_url: "type.googleapis.com/vendorx.kiapi.board.types.Pad".to_string(),
+            value: Vec::new(),
+        };
+        assert!(
+            !any_is(&other_package, "kiapi.board.types.Pad"),
+            "a different package that ends in the same name is not the same message"
+        );
+
+        // A bare name with no domain prefix still resolves.
+        let bare = prost_types::Any {
+            type_url: "kiapi.board.types.Pad".to_string(),
+            value: Vec::new(),
+        };
+        assert!(any_is(&bare, "kiapi.board.types.Pad"));
+    }
 
     /// Every layer a KiCAD 10 footprint may legally draw on has a `BoardLayer`.
     ///
