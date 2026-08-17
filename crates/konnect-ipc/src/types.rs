@@ -92,6 +92,32 @@ pub enum IpcGraphicDefinition {
     },
 }
 
+impl IpcGraphicDefinition {
+    /// The KiCAD layer name this item draws on.
+    pub fn layer(&self) -> &str {
+        match self {
+            Self::Line { layer, .. }
+            | Self::Rect { layer, .. }
+            | Self::Circle { layer, .. }
+            | Self::Arc { layer, .. }
+            | Self::Poly { layer, .. }
+            | Self::Text { layer, .. } => layer,
+        }
+    }
+
+    /// What this item is, for an error that has to name it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Line { .. } => "fp_line",
+            Self::Rect { .. } => "fp_rect",
+            Self::Circle { .. } => "fp_circle",
+            Self::Arc { .. } => "fp_arc",
+            Self::Poly { .. } => "fp_poly",
+            Self::Text { .. } => "fp_text",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
     /// KIID of the track, needed to delete it via delete_track. Empty only if
