@@ -1031,6 +1031,13 @@ fn prepare_closed_board_footprint_update(
         content.to_string(),
         vec![SexpEdit::replace(start, end, replacement)],
     );
+    // Defensive, and deliberately kept despite having no reachable trigger:
+    // `update_footprint_placement` already refuses anything whose root is not
+    // a `footprint`, and `apply_edits` swaps one balanced block for another,
+    // so there is no input that reaches here with a broken board. Neutering it
+    // changes no test, which is the honest state of affairs — it exists to
+    // make "we never write a board we did not just re-validate" true by
+    // construction rather than by tracing every caller.
     if let Err(reason) = check_single_board_form(&updated) {
         return Err(ClosedBoardError::Unusable(format!(
             "updating '{reference}' would have produced {reason}"
@@ -2921,6 +2928,15 @@ mod tests {
         .unwrap();
         assert!(moved.is_error);
         assert!(result_text(&moved).contains("R404"));
+        // Not just "an error": a reference that names nothing on this board is
+        // the caller's mistake, so it carries the structured field rather than
+        // reaching them as an opaque handler_error (#194's class).
+        assert!(
+            result_text(&moved).contains("invalid_argument")
+                && result_text(&moved).contains("\"field\":\"reference\""),
+            "{}",
+            result_text(&moved)
+        );
         assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
 
         let rotated = handle_rotate_component(
