@@ -19,12 +19,14 @@ ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 Most PCB layout operations require KiCAD to be running with the board file open. The IPC
 connection communicates with the running KiCAD instance in real-time.
 
-`place_component`, `move_component`, and `rotate_component` are narrow exceptions:
-when IPC is unreachable, they can mutate one footprint in a closed `.kicad_pcb` file
-through revision-aware atomic fallbacks. Placement preserves pads, graphics,
-attributes, and models; moves preserve the existing angle; rotations update the
-footprint and its child angles together. If KiCAD is reachable but rejects a request,
-the fallback stays disabled to avoid racing a live editor.
+`place_component`, `move_component`, `rotate_component`, and `flip_component` are
+narrow exceptions for closed boards. Placement, move, and rotation fall back when
+IPC is unreachable. Flip intentionally requires IPC to be unreachable because KiCAD's
+typed IPC API has no native footprint-flip command. The file paths use revision-aware
+atomic writes: placement preserves pads, graphics, attributes, and models; moves
+preserve the existing angle; rotations update the footprint and its child angles;
+flips mirror supported geometry and swap front/back layers. If KiCAD is reachable and
+rejects a request, the fallback stays disabled to avoid racing a live editor.
 
 If connection fails:
 - Tell the user to open KiCAD and load the project
@@ -97,6 +99,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `place_component`         | Position one footprint via IPC or safe file fallback |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
+| `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 
@@ -279,8 +282,8 @@ Common DRC errors and fixes:
 5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
 7. **KiCAD normally must be running** — `place_component`, `move_component`, and
-   `rotate_component` have safe IPC-unreachable file fallbacks; other PCB edits still
-   require the live IPC connection
+   `rotate_component` have safe IPC-unreachable file fallbacks; `flip_component`
+   requires a closed board; other PCB edits still require the live IPC connection
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 10. **Copper pour last** — add zones only after routing is substantially complete
