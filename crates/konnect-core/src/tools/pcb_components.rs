@@ -2733,6 +2733,81 @@ mod tests {
         assert!(moved.contains("(at 1 2 247.5)"), "{moved}");
     }
 
+    /// A reference naming two footprints identifies none of them, and a board
+    /// Konnect cannot parse is not one it will write to. Both refuse, both
+    /// with a structured reason, and both leave the file byte-identical.
+    ///
+    /// Added because neutering each guard found nothing: the PR describes all
+    /// three behaviours — missing reference, duplicate reference, unusable
+    /// board — and only the missing one was exercised, for move or rotate.
+    #[tokio::test]
+    async fn a_duplicate_reference_or_an_unparseable_board_refuses_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let footprint = "  (footprint \"Test:R\"\n    (layer \"F.Cu\")\n    (at 10 20 30)\n    \
+             (property \"Reference\" \"R1\" (at 0 -1.65 30) (layer \"F.SilkS\"))\n    \
+             (pad \"1\" smd roundrect (at -0.9125 0 30) (size 1 1) (layers \"F.Cu\"))\n  )";
+        let duplicated = tmp.path().join("duplicate.kicad_pcb");
+        std::fs::write(
+            &duplicated,
+            format!(
+                "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n{footprint}\n{footprint}\n)"
+            ),
+        )
+        .unwrap();
+
+        let truncated = tmp.path().join("truncated.kicad_pcb");
+        std::fs::write(
+            &truncated,
+            "(kicad_pcb (version 20241229)\n  (footprint \"Test:R\"",
+        )
+        .unwrap();
+
+        for (label, board, structured_reference) in [
+            ("duplicate", &duplicated, true),
+            ("truncated", &truncated, false),
+        ] {
+            let before = std::fs::read_to_string(board).unwrap();
+            for tool in ["move", "rotate"] {
+                let mut arguments = json!({
+                    "board": board.to_string_lossy(),
+                    "reference": "R1",
+                });
+                let result = if tool == "move" {
+                    arguments["x"] = json!(40.0);
+                    arguments["y"] = json!(50.0);
+                    handle_move_component(&arguments, &test_ctx())
+                        .await
+                        .unwrap()
+                } else {
+                    arguments["rotation"] = json!(90.0);
+                    handle_rotate_component(&arguments, &test_ctx())
+                        .await
+                        .unwrap()
+                };
+
+                assert!(result.is_error, "{label}/{tool} must refuse");
+                let text = result_text(&result);
+                if structured_reference {
+                    assert!(
+                        text.contains("invalid_argument") && text.contains("reference"),
+                        "{label}/{tool}: {text}"
+                    );
+                } else {
+                    assert!(
+                        text.contains("Refusing to edit the board"),
+                        "{label}/{tool}: {text}"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_to_string(board).unwrap(),
+                    before,
+                    "{label}/{tool} must leave the board byte-identical"
+                );
+            }
+        }
+    }
+
     /// The same board must survive a move, which does not rewrite children at
     /// all — pinned so a future refactor cannot reintroduce the coupling by
     /// making the move path share the rotate path's ordering.
