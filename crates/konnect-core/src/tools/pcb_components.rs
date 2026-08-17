@@ -1584,7 +1584,8 @@ fn prepare_closed_board_footprint_side(
     let current_layer = footprint_layer(block).map_err(ClosedBoardError::Io)?;
     if !matches!(current_layer.as_str(), "F.Cu" | "B.Cu") {
         return Err(ClosedBoardError::Unusable(format!(
-            "footprint '{reference}' sits on root layer '{current_layer}', which is neither              side of the board"
+            "footprint '{reference}' sits on root layer '{current_layer}', which is neither \
+             side of the board"
         )));
     }
     if current_layer == target_layer {
