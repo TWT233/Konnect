@@ -62,7 +62,10 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "validate_for_manufacturing",
             "Pre-flight check before ordering: verifies the design is ready for the target \
-             fab house. Checks board outline, design rules, BOM completeness, and assembly constraints.",
+             fab house. Runs KiCAD's DRC and checks board outline, design rules, BOM \
+             completeness, and assembly constraints. Returns NOT READY — never READY — if \
+             DRC reports errors or could not be run, so a READY verdict always rests on \
+             evidence rather than on an absence of findings.",
             json!({
                 "type": "object",
                 "properties": {
@@ -286,7 +289,7 @@ async fn handle_export_manufacturing_package(
 
 async fn handle_validate_for_manufacturing(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let fab_house = args["fab_house"].as_str().unwrap_or("jlcpcb");
@@ -362,6 +365,48 @@ async fn handle_validate_for_manufacturing(
         }));
     }
 
+    // That heuristic only fires on a board with *zero* tracks, so a board
+    // routed except for one net sailed past it — and nothing here had ever
+    // consulted DRC, which is the only thing that actually knows. This tool
+    // returned READY on a board with 25 DRC errors and an unrouted item
+    // (#247). A readiness verdict now requires the evidence.
+    let drc = cli::run_drc(&ctx.config.kicad_cli, &board, false).await;
+    let drc_summary = match &drc {
+        Ok(report) => {
+            for violation in report.all().filter(|v| v.severity == "error") {
+                issues.push(json!({
+                    "severity": "error",
+                    "issue": format!("DRC [{}]: {}", violation.rule, violation.description),
+                    "fix": "Fix in the PCB editor, or waive the rule deliberately; \
+                            run_drc lists every violation with its location"
+                }));
+            }
+            for missing in report.missing_categories() {
+                issues.push(json!({
+                    "severity": "error",
+                    "issue": format!("kicad-cli did not report DRC '{missing}'"),
+                    "fix": "Readiness cannot be established without it; check the \
+                            kicad-cli version"
+                }));
+            }
+            json!({
+                "errors": report.error_count(),
+                "design_rule_violations": report.violations.len(),
+                "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+                "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+            })
+        }
+        Err(error) => {
+            issues.push(json!({
+                "severity": "error",
+                "issue": format!("DRC could not run: {error:#}"),
+                "fix": "Without DRC this tool cannot tell a clean board from a \
+                        broken one; fix the kicad-cli path and re-run"
+            }));
+            serde_json::Value::Null
+        }
+    };
+
     let verdict = if issues.iter().any(|i| i["severity"] == "error") {
         "NOT READY"
     } else if !issues.is_empty() {
@@ -386,6 +431,10 @@ async fn handle_validate_for_manufacturing(
                 "net_count": net_count,
                 "track_count": track_count
             },
+            // Null means DRC did not run, and an issue above says so. Never a
+            // zeroed-out object: this tool must not be able to imply a clean
+            // board it never checked.
+            "drc": drc_summary,
             "issues": issues,
             "summary": format!(
                 "{}: {} issues found. {} footprints, {} copper layers.",
@@ -760,6 +809,84 @@ mod net_track_count_tests {
                 .unwrap_or("")
                 .contains("no traces routed")),
             "{issues:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod readiness_evidence_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// No kicad-cli, so DRC cannot run — the point of these tests.
+    fn ctx_without_kicad_cli() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    async fn validate(board_text: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, board_text).unwrap();
+        let result = handle_validate_for_manufacturing(
+            &json!({ "board": board.to_str().unwrap() }),
+            &ctx_without_kicad_cli(),
+        )
+        .await
+        .unwrap();
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => {
+                serde_json::from_str(text).unwrap()
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A board that passes every check this tool performs itself.
+    const CLEAN_LOOKING_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+        \t(gr_line (start 0 0) (end 50 0) (layer \"Edge.Cuts\") (width 0.1))\n\
+        \t(footprint \"R:R_0402\"\n\
+        \t\t(pad \"1\" smd rect (at 5 0) (size 1 1) (net \"SDA\"))\n\
+        \t)\n\
+        \t(segment (start 0 0) (end 5 0) (width 0.25) (layer \"F.Cu\") (net \"SDA\"))\n\
+        )\n";
+
+    /// #247. This tool returned `READY` with zero issues on a board carrying
+    /// 25 DRC errors and an unrouted item, because it never asked DRC —
+    /// its only routing check fires when a board has *no* tracks at all.
+    ///
+    /// The test context has no kicad-cli, so DRC cannot run. Missing evidence
+    /// must block the verdict: "I found nothing wrong" is not the same claim
+    /// as "nothing is wrong", and only one of them justifies ordering boards.
+    #[tokio::test]
+    async fn readiness_needs_drc_evidence_not_just_an_absence_of_findings() {
+        let report = validate(CLEAN_LOOKING_BOARD).await;
+
+        assert_ne!(
+            report["verdict"], "READY",
+            "a board whose DRC was never run cannot be declared ready: {report}"
+        );
+        assert!(report["drc"].is_null(), "no DRC ran, so no DRC summary");
+        let issues = report["issues"].as_array().unwrap();
+        assert!(
+            issues.iter().any(|i| i["issue"]
+                .as_str()
+                .unwrap_or("")
+                .contains("DRC could not run")),
+            "the missing evidence must be named: {issues:?}"
         );
     }
 }

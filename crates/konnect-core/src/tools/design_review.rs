@@ -5,6 +5,7 @@
 //!
 //! These tools work on the S-expression files directly — no KiCAD running required.
 
+use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
@@ -91,9 +92,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_design_review",
             "Run all available audit checks and produce a consolidated design review report. \
-             Audits every reachable schematic sheet and reports status, coverage, and diagnostics. \
-             Returns an INCOMPLETE verdict instead of approval when coverage is partial or failed. \
-             This is the tool to call when the user asks 'is my board ready?' or 'review my design'.",
+             Audits every reachable schematic sheet, and when a board is supplied also runs \
+             KiCAD's DRC, folding its errors, unconnected items and schematic-parity findings \
+             into the verdict. Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
+             verdict instead of approval when coverage is partial, when an audit failed, or \
+             when DRC could not run. This is the tool to call when the user asks 'is my board \
+             ready?' or 'review my design'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -815,6 +819,7 @@ async fn handle_run_design_review(
     }
 
     let mut board_coverage = None;
+    let mut drc_summary = None;
     if let Some(board) = args["board"].as_str() {
         let board_path = PathBuf::from(board);
         match inspect_board_coverage(&board_path) {
@@ -855,6 +860,52 @@ async fn handle_run_design_review(
         let result = handle_audit_manufacturing(args, ctx).await;
         manufacturing.record(&board_path, result, &mut diagnostics);
         audits.push(manufacturing);
+
+        // KiCad's own DRC is the authority on whether a board is clean, and
+        // this review never asked it. It ran four schematic audits plus a DFM
+        // check, found nothing, and said LOOKS GOOD about a board carrying 25
+        // DRC errors and an unrouted net (#247). A review that has not
+        // consulted DRC has not reviewed the board.
+        match cli::run_drc(&ctx.config.kicad_cli, &board_path, false).await {
+            Ok(report) => {
+                for missing in report.missing_categories() {
+                    diagnostics.push(json!({
+                        "code": "drc_category_not_reported",
+                        "source": board_path.display().to_string(),
+                        "message": format!(
+                            "kicad-cli did not report '{missing}', so this review \
+                             cannot speak to that class of problem"
+                        )
+                    }));
+                }
+                drc_summary = Some(json!({
+                    "errors": report.error_count(),
+                    "design_rule_violations": report.violations.len(),
+                    "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+                    "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+                }));
+                let mut drc = AuditAggregate::new("drc");
+                drc.completed += 1;
+                drc.findings.extend(report.all().map(|violation| {
+                    json!({
+                        "severity": violation.severity,
+                        "category": "drc",
+                        "rule": violation.rule,
+                        "message": violation.description,
+                        "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                    })
+                }));
+                audits.push(drc);
+            }
+            Err(error) => diagnostics.push(json!({
+                "code": "drc_unavailable",
+                "source": board_path.display().to_string(),
+                "message": format!(
+                    "DRC could not run, so no verdict here accounts for design \
+                     rule violations or unrouted nets: {error:#}"
+                )
+            })),
+        }
     }
 
     let audit_summaries = audits
@@ -948,6 +999,11 @@ async fn handle_run_design_review(
                         "named_nets": coverage.named_nets
                     }))
                 },
+                // Null when no board was supplied, or when DRC could not run
+                // — in the latter case `diagnostics` says so and the verdict
+                // is INCOMPLETE. Never zero: this review must not be able to
+                // imply a clean board it did not check.
+                "drc": drc_summary,
                 "diagnostics": diagnostics
             }
         }))
@@ -1720,6 +1776,65 @@ mod review_completion_tests {
          \t\t(pad \"2\" smd roundrect\n\t\t\t(at 0.8 0)\n\t\t\t(size 0.9 0.95)\n\t\t)\n\
          \t)\n\
          )"
+    }
+
+    /// #247: this review never consulted DRC. It ran four schematic audits
+    /// plus a DFM check, found nothing, and said `LOOKS GOOD` about a board
+    /// carrying 25 DRC errors and an unrouted net.
+    ///
+    /// The test context has no kicad-cli, so DRC cannot run — which is the
+    /// case that matters: missing evidence must produce `INCOMPLETE`, not a
+    /// verdict that quietly means "clean except for everything I didn't
+    /// check".
+    #[tokio::test]
+    async fn a_board_review_without_drc_evidence_cannot_look_good() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("two_pads.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(&board, board_with_two_pads()).unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+
+        assert_eq!(report["status"], "partial");
+        assert_eq!(
+            report["verdict"],
+            "INCOMPLETE — review could not evaluate the full design"
+        );
+        assert!(report["drc"].is_null(), "no DRC ran, so no DRC summary");
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "drc_unavailable"));
+    }
+
+    /// A schematic-only review is unaffected: DRC is required when a board is
+    /// in scope, not always. Otherwise this change would make every
+    /// schematic review permanently INCOMPLETE.
+    #[tokio::test]
+    async fn a_schematic_only_review_does_not_need_drc() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "complete");
+        assert!(!report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "drc_unavailable"));
     }
 
     /// #246: `find_all` is direct-children-only and pads are nested, so the
