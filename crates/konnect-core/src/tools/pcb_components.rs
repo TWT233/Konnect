@@ -7,6 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
+use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
@@ -912,14 +913,69 @@ enum FootprintPlacementUpdate {
     Rotate { rotation: f64 },
 }
 
+/// Why a closed-board placement update could not be applied.
+///
+/// The handlers have to tell a caller's mistake — a reference that is not on
+/// this board — from a board Konnect declines to edit, from a genuine I/O
+/// failure, and report each differently. Deciding that by matching on the
+/// error's message text is exactly what [`with_ipc_classified`]'s contract
+/// forbids two screens up, and it left every case except the missing
+/// reference surfacing as an unstructured `handler_error` (#194's class).
+#[derive(Debug)]
+enum ClosedBoardError {
+    /// No footprint on this board carries that reference.
+    ReferenceNotFound(String),
+    /// More than one does, so "the" footprint is ambiguous.
+    ReferenceAmbiguous(String),
+    /// The board is not a shape this tool will edit, before or after.
+    Unusable(String),
+    /// Reading or writing failed, or the file changed under us.
+    Io(anyhow::Error),
+}
+
+impl ClosedBoardError {
+    /// The result to hand back. Never `Err`: every one of these is something
+    /// the caller can act on, and all of them leave the board untouched.
+    fn into_result(self) -> CallToolResult {
+        match self {
+            Self::ReferenceNotFound(reference) => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "reference".to_string(),
+                    reason: format!("no footprint '{reference}' on this board"),
+                },
+                format!(
+                    "Footprint '{reference}' is not on this board, so there was nothing to \
+                     update. The board file was not modified."
+                ),
+            ),
+            Self::ReferenceAmbiguous(reference) => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "reference".to_string(),
+                    reason: format!("'{reference}' appears more than once on this board"),
+                },
+                format!(
+                    "Footprint reference '{reference}' appears more than once on the board, so \
+                     it does not identify one footprint. The board file was not modified — \
+                     give the duplicates distinct references first."
+                ),
+            ),
+            Self::Unusable(reason) => CallToolResult::error(format!(
+                "Refusing to edit the board: {reason}. The board file was not modified."
+            )),
+            Self::Io(error) => CallToolResult::error(format!("{error:#}")),
+        }
+    }
+}
+
 fn update_closed_board_footprint(
     board_path: &Path,
     reference: &str,
     update: FootprintPlacementUpdate,
-) -> anyhow::Result<()> {
-    let content = read_consistent(board_path)?;
+) -> Result<(), ClosedBoardError> {
+    let content = read_consistent(board_path).map_err(|e| ClosedBoardError::Io(e.into()))?;
     let updated = prepare_closed_board_footprint_update(&content, reference, update)?;
-    persist_board_replacement(board_path, &content, &updated)?;
+    persist_board_replacement(board_path, &content, &updated)
+        .map_err(|e| ClosedBoardError::Io(e.into()))?;
     Ok(())
 }
 
@@ -927,12 +983,9 @@ fn prepare_closed_board_footprint_update(
     content: &str,
     reference: &str,
     update: FootprintPlacementUpdate,
-) -> anyhow::Result<String> {
+) -> Result<String, ClosedBoardError> {
     if let Err(reason) = check_single_board_form(content) {
-        anyhow::bail!(
-            "Refusing to edit the board: {}. The board file was left untouched.",
-            reason,
-        );
+        return Err(ClosedBoardError::Unusable(reason.to_string()));
     }
 
     let mut matched = None;
@@ -945,26 +998,22 @@ fn prepare_closed_board_footprint_update(
         if footprint_reference(&footprint).as_deref() == Some(reference)
             && matched.replace((start, end)).is_some()
         {
-            anyhow::bail!(
-                "Footprint reference '{}' appears more than once on the board",
-                reference
-            );
+            return Err(ClosedBoardError::ReferenceAmbiguous(reference.to_string()));
         }
     }
 
-    let (start, end) = matched
-        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on the board", reference))?;
-    let replacement = update_footprint_placement(&content[start..end], update)?;
+    let (start, end) =
+        matched.ok_or_else(|| ClosedBoardError::ReferenceNotFound(reference.to_string()))?;
+    let replacement = update_footprint_placement(&content[start..end], update)
+        .map_err(|error| ClosedBoardError::Unusable(format!("{error:#}")))?;
     let updated = apply_edits(
         content.to_string(),
         vec![SexpEdit::replace(start, end, replacement)],
     );
     if let Err(reason) = check_single_board_form(&updated) {
-        anyhow::bail!(
-            "Refusing to write the board after updating '{}': {}. The board file was left untouched.",
-            reference,
-            reason
-        );
+        return Err(ClosedBoardError::Unusable(format!(
+            "updating '{reference}' would have produced {reason}"
+        )));
     }
     Ok(updated)
 }
@@ -993,24 +1042,42 @@ fn update_footprint_placement(
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
 
-    let (x, y, rotation, mut updated) = match update {
-        FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation, footprint.to_string()),
-        FootprintPlacementUpdate::Rotate { rotation } => (
-            old_x,
-            old_y,
-            rotation,
-            apply_rotation_to_children(footprint, rotation - old_rotation),
-        ),
+    let (x, y, rotation) = match update {
+        FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation),
+        FootprintPlacementUpdate::Rotate { rotation } => (old_x, old_y, rotation),
     };
 
-    updated = apply_edits(
-        updated,
+    // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
+    // the string they were measured against.
+    //
+    // `apply_rotation_to_children` rewrites the `(at …)` inside every pad,
+    // property and fp_text, and those replacements change length — an angle
+    // can gain digits, or reach zero and be dropped entirely. Rotating first
+    // and splicing after left the root offsets stale by that delta whenever a
+    // child `(at …)` preceded the root one, which is legal S-expression even
+    // though KiCad's own writer does not emit it. A −45° property angle
+    // rotating to 0 shortens by four bytes and lands the splice inside the
+    // preceding block: `(at (at 10 20 75) (pad "1" …`.
+    //
+    // The two passes are safe in this order because they touch disjoint
+    // blocks: the root `(at …)` is a direct child of `footprint`, and
+    // `apply_rotation_to_children` only rewrites the first `(at …)` *inside* a
+    // pad/property/fp_text — and it recomputes its own offsets against the
+    // string it is given.
+    let updated = apply_edits(
+        footprint.to_string(),
         vec![SexpEdit::replace(
             *at_start,
             *at_end,
             format_at(x, y, rotation),
         )],
     );
+    let updated = match update {
+        FootprintPlacementUpdate::Move { .. } => updated,
+        FootprintPlacementUpdate::Rotate { rotation } => {
+            apply_rotation_to_children(&updated, rotation - old_rotation)
+        }
+    };
     let parsed = konnect_sexp::parse_sexp(&updated)?;
     if parsed.head() != Some("footprint") {
         anyhow::bail!("placement update changed the footprint root");
@@ -1462,23 +1529,17 @@ async fn handle_move_component(
         Err(e) => return Ok(e),
     };
 
-    let requested_board = board.clone();
     let ref_ipc = reference.clone();
-    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested_board)?;
+    match attempt_ipc_write(ctx.config.ipc_address.clone(), &board, "move", move |c| {
         c.move_footprint(&ref_ipc, x, y)
     })
-    .await?;
-    match attempt {
-        Ok(()) => Ok(CallToolResult::json(
+    .await?
+    {
+        BoardWrite::Ipc(()) => Ok(CallToolResult::json(
             &json!({ "moved": reference, "x": x, "y": y, "source": "ipc" }),
         )),
-        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
-            "KiCAD rejected the move over IPC: {message}. The board file was not modified — \
-             KiCAD is reachable and may hold this board open, so editing the file directly \
-             could be silently overwritten."
-        ))),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -1491,10 +1552,7 @@ async fn handle_move_component(
                     "source": "file",
                     "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
                 }))),
-                Err(error) if error.to_string().contains("not found on the board") => {
-                    Ok(CallToolResult::error(error.to_string()))
-                }
-                Err(error) => Err(error),
+                Err(error) => Ok(error.into_result()),
             }
         }
     }
@@ -1573,25 +1631,22 @@ async fn handle_rotate_component(
         Err(e) => return Ok(e),
     };
 
-    let requested_board = board.clone();
     let ref_ipc = reference.clone();
-    let attempt = with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested_board)?;
-        c.rotate_footprint(&ref_ipc, rotation)
-    })
-    .await?;
-    match attempt {
-        Ok(()) => Ok(CallToolResult::json(&json!({
+    match attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "rotation",
+        move |c| c.rotate_footprint(&ref_ipc, rotation),
+    )
+    .await?
+    {
+        BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
             "rotated": reference,
             "rotation": rotation,
             "source": "ipc"
         }))),
-        Err(konnect_ipc::IpcFailure::Rejected(message)) => Ok(CallToolResult::error(format!(
-            "KiCAD rejected the rotation over IPC: {message}. The board file was not modified — \
-             KiCAD is reachable and may hold this board open, so editing the file directly \
-             could be silently overwritten."
-        ))),
-        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+        BoardWrite::Refused(result) => Ok(result),
+        BoardWrite::File => {
             match update_closed_board_footprint(
                 &board,
                 &reference,
@@ -1603,10 +1658,7 @@ async fn handle_rotate_component(
                     "source": "file",
                     "warning": "KiCAD IPC was not reachable, so the closed board file was edited directly."
                 }))),
-                Err(error) if error.to_string().contains("not found on the board") => {
-                    Ok(CallToolResult::error(error.to_string()))
-                }
-                Err(error) => Err(error),
+                Err(error) => Ok(error.into_result()),
             }
         }
     }
@@ -2533,6 +2585,97 @@ mod tests {
             duplicate.content
         );
         assert_eq!(std::fs::read_to_string(board).unwrap(), before_duplicate);
+    }
+
+    /// A board whose footprint carries a `(property …)` *before* its root
+    /// `(at …)`, with `angle` chosen so rotating changes the rendered width.
+    ///
+    /// KiCad's own writer emits `at` before properties and pads, so this shape
+    /// never comes out of KiCad — but it is legal S-expression, KiCad loads it,
+    /// and Konnect reads boards it did not write.
+    fn board_with_a_property_before_the_root_at(property_angle: &str) -> String {
+        format!(
+            "(kicad_pcb (version 20241229) (generator \"pcbnew\")\n\
+             \x20 (footprint \"Test:R\"\n\
+             \x20   (layer \"F.Cu\")\n\
+             \x20   (property \"Reference\" \"R1\"\n\
+             \x20     (at 0 -1.65{property_angle})\n\
+             \x20     (layer \"F.SilkS\")\n\
+             \x20     (effects (font (size 1 1)))\n\
+             \x20   )\n\
+             \x20   (at 10 20 30)\n\
+             \x20   (pad \"1\" smd roundrect (at -0.9125 0 30) (size 1 1) (layers \"F.Cu\"))\n\
+             \x20 )\n\
+             )"
+        )
+    }
+
+    /// Rotating must not splice the root `(at …)` at offsets measured before
+    /// the child rewrite moved them.
+    ///
+    /// `apply_rotation_to_children` reformats every pad/property/fp_text
+    /// `(at …)`, and those replacements change length. Running it before the
+    /// root splice left the root offsets stale by that delta.
+    ///
+    /// Both directions are covered because they failed differently and only
+    /// one of them was obviously a failure:
+    ///
+    /// * shrinking — a −45° property rotating to exactly 0, which `format_at`
+    ///   drops, moving the root four bytes: `(at (at 10 20 75) (pad "1" …`;
+    /// * growing — a property with no angle at all gaining one, which tripped
+    ///   the root-head check with "placement update changed the footprint
+    ///   root" and gave no hint why.
+    #[test]
+    fn rotating_splices_the_root_at_before_the_children_move_it() {
+        for (label, property_angle, target, expected_root, expected_property) in [
+            ("shrinking", " -45", 75.0, "(at 10 20 75)", "(at 0 -1.65)"),
+            // 0° + 240° of delta = 240°, which `rotate_at_block` folds to 60°
+            // to keep the text readable.
+            ("growing", "", 270.0, "(at 10 20 270)", "(at 0 -1.65 60)"),
+        ] {
+            let board = board_with_a_property_before_the_root_at(property_angle);
+            let updated = prepare_closed_board_footprint_update(
+                &board,
+                "R1",
+                FootprintPlacementUpdate::Rotate { rotation: target },
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+
+            assert!(
+                konnect_sexp::parse_sexp(&updated).is_ok(),
+                "{label}: result must still parse\n{updated}"
+            );
+            assert!(
+                updated.contains(expected_root),
+                "{label}: root placement\n{updated}"
+            );
+            assert!(
+                updated.contains(expected_property),
+                "{label}: property angle\n{updated}"
+            );
+            assert!(
+                !updated.contains("(at (at"),
+                "{label}: a splice landed inside another block\n{updated}"
+            );
+        }
+    }
+
+    /// The same board must survive a move, which does not rewrite children at
+    /// all — pinned so a future refactor cannot reintroduce the coupling by
+    /// making the move path share the rotate path's ordering.
+    #[test]
+    fn moving_keeps_every_child_untouched() {
+        let board = board_with_a_property_before_the_root_at(" -45");
+        let updated = prepare_closed_board_footprint_update(
+            &board,
+            "R1",
+            FootprintPlacementUpdate::Move { x: 40.0, y: 50.0 },
+        )
+        .expect("move must succeed");
+
+        assert!(updated.contains("(at 40 50 30)"), "{updated}");
+        assert!(updated.contains("(at 0 -1.65 -45)"), "{updated}");
+        assert!(updated.contains("(at -0.9125 0 30)"), "{updated}");
     }
 
     async fn placed_fallback_fixture(dir: &Path) -> std::path::PathBuf {
