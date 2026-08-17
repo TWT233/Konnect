@@ -296,11 +296,14 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             }
 
             let (creates, updates) = build_mutation_items(client, &plan, &prepared, &snapshot)?;
+            // What we are about to send, so the board can be held to it.
+            let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit("Update PCB from saved schematic", |client| {
                 client.create_items_in(snapshot.document.clone(), creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
             })?;
+            verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?;
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
             plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
@@ -962,6 +965,106 @@ fn apply_footprint_fields(
         }
     }
 
+    Ok(())
+}
+
+/// How many pads and how many drawn items a footprint carries.
+///
+/// The two numbers #244 got wrong in opposite directions: every graphic became
+/// a pad, so pads went up by exactly the number of drawings, and drawings went
+/// to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FootprintShape {
+    pads: usize,
+    drawings: usize,
+}
+
+/// Tally the pads and drawings of each footprint in a set of packed items,
+/// keyed by reference.
+fn footprint_shapes<'a>(
+    items: impl Iterator<Item = &'a prost_types::Any>,
+) -> BTreeMap<String, FootprintShape> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    let mut out = BTreeMap::new();
+    for item in items {
+        let Ok(footprint) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        else {
+            continue;
+        };
+        let Some(definition) = footprint.definition.as_ref() else {
+            continue;
+        };
+        let reference = field_text(&footprint.reference_field);
+        if reference.is_empty() {
+            continue;
+        }
+        let mut shape = FootprintShape::default();
+        for child in &definition.items {
+            match konnect_ipc::builders::any_type_name(child) {
+                "kiapi.board.types.Pad" => shape.pads += 1,
+                "kiapi.board.types.BoardGraphicShape" | "kiapi.board.types.BoardText" => {
+                    shape.drawings += 1
+                }
+                _ => {}
+            }
+        }
+        out.insert(reference, shape);
+    }
+    out
+}
+
+/// Read the board back and hold it to what was just sent.
+///
+/// `create_items`/`update_items` only confirm that KiCad *accepted* each item,
+/// and the counts this tool reports are copied from the plan — so when #244
+/// turned every footprint graphic into a nameless pad, KiCad returned ISC_OK
+/// for each one and the response said the sync succeeded. Nothing anywhere
+/// looked at what actually landed.
+///
+/// This is a backstop for that class, not for that bug: with the type-URL fix
+/// in place it should never fire. `delete_footprint` already re-queries after
+/// mutating; this follows it.
+fn verify_board_matches_what_was_sent(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    expected: &BTreeMap<String, FootprintShape>,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let items = client.get_items_in(
+        document.clone(),
+        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+    )?;
+    let actual = footprint_shapes(items.iter());
+
+    let mut wrong = Vec::new();
+    for (reference, want) in expected {
+        // A reference the read-back cannot see is its own problem, but not this
+        // check's: KiCad may name it differently after a rename, and failing
+        // here would turn a successful sync into an error over bookkeeping.
+        let Some(got) = actual.get(reference) else {
+            continue;
+        };
+        if got != want {
+            wrong.push(format!(
+                "{reference}: sent {} pads and {} drawings, board now has {} and {}",
+                want.pads, want.drawings, got.pads, got.drawings
+            ));
+        }
+    }
+    if !wrong.is_empty() {
+        bail!(
+            "the board KiCad wrote does not match what was sent, so the sync is \
+             reported as failed even though KiCad accepted every item — inspect \
+             the board before saving it: {}",
+            wrong.join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -1842,6 +1945,55 @@ mod tests {
         let repacked =
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
         assert_eq!(child_types(&repacked), before);
+    }
+
+    /// The invariant that would have caught #244 on its own.
+    ///
+    /// `create_items`/`update_items` only confirm KiCad *accepted* each item,
+    /// and the reported counts are copied from the plan — so the corruption
+    /// travelled all the way to a success message. Here the exact damage is
+    /// reproduced (every drawing re-typed as a pad, which is what the old
+    /// `Pad::decode` filter did) and the shape comparison is shown to see it.
+    #[test]
+    fn the_post_apply_check_sees_drawings_turned_into_pads() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let sent = footprint_with_artwork("U4");
+        let expected = footprint_shapes(std::iter::once(&sent));
+        assert_eq!(
+            expected["U4"],
+            FootprintShape {
+                pads: 1,
+                drawings: 6
+            }
+        );
+
+        // Exactly #244: decode every child as a Pad and pack it back as one.
+        let mut corrupted =
+            kiapi::board::types::FootprintInstance::decode(sent.value.as_slice()).unwrap();
+        for child in &mut corrupted.definition.as_mut().unwrap().items {
+            if let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) {
+                *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+            }
+        }
+        let corrupted =
+            konnect_ipc::builders::pack_any(&corrupted, "kiapi.board.types.FootprintInstance");
+        let actual = footprint_shapes(std::iter::once(&corrupted));
+
+        // The reported symptom, reproduced: the five graphic shapes each become
+        // a pad. The text survives — `BoardText`'s bytes genuinely fail to
+        // decode as a `Pad`, while `BoardGraphicShape`'s do not — which is why
+        // #239 reported footprints losing their *graphics* while their
+        // reference and value text stayed put.
+        assert_eq!(
+            actual["U4"],
+            FootprintShape {
+                pads: 6,
+                drawings: 1
+            }
+        );
+        assert_ne!(actual["U4"], expected["U4"]);
     }
 
     /// A child that declares itself a pad and will not decode is a real
