@@ -303,7 +303,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
             })?;
-            verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?;
+            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
+            {
+                plan.diagnostics.push(conflict(
+                    "board_readback_differs",
+                    format!(
+                        "the board KiCad wrote differs from what was sent — {detail}. \
+                         No pad was invented, so this is reported rather than \
+                         refused; check the footprint before relying on it."
+                    ),
+                    None,
+                ));
+            }
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
             plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
@@ -1026,15 +1037,25 @@ fn footprint_shapes<'a>(
 /// This is a backstop for that class, not for that bug: with the type-URL fix
 /// in place it should never fire. `delete_footprint` already re-queries after
 /// mutating; this follows it.
+///
+/// **It fails the call only on a gained pad.** KiCad has no business inventing
+/// one, so that is unambiguous and is #244's exact signature. A *drop* in
+/// drawings is reported instead of refused, because it has a benign
+/// explanation this check cannot yet rule out — KiCad re-creates a footprint's
+/// children from the message on deserialize, and if it promotes a `BoardText`
+/// child into a `Field` (which this tally deliberately ignores) the count
+/// would fall without anything being wrong. Turning a working sync into an
+/// error over that is worse than the warning. Tighten it once it has been
+/// watched against a live KiCad; see the note on #244.
 fn verify_board_matches_what_was_sent(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     expected: &BTreeMap<String, FootprintShape>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     use konnect_ipc::gen::kiapi;
 
     if expected.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let items = client.get_items_in(
         document.clone(),
@@ -1042,7 +1063,8 @@ fn verify_board_matches_what_was_sent(
     )?;
     let actual = footprint_shapes(items.iter());
 
-    let mut wrong = Vec::new();
+    let mut corrupted = Vec::new();
+    let mut suspicious = Vec::new();
     for (reference, want) in expected {
         // A reference the read-back cannot see is its own problem, but not this
         // check's: KiCad may name it differently after a rename, and failing
@@ -1050,22 +1072,25 @@ fn verify_board_matches_what_was_sent(
         let Some(got) = actual.get(reference) else {
             continue;
         };
-        if got != want {
-            wrong.push(format!(
-                "{reference}: sent {} pads and {} drawings, board now has {} and {}",
-                want.pads, want.drawings, got.pads, got.drawings
-            ));
+        let detail = format!(
+            "{reference}: sent {} pads and {} drawings, board now has {} and {}",
+            want.pads, want.drawings, got.pads, got.drawings
+        );
+        if got.pads > want.pads {
+            corrupted.push(detail);
+        } else if got != want {
+            suspicious.push(detail);
         }
     }
-    if !wrong.is_empty() {
+    if !corrupted.is_empty() {
         bail!(
-            "the board KiCad wrote does not match what was sent, so the sync is \
-             reported as failed even though KiCad accepted every item — inspect \
-             the board before saving it: {}",
-            wrong.join("; ")
+            "KiCad's board gained pads this sync never sent, so the footprints on \
+             it are not the ones that were planned — inspect the board and do not \
+             save it: {}",
+            corrupted.join("; ")
         );
     }
-    Ok(())
+    Ok(suspicious)
 }
 
 fn set_field_text(
