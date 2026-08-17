@@ -40,7 +40,59 @@ pub struct ErcPos {
 pub struct DrcViolation {
     pub severity: String,
     pub description: String,
+    /// KiCad's rule key (`"silk_edge_clearance"`, `"clearance"`, …). This is
+    /// what a caller needs to fix or waive the rule; the prose description
+    /// alone is not addressable.
+    pub rule: String,
+    /// Where to look. KiCad reports one position per *involved item*, not one
+    /// per violation, so this is the first item's — which is what the report
+    /// used to try to read from a top-level `pos` field that does not exist,
+    /// making every position `null`.
     pub pos: Option<ErcPos>,
+}
+
+/// Everything `kicad-cli pcb drc` reports, not just the part Konnect used to
+/// read.
+///
+/// The JSON carries three sibling arrays. Konnect took `violations` and
+/// dropped the other two, so a board with an unrouted net — which is what
+/// `unconnected_items` is for — came back clean from every tool that gates on
+/// DRC (#245).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrcReport {
+    pub violations: Vec<DrcViolation>,
+    /// `None` means this kicad-cli did not report the category at all, which
+    /// is not the same as "there are none" and must not be rendered as zero.
+    pub unconnected_items: Option<Vec<DrcViolation>>,
+    pub schematic_parity: Option<Vec<DrcViolation>>,
+}
+
+impl DrcReport {
+    /// Findings across every category, for a caller that just wants to know
+    /// whether the board is clean.
+    pub fn all(&self) -> impl Iterator<Item = &DrcViolation> {
+        self.violations
+            .iter()
+            .chain(self.unconnected_items.iter().flatten())
+            .chain(self.schematic_parity.iter().flatten())
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.all().filter(|v| v.severity == "error").count()
+    }
+
+    /// Categories this kicad-cli did not report, by name. A gate that wants to
+    /// fail closed needs to know its evidence was incomplete.
+    pub fn missing_categories(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.unconnected_items.is_none() {
+            missing.push("unconnected_items");
+        }
+        if self.schematic_parity.is_none() {
+            missing.push("schematic_parity");
+        }
+        missing
+    }
 }
 
 // ─── KiCAD CLI Runner ─────────────────────────────────────────────────────────
@@ -163,7 +215,7 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
 
 /// Run DRC on a PCB and return parsed violations.
 /// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
-pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<DrcViolation>> {
+pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
     let out_path = pcb.with_extension("drc.json");
     let mut args = vec![
         "pcb",
@@ -185,22 +237,46 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
     let _ = tokio::fs::remove_file(&out_path).await;
 
-    Ok(raw
-        .get("violations")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|v| DrcViolation {
-            severity: v["severity"].as_str().unwrap_or("error").to_string(),
-            description: v["description"].as_str().unwrap_or("").to_string(),
-            pos: v.get("pos").and_then(|p| {
-                Some(ErcPos {
-                    x: p["x"].as_f64()?,
-                    y: p["y"].as_f64()?,
+    parse_drc_report(&raw)
+}
+
+/// Split out so it can be tested against a real `kicad-cli` report without
+/// running kicad-cli.
+fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
+    fn category(raw: &serde_json::Value, key: &str) -> Option<Vec<DrcViolation>> {
+        Some(
+            raw.get(key)?
+                .as_array()?
+                .iter()
+                .map(|v| DrcViolation {
+                    severity: v["severity"].as_str().unwrap_or("error").to_string(),
+                    description: v["description"].as_str().unwrap_or("").to_string(),
+                    rule: v["type"].as_str().unwrap_or("").to_string(),
+                    // The position lives on each involved item; a violation has
+                    // no `pos` of its own.
+                    pos: v["items"].as_array().and_then(|items| {
+                        items.iter().find_map(|item| {
+                            let p = item.get("pos")?;
+                            Some(ErcPos {
+                                x: p["x"].as_f64()?,
+                                y: p["y"].as_f64()?,
+                            })
+                        })
+                    }),
                 })
-            }),
-        })
-        .collect())
+                .collect(),
+        )
+    }
+
+    Ok(DrcReport {
+        // A report without this key is not a DRC report. Defaulting it to an
+        // empty list would render as a clean board, which is the failure mode
+        // this whole change exists to remove.
+        violations: category(raw, "violations")
+            .context("DRC report has no 'violations' array; kicad-cli did not produce a report")?,
+        unconnected_items: category(raw, "unconnected_items"),
+        schematic_parity: category(raw, "schematic_parity"),
+    })
 }
 
 // ─── Annotation ───────────────────────────────────────────────────────────────
@@ -699,6 +775,90 @@ pub async fn render_pcb_png(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod drc_parse_tests {
+    use super::*;
+
+    /// Real `kicad-cli pcb drc --format json` output (KiCAD 10.0.0, schema
+    /// https://schemas.kicad.org/drc.v1.json), captured from the bundled
+    /// `ecc83-pp` demo with its track segments removed so KiCad would actually
+    /// report unconnected items. Trimmed to two entries per category; nothing
+    /// is reshaped.
+    fn real_report() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/drc_report_kicad10.json")).unwrap()
+    }
+
+    /// The whole point of #245: `unconnected_items` is where an unrouted net
+    /// is reported, it carries severity `error`, and Konnect read only
+    /// `violations` — so this board came back with zero errors.
+    #[test]
+    fn unconnected_items_are_part_of_the_result() {
+        let report = parse_drc_report(&real_report()).unwrap();
+
+        assert_eq!(report.violations.len(), 2);
+        assert_eq!(report.unconnected_items.as_ref().unwrap().len(), 2);
+        assert_eq!(report.schematic_parity.as_ref().unwrap().len(), 0);
+        assert_eq!(report.all().count(), 4);
+
+        // Reading `violations` alone would have said zero.
+        assert_eq!(report.error_count(), 2);
+        assert!(report
+            .unconnected_items
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.severity == "error"));
+    }
+
+    /// KiCad reports a position per *involved item*, not one per violation.
+    /// Reading a top-level `pos` — which the schema has never had — made every
+    /// position `null`, and the rule key was dropped entirely, leaving the
+    /// caller with prose they cannot act on.
+    #[test]
+    fn a_violation_carries_its_rule_key_and_a_real_position() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let first = &report.violations[0];
+
+        assert!(
+            !first.rule.is_empty(),
+            "the rule key is what you fix or waive"
+        );
+        let pos = first
+            .pos
+            .as_ref()
+            .expect("position comes from items[0].pos");
+        assert!(pos.x != 0.0 || pos.y != 0.0);
+
+        let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
+        assert_eq!(unconnected.rule, "unconnected_items");
+        assert!(unconnected.pos.is_some());
+    }
+
+    /// A report missing `violations` is not a DRC report. Defaulting it to an
+    /// empty list renders as a clean board, which is the failure this change
+    /// exists to remove.
+    #[test]
+    fn a_report_without_violations_is_an_error_not_a_clean_board() {
+        let error = parse_drc_report(&serde_json::json!({ "source": "x.kicad_pcb" }))
+            .expect_err("a report with no violations array is not a result");
+        assert!(format!("{error:#}").contains("violations"));
+    }
+
+    /// A kicad-cli that does not report a category must read as `None`, never
+    /// as zero: "none found" and "never asked" are different answers, and only
+    /// one of them justifies calling a board clean.
+    #[test]
+    fn an_unreported_category_is_absent_not_zero() {
+        let report = parse_drc_report(&serde_json::json!({ "violations": [] })).unwrap();
+        assert!(report.unconnected_items.is_none());
+        assert!(report.schematic_parity.is_none());
+        assert_eq!(
+            report.missing_categories(),
+            vec!["unconnected_items", "schematic_parity"]
+        );
+    }
 }
 
 #[cfg(test)]

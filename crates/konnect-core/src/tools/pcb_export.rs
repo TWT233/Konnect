@@ -7,6 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_array, ToolContext, ToolDef};
+use anyhow::Context;
 use serde_json::json;
 use tokio::task;
 
@@ -675,25 +676,38 @@ async fn handle_get_drc_violations(
 
     let cli = &ctx.config.kicad_cli;
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let violations = cli::run_drc(cli, &board, refill).await?;
+    let report = cli::run_drc(cli, &board, refill).await?;
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        let report = serde_json::to_string_pretty(&violations)?;
-        tokio::fs::write(out_path, report).await?;
+        let json = serde_json::to_string_pretty(&report)?;
+        let path = std::path::Path::new(out_path);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("could not create report directory {}", parent.display())
+            })?;
+        }
+        tokio::fs::write(path, json)
+            .await
+            .with_context(|| format!("could not write report to {}", path.display()))?;
     }
 
-    let filtered: Vec<_> = violations
-        .iter()
+    let filtered: Vec<_> = report
+        .all()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .collect();
 
     let summary = json!({
-        "total": violations.len(),
+        "total": report.all().count(),
+        "design_rule_violations": report.violations.len(),
+        "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+        "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+        "categories_not_reported": report.missing_categories(),
         "filtered_count": filtered.len(),
         "severity_filter": severity_filter,
         "violations": filtered.iter().map(|v| json!({
             "severity": v.severity,
+            "rule": v.rule,
             "description": v.description,
             "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
         })).collect::<Vec<_>>()

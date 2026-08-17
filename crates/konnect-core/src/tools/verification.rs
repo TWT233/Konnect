@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use anyhow::Context;
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -189,16 +190,19 @@ async fn handle_run_drc(
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let violations = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
+    let report = cli::run_drc(&ctx.config.kicad_cli, &board, refill).await?;
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
-        let report = serde_json::to_string_pretty(&violations)?;
-        tokio::fs::write(out_path, report).await?;
+        let json = serde_json::to_string_pretty(&report)?;
+        write_report(out_path, &json).await?;
     }
 
-    let filtered: Vec<_> = violations
-        .iter()
+    // Every category, not just `violations`. An unrouted net is reported under
+    // `unconnected_items`, which Konnect used to discard — so a board that
+    // KiCad called unrouted came back from here clean (#245).
+    let filtered: Vec<_> = report
+        .all()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .collect();
 
@@ -206,10 +210,17 @@ async fn handle_run_drc(
     let warnings = filtered.iter().filter(|v| v.severity == "warning").count();
     let shown = filtered.len().min(limit);
     let truncated = filtered.len() > limit;
+    let missing = report.missing_categories();
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
-            "total_violations": violations.len(),
+            "total_violations": report.all().count(),
+            "design_rule_violations": report.violations.len(),
+            // Null, not zero, when this kicad-cli did not report the category:
+            // "none found" and "never asked" are different answers.
+            "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+            "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+            "categories_not_reported": missing,
             "filtered_count": filtered.len(),
             "errors": errors,
             "warnings": warnings,
@@ -218,12 +229,31 @@ async fn handle_run_drc(
             "truncated": truncated,
             "violations": filtered.iter().take(limit).map(|v| json!({
                 "severity": v.severity,
+                "rule": v.rule,
                 "description": v.description,
                 "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
             })).collect::<Vec<_>>()
         }))
         .unwrap(),
     ))
+}
+
+/// Write a report, creating the directory the caller named.
+///
+/// A missing parent used to surface as a bare OS "path not found" with nothing
+/// naming what was missing — the export tools next door already call
+/// `create_dir_all` first.
+async fn write_report(out_path: &str, contents: &str) -> anyhow::Result<()> {
+    let path = Path::new(out_path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("could not create report directory {}", parent.display()))?;
+    }
+    tokio::fs::write(path, contents)
+        .await
+        .with_context(|| format!("could not write report to {}", path.display()))?;
+    Ok(())
 }
 
 // ─── Design rules helpers ────────────────────────────────────────────────────
