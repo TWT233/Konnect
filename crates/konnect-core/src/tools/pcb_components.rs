@@ -1135,6 +1135,14 @@ fn direct_children_with_tags(
         .collect()
 }
 
+/// Whether `source` has at least one direct `(child_tag …)`, without caring
+/// how many or failing on a block that has none.
+fn has_direct_child(source: &str, parent_tag: &str, child_tag: &str) -> bool {
+    direct_children_with_tags(source, parent_tag)
+        .map(|children| children.iter().any(|(_, _, tag)| tag == child_tag))
+        .unwrap_or(false)
+}
+
 fn exactly_one_direct_child(
     source: &str,
     parent_tag: &str,
@@ -1515,6 +1523,20 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
     for (start, end, tag) in direct_children_with_tags(footprint, "footprint")? {
         let block = &footprint[start..end];
         let replacement = match tag.as_str() {
+            // A property with no `(at …)` carries no geometry, so there is
+            // nothing to mirror and it passes through untouched.
+            //
+            // This is not an edge case. KiCad writes
+            // `(property ki_fp_filters "R_* Resistor_*")` — a bare token, no
+            // position, no layer — into every footprint it places from a
+            // library: 779 of them across the 19 boards shipped in
+            // `share/kicad/demos`. Requiring exactly one `(at …)` on every
+            // property therefore refused practically every real board with
+            // "property must contain exactly one direct (at ...) block",
+            // which is what the first live run of this tool hit. The
+            // synthetic fixture has only positioned properties, so nothing
+            // offline could have caught it.
+            "property" if !has_direct_child(block, "property", "at") => None,
             "property" | "fp_text" => Some(flip_text_block(block, &tag)?),
             "fp_line" | "fp_rect" | "fp_circle" | "fp_arc" => {
                 Some(flip_graphic_block(block, &tag)?)
@@ -3667,6 +3689,43 @@ mod tests {
             flipped.contains("(offset (xyz 0 0 0))") && flipped.contains("(rotate (xyz 0 0 90))"),
             "a model a flip does not move must survive verbatim: {flipped}"
         );
+        assert!(konnect_sexp::parse_sexp(&flipped).is_ok());
+    }
+
+    /// A property with no position is metadata, not geometry, and must not
+    /// stop the flip.
+    ///
+    /// KiCad writes `(property ki_fp_filters "R_* Resistor_*")` — a bare
+    /// token, no `(at …)`, no layer — into every footprint it places from a
+    /// library. There are **779** of them across the 19 boards in
+    /// `share/kicad/demos`. Requiring exactly one `(at …)` on every property
+    /// therefore refused practically every real board with "property must
+    /// contain exactly one direct (at ...) block", which is what the first
+    /// live run of this tool hit on the stock ecc83 demo.
+    ///
+    /// Nothing offline could have caught it: the synthetic fixture has only
+    /// positioned properties.
+    #[test]
+    fn a_positionless_property_does_not_block_the_flip() {
+        let with_metadata = FLIP_FOOTPRINT.replace(
+            "  (pad \"1\"",
+            "  (property ki_fp_filters \"R_* Resistor_*\")\n  (pad \"1\"",
+        );
+        assert!(
+            with_metadata.contains("ki_fp_filters"),
+            "fixture must carry the metadata property"
+        );
+
+        let flipped = flip_footprint_block(&with_metadata)
+            .expect("a positionless property must not block the flip");
+
+        // Carried through untouched — it has no geometry to mirror.
+        assert!(
+            flipped.contains("(property ki_fp_filters \"R_* Resistor_*\")"),
+            "{flipped}"
+        );
+        // And the positioned ones still flipped.
+        assert!(flipped.contains("(layer \"B.Cu\")"), "{flipped}");
         assert!(konnect_sexp::parse_sexp(&flipped).is_ok());
     }
 
