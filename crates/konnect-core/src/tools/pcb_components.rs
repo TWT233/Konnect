@@ -732,6 +732,27 @@ fn rotate_at_block(block: &str, rotation: f64, readable: bool) -> Option<String>
     Some(format_at(x, y, angle))
 }
 
+/// Normalise a footprint's *root* orientation the way KiCad's writer does,
+/// to (-180, 180].
+///
+/// Measured, not assumed: rotating `R1` to 247.5° through the closed-board
+/// path and then letting KiCad re-save the board, KiCad wrote `-112.5` for the
+/// root `(at …)` and left both pad angles at `247.5` untouched. Same angle,
+/// different spelling — but writing the un-normalised form means the user's
+/// next save in KiCad produces a diff on a footprint nobody touched, and it
+/// makes the file path disagree with the IPC path, which ends up normalised
+/// because KiCad itself does it.
+///
+/// Deliberately not applied to children: KiCad does not normalise those.
+fn normalize_root_angle(degrees: f64) -> f64 {
+    let wrapped = degrees.rem_euclid(360.0);
+    if wrapped > 180.0 {
+        wrapped - 360.0
+    } else {
+        wrapped
+    }
+}
+
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
 /// trimming trailing zeros from the decimals.
 fn format_at(x: f64, y: f64, angle: f64) -> String {
@@ -1042,9 +1063,14 @@ fn update_footprint_placement(
         .context("footprint root placement has an invalid Y position")?;
     let old_rotation = at.get_f64(3).unwrap_or(0.0);
 
+    // A move preserves the existing orientation *exactly as spelled* — it is
+    // not this tool's business to renormalise an angle the caller did not ask
+    // to change. A rotation writes KiCad's spelling of the new one.
     let (x, y, rotation) = match update {
         FootprintPlacementUpdate::Move { x, y } => (x, y, old_rotation),
-        FootprintPlacementUpdate::Rotate { rotation } => (old_x, old_y, rotation),
+        FootprintPlacementUpdate::Rotate { rotation } => {
+            (old_x, old_y, normalize_root_angle(rotation))
+        }
     };
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
@@ -2630,8 +2656,9 @@ mod tests {
         for (label, property_angle, target, expected_root, expected_property) in [
             ("shrinking", " -45", 75.0, "(at 10 20 75)", "(at 0 -1.65)"),
             // 0° + 240° of delta = 240°, which `rotate_at_block` folds to 60°
-            // to keep the text readable.
-            ("growing", "", 270.0, "(at 10 20 270)", "(at 0 -1.65 60)"),
+            // to keep the text readable. The root becomes -90, KiCad's
+            // spelling of 270.
+            ("growing", "", 270.0, "(at 10 20 -90)", "(at 0 -1.65 60)"),
         ] {
             let board = board_with_a_property_before_the_root_at(property_angle);
             let updated = prepare_closed_board_footprint_update(
@@ -2658,6 +2685,52 @@ mod tests {
                 "{label}: a splice landed inside another block\n{updated}"
             );
         }
+    }
+
+    /// The root orientation is written the way KiCad writes it, and the
+    /// children are not.
+    ///
+    /// Measured, not assumed. Rotating `R1` on the ecc83 demo to 247.5°
+    /// through this path and then letting KiCad 10.0.5 re-save the board,
+    /// KiCad rewrote the root `(at …)` as `-112.5` and left both pad angles at
+    /// `247.5` exactly as Konnect had written them. Writing the un-normalised
+    /// root means a footprint nobody touched shows a diff after the user's
+    /// next save in KiCad, and it makes this path disagree with the IPC path —
+    /// which ends up normalised because KiCad does it there.
+    #[test]
+    fn the_root_orientation_is_spelled_the_way_kicad_spells_it() {
+        for (target, expected) in [
+            (247.5, "(at 10 20 -112.5)"),
+            (270.0, "(at 10 20 -90)"),
+            (180.0, "(at 10 20 180)"),
+            (181.0, "(at 10 20 -179)"),
+            (90.0, "(at 10 20 90)"),
+            (-450.0, "(at 10 20 -90)"),
+            (360.0, "(at 10 20)"),
+        ] {
+            let board = board_with_a_property_before_the_root_at(" -45");
+            let updated = prepare_closed_board_footprint_update(
+                &board,
+                "R1",
+                FootprintPlacementUpdate::Rotate { rotation: target },
+            )
+            .unwrap_or_else(|error| panic!("{target}: {error:?}"));
+            assert!(updated.contains(expected), "{target} =>\n{updated}");
+        }
+
+        // A move must not renormalise the angle it is preserving — that would
+        // rewrite a root `(at …)` the caller did not ask to change. Checked on
+        // a board whose root angle is already outside (-180, 180], which is
+        // the only case where the two behaviours differ.
+        let board = board_with_a_property_before_the_root_at(" -45")
+            .replace("(at 10 20 30)", "(at 10 20 247.5)");
+        let moved = prepare_closed_board_footprint_update(
+            &board,
+            "R1",
+            FootprintPlacementUpdate::Move { x: 1.0, y: 2.0 },
+        )
+        .expect("move");
+        assert!(moved.contains("(at 1 2 247.5)"), "{moved}");
     }
 
     /// The same board must survive a move, which does not rewrite children at
@@ -2745,7 +2818,10 @@ mod tests {
             serde_json::from_str(&result_text(&rotated)).expect("rotate result must be JSON");
         assert_eq!(result["source"], "file");
         let written = std::fs::read_to_string(board).unwrap();
-        assert!(written.contains("(at 10 20 270)"), "{written}");
+        // The root orientation is normalised to (-180, 180] because that is
+        // what KiCad writes; the pad and text angles are not, because KiCad
+        // leaves those alone. Both measured against a real KiCad 10 re-save.
+        assert!(written.contains("(at 10 20 -90)"), "{written}");
         assert!(written.contains("(at -0.9125 0 270)"), "{written}");
         assert!(written.contains("(at 0 -1.65 90)"), "{written}");
         assert!(konnect_sexp::parse_sexp(&written).is_ok());
