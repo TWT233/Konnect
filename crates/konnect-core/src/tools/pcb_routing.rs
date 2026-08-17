@@ -235,7 +235,11 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist.",
+             to exist. An update changes only the settings you name. To see what a \
+             class holds, call get_netclasses rather than this tool: naming a class \
+             that does not exist here creates it with the defaults, so a call meant \
+             as a look writes one instead — and its result is nearly \
+             indistinguishable from a read of an existing class.",
             json!({
                 "type": "object",
                 "properties": {
