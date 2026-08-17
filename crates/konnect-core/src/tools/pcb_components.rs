@@ -2258,6 +2258,13 @@ async fn handle_flip_component(
     //
     // The helper refuses only when KiCAD holds *this* board, because that is
     // the only case where the edit would be discarded by its next save.
+    //
+    // Untested branch, honestly: the only IPC mock in this crate rejects every
+    // request, which exercises the *proceed* side. Confirming the refusal
+    // needs a mock that answers `GetOpenDocuments` naming this board, which
+    // does not exist here — so the refusal is equally untested for
+    // `add_zone` and the copper-pour path, this helper's two other callers.
+    // Tracked as #241 rather than pretended away.
     if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
         ctx.config.ipc_address.clone(),
         &board,
@@ -3661,6 +3668,38 @@ mod tests {
             "a model a flip does not move must survive verbatim: {flipped}"
         );
         assert!(konnect_sexp::parse_sexp(&flipped).is_ok());
+    }
+
+    /// A footprint that is not on either copper side has no "other side" to
+    /// flip to, so it is refused rather than moved to one.
+    ///
+    /// Reachable on any board a user hand-edited or an older tool wrote — and
+    /// the guard existed with nothing exercising it, which the neuter pass
+    /// found.
+    #[tokio::test]
+    async fn a_footprint_on_neither_side_of_the_board_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("inner.kicad_pcb");
+        let stranded = FLIP_FOOTPRINT.replace("(layer \"F.Cu\")", "(layer \"In1.Cu\")");
+        let before = flip_board(&[&stranded], "\n");
+        std::fs::write(&board, &before).unwrap();
+
+        let refusal = handle_flip_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "reference": "U1",
+                "layer": "B.Cu",
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(refusal.is_error, "{:?}", refusal.content);
+        let text = result_text(&refusal);
+        assert!(text.contains("In1.Cu"), "{text}");
+        assert!(text.contains("neither side"), "{text}");
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
 
     /// KiCad's own flip transforms a model's Y offset and its X/Y rotation.
