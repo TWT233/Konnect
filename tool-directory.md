@@ -62,7 +62,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `create_schematic` | Create a new blank `.kicad_sch` schematic file. |
+| `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
