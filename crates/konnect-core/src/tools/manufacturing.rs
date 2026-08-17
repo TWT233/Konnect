@@ -318,7 +318,7 @@ async fn handle_validate_for_manufacturing(
         issues.push(json!({
             "severity": "error",
             "issue": "No footprints found on the board",
-            "fix": "Open the PCB in KiCAD and run Tools > Update PCB from Schematic (kicad-cli 'pcb sync' was removed in v10)"
+            "fix": "Open the PCB in KiCAD and run Tools > Update PCB from Schematic (kicad-cli has no 'pcb sync' command)"
         }));
     }
 

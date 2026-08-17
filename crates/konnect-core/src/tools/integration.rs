@@ -1000,13 +1000,19 @@ async fn handle_autoroute(
     _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // ponytail: Freerouting workflow requires Specctra DSN export + SES import,
-    // both of which were removed from kicad-cli in KiCAD 10. The tool stays in the
-    // registry so callers get a clear error; remove entirely once IPC round-trip lands.
+    // The Freerouting workflow needs Specctra DSN export + SES import, which
+    // `kicad-cli` does not expose — in KiCAD 8, 9 or 10. They were never CLI
+    // commands, so this is not a KiCAD 10 removal, and Freerouting itself works
+    // fine on KiCAD 10 through the PCB editor and the PCM ActionPlugin. Tracked
+    // by #253, which covers both a real bridge and no longer advertising a tool
+    // that always fails.
     Ok(CallToolResult::error(
-        "Autoroute via Freerouting is not available: kicad-cli in KiCAD 10 no longer \
-         supports Specctra DSN export or SES import. Use KiCAD's PCB editor \
-         (File > Export > Specctra DSN, then File > Import > Specctra Session) manually.",
+        "Autoroute via Freerouting is not available through Konnect: the Specctra \
+         DSN export and SES import it needs are PCB-editor operations that \
+         kicad-cli does not expose. Freerouting itself does work with KiCAD 10 — \
+         use the Freerouting ActionPlugin (Tools > External Plugins), or KiCAD's \
+         PCB editor manually (File > Export > Specctra DSN, route, then \
+         File > Import > Specctra Session).",
     ))
 }
 

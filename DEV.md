@@ -378,4 +378,6 @@ convention for other `kicad-cli`-calling code.
 - Full-catalog `tools/list` (all loaded): 209 tools (203 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
-- **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)
+- **3 operations `kicad-cli` has never exposed** (specctra DSN/SES, pcb sync — return clear
+  errors). These are absent from the KiCAD 8, 9 and 10 CLI alike, not removals; KiCAD's PCB
+  editor still performs all three. See [#253](https://github.com/mixelpixx/Konnect/issues/253).
