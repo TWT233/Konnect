@@ -1,3 +1,4 @@
+pub mod board;
 pub mod command;
 pub mod error;
 pub mod geometry;

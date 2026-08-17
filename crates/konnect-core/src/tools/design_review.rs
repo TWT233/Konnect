@@ -732,8 +732,10 @@ fn inspect_board_coverage(path: &Path) -> anyhow::Result<BoardReviewCoverage> {
     let content = std::fs::read_to_string(path)?;
     let tree = parse_sexp(&content)?;
     Ok(BoardReviewCoverage {
-        footprints: tree.find_all("footprint").len(),
-        pads: tree.find_all("pad").len(),
+        footprints: konnect_sexp::board::footprints(&tree).len(),
+        // Pads are nested inside each footprint, so asking the root for them
+        // returned 0 for every board this review has ever run on (#246).
+        pads: konnect_sexp::board::count_pads(&tree),
         named_nets: konnect_sexp::net::count_distinct_nets(&tree),
     })
 }
@@ -822,6 +824,22 @@ async fn handle_run_design_review(
                         "code": "zero_footprints",
                         "source": board_path.display().to_string(),
                         "message": "the supplied board contains no footprints"
+                    }));
+                } else if coverage.pads == 0 {
+                    // A board with footprints and no pads is not a design, it
+                    // is a failed read. #185 added the zero-footprint and
+                    // zero-net diagnostics and missed this one, so an
+                    // impossible pad count was absorbed into a "complete"
+                    // review that then said LOOKS GOOD (#246).
+                    diagnostics.push(json!({
+                        "code": "zero_pads",
+                        "source": board_path.display().to_string(),
+                        "message": format!(
+                            "the supplied board has {} footprints but no pads; \
+                             the board was not read correctly, so this review \
+                             cannot speak for it",
+                            coverage.footprints
+                        )
                     }));
                 }
                 board_coverage = Some(coverage);
@@ -1686,5 +1704,89 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|item| item["code"] == "zero_footprints"));
+    }
+
+    /// A board KiCad wrote, in KiCad's own tab-indented layout, with pads
+    /// where pads actually live: nested inside each `(footprint …)`.
+    fn board_with_two_pads() -> &'static str {
+        "(kicad_pcb\n\
+         \t(version 20260206)\n\
+         \t(generator \"pcbnew\")\n\
+         \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+         \t(footprint \"Resistor_SMD:R_0603_1608Metric\"\n\
+         \t\t(layer \"F.Cu\")\n\
+         \t\t(at 10 10)\n\
+         \t\t(pad \"1\" smd roundrect\n\t\t\t(at -0.8 0)\n\t\t\t(size 0.9 0.95)\n\t\t)\n\
+         \t\t(pad \"2\" smd roundrect\n\t\t\t(at 0.8 0)\n\t\t\t(size 0.9 0.95)\n\t\t)\n\
+         \t)\n\
+         )"
+    }
+
+    /// #246: `find_all` is direct-children-only and pads are nested, so the
+    /// old `tree.find_all("pad")` on the board root reported 0 for every board
+    /// ever reviewed — including this one, which plainly has two.
+    #[tokio::test]
+    async fn board_coverage_counts_pads_inside_footprints() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("two_pads.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(&board, board_with_two_pads()).unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["board"]["footprints"], 1);
+        assert_eq!(report["coverage"]["board"]["pads"], 2);
+        assert!(
+            !report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["code"] == "zero_pads"),
+            "a board with pads must not be flagged as unread: {report}"
+        );
+    }
+
+    /// Footprints but no pads is not a design, it is a failed read — and #185's
+    /// coverage guard checked footprints and nets but never pads, so the
+    /// impossible count passed straight through to a `LOOKS GOOD` verdict.
+    #[tokio::test]
+    async fn a_board_whose_footprints_have_no_pads_cannot_be_reviewed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("padless.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(version 20260206)\n\
+             \t(generator \"pcbnew\")\n\
+             \t(footprint \"Resistor_SMD:R_0603_1608Metric\"\n\
+             \t\t(layer \"F.Cu\")\n\
+             \t\t(at 10 10)\n\
+             \t)\n\
+             )",
+        )
+        .unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["board"]["footprints"], 1);
+        assert_eq!(report["coverage"]["board"]["pads"], 0);
+        assert_eq!(report["status"], "partial");
+        assert_ne!(report["verdict"], "LOOKS GOOD — no critical issues found");
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "zero_pads"));
     }
 }
