@@ -164,6 +164,12 @@ Claude remains the default when `--client` is omitted. The installer tracks the
 two clients independently, and a Codex install does not create or modify
 `~/.claude`.
 
+`--help` on any subcommand prints that subcommand's usage and writes nothing —
+`konnect init --help` describes the installer rather than running it. An
+argument Konnect does not recognise is an error rather than being ignored, so a
+typo such as `--cleint codex` stops instead of quietly installing for the
+default client.
+
 ### macOS
 
 The [Releases](https://github.com/mixelpixx/Konnect/releases) page ships

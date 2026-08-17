@@ -271,6 +271,14 @@ Why the gate exists: nothing validated `required` server-side, and `execute_tool
 
 Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
+### One value KiCAD does not reject: an unrepresentable layer
+
+`builders::layer_from_name` maps a layer name to a `BoardLayer`, and anything it does not know becomes `BL_UNDEFINED`. KiCAD 10.0.5 does **not** validate that field on an incoming item — it indexes its layer bitset with whatever arrives — so `BL_UNDEFINED` is answered with an access violation that terminates the process and takes the user's unsaved board with it (#237). Konnect sees only an NNG receive timeout.
+
+So on any path that puts a layer into a message bound for KiCAD, use **`builders::try_layer_from_name`**, which refuses instead. `client.rs::build_footprint_item` validates the root layer, every pad layer and every graphic layer before it builds a single child; the `*.Cu`/`*.Mask`/`*.Paste` wildcards KiCAD itself writes are expanded rather than mapped, so they are skipped.
+
+The infallible `layer_from_name` stays for read paths that already filter `BL_UNDEFINED` out. If you add a write path, the fallible one is the default — this is the class of bug where "the tool returned no error" and "the editor is still alive" are different questions.
+
 ## Observability
 
 Every `tools/call` flows through `McpHandler::execute_tool`, which wraps the dispatch with:

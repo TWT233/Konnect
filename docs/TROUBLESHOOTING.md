@@ -52,6 +52,41 @@ that board open and a tool still refuses, the error you get back is the tool's
 own reason — "a polygon needs at least 3 points", "requested board … is not open
 in KiCAD" — and it names what to change about the request.
 
+## "layer 'X' has no KiCAD board layer this build can represent"
+
+The footprint or request names a layer this build cannot map, so the request was
+refused before anything was sent. Nothing on the board changed.
+
+This refusal exists because the alternative is worse. KiCAD 10.0.5 does not
+validate the layer field on an incoming item, so an unrepresentable value used
+to reach it and **terminate the process**, discarding any unsaved board
+([#237](https://github.com/mixelpixx/Konnect/issues/237)). Konnect now stops at
+its own boundary instead.
+
+Every layer a KiCAD 10 footprint can legally draw on is supported, including
+`Dwgs.User`, `Cmts.User`, `Eco1/2.User`, `F/B.Adhes`, `Margin`, `Rescue`,
+`In1.Cu`–`In30.Cu` and `User.1`–`User.45`. If you hit this on stock library
+content, that is a bug worth reporting with the footprint name — the message
+names the layer and the item.
+
+**If you are on v0.6.0 or earlier**, placing
+`Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal` or
+`Connector:BJB_Pico_46.110.1001_Receptacle_Horizontal` can kill KiCAD outright.
+Update to v0.6.1 or later.
+
+## A closed-board edit landed after KiCAD crashed
+
+`place_component`, `move_component` and `rotate_component` edit the board file
+directly when the IPC transport is unreachable, which is safe when KiCAD was
+never running.
+
+They cannot currently tell that from "KiCAD died a second ago holding this
+board" — the transport looks identical
+([#240](https://github.com/mixelpixx/Konnect/issues/240)). If KiCAD crashes or
+is force-quit mid-session, the next such call may edit the file behind it and
+report success. Reopen the board and check before continuing, and prefer
+reopening KiCAD first.
+
 ## "kicad-cli not found"
 
 Common install paths are auto-detected (including the Windows registry). If
