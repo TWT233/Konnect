@@ -2761,6 +2761,37 @@ mod field_visibility_tests {
     }
 
     #[tokio::test]
+    async fn empty_edits_is_a_successful_byte_identical_no_op() {
+        let (_dir, path) = write_fixture(
+            "visibility-empty-edits.kicad_sch",
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": []
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(
+            body,
+            json!({
+                "updated_count": 0,
+                "unchanged_count": 0,
+                "results": []
+            })
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn multi_unit_reference_updates_every_unit_copy() {
         let (_dir, path) = write_fixture("visibility-multi-unit.kicad_sch", SCH_MULTI_UNIT_VISIBLE);
 
@@ -2798,6 +2829,33 @@ mod field_visibility_tests {
             4,
             "{after}"
         );
+    }
+
+    #[tokio::test]
+    async fn hide_show_edit_changes_only_direct_hide_nodes_and_local_whitespace() {
+        let (_dir, path) = write_fixture(
+            "visibility-byte-preservation.kicad_sch",
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+        );
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "reference_visible": false,
+                    "value_visible": true
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let expected = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide yes)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+        assert_eq!(after, expected);
     }
 
     #[tokio::test]
