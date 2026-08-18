@@ -110,7 +110,28 @@ fn extract_schematic_lines(tree: &SexpNode, kind: &str) -> Vec<Wire> {
 
 /// Extract all junction dot positions from a parsed schematic tree.
 pub fn extract_junctions(tree: &SexpNode) -> Vec<(f64, f64)> {
-    tree.find_all("junction")
+    at_positions(tree.find_all("junction"))
+}
+
+/// Extract all no-connect flag positions from a parsed schematic tree.
+pub fn extract_no_connects(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(tree.find_all("no_connect"))
+}
+
+/// Extract every hierarchical sheet pin position. A wire terminating on one
+/// leaves the sheet rather than dangling.
+pub fn extract_sheet_pins(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(
+        tree.find_all("sheet")
+            .iter()
+            .flat_map(|sheet| sheet.find_all("pin"))
+            .collect(),
+    )
+}
+
+/// The `(at x y …)` position of each node that has one.
+fn at_positions(nodes: Vec<&SexpNode>) -> Vec<(f64, f64)> {
+    nodes
         .iter()
         .filter_map(|node| {
             let at = node.find("at")?;
@@ -325,6 +346,9 @@ pub fn find_lib_symbol<'a>(
 pub struct LibPin {
     pub number: String,
     pub name: String,
+    /// KiCAD's electrical type — `power_in`, `passive`, `no_connect`, … — read
+    /// from `(pin <type> <style> …)`. Empty when the pin declares none.
+    pub electrical_type: String,
     /// Position in symbol-local Y-up space (mm).
     pub local_x: f64,
     pub local_y: f64,
@@ -415,9 +439,15 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
+    let electrical_type = node
+        .get(1)
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(LibPin {
         number,
         name,
+        electrical_type,
         local_x: x,
         local_y: y,
         rotation,
@@ -796,6 +826,7 @@ mod pin_endpoint_tests {
         LibPin {
             number: number.to_string(),
             name: "~".to_string(),
+            electrical_type: "passive".to_string(),
             local_x: 0.0,
             local_y,
             rotation,
@@ -1030,6 +1061,7 @@ mod pin_label_rotation_tests {
         LibPin {
             number: "1".into(),
             name: "PIN".into(),
+            electrical_type: "passive".into(),
             // Tip sits 10 mm out from the origin, opposite the way it points.
             local_x: -10.0 * rad.cos(),
             local_y: -10.0 * rad.sin(),
