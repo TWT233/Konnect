@@ -404,3 +404,160 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
         "expected notifications/tools/list_changed after auto-load; saw: {lines:#?}"
     );
 }
+#[test]
+fn schematic_field_display_round_trips_over_stdio() {
+    let temp = tempfile::tempdir().expect("create temporary protocol fixture directory");
+    let schematic = temp.path().join("display.kicad_sch");
+    std::fs::copy("../konnect-core/tests/fixtures/test.kicad_sch", &schematic)
+        .expect("copy disposable schematic fixture");
+    let labels = temp.path().join("duplicate-labels.kicad_sch");
+    std::fs::write(
+        &labels,
+        r#"(kicad_sch
+  (version 20240108)
+  (generator "protocol-test")
+  (uuid "00000000-0000-0000-0000-000000000000")
+  (lib_symbols)
+  (net_label "DUP" (at 10 20 0)
+    (effects (font (size 1.27 1.27)) (justify left))
+    (uuid "11111111-1111-1111-1111-111111111111")
+  )
+  (net_label "DUP" (at 10 20 0)
+    (effects (font (size 1.27 1.27)) (justify left))
+    (uuid "22222222-2222-2222-2222-222222222222")
+  )
+)
+"#,
+    )
+    .expect("write duplicate labels fixture");
+    let board = temp.path().join("two-zones.kicad_pcb");
+    std::fs::write(
+        &board,
+        r#"(kicad_pcb
+  (version 20260206)
+  (generator "pcbnew")
+  (paper "A4")
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "GND")
+  (zone (net 1) (net_name "GND") (layer "F.Cu") (uuid "z1")
+    (hatch edge 0.5)
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10))))
+  (zone (net 1) (net_name "GND") (layer "B.Cu") (uuid "z2")
+    (hatch edge 0.5)
+    (polygon (pts (xy 20 20) (xy 30 20) (xy 30 30))))
+)
+"#,
+    )
+    .expect("write two-zone board fixture");
+    let library = temp.path().join("anchors.kicad_sym");
+    std::fs::write(
+        &library,
+        "(kicad_symbol_lib (version 20231120) (generator \"protocol-test\"))\n",
+    )
+    .expect("write disposable symbol library");
+
+    let mut p = McpProcess::spawn();
+    let loaded = p.call_tool(
+        "load_toolset",
+        json!({"name": ["sch_batch", "sch_analysis", "pcb_board", "library"]}),
+    );
+    assert_ne!(loaded["isError"], json!(true), "load toolsets: {loaded:#?}");
+
+    let edit = json!([{"reference": "R1", "reference_visible": false, "value_visible": false}]);
+    let hidden = McpProcess::tool_body(&p.call_tool(
+        "batch_set_schematic_field_visibility",
+        json!({"schematic": schematic, "edits": edit}),
+    ));
+    assert_eq!(hidden["updated_count"], 1, "{hidden:#?}");
+    assert_eq!(
+        hidden["results"][0]["reference_visible"],
+        json!({"old": true, "new": false})
+    );
+    assert_eq!(
+        hidden["results"][0]["value_visible"],
+        json!({"old": true, "new": false})
+    );
+    let hidden_file = std::fs::read_to_string(&schematic).expect("read hidden schematic");
+    assert!(hidden_file.contains("(property \"Footprint\" \"Resistor_SMD:R_0402\""));
+
+    let shown_edit = json!([{"reference": "R1", "reference_visible": true, "value_visible": true}]);
+    let shown = McpProcess::tool_body(&p.call_tool(
+        "batch_set_schematic_field_visibility",
+        json!({"schematic": schematic, "edits": shown_edit}),
+    ));
+    assert_eq!(
+        shown["results"][0]["reference_visible"],
+        json!({"old": false, "new": true})
+    );
+    assert_eq!(
+        shown["results"][0]["value_visible"],
+        json!({"old": false, "new": true})
+    );
+    let before_noop = std::fs::read(&schematic).expect("read schematic before no-op");
+    let noop = p.call_tool(
+        "batch_set_schematic_field_visibility",
+        json!({"schematic": schematic, "edits": shown_edit}),
+    );
+    assert_ne!(noop["isError"], json!(true), "{noop:#?}");
+    assert_eq!(
+        std::fs::read(&schematic).expect("read schematic after no-op"),
+        before_noop
+    );
+
+    let missing_edits = p.call_tool(
+        "batch_set_schematic_field_visibility",
+        json!({"schematic": schematic}),
+    );
+    assert_eq!(missing_edits["isError"], json!(true));
+    let missing_body = McpProcess::tool_body(&missing_edits);
+    assert_eq!(missing_body["error"]["kind"], "invalid_argument");
+    assert_eq!(missing_body["error"]["field"], "edits");
+
+    let listed =
+        McpProcess::tool_body(&p.call_tool("list_schematic_labels", json!({"schematic": labels})));
+    let label_uuids: Vec<&str> = listed["labels"]
+        .as_array()
+        .expect("labels response array")
+        .iter()
+        .filter(|label| {
+            label["net"] == "DUP"
+                && label["x"].as_f64() == Some(10.0)
+                && label["y"].as_f64() == Some(20.0)
+        })
+        .map(|label| label["uuid"].as_str().expect("stable label uuid"))
+        .collect();
+    assert_eq!(label_uuids.len(), 2, "{listed:#?}");
+    assert!(label_uuids.contains(&"11111111-1111-1111-1111-111111111111"));
+    assert!(label_uuids.contains(&"22222222-2222-2222-2222-222222222222"));
+
+    let board_info = McpProcess::tool_body(&p.call_tool("get_board_info", json!({"board": board})));
+    assert_eq!(board_info["zone_count"], 2, "{board_info:#?}");
+    assert!(board_info["paper"].is_string());
+    assert!(board_info["net_count"].is_number());
+
+    let created = p.call_tool(
+        "create_symbol",
+        json!({
+            "library_path": library, "name": "ANCHOR_TEST", "reference_prefix": "U",
+            "pins": [{"number": "1", "name": "IN", "type": "input", "x": -7.62, "y": 0.0, "angle": 0, "length": 2.54}],
+            "reference_at": {"x": 0, "y": 17.78, "rotation": 0},
+            "value_at": {"x": 0, "y": -20.32, "rotation": 0}
+        }),
+    );
+    assert_ne!(
+        created["isError"],
+        json!(true),
+        "create symbol: {created:#?}"
+    );
+    let library_content =
+        std::fs::read_to_string(&library).expect("read disposable symbol library");
+    assert!(
+        library_content.contains("(property \"Reference\"")
+            && library_content.contains("(at 0 17.78 0)")
+    );
+    assert!(
+        library_content.contains("(property \"Value\"")
+            && library_content.contains("(at 0 -20.32 0)")
+    );
+}
