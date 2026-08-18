@@ -5,6 +5,7 @@
 //! then calls `write_atomic` exactly once. This fixes the Python bug where
 //! `batch_connect_to_net` did N separate read/write cycles.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
@@ -19,12 +20,15 @@ use konnect_sexp::{
         format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
     },
     writer::{
-        apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
-        new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks,
+        find_enclosing_direct_child_block, new_uuid, read_consistent, write_atomic_if_unchanged,
+        SexpEdit,
     },
+    SexpError,
 };
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 // Re-use the crate-internal net-graph primitives from sch_analysis.
 use super::sch_analysis::build_net_graph;
@@ -188,6 +192,32 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_edit(args, ctx).await }
         ),
         tool!(
+            "batch_set_schematic_field_visibility",
+            "Set placed Reference/Value field visibility on one or more schematic components \
+             in a single atomic file write.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "reference_visible": { "type": "boolean" },
+                                "value_visible": { "type": "boolean" }
+                            },
+                            "required": ["reference"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["schematic", "edits"]
+            }),
+            |args, ctx| async move { handle_batch_set_schematic_field_visibility(args, ctx).await }
+        ),
+        tool!(
             "batch_delete_schematic_components",
             "Delete multiple components by reference designator in a single atomic file write.",
             json!({
@@ -339,7 +369,442 @@ fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct FieldVisibilityRequest {
+    reference: String,
+    reference_visible: Option<bool>,
+    value_visible: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisibilityTransition {
+    old: bool,
+    new: bool,
+}
+
+#[derive(Debug)]
+struct PreparedFieldVisibilityUpdate {
+    content: String,
+    updated_count: usize,
+    unchanged_count: usize,
+    results: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FieldVisibilityKind {
+    Reference,
+    Value,
+}
+
+impl FieldVisibilityKind {
+    fn property_name(self) -> &'static str {
+        match self {
+            Self::Reference => "Reference",
+            Self::Value => "Value",
+        }
+    }
+
+    fn result_key(self) -> &'static str {
+        match self {
+            Self::Reference => "reference_visible",
+            Self::Value => "value_visible",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PropertyVisibilityState {
+    visible: bool,
+    hide_start: Option<usize>,
+    effects_start: Option<usize>,
+    closing_line_start: usize,
+    child_indent: String,
+}
+
+fn invalid_field_visibility_arg(reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "edits".to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument 'edits' is invalid: {reason}"),
+    )
+}
+
+fn conflict_result(path: &Path) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: vec![path.display().to_string()],
+        },
+        format!(
+            "Write conflict: '{}' changed since it was read; reload and retry.",
+            path.display()
+        ),
+    )
+}
+
+fn parse_field_visibility_requests(
+    edits: &[serde_json::Value],
+) -> Result<Vec<FieldVisibilityRequest>, CallToolResult> {
+    let mut requests = Vec::with_capacity(edits.len());
+    let mut seen = HashSet::new();
+
+    for edit in edits {
+        let Some(object) = edit.as_object() else {
+            return Err(invalid_field_visibility_arg(
+                "each edit must be an object with reference and optional visibility keys",
+            ));
+        };
+
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "reference" | "reference_visible" | "value_visible"
+            ) {
+                return Err(invalid_field_visibility_arg(format!(
+                    "unknown key '{}' in visibility edit",
+                    key
+                )));
+            }
+        }
+
+        let Some(reference) = object.get("reference").and_then(|value| value.as_str()) else {
+            return Err(invalid_field_visibility_arg(
+                "each edit must include string field 'reference'",
+            ));
+        };
+
+        let reference_visible = match object.get("reference_visible") {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                invalid_field_visibility_arg(
+                    "field 'reference_visible' must be boolean when present",
+                )
+            })?),
+            None => None,
+        };
+        let value_visible = match object.get("value_visible") {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                invalid_field_visibility_arg("field 'value_visible' must be boolean when present")
+            })?),
+            None => None,
+        };
+
+        if reference_visible.is_none() && value_visible.is_none() {
+            return Err(invalid_field_visibility_arg(format!(
+                "edit for '{}' must set at least one of reference_visible or value_visible",
+                reference
+            )));
+        }
+
+        if !seen.insert(reference.to_string()) {
+            return Err(invalid_field_visibility_arg(format!(
+                "duplicate edit for reference '{}'",
+                reference
+            )));
+        }
+
+        requests.push(FieldVisibilityRequest {
+            reference: reference.to_string(),
+            reference_visible,
+            value_visible,
+        });
+    }
+
+    Ok(requests)
+}
+
+fn property_name_from_block(block: &str) -> Option<&str> {
+    let rest = block.strip_prefix("(property ")?;
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn line_indent(content: &str, start: usize) -> String {
+    let line_start = content[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
+    content[line_start..start]
+        .chars()
+        .take_while(|ch| *ch == ' ' || *ch == '\t')
+        .collect()
+}
+
+fn property_visibility_state(
+    content: &str,
+    property_start: usize,
+    property_end: usize,
+) -> Result<PropertyVisibilityState, String> {
+    let property = &content[property_start..property_end];
+    let direct_children = find_direct_child_blocks(property, "property");
+    let closing_line_start = content[..property_end - 1]
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(property_end - 1);
+    let child_indent = direct_children
+        .last()
+        .map(|(start, _)| line_indent(property, *start))
+        .unwrap_or_else(|| {
+            let closing_indent = &content[closing_line_start..property_end - 1];
+            format!("{closing_indent}  ")
+        });
+
+    let mut hide_start = None;
+    let mut effects_start = None;
+    for (child_start, child_end) in direct_children {
+        let child = &property[child_start..child_end];
+        match sexp_tag(child) {
+            "hide" => {
+                if hide_start.is_some() {
+                    return Err("property contains multiple direct hide nodes".to_string());
+                }
+                if child.trim() != "(hide yes)" {
+                    return Err(format!(
+                        "property has malformed direct hide node '{}'",
+                        child.trim()
+                    ));
+                }
+                hide_start = Some(property_start + child_start);
+            }
+            "effects" => {
+                if effects_start.is_none() {
+                    effects_start = Some(property_start + child_start);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(PropertyVisibilityState {
+        visible: hide_start.is_none(),
+        hide_start,
+        effects_start,
+        closing_line_start,
+        child_indent,
+    })
+}
+
+fn symbol_property_range(
+    content: &str,
+    symbol_start: usize,
+    symbol_end: usize,
+    property_name: &str,
+) -> Result<(usize, usize), String> {
+    let symbol = &content[symbol_start..symbol_end];
+    let mut matches = Vec::new();
+
+    for (child_start, child_end) in find_direct_child_blocks(symbol, "symbol") {
+        let child = &symbol[child_start..child_end];
+        if sexp_tag(child) == "property" && property_name_from_block(child) == Some(property_name) {
+            matches.push((symbol_start + child_start, symbol_start + child_end));
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(format!("property '{}' not found", property_name)),
+        _ => Err(format!(
+            "property '{}' appears multiple times",
+            property_name
+        )),
+    }
+}
+
+fn visibility_edits_for_field(
+    content: &str,
+    reference: &str,
+    kind: FieldVisibilityKind,
+    target_visible: bool,
+) -> Result<(VisibilityTransition, Vec<SexpEdit>), String> {
+    let symbol_blocks = find_all_symbol_instance_blocks(content, reference);
+    if symbol_blocks.is_empty() {
+        return Err(format!("component '{}' not found", reference));
+    }
+
+    let mut edits = Vec::new();
+    let mut current_visible: Option<bool> = None;
+
+    for (symbol_start, symbol_end) in symbol_blocks {
+        let (property_start, property_end) =
+            symbol_property_range(content, symbol_start, symbol_end, kind.property_name())
+                .map_err(|reason| format!("component '{}' {}", reference, reason))?;
+        let state =
+            property_visibility_state(content, property_start, property_end).map_err(|e| {
+                format!(
+                    "component '{}' property '{}' {}",
+                    reference,
+                    kind.property_name(),
+                    e
+                )
+            })?;
+
+        if let Some(previous) = current_visible {
+            if previous != state.visible {
+                return Err(format!(
+                    "component '{}' property '{}' differs across units",
+                    reference,
+                    kind.property_name()
+                ));
+            }
+        } else {
+            current_visible = Some(state.visible);
+        }
+
+        match (state.visible, target_visible) {
+            (true, false) => {
+                if let Some(effects_start) = state.effects_start {
+                    let indent = line_indent(content, effects_start);
+                    edits.push(SexpEdit::insert(
+                        effects_start,
+                        format!("(hide yes)\n{indent}"),
+                    ));
+                } else {
+                    edits.push(SexpEdit::insert(
+                        state.closing_line_start,
+                        format!("{}(hide yes)\n", state.child_indent),
+                    ));
+                }
+            }
+            (false, true) => {
+                let hide_start = state.hide_start.ok_or_else(|| {
+                    format!(
+                        "component '{}' property '{}' expected direct hide node",
+                        reference,
+                        kind.property_name()
+                    )
+                })?;
+                let (delete_start, delete_end) =
+                    find_block_with_leading_whitespace(content, hide_start).ok_or_else(|| {
+                        format!(
+                            "component '{}' property '{}' direct hide node could not be removed",
+                            reference,
+                            kind.property_name()
+                        )
+                    })?;
+                edits.push(SexpEdit::delete(delete_start, delete_end));
+            }
+            _ => {}
+        }
+    }
+
+    let old = current_visible.unwrap_or(true);
+    Ok((
+        VisibilityTransition {
+            old,
+            new: target_visible,
+        },
+        edits,
+    ))
+}
+
+fn prepare_field_visibility_update(
+    content: &str,
+    requests: &[FieldVisibilityRequest],
+) -> Result<PreparedFieldVisibilityUpdate, String> {
+    let mut edits = Vec::new();
+    let mut updated_count = 0usize;
+    let mut unchanged_count = 0usize;
+    let mut results = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let mut field_results = HashMap::new();
+        let mut request_changed = false;
+
+        for (kind, target_visible) in [
+            (FieldVisibilityKind::Reference, request.reference_visible),
+            (FieldVisibilityKind::Value, request.value_visible),
+        ] {
+            let Some(target_visible) = target_visible else {
+                continue;
+            };
+            let (transition, field_edits) =
+                visibility_edits_for_field(content, &request.reference, kind, target_visible)?;
+            request_changed |= transition.old != transition.new;
+            edits.extend(field_edits);
+            field_results.insert(
+                kind.result_key(),
+                json!({
+                    "old": transition.old,
+                    "new": transition.new,
+                }),
+            );
+        }
+
+        let mut result = serde_json::Map::new();
+        result.insert("reference".to_string(), json!(request.reference));
+        if let Some(value) = field_results.remove("reference_visible") {
+            result.insert("reference_visible".to_string(), value);
+        }
+        if let Some(value) = field_results.remove("value_visible") {
+            result.insert("value_visible".to_string(), value);
+        }
+        results.push(serde_json::Value::Object(result));
+
+        if request_changed {
+            updated_count += 1;
+        } else {
+            unchanged_count += 1;
+        }
+    }
+
+    let new_content = apply_edits(content.to_string(), edits);
+    Ok(PreparedFieldVisibilityUpdate {
+        content: new_content,
+        updated_count,
+        unchanged_count,
+        results,
+    })
+}
+
+fn persist_field_visibility_update(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> CallToolResult {
+    match write_atomic_if_unchanged(path, expected, replacement) {
+        Ok(()) => CallToolResult::text("ok"),
+        Err(SexpError::Conflict { .. }) => conflict_result(path),
+        Err(error) => CallToolResult::error(format!(
+            "Failed to persist field visibility update to '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async fn handle_batch_set_schematic_field_visibility(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let edits = match require_array(args, "edits") {
+        Ok(edits) => edits,
+        Err(error) => return Ok(error),
+    };
+    let requests = match parse_field_visibility_requests(edits) {
+        Ok(requests) => requests,
+        Err(error) => return Ok(error),
+    };
+
+    let content = read_consistent(&sch_path)?;
+    let prepared = match prepare_field_visibility_update(&content, &requests) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(invalid_field_visibility_arg(reason)),
+    };
+
+    if prepared.content != content {
+        let persisted = persist_field_visibility_update(&sch_path, &content, &prepared.content);
+        if persisted.is_error {
+            return Ok(persisted);
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "updated_count": prepared.updated_count,
+        "unchanged_count": prepared.unchanged_count,
+        "results": prepared.results,
+    })))
+}
 
 async fn handle_batch_connect_to_net(
     args: &serde_json::Value,
@@ -2096,6 +2561,382 @@ mod multi_unit_field_tests {
         for w in blocks.windows(2) {
             assert!(w[0].1 <= w[1].0, "blocks overlap: {:?} {:?}", w[0], w[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod field_visibility_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn result_body(result: &CallToolResult) -> Value {
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text content: {result:?}");
+        };
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    fn write_fixture(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    const SCH_VISIBLE_REF_HIDDEN_VALUE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n      (hide yes)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_NO_EFFECTS_VALUE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_MULTI_UNIT_VISIBLE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\"\n      (at 10 8 0)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"74HC14\"\n      (at 10 12 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 10 25 0)\n    (unit 2)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\"\n      (at 10 23 0)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"74HC14\"\n      (at 10 27 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_DUPLICATE_HIDE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide yes)\n      (hide yes)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    #[test]
+    fn batch_set_schematic_field_visibility_is_registered_with_the_frozen_schema() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "batch_set_schematic_field_visibility")
+            .expect("tool is registered");
+        let schema = tool.input_schema;
+        assert_eq!(schema["required"], json!(["schematic", "edits"]));
+        assert_eq!(schema["properties"]["schematic"]["type"], json!("string"));
+        assert_eq!(schema["properties"]["edits"]["type"], json!("array"));
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["reference_visible"]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["value_visible"]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn toggles_reference_and_value_visibility_atomically() {
+        let (_dir, path) = write_fixture("visibility.kicad_sch", SCH_VISIBLE_REF_HIDDEN_VALUE);
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "reference_visible": false,
+                    "value_visible": true
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(1));
+        assert_eq!(body["unchanged_count"], json!(0));
+        assert_eq!(body["results"][0]["reference"], json!("R1"));
+        assert_eq!(
+            body["results"][0]["reference_visible"],
+            json!({"old": true, "new": false})
+        );
+        assert_eq!(
+            body["results"][0]["value_visible"],
+            json!({"old": false, "new": true})
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(
+            "(property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide yes)\n      (effects"
+        ));
+        assert!(!after.contains(
+            "(property \"Value\" \"10k\"\n      (at 10 12 0)\n      (hide yes)\n      (effects"
+        ));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    #[tokio::test]
+    async fn can_update_only_one_requested_field_and_preserve_the_other() {
+        let (_dir, path) = write_fixture(
+            "visibility-one-field.kicad_sch",
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+        );
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "reference_visible": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert!(body["results"][0].get("value_visible").is_none(), "{body}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(
+            "(property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide yes)\n      (effects"
+        ));
+        assert!(after.contains(
+            "(property \"Value\" \"10k\"\n      (at 10 12 0)\n      (hide yes)\n      (effects"
+        ));
+    }
+
+    #[tokio::test]
+    async fn inserts_hide_before_property_close_when_effects_are_absent() {
+        let (_dir, path) = write_fixture("visibility-no-effects.kicad_sch", SCH_NO_EFFECTS_VALUE);
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "value_visible": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after
+            .contains("(property \"Value\" \"10k\"\n      (at 10 12 0)\n      (hide yes)\n    )"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "{after}");
+    }
+
+    #[tokio::test]
+    async fn repeated_request_is_a_successful_byte_identical_no_op() {
+        let (_dir, path) = write_fixture("visibility-noop.kicad_sch", SCH_VISIBLE_REF_HIDDEN_VALUE);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "reference_visible": true,
+                    "value_visible": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(0));
+        assert_eq!(body["unchanged_count"], json!(1));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn multi_unit_reference_updates_every_unit_copy() {
+        let (_dir, path) = write_fixture("visibility-multi-unit.kicad_sch", SCH_MULTI_UNIT_VISIBLE);
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "U1",
+                    "reference_visible": false,
+                    "value_visible": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(property \"Reference\" \"U1\"").count(), 2);
+        assert_eq!(
+            after
+                .matches("(property \"Reference\" \"U1\"\n      (at ")
+                .count(),
+            2
+        );
+        assert_eq!(
+            after
+                .matches("(property \"Reference\" \"U1\"\n      (at ")
+                .count(),
+            2
+        );
+        assert_eq!(
+            after.matches("(hide yes)\n      (effects").count(),
+            4,
+            "{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_batches_are_rejected_without_partial_writes() {
+        let (_dir, path) = write_fixture(
+            "visibility-invalid-batch.kicad_sch",
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {
+                        "reference": "R1",
+                        "reference_visible": false
+                    },
+                    {
+                        "value_visible": true
+                    }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_references_and_unknown_keys_are_rejected() {
+        let (_dir, path) = write_fixture(
+            "visibility-invalid-keys.kicad_sch",
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        for args in [
+            json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "R1", "reference_visible": false},
+                    {"reference": "R1", "value_visible": true}
+                ]
+            }),
+            json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "R1", "reference_visible": false, "unexpected": 1}
+                ]
+            }),
+        ] {
+            let result = handle_batch_set_schematic_field_visibility(&args, &test_ctx())
+                .await
+                .unwrap();
+            assert!(result.is_error, "{args}: {result:?}");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_symbol_missing_property_and_duplicate_hide_leave_the_file_unchanged() {
+        for (name, content, args) in [
+            (
+                "visibility-missing-symbol.kicad_sch",
+                SCH_VISIBLE_REF_HIDDEN_VALUE,
+                json!({
+                    "edits": [{"reference": "R99", "reference_visible": false}]
+                }),
+            ),
+            (
+                "visibility-missing-property.kicad_sch",
+                "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\")\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n",
+                json!({
+                    "edits": [{"reference": "R1", "value_visible": false}]
+                }),
+            ),
+            (
+                "visibility-duplicate-hide.kicad_sch",
+                SCH_DUPLICATE_HIDE,
+                json!({
+                    "edits": [{"reference": "R1", "reference_visible": true}]
+                }),
+            ),
+        ] {
+            let (_dir, path) = write_fixture(name, content);
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut full_args = args;
+            full_args["schematic"] = json!(path.display().to_string());
+
+            let result = handle_batch_set_schematic_field_visibility(&full_args, &test_ctx())
+                .await
+                .unwrap();
+
+            assert!(result.is_error, "{full_args}: {result:?}");
+            assert_eq!(extract_error_kind(&result).as_deref(), Some("invalid_argument"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_conflicts_are_reported_structurally_without_overwriting_the_newer_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stale-visibility.kicad_sch");
+        std::fs::write(&path, SCH_VISIBLE_REF_HIDDEN_VALUE).unwrap();
+
+        let prepared = prepare_field_visibility_update(
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+            &[FieldVisibilityRequest {
+                reference: "R1".to_string(),
+                reference_visible: Some(false),
+                value_visible: Some(true),
+            }],
+        )
+        .expect("request prevalidates");
+
+        let externally_changed = SCH_VISIBLE_REF_HIDDEN_VALUE.replace("\"10k\"", "\"22k\"");
+        std::fs::write(&path, &externally_changed).unwrap();
+
+        let result = persist_field_visibility_update(
+            Path::new(&path),
+            SCH_VISIBLE_REF_HIDDEN_VALUE,
+            &prepared.content,
+        );
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), externally_changed);
     }
 }
 
