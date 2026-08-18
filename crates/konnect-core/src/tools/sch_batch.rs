@@ -565,10 +565,8 @@ fn property_visibility_state(
                 }
                 hide_start = Some(property_start + child_start);
             }
-            "effects" => {
-                if effects_start.is_none() {
-                    effects_start = Some(property_start + child_start);
-                }
+            "effects" if effects_start.is_none() => {
+                effects_start = Some(property_start + child_start);
             }
             _ => {}
         }
