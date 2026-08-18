@@ -2912,8 +2912,7 @@ mod tests {
     #[tokio::test]
     async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stale.kicad_sch");
+        let path = symdir.path().join("stale.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3007,8 +3006,7 @@ mod tests {
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_moved_pin_unless_allowed() {
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("guarded.kicad_sch");
+        let path = symdir.path().join("guarded.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3202,8 +3200,7 @@ mod tests {
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_removed_pin() {
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shrunk.kicad_sch");
+        let path = symdir.path().join("shrunk.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
