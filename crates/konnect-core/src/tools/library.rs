@@ -4432,8 +4432,7 @@ mod tests {
         let original = "(sym_lib_table
   (version 7)
   (lib (name \"Parts\") (type \"KiCad\") (uri \"C:/stale/Parts.kicad_sym\") (options \"keep=1\") (descr \"keep me\"))
-)
-";
+)";
         std::fs::write(&table, original).unwrap();
 
         let result = handle_register_symbol_library(
@@ -5519,6 +5518,66 @@ mod tests {
         std::fs::read_to_string(&lib).unwrap()
     }
 
+    fn property_sexp(content: &str, property: &str) -> String {
+        let needle = format!("(property \"{property}\" ");
+        let start = content
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing property {property}:\n{content}"));
+        let mut depth = 0i32;
+        let mut end = None;
+        for (offset, ch) in content[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("unterminated property {property}:\n{content}"));
+        content[start..end].to_string()
+    }
+
+    const LEGACY_ANCHOR_TEST_OUTPUT: &str = "\
+(kicad_symbol_lib
+  (version 20251024)
+  (generator \"konnect\")
+  (generator_version \"10.0\")
+
+  (symbol \"ANCHOR_TEST\"
+    (pin_names
+      (offset 1.016))
+    (exclude_from_sim no)
+    (in_bom yes)
+    (on_board yes)
+    (in_pos_files yes)
+    (duplicate_pin_numbers_are_jumpers no)
+    (property \"Reference\" \"U\" (at 0 5.0800 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27))))
+    (property \"Value\" \"ANCHOR_TEST\" (at 0 -5.0800 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27))))
+    (property \"Footprint\" \"\" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))
+    (property \"Datasheet\" \"\" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))
+    (property \"Description\" \"\" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))
+    (symbol \"ANCHOR_TEST_0_1\"
+      (rectangle (start -6.3500 -2.5400) (end -1.2700 2.5400)
+        (stroke (width 0.254) (type default))
+        (fill (type background))
+      )
+    (pin input line (at -8.89 0 0)
+      (length 2.54)
+      (name \"IN\" (effects (font (size 1.27 1.27))))
+      (number \"1\" (effects (font (size 1.27 1.27))))
+    )
+    )
+    (embedded_fonts no)
+  )
+)";
+    const LEGACY_REFERENCE_PROPERTY: &str = "(property \"Reference\" \"U\" (at 0 5.0800 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27))))";
+    const LEGACY_VALUE_PROPERTY: &str = "(property \"Value\" \"ANCHOR_TEST\" (at 0 -5.0800 0) (show_name no) (do_not_autoplace no) (effects (font (size 1.27 1.27))))";
+
     #[test]
     fn symbol_field_anchor_schema_exposes_optional_reference_and_value_objects() {
         let schema = tools()
@@ -5570,17 +5629,13 @@ mod tests {
 
     #[tokio::test]
     async fn symbol_field_anchor_partial_override_preserves_the_legacy_automatic_other_field() {
-        let automatic = create_symbol_output(json!({})).await;
         let partial = create_symbol_output(json!({
             "reference_at": {"x": 0, "y": 17.78, "rotation": 0}
         }))
         .await;
 
         assert_eq!(property_anchor(&partial, "Reference"), (0.0, 17.78, 0.0));
-        assert_eq!(
-            property_anchor(&partial, "Value"),
-            property_anchor(&automatic, "Value")
-        );
+        assert_eq!(property_sexp(&partial, "Value"), LEGACY_VALUE_PROPERTY);
     }
 
     #[tokio::test]
@@ -5631,16 +5686,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn symbol_field_anchor_omission_keeps_legacy_automatic_anchor_bytes() {
+    async fn symbol_field_anchor_rejects_non_object_or_unknown_keys() {
+        let cases = [
+            (json!({"reference_at": "bad"}), "reference_at"),
+            (
+                json!({"reference_at": {"x": 0, "y": 17.78, "rotation": 0, "z": 1}}),
+                "reference_at",
+            ),
+            (json!({"value_at": []}), "value_at"),
+            (
+                json!({"value_at": {"x": 0, "y": -20.32, "extra": true}}),
+                "value_at",
+            ),
+        ];
+
+        for (extra, field) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("invalid-anchor-shape.kicad_sym");
+            let mut args = json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "BAD_ANCHOR",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54}
+                ]
+            });
+            let args_obj = args.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                args_obj.insert(key.clone(), value.clone());
+            }
+
+            let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error, "{field} must be rejected");
+            let body = result_text(&result);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(parsed["error"]["field"], field, "{body}");
+            assert!(
+                !lib.exists(),
+                "invalid anchors must not write a library for {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_field_anchor_omission_keeps_the_full_legacy_output_byte_for_byte() {
         let content = create_symbol_output(json!({})).await;
-        assert!(
-            content.contains("(property \"Reference\" \"U\" (at 0 5.0800 0)"),
-            "reference must keep the legacy automatic anchor:\n{content}"
+        assert_eq!(content, LEGACY_ANCHOR_TEST_OUTPUT);
+        assert_eq!(
+            property_sexp(&content, "Reference"),
+            LEGACY_REFERENCE_PROPERTY
         );
-        assert!(
-            content.contains("(property \"Value\" \"ANCHOR_TEST\" (at 0 -5.0800 0)"),
-            "value must keep the legacy automatic anchor:\n{content}"
-        );
+        assert_eq!(property_sexp(&content, "Value"), LEGACY_VALUE_PROPERTY);
     }
 
     #[tokio::test]
