@@ -53,6 +53,20 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
     })
 }
 
+fn symbol_field_anchor_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "rotation": { "type": "number", "default": 0 }
+        },
+        "required": ["x", "y"],
+        "additionalProperties": false
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     let mut tools = vec![
         tool!(
@@ -195,6 +209,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "Symbol name" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
+                    "reference_at": symbol_field_anchor_schema("Optional explicit anchor for the visible Reference property. When omitted, create_symbol keeps the current automatic placement above the first unit body."),
+                    "value_at": symbol_field_anchor_schema("Optional explicit anchor for the visible Value property. When omitted, create_symbol keeps the current automatic placement below the first unit body."),
                     "glyph": {
                         "type": "string",
                         "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
@@ -924,6 +940,44 @@ fn invalid_library_argument(field: &str, reason: impl Into<String>) -> CallToolR
         },
         format!("Argument '{field}' is invalid: {reason}"),
     )
+}
+
+fn parse_symbol_field_anchor(
+    args: &serde_json::Value,
+    field: &str,
+) -> Result<Option<(f64, f64, f64)>, CallToolResult> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let Some(anchor) = value.as_object() else {
+        return Err(invalid_library_argument(field, "must be an object"));
+    };
+
+    for key in anchor.keys() {
+        if key != "x" && key != "y" && key != "rotation" {
+            return Err(invalid_library_argument(
+                field,
+                format!("unknown key '{key}'"),
+            ));
+        }
+    }
+
+    let x = anchor
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| invalid_library_argument(field, "x must be a number"))?;
+    let y = anchor
+        .get("y")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| invalid_library_argument(field, "y must be a number"))?;
+    let rotation = match anchor.get("rotation") {
+        None => 0.0,
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| invalid_library_argument(field, "rotation must be a number"))?,
+    };
+
+    Ok(Some((x, y, rotation)))
 }
 
 fn edit_footprint_pad_block(
@@ -3014,6 +3068,14 @@ async fn handle_create_symbol(
     let value_str = args["value"].as_str().unwrap_or(name);
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
+    let reference_at = match parse_symbol_field_anchor(args, "reference_at") {
+        Ok(anchor) => anchor,
+        Err(error) => return Ok(error),
+    };
+    let value_at = match parse_symbol_field_anchor(args, "value_at") {
+        Ok(anchor) => anchor,
+        Err(error) => return Ok(error),
+    };
 
     // Optional conventional body shape. `glyph` may be set at the symbol level
     // (a default for every unit) and/or per unit (overriding the default).
@@ -3179,6 +3241,16 @@ async fn handle_create_symbol(
              (effects (font (size 1.27 1.27))))"
         )
     };
+    let explicit_visible_property = |name: &str, value: &str, x: f64, y: f64, rotation: f64| {
+        format!(
+            "\n    (property \"{name}\" \"{value}\" (at {} {} {}) \
+             (show_name no) (do_not_autoplace no) \
+             (effects (font (size 1.27 1.27))))",
+            fmt_f64(x),
+            fmt_f64(y),
+            fmt_f64(rotation)
+        )
+    };
     let hidden_property = |name: &str, value: &str| {
         format!(
             "\n    (property \"{name}\" \"{value}\" (at 0 0 0) \
@@ -3192,8 +3264,14 @@ async fn handle_create_symbol(
         name,
         numbers,
         names,
-        visible_property("Reference", ref_prefix, ref_y),
-        visible_property("Value", value_str, value_y),
+        match reference_at {
+            Some((x, y, rotation)) => explicit_visible_property("Reference", ref_prefix, x, y, rotation),
+            None => visible_property("Reference", ref_prefix, ref_y),
+        },
+        match value_at {
+            Some((x, y, rotation)) => explicit_visible_property("Value", value_str, x, y, rotation),
+            None => visible_property("Value", value_str, value_y),
+        },
         hidden_property("Footprint", ""),
         hidden_property("Datasheet", ""),
         hidden_property("Description", ""),
@@ -5385,6 +5463,183 @@ mod tests {
         assert!(
             !c.contains("SINGLE_1_1"),
             "single unit must not create a _1_1 unit"
+        );
+    }
+
+    fn property_anchor(content: &str, property: &str) -> (f64, f64, f64) {
+        let needle = format!("(property \"{property}\" ");
+        let start = content
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing property {property}:\n{content}"));
+        let rest = &content[start..];
+        let at_start = rest
+            .find("(at ")
+            .unwrap_or_else(|| panic!("missing (at ...) for {property}:\n{content}"))
+            + 4;
+        let coords = &rest[at_start..];
+        let end = coords
+            .find(')')
+            .unwrap_or_else(|| panic!("unterminated (at ...) for {property}:\n{content}"));
+        let parts: Vec<&str> = coords[..end].split_whitespace().collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected 3 at-parts for {property}: {parts:?}"
+        );
+        (
+            parts[0].parse().unwrap(),
+            parts[1].parse().unwrap(),
+            parts[2].parse().unwrap(),
+        )
+    }
+
+    async fn create_symbol_output(extra: serde_json::Value) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("anchors.kicad_sym");
+        let mut args = json!({
+            "library_path": lib.to_string_lossy(),
+            "name": "ANCHOR_TEST",
+            "reference_prefix": "U",
+            "pins": [
+                {"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54}
+            ]
+        });
+        if let Some(extra) = extra.as_object() {
+            let args_obj = args.as_object_mut().unwrap();
+            for (key, value) in extra {
+                args_obj.insert(key.clone(), value.clone());
+            }
+        }
+        let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(
+            !result.is_error,
+            "create_symbol errored: {:?}",
+            result.content
+        );
+        std::fs::read_to_string(&lib).unwrap()
+    }
+
+    #[test]
+    fn symbol_field_anchor_schema_exposes_optional_reference_and_value_objects() {
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_symbol")
+            .unwrap()
+            .input_schema;
+
+        for field in ["reference_at", "value_at"] {
+            let anchor = &schema["properties"][field];
+            assert_eq!(anchor["type"], "object", "{field}: {anchor}");
+            assert_eq!(anchor["required"], json!(["x", "y"]), "{field}: {anchor}");
+            assert_eq!(
+                anchor["additionalProperties"],
+                json!(false),
+                "{field}: {anchor}"
+            );
+            assert_eq!(
+                anchor["properties"]["x"]["type"], "number",
+                "{field}: {anchor}"
+            );
+            assert_eq!(
+                anchor["properties"]["y"]["type"], "number",
+                "{field}: {anchor}"
+            );
+            assert_eq!(
+                anchor["properties"]["rotation"]["type"], "number",
+                "{field}: {anchor}"
+            );
+            assert_eq!(
+                anchor["properties"]["rotation"]["default"],
+                json!(0),
+                "{field}: {anchor}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_field_anchor_explicit_reference_and_value_positions_are_used() {
+        let content = create_symbol_output(json!({
+            "reference_at": {"x": 0, "y": 17.78, "rotation": 0},
+            "value_at": {"x": 0, "y": -20.32, "rotation": 0}
+        }))
+        .await;
+
+        assert_eq!(property_anchor(&content, "Reference"), (0.0, 17.78, 0.0));
+        assert_eq!(property_anchor(&content, "Value"), (0.0, -20.32, 0.0));
+    }
+
+    #[tokio::test]
+    async fn symbol_field_anchor_partial_override_preserves_the_legacy_automatic_other_field() {
+        let automatic = create_symbol_output(json!({})).await;
+        let partial = create_symbol_output(json!({
+            "reference_at": {"x": 0, "y": 17.78, "rotation": 0}
+        }))
+        .await;
+
+        assert_eq!(property_anchor(&partial, "Reference"), (0.0, 17.78, 0.0));
+        assert_eq!(
+            property_anchor(&partial, "Value"),
+            property_anchor(&automatic, "Value")
+        );
+    }
+
+    #[tokio::test]
+    async fn symbol_field_anchor_rejects_missing_or_non_numeric_coordinates() {
+        let cases = [
+            (
+                json!({"reference_at": {"y": 17.78, "rotation": 0}}),
+                "reference_at",
+            ),
+            (
+                json!({"reference_at": {"x": 0, "y": "17.78", "rotation": 0}}),
+                "reference_at",
+            ),
+            (json!({"value_at": {"x": 0, "rotation": 0}}), "value_at"),
+            (
+                json!({"value_at": {"x": 0, "y": -20.32, "rotation": "0"}}),
+                "value_at",
+            ),
+        ];
+
+        for (extra, field) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let lib = tmp.path().join("invalid-anchor.kicad_sym");
+            let mut args = json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "BAD_ANCHOR",
+                "reference_prefix": "U",
+                "pins": [
+                    {"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54}
+                ]
+            });
+            let args_obj = args.as_object_mut().unwrap();
+            for (key, value) in extra.as_object().unwrap() {
+                args_obj.insert(key.clone(), value.clone());
+            }
+
+            let result = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(result.is_error, "{field} must be rejected");
+            let body = result_text(&result);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"]["kind"], "invalid_argument", "{body}");
+            assert_eq!(parsed["error"]["field"], field, "{body}");
+            assert!(
+                !lib.exists(),
+                "invalid anchors must not write a library for {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn symbol_field_anchor_omission_keeps_legacy_automatic_anchor_bytes() {
+        let content = create_symbol_output(json!({})).await;
+        assert!(
+            content.contains("(property \"Reference\" \"U\" (at 0 5.0800 0)"),
+            "reference must keep the legacy automatic anchor:\n{content}"
+        );
+        assert!(
+            content.contains("(property \"Value\" \"ANCHOR_TEST\" (at 0 -5.0800 0)"),
+            "value must keep the legacy automatic anchor:\n{content}"
         );
     }
 
