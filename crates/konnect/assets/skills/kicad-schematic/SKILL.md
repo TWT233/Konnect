@@ -171,6 +171,20 @@ Connect multiple pins to the same net in one call. Ideal for:
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.
 
+### batch_set_schematic_field_visibility
+
+Use this batch tool to hide or show the placed `Reference` and `Value` fields on
+existing components. Provide `schematic` plus an `edits` array of
+`{reference, reference_visible?, value_visible?}` objects.
+
+- This is the supported way to control placed field visibility. Do not blank the
+  field text as a hide/show workaround.
+- Every edit is prevalidated before Konnect writes anything, so one bad
+  reference or malformed request aborts the entire batch.
+- Each edit must set at least one of `reference_visible` or `value_visible`.
+- Repeating the current target state is a successful no-op, so unchanged sheets
+  stay byte-identical.
+
 ### When to Use Batch vs Individual
 
 - 1-2 components: individual calls

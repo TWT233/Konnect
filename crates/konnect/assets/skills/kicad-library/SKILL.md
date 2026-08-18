@@ -104,6 +104,11 @@ Optional but recommended:
 - Power pins on top (VCC) and bottom (GND)
 - Pin spacing: 2.54mm (100mil) standard grid
 - Symbol body: rectangle for ICs, standard shapes for passives/discretes
+- `create_symbol` also accepts optional `reference_at` and `value_at` objects to
+  override the visible Reference/Value anchors. Each object requires numeric
+  `x` and `y`, accepts optional numeric `rotation` (default `0`), and when
+  omitted Konnect keeps the automatic anchors above and below the first unit
+  body.
 
 ---
 
