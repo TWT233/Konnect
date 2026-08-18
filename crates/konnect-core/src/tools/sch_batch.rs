@@ -2609,6 +2609,8 @@ mod field_visibility_tests {
 
     const SCH_DUPLICATE_HIDE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide yes)\n      (hide yes)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
 
+    const SCH_MALFORMED_HIDE: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n    )\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 10 10 0)\n    (unit 1)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\"\n      (at 10 8 0)\n      (hide no)\n      (effects (font (size 1.27 1.27)))\n    )\n    (property \"Value\" \"10k\"\n      (at 10 12 0)\n      (effects (font (size 1.27 1.27)))\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
     #[test]
     fn batch_set_schematic_field_visibility_is_registered_with_the_frozen_schema() {
         let tool = tools()
@@ -2963,6 +2965,32 @@ mod field_visibility_tests {
             assert_eq!(extract_error_kind(&result).as_deref(), Some("invalid_argument"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_direct_hide_is_rejected_without_changing_bytes() {
+        let (_dir, path) = write_fixture("visibility-malformed-hide.kicad_sch", SCH_MALFORMED_HIDE);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_set_schematic_field_visibility(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "reference_visible": true
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[tokio::test]
