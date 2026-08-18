@@ -326,6 +326,11 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "open_collector",
         "open_emitter",
         "tri_state",
+        // Nested public schema fields are not tool names.
+        "reference_visible",
+        "value_visible",
+        "reference_at",
+        "value_at",
         // Tool parameters are exempted from the schemas, not from this list —
         // see the doc comment. Only values and vocabulary belong here.
         "usb_c_5v_sink",
