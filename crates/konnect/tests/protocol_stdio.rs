@@ -137,6 +137,35 @@ impl Drop for McpProcess {
     }
 }
 
+/// Return a field anchor from the named symbol's direct property block. This
+/// deliberately parses the generated library instead of matching independent
+/// strings, so an `(at ...)` belonging to another property cannot satisfy it.
+fn symbol_property_anchor(
+    library: &str,
+    symbol_name: &str,
+    property_name: &str,
+) -> (f64, f64, f64) {
+    let root = konnect_sexp::parser::parse_sexp(library).expect("parse generated symbol library");
+    let symbol = root
+        .find_all("symbol")
+        .into_iter()
+        .find(|symbol| symbol.get(1).and_then(|node| node.as_str()) == Some(symbol_name))
+        .unwrap_or_else(|| panic!("missing symbol {symbol_name}"));
+    let property = symbol
+        .find_all("property")
+        .into_iter()
+        .find(|property| property.get(1).and_then(|node| node.as_str()) == Some(property_name))
+        .unwrap_or_else(|| panic!("missing {property_name} property"));
+    let at = property
+        .find("at")
+        .unwrap_or_else(|| panic!("missing anchor on {property_name} property"));
+    (
+        at.get_f64(1).expect("anchor x"),
+        at.get_f64(2).expect("anchor y"),
+        at.get_f64(3).expect("anchor rotation"),
+    )
+}
+
 #[test]
 fn handshake_baseline_and_full_registry_loads() {
     let mut p = McpProcess::spawn();
@@ -500,6 +529,18 @@ fn schematic_field_display_round_trips_over_stdio() {
         json!({"schematic": schematic, "edits": shown_edit}),
     );
     assert_ne!(noop["isError"], json!(true), "{noop:#?}");
+    let noop_body = McpProcess::tool_body(&noop);
+    assert_eq!(noop_body["updated_count"], 0, "{noop_body:#?}");
+    assert_eq!(noop_body["unchanged_count"], 1, "{noop_body:#?}");
+    assert_eq!(noop_body["results"][0]["reference"], "R1");
+    assert_eq!(
+        noop_body["results"][0]["reference_visible"],
+        json!({"old": true, "new": true})
+    );
+    assert_eq!(
+        noop_body["results"][0]["value_visible"],
+        json!({"old": true, "new": true})
+    );
     assert_eq!(
         std::fs::read(&schematic).expect("read schematic after no-op"),
         before_noop
@@ -552,12 +593,12 @@ fn schematic_field_display_round_trips_over_stdio() {
     );
     let library_content =
         std::fs::read_to_string(&library).expect("read disposable symbol library");
-    assert!(
-        library_content.contains("(property \"Reference\"")
-            && library_content.contains("(at 0 17.78 0)")
+    assert_eq!(
+        symbol_property_anchor(&library_content, "ANCHOR_TEST", "Reference"),
+        (0.0, 17.78, 0.0)
     );
-    assert!(
-        library_content.contains("(property \"Value\"")
-            && library_content.contains("(at 0 -20.32 0)")
+    assert_eq!(
+        symbol_property_anchor(&library_content, "ANCHOR_TEST", "Value"),
+        (0.0, -20.32, 0.0)
     );
 }
