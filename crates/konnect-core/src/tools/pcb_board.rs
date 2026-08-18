@@ -600,6 +600,7 @@ async fn handle_get_board_info(
     // every KiCad 10 board reported 0. Collect from wherever the nets actually
     // are and de-duplicate; see konnect_sexp::net.
     let net_count = konnect_sexp::net::count_distinct_nets(&tree);
+    let zone_count = tree.find_all("zone").len();
 
     Ok(CallToolResult::json(&json!({
         "file": board_path.display().to_string(),
@@ -607,7 +608,8 @@ async fn handle_get_board_info(
         "paper": paper,
         "layer_count": layer_count,
         "copper_layer_count": copper_layer_count,
-        "net_count": net_count
+        "net_count": net_count,
+        "zone_count": zone_count
     })))
 }
 
@@ -1453,6 +1455,80 @@ mod net_count_tests {
             net_count_of("(kicad_pcb\n  (version 20250610)\n  (net 0 \"\")\n)\n").await,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod query_identity_inventory_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    async fn board_info_of(board: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let result =
+            handle_get_board_info(&json!({ "board": path.to_str().unwrap() }), &test_ctx())
+                .await
+                .expect("handler should succeed");
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_identity_inventory_reports_zero_zones_for_a_blank_board() {
+        let parsed = board_info_of(
+            "(kicad_pcb\n  (version 20250610)\n  (generator \"konnect\")\n  (paper \"A4\")\n  (net 0 \"\")\n)\n",
+        )
+        .await;
+        assert_eq!(parsed["zone_count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn query_identity_inventory_counts_top_level_zones_on_a_real_style_board() {
+        let parsed = board_info_of(
+            "(kicad_pcb\n\
+  (version 20260206)\n\
+  (generator \"pcbnew\")\n\
+  (paper \"A4\")\n\
+  (layers\n\
+    (0 \"F.Cu\" signal)\n\
+    (31 \"B.Cu\" signal)\n\
+  )\n\
+  (net 0 \"\")\n\
+  (net 1 \"GND\")\n\
+  (zone (net 1) (net_name \"GND\") (layer \"F.Cu\") (uuid \"z1\")\n\
+    (hatch edge 0.5)\n\
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10)))\n\
+  )\n\
+  (zone (net 1) (net_name \"GND\") (layer \"B.Cu\") (uuid \"z2\")\n\
+    (hatch edge 0.5)\n\
+    (polygon (pts (xy 20 20) (xy 30 20) (xy 30 30)))\n\
+  )\n\
+)\n",
+        )
+        .await;
+        assert_eq!(parsed["zone_count"], json!(2));
     }
 }
 
