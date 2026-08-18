@@ -336,14 +336,54 @@ async fn handle_list_labels(
     let sch_path = get_path(args, "schematic")?;
     let sch = cse::Schematic::load(&sch_path)?;
     let mut items: Vec<serde_json::Value> = Vec::new();
+
+    let require_uuid = |kind: &str, net: &str, uuid: &str| -> Option<CallToolResult> {
+        if uuid.is_empty() {
+            return Some(CallToolResult::error(format!(
+                "{kind} '{net}' has an empty uuid and cannot be identified safely"
+            )));
+        }
+        None
+    };
+
     for l in sch.labels.iter() {
-        items.push(json!({ "net": l.text, "type": "NetLabel", "x": l.at.x, "y": l.at.y, "rotation": l.at.rotation.unwrap_or(0.0) }));
+        if let Some(err) = require_uuid("NetLabel", &l.text, &l.uuid) {
+            return Ok(err);
+        }
+        items.push(json!({
+            "net": l.text,
+            "type": "NetLabel",
+            "x": l.at.x,
+            "y": l.at.y,
+            "rotation": l.at.rotation.unwrap_or(0.0),
+            "uuid": l.uuid
+        }));
     }
     for g in sch.global_labels.iter() {
-        items.push(json!({ "net": g.text, "type": "GlobalLabel", "x": g.at.x, "y": g.at.y, "rotation": g.at.rotation.unwrap_or(0.0) }));
+        if let Some(err) = require_uuid("GlobalLabel", &g.text, &g.uuid) {
+            return Ok(err);
+        }
+        items.push(json!({
+            "net": g.text,
+            "type": "GlobalLabel",
+            "x": g.at.x,
+            "y": g.at.y,
+            "rotation": g.at.rotation.unwrap_or(0.0),
+            "uuid": g.uuid
+        }));
     }
     for h in sch.hierarchical_labels.iter() {
-        items.push(json!({ "net": h.text, "type": "HierarchicalLabel", "x": h.at.x, "y": h.at.y, "rotation": h.at.rotation.unwrap_or(0.0) }));
+        if let Some(err) = require_uuid("HierarchicalLabel", &h.text, &h.uuid) {
+            return Ok(err);
+        }
+        items.push(json!({
+            "net": h.text,
+            "type": "HierarchicalLabel",
+            "x": h.at.x,
+            "y": h.at.y,
+            "rotation": h.at.rotation.unwrap_or(0.0),
+            "uuid": h.uuid
+        }));
     }
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "labels": items }),
@@ -827,4 +867,141 @@ async fn handle_check_overlaps(
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+#[cfg(test)]
+mod query_identity_inventory_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn labels_fixture() -> &'static str {
+        "(kicad_sch\n\
+  (version 20260306)\n\
+  (generator \"eeschema\")\n\
+  (uuid \"root\")\n\
+  (paper \"A4\")\n\
+  (lib_symbols)\n\
+  (label \"DUP\"\n\
+    (at 10 20 0)\n\
+    (uuid \"11111111-1111-1111-1111-111111111111\")\n\
+  )\n\
+  (label \"DUP\"\n\
+    (at 10 20 0)\n\
+    (uuid \"22222222-2222-2222-2222-222222222222\")\n\
+  )\n\
+  (global_label \"GLOBAL\"\n\
+    (shape input)\n\
+    (at 30 40 180)\n\
+    (uuid \"33333333-3333-3333-3333-333333333333\")\n\
+  )\n\
+  (hierarchical_label \"HIER\"\n\
+    (shape input)\n\
+    (at 50 60 90)\n\
+    (uuid \"44444444-4444-4444-4444-444444444444\")\n\
+  )\n\
+  (sheet_instances\n\
+    (path \"/\" (page \"1\"))\n\
+  )\n\
+ )\n"
+    }
+
+    fn empty_uuid_fixture() -> &'static str {
+        "(kicad_sch\n\
+  (version 20260306)\n\
+  (generator \"eeschema\")\n\
+  (uuid \"root\")\n\
+  (paper \"A4\")\n\
+  (lib_symbols)\n\
+  (label \"BROKEN\"\n\
+    (at 10 20 0)\n\
+    (uuid \"\")\n\
+  )\n\
+  (sheet_instances\n\
+    (path \"/\" (page \"1\"))\n\
+  )\n\
+ )\n"
+    }
+
+    #[tokio::test]
+    async fn query_identity_inventory_lists_label_uuids_for_all_label_kinds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fixture.kicad_sch");
+        std::fs::write(&path, labels_fixture()).unwrap();
+
+        let result =
+            handle_list_labels(&json!({ "schematic": path.to_str().unwrap() }), &test_ctx())
+                .await
+                .expect("handler should succeed");
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let labels = parsed["labels"].as_array().expect("labels array");
+        assert_eq!(parsed["count"], json!(4));
+        assert_eq!(labels.len(), 4);
+
+        let uuids: Vec<&str> = labels
+            .iter()
+            .map(|item| item["uuid"].as_str().expect("label uuid"))
+            .collect();
+        assert!(uuids.contains(&"11111111-1111-1111-1111-111111111111"));
+        assert!(uuids.contains(&"22222222-2222-2222-2222-222222222222"));
+        assert!(uuids.contains(&"33333333-3333-3333-3333-333333333333"));
+        assert!(uuids.contains(&"44444444-4444-4444-4444-444444444444"));
+
+        let duplicate_count = labels
+            .iter()
+            .filter(|item| {
+                item["net"] == json!("DUP")
+                    && item["x"] == json!(10.0)
+                    && item["y"] == json!(20.0)
+                    && item["type"] == json!("NetLabel")
+            })
+            .count();
+        assert_eq!(
+            duplicate_count, 2,
+            "same-net, same-position labels must remain separately addressable by uuid"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_identity_inventory_rejects_an_empty_label_uuid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fixture.kicad_sch");
+        std::fs::write(&path, empty_uuid_fixture()).unwrap();
+
+        let result =
+            handle_list_labels(&json!({ "schematic": path.to_str().unwrap() }), &test_ctx())
+                .await
+                .expect("handler should return a tool result");
+        assert!(result.is_error, "empty uuid must not be accepted");
+        assert!(
+            text_of(&result).contains("uuid"),
+            "the error should mention the unusable uuid: {}",
+            text_of(&result)
+        );
+    }
 }
