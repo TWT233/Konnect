@@ -14,7 +14,7 @@
 - The new tool is named `rebind_pcb_schematic_identities` and belongs to `sch_export`.
 - It modifies only `FootprintInstance.symbol_path`; it never adds, deletes, moves, rotates, flips, reroutes, renumbers, changes values, changes DNP, changes footprint IDs, changes pad nets, or saves.
 - Input requires exact nonempty `schematic`, `board`, and unique nonempty `references`; apply also requires the exact latest `expected_plan_revision`.
-- A requested reference is eligible only when exact reference, value, footprint ID, DNP, pad-number set, and normalized pad-net mapping match while nonempty old/new symbol paths differ.
+- A requested reference is eligible only when exact reference, value, footprint ID, DNP, pad-number set, and normalized pad-net mapping match while old/new symbol paths differ and each path is exactly one leading `/` followed by one or more nonempty UUID segments accepted by `uuid::Uuid::parse_str`.
 - A mixed request is atomic and fail-closed: one conflict clears every planned change.
 - Apply is one KiCad undo commit and readback must prove every protobuf field except `symbol_path` unchanged.
 - The saved schematic must be closed and the exact target PCB must be open over live IPC.
@@ -108,8 +108,14 @@ assert_eq!(
     plan.changes.iter().map(|change| change.reference.as_str()).collect::<Vec<_>>(),
     vec!["D1", "SW1"],
 );
-assert_eq!(plan.changes[0].old_symbol_path, "/old/d1");
-assert_eq!(plan.changes[0].new_symbol_path, "/new/d1");
+assert_eq!(
+    plan.changes[0].old_symbol_path,
+    "/11111111-1111-4111-8111-111111111111",
+);
+assert_eq!(
+    plan.changes[0].new_symbol_path,
+    "/22222222-2222-4222-8222-222222222222",
+);
 assert_eq!(plan.changes[0].preserve.layer, "F.Cu");
 ```
 
@@ -160,7 +166,7 @@ struct IdentityRebindPlan {
 }
 ```
 
-Implement sorted requested-reference traversal, exact reference lookup, root-net normalization (`/VSYS` equals `VSYS`; nested paths remain distinct), exact non-identity comparisons, and deterministic change sorting. The normal sync planner must remain byte-for-byte behaviorally unchanged.
+Implement sorted requested-reference traversal, exact reference lookup, root-net normalization (`/VSYS` equals `VSYS`; nested paths remain distinct), exact non-identity comparisons, deterministic change sorting, and `valid_symbol_path(path: &str) -> bool`. The path helper accepts exactly one leading `/`, one or more nonempty segments, and only segments for which `uuid::Uuid::parse_str(segment).is_ok()`; it rejects `/`, `//22222222-2222-4222-8222-222222222222`, trailing `/`, symbolic text and empty segments. The normal sync planner must remain byte-for-byte behaviorally unchanged.
 
 - [ ] **Step 4: Run success test GREEN**
 
@@ -190,6 +196,8 @@ Add literal cases, each asserting `status=Conflict`, `changes.is_empty()`, `plan
 | Target identity collides with unrequested board item | Add unrequested board R1 whose old path equals schematic D1 new path | `target_identity_in_use` |
 | Invalid old KIID | Set board D1 old path to `/not-a-uuid` | `invalid_board_identity` |
 | Invalid new KIID | Set schematic D1 new path to `/not-a-uuid` | `invalid_schematic_identity` |
+| Empty path segment | Set schematic D1 new path to `//22222222-2222-4222-8222-222222222222` | `invalid_schematic_identity` |
+| Trailing path segment | Set board D1 old path to `/11111111-1111-4111-8111-111111111111/` | `invalid_board_identity` |
 
 Also add a separate all-matching request asserting `status=Noop`, `planned=0`, empty changes and diagnostics.
 

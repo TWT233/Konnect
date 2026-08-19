@@ -95,7 +95,10 @@ rebind can be planned:
 - exact pad-number-to-logical-net mapping after normalizing only the root-sheet
   KiCad prefix (`/VSYS` equals `VSYS`; nested names such as `/sheet/VSYS` are not
   normalized into root nets);
-- both old and new `symbol_path` must be nonempty and syntactically valid;
+- both old and new `symbol_path` must be nonempty and syntactically valid. A
+  valid path starts with exactly one `/`, has one or more nonempty `/`-separated
+  segments, and every segment must parse with `uuid::Uuid::parse_str`; no empty,
+  symbolic or trailing segment is accepted;
 - old and new identities must differ.
 
 The tool rejects missing references, duplicate references, duplicate identities,
@@ -130,8 +133,8 @@ Normal JSON response:
     {
       "reference": "D1",
       "kiid": "<board footprint UUID>",
-      "old_symbol_path": "/<old symbol UUID>",
-      "new_symbol_path": "/<new symbol UUID>",
+      "old_symbol_path": "/11111111-1111-4111-8111-111111111111",
+      "new_symbol_path": "/22222222-2222-4222-8222-222222222222",
       "value": "1N4148WS",
       "footprint_id": "lh60-core:D_SOD-323_Bottom",
       "dnp": false,
