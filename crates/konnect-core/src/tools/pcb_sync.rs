@@ -219,6 +219,192 @@ struct PreparedFootprint {
     height: f64,
 }
 
+#[derive(Debug, Clone)]
+struct IdentityRebindApplyContext {
+    plan: IdentityRebindPlan,
+    requested_before_items: BTreeMap<String, prost_types::Any>,
+    document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    hierarchy_files: usize,
+}
+
+enum IdentityRebindLiveDecision {
+    Respond(CallToolResult),
+    Apply(IdentityRebindApplyContext),
+}
+
+fn apply_identity_rebind_context_unavailable(
+    _context: IdentityRebindApplyContext,
+) -> CallToolResult {
+    CallToolResult::error(
+        "identity rebind apply execution is not installed in this internal build step; R1c-A replaces this placeholder"
+            .to_string(),
+    )
+}
+
+fn plan_live_identity_rebind(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    snapshot: &LiveSnapshot,
+    request: &IdentityRebindArgs,
+    hierarchy_files: usize,
+) -> Result<IdentityRebindLiveDecision> {
+    let mut plan =
+        plan_identity_rebind(netlist_source, design, &snapshot.state, &request.references);
+
+    let mut requested_items = BTreeMap::new();
+    for reference in &request.references {
+        let mut matches = snapshot
+            .state
+            .footprints
+            .iter()
+            .filter(|footprint| footprint.reference == *reference);
+        let footprint = matches.next().with_context(|| {
+            format!("requested reference {reference} is missing from the live board")
+        })?;
+        if matches.next().is_some() {
+            bail!("requested reference {reference} is ambiguous on the live board");
+        }
+        let kiid = footprint.kiid.clone();
+        let item = snapshot.items.get(&kiid).with_context(|| {
+            format!("requested footprint {reference} has no raw live item for KIID {kiid}")
+        })?;
+        if requested_items.insert(kiid.clone(), item.clone()).is_some() {
+            bail!("requested reference {reference} resolved to duplicate live KIID {kiid}");
+        }
+    }
+
+    refresh_identity_rebind_revision(&mut plan, &requested_items, &snapshot.document)?;
+
+    if request.dry_run || plan.status == PlanStatus::Conflict {
+        return Ok(IdentityRebindLiveDecision::Respond(
+            identity_rebind_response(&plan, hierarchy_files, None),
+        ));
+    }
+
+    if request.expected_plan_revision.as_deref() != Some(plan.plan_revision.as_str()) {
+        plan.status = PlanStatus::Conflict;
+        plan.counts.conflicts += 1;
+        plan.counts.planned = 0;
+        plan.changes.clear();
+        plan.diagnostics.push(conflict(
+            "stale_plan_revision",
+            "The live board or saved schematic changed; rerun dry run and apply its new plan revision."
+                .to_string(),
+            None,
+        ));
+        return Ok(IdentityRebindLiveDecision::Respond(
+            identity_rebind_response(&plan, hierarchy_files, None),
+        ));
+    }
+
+    if plan.status == PlanStatus::Noop {
+        return Ok(IdentityRebindLiveDecision::Respond(
+            identity_rebind_response(&plan, hierarchy_files, None),
+        ));
+    }
+
+    Ok(IdentityRebindLiveDecision::Apply(
+        IdentityRebindApplyContext {
+            plan,
+            requested_before_items: requested_items,
+            document: snapshot.document.clone(),
+            hierarchy_files,
+        },
+    ))
+}
+
+pub(crate) async fn handle_rebind_pcb_schematic_identities(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<CallToolResult> {
+    let request = match parse_rebind_request(args) {
+        Ok(request) => request,
+        Err(result) => return Ok(result),
+    };
+    let facts = observe_rebind_paths(&request);
+    if let Err(result) = require_rebind_paths(&facts) {
+        return Ok(result);
+    }
+
+    let hierarchy = match saved_hierarchy_files(&request.schematic) {
+        Ok(files) => files,
+        Err(error) => {
+            return Ok(conflict_result(format!(
+                "saved schematic preflight failed: {error:#}"
+            )))
+        }
+    };
+    let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
+    if let Err(error) = super::cli::export_netlist(
+        &ctx.config.kicad_cli,
+        &request.schematic,
+        temp.path(),
+        "kicadsexpr",
+    )
+    .await
+    {
+        return Ok(conflict_result(format!(
+            "KiCad netlist export failed: {error:#}"
+        )));
+    }
+    let netlist_source = match std::fs::read_to_string(temp.path()) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok(conflict_result(format!(
+                "KiCad netlist export could not be read: {error}"
+            )))
+        }
+    };
+    let mut design = match parse_exported_netlist(&netlist_source) {
+        Ok(design) => design,
+        Err(error) => {
+            return Ok(conflict_result(format!(
+                "netlist preflight failed: {error:#}"
+            )))
+        }
+    };
+    if let Err(error) = apply_saved_symbol_flags(&hierarchy, &mut design) {
+        return Ok(conflict_result(format!(
+            "schematic flag preflight failed: {error:#}"
+        )));
+    }
+
+    let what = if request.dry_run {
+        "Identity rebind dry run"
+    } else {
+        "Identity rebind apply"
+    };
+    let board = request.board.clone();
+    let request_for_live = request.clone();
+    let hierarchy_len = hierarchy.len();
+    let result = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &request.board,
+        what,
+        move |client| {
+            let snapshot = snapshot_board(client, &board)?;
+            match plan_live_identity_rebind(
+                &netlist_source,
+                &design,
+                &snapshot,
+                &request_for_live,
+                hierarchy_len,
+            )? {
+                IdentityRebindLiveDecision::Respond(result) => Ok(result),
+                IdentityRebindLiveDecision::Apply(context) => {
+                    Ok(apply_identity_rebind_context_unavailable(context))
+                }
+            }
+        },
+    )
+    .await?;
+
+    Ok(match require_live_rebind_ipc(result) {
+        Ok(result) => result,
+        Err(result) => result,
+    })
+}
+
 pub(crate) async fn handle_update_pcb_from_schematic(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -3788,6 +3974,23 @@ mod tests {
         requested
     }
 
+    fn rebind_handler_requested_items() -> BTreeMap<String, prost_types::Any> {
+        let mut requested = rebind_revision_refresh_requested_items();
+        for (from, to) in [
+            ("rebind-d1-kiid", "d1-kiid"),
+            ("rebind-sw1-kiid", "sw1-kiid"),
+        ] {
+            let item = requested.remove(from).unwrap();
+            let item = mutate_rebound_footprint_item(&item, |footprint| {
+                footprint.id = Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                    value: to.to_string(),
+                });
+            });
+            requested.insert(to.to_string(), item);
+        }
+        requested
+    }
+
     #[test]
     fn rebind_revision_refresh_hashes_all_requested_items_for_ready_and_noop() {
         let requested_items = rebind_revision_refresh_requested_items();
@@ -4178,6 +4381,309 @@ mod tests {
             invalid_item_bytes_error.contains("valid FootprintInstance"),
             "{invalid_item_bytes_error}"
         );
+    }
+
+    #[test]
+    fn rebind_handler_core_returns_refreshed_ready_dry_run() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+
+        let decision = plan_live_identity_rebind(&source, &design, &snapshot, &request, 3).unwrap();
+        let IdentityRebindLiveDecision::Respond(result) = decision else {
+            panic!("expected dry-run response");
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["coverage"]["hierarchy_files"], 3);
+        assert_ne!(value["plan_revision"], "base-rebind-revision");
+    }
+
+    #[test]
+    fn rebind_handler_core_hashes_exact_requested_items_not_full_snapshot() {
+        let (source, design, board) = identity_rebind_fixture();
+        let exact_items = rebind_handler_requested_items();
+        let request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+        let document = rebind_test_document("board-a.kicad_pcb");
+
+        let exact_snapshot = LiveSnapshot {
+            state: board.clone(),
+            items: exact_items.clone(),
+            net_codes: BTreeMap::new(),
+            document: document.clone(),
+        };
+        let exact_decision =
+            plan_live_identity_rebind(&source, &design, &exact_snapshot, &request, 1).unwrap();
+        let IdentityRebindLiveDecision::Respond(exact_result) = exact_decision else {
+            panic!("expected response");
+        };
+        let exact_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&exact_result).unwrap()).unwrap();
+
+        let mut full_items = exact_items.clone();
+        let unrelated = footprint_with_artwork("R1");
+        let unrelated = mutate_rebound_footprint_item(&unrelated, |footprint| {
+            footprint.id = Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                value: "r1-kiid".to_string(),
+            });
+        });
+        full_items.insert("r1-kiid".to_string(), unrelated);
+        let full_snapshot = LiveSnapshot {
+            state: board,
+            items: full_items,
+            net_codes: BTreeMap::new(),
+            document,
+        };
+        let full_decision =
+            plan_live_identity_rebind(&source, &design, &full_snapshot, &request, 1).unwrap();
+        let IdentityRebindLiveDecision::Respond(full_result) = full_decision else {
+            panic!("expected response");
+        };
+        let full_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&full_result).unwrap()).unwrap();
+
+        assert_eq!(exact_value["plan_revision"], full_value["plan_revision"]);
+    }
+
+    #[test]
+    fn rebind_handler_core_returns_refreshed_noop() {
+        let (source, design, mut board) = identity_rebind_fixture();
+        board_footprint_mut(&mut board, "D1").symbol_path = Some(
+            design_component_mut(&mut design.clone(), "D1")
+                .symbol_path
+                .clone(),
+        );
+        board_footprint_mut(&mut board, "SW1").symbol_path = Some(
+            design_component_mut(&mut design.clone(), "SW1")
+                .symbol_path
+                .clone(),
+        );
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+
+        let decision = plan_live_identity_rebind(&source, &design, &snapshot, &request, 2).unwrap();
+        let IdentityRebindLiveDecision::Respond(result) = decision else {
+            panic!("expected noop response");
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
+        assert_eq!(value["status"], "noop");
+        assert_ne!(value["plan_revision"], "base-rebind-revision");
+    }
+
+    #[test]
+    fn rebind_handler_core_stale_apply_is_non_mutating_conflict() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: false,
+            expected_plan_revision: Some("stale-revision".to_string()),
+        };
+
+        let decision = plan_live_identity_rebind(&source, &design, &snapshot, &request, 4).unwrap();
+        let IdentityRebindLiveDecision::Respond(result) = decision else {
+            panic!("expected stale conflict response");
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
+        assert_eq!(value["status"], "conflict");
+        assert_eq!(value["changes"], serde_json::json!([]));
+        assert_eq!(value["coverage"]["planned"], 0);
+        assert_eq!(value["undo"], serde_json::Value::Null);
+        assert!(value["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "stale_plan_revision"));
+    }
+
+    #[test]
+    fn rebind_handler_core_matching_apply_returns_apply_context() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let dry_run_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+        let dry_run_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &dry_run_request, 5).unwrap();
+        let IdentityRebindLiveDecision::Respond(dry_run_result) = dry_run_decision else {
+            panic!("expected dry-run response");
+        };
+        let dry_run_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&dry_run_result).unwrap()).unwrap();
+        let expected_revision = dry_run_value["plan_revision"].as_str().unwrap().to_string();
+
+        let apply_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: false,
+            expected_plan_revision: Some(expected_revision.clone()),
+        };
+        let decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &apply_request, 5).unwrap();
+        let IdentityRebindLiveDecision::Apply(context) = decision else {
+            panic!("expected apply context");
+        };
+        assert_eq!(context.plan.plan_revision, expected_revision);
+        assert_eq!(context.requested_before_items.len(), 2);
+        assert!(
+            context.requested_before_items.contains_key("d1-kiid")
+                || context
+                    .requested_before_items
+                    .contains_key("rebind-d1-kiid")
+        );
+        assert_eq!(context.document, snapshot.document);
+        assert_eq!(context.hierarchy_files, 5);
+    }
+
+    fn rebind_handler_test_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn rebind_handler_argument_and_path_gates_run_before_external_io() {
+        let ctx = rebind_handler_test_ctx();
+
+        let invalid_args = serde_json::json!({});
+        let invalid_result = handle_rebind_pcb_schematic_identities(&invalid_args, &ctx)
+            .await
+            .unwrap();
+        assert!(invalid_result.is_error);
+
+        let missing_paths_args = serde_json::json!({
+            "schematic": "/definitely/missing/test.kicad_sch",
+            "board": "/definitely/missing/test.kicad_pcb",
+            "references": ["D1"],
+            "dry_run": true
+        });
+        let missing_result = handle_rebind_pcb_schematic_identities(&missing_paths_args, &ctx)
+            .await
+            .unwrap();
+        assert!(missing_result.is_error);
+    }
+
+    #[test]
+    fn rebind_handler_maps_file_fallback_or_refusal_to_live_ipc_conflict() {
+        let file_result = require_live_rebind_ipc::<()>(BoardWrite::File).unwrap_err();
+        assert!(file_result.is_error);
+        let file_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&file_result).unwrap()).unwrap();
+        assert_eq!(file_value["status"], "conflict");
+        assert_eq!(file_value["diagnostics"][0]["code"], "preflight_conflict");
+
+        let refusal = CallToolResult::error("KiCad refused the live rebind");
+        let refused_result =
+            require_live_rebind_ipc::<()>(BoardWrite::Refused(refusal)).unwrap_err();
+        assert!(refused_result.is_error);
+        let refused_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&refused_result).unwrap()).unwrap();
+        assert_eq!(refused_value["status"], "conflict");
+        assert_eq!(
+            refused_value["diagnostics"][0]["code"],
+            "preflight_conflict"
+        );
+    }
+
+    #[test]
+    fn rebind_handler_placeholder_matching_apply_returns_error_not_applied() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let dry_run_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+        let dry_run_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &dry_run_request, 5).unwrap();
+        let IdentityRebindLiveDecision::Respond(dry_run_result) = dry_run_decision else {
+            panic!("expected dry-run response");
+        };
+        let dry_run_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&dry_run_result).unwrap()).unwrap();
+        let expected_revision = dry_run_value["plan_revision"].as_str().unwrap().to_string();
+
+        let apply_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: false,
+            expected_plan_revision: Some(expected_revision),
+        };
+        let decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &apply_request, 5).unwrap();
+        let IdentityRebindLiveDecision::Apply(context) = decision else {
+            panic!("expected apply context");
+        };
+        let result = apply_identity_rebind_context_unavailable(context);
+        assert!(result.is_error);
+        let text = tool_result_text(&result).unwrap();
+        assert!(text.contains("not installed"), "{text}");
+        assert!(!text.contains("applied"), "{text}");
     }
 
     #[test]
