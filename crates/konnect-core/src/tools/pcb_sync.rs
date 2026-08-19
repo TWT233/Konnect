@@ -150,6 +150,37 @@ struct SyncPlan {
     diagnostics: Vec<SyncDiagnostic>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct IdentityRebindCounts {
+    requested: usize,
+    eligible: usize,
+    planned: usize,
+    applied: usize,
+    conflicts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct IdentityRebindChange {
+    reference: String,
+    kiid: String,
+    old_symbol_path: String,
+    new_symbol_path: String,
+    value: String,
+    footprint_id: String,
+    dnp: bool,
+    pad_nets: BTreeMap<String, String>,
+    preserve: PreservedBoardState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct IdentityRebindPlan {
+    status: PlanStatus,
+    plan_revision: String,
+    counts: IdentityRebindCounts,
+    changes: Vec<IdentityRebindChange>,
+    diagnostics: Vec<SyncDiagnostic>,
+}
+
 #[derive(Debug)]
 struct LiveSnapshot {
     state: BoardState,
@@ -683,6 +714,384 @@ fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnos
         message,
         reference: reference.map(str::to_string),
     }
+}
+
+fn plan_identity_rebind(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    requested: &[String],
+) -> IdentityRebindPlan {
+    let mut diagnostics = Vec::new();
+    let mut counts = IdentityRebindCounts {
+        requested: requested.len(),
+        ..Default::default()
+    };
+
+    let mut requested_references = requested.to_vec();
+    requested_references.sort();
+    for pair in requested_references.windows(2) {
+        if pair[0] == pair[1] {
+            diagnostics.push(conflict(
+                "duplicate_requested_reference",
+                format!("requested reference {} appears more than once", pair[0]),
+                Some(&pair[0]),
+            ));
+        }
+    }
+
+    let design_by_reference = design
+        .components
+        .iter()
+        .map(|component| (component.reference.as_str(), component))
+        .collect::<HashMap<_, _>>();
+    let mut board_by_reference = HashMap::new();
+    for footprint in &board.footprints {
+        board_by_reference
+            .entry(footprint.reference.as_str())
+            .or_insert_with(Vec::new)
+            .push(footprint);
+    }
+    let requested_set = requested_references
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut board_identity_owner = HashMap::new();
+    for footprint in &board.footprints {
+        if let Some(path) = footprint.symbol_path.as_deref() {
+            board_identity_owner
+                .entry(path)
+                .or_insert_with(Vec::new)
+                .push(footprint.reference.as_str());
+        }
+    }
+    let mut schematic_identity_owner = HashMap::new();
+    for component in &design.components {
+        schematic_identity_owner
+            .entry(component.symbol_path.as_str())
+            .or_insert_with(Vec::new)
+            .push(component.reference.as_str());
+    }
+
+    let mut changes = Vec::new();
+    let mut matching_references = Vec::new();
+
+    for reference in &requested_references {
+        let Some(component) = design_by_reference.get(reference.as_str()) else {
+            diagnostics.push(conflict(
+                "requested_reference_missing_from_schematic",
+                format!("requested reference {reference} is missing from the schematic"),
+                Some(reference),
+            ));
+            continue;
+        };
+        let Some(board_matches) = board_by_reference.get(reference.as_str()) else {
+            diagnostics.push(conflict(
+                "requested_reference_missing_from_board",
+                format!("requested reference {reference} is missing from the board"),
+                Some(reference),
+            ));
+            continue;
+        };
+        let [footprint] = board_matches.as_slice() else {
+            diagnostics.push(conflict(
+                "requested_reference_missing_from_board",
+                format!("requested reference {reference} is ambiguous on the board"),
+                Some(reference),
+            ));
+            continue;
+        };
+
+        if footprint.not_in_schematic {
+            diagnostics.push(conflict(
+                "board_only_footprint",
+                format!("board reference {reference} is marked not_in_schematic"),
+                Some(reference),
+            ));
+            continue;
+        }
+        let Some(old_symbol_path) = footprint.symbol_path.as_deref() else {
+            diagnostics.push(conflict(
+                "missing_board_identity",
+                format!("board reference {reference} has no schematic identity"),
+                Some(reference),
+            ));
+            continue;
+        };
+        if component.symbol_path.is_empty() {
+            diagnostics.push(conflict(
+                "missing_schematic_identity",
+                format!("schematic reference {reference} has no schematic identity"),
+                Some(reference),
+            ));
+            continue;
+        }
+        if board_identity_owner
+            .get(old_symbol_path)
+            .is_some_and(|owners| owners.len() > 1)
+        {
+            diagnostics.push(conflict(
+                "duplicate_board_identity",
+                format!(
+                    "board schematic identity {old_symbol_path} is used by more than one footprint"
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if schematic_identity_owner
+            .get(component.symbol_path.as_str())
+            .is_some_and(|owners| owners.len() > 1)
+        {
+            diagnostics.push(conflict(
+                "duplicate_schematic_identity",
+                format!(
+                    "schematic identity {} is used by more than one component",
+                    component.symbol_path
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if !valid_symbol_path(old_symbol_path) {
+            diagnostics.push(conflict(
+                "invalid_board_identity",
+                format!("board reference {reference} has an invalid schematic identity"),
+                Some(reference),
+            ));
+            continue;
+        }
+        if !valid_symbol_path(&component.symbol_path) {
+            diagnostics.push(conflict(
+                "invalid_schematic_identity",
+                format!("schematic reference {reference} has an invalid schematic identity"),
+                Some(reference),
+            ));
+            continue;
+        }
+        if footprint.value != component.value {
+            diagnostics.push(conflict(
+                "value_mismatch",
+                format!(
+                    "requested reference {reference} has board value {} but schematic value {}",
+                    footprint.value, component.value
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if footprint.footprint_id != component.footprint_id {
+            diagnostics.push(conflict(
+                "footprint_mismatch",
+                format!(
+                    "requested reference {reference} has board footprint {} but schematic footprint {}",
+                    footprint.footprint_id, component.footprint_id
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if footprint.dnp != component.dnp {
+            diagnostics.push(conflict(
+                "dnp_mismatch",
+                format!(
+                    "requested reference {reference} has board dnp {} but schematic dnp {}",
+                    footprint.dnp, component.dnp
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if footprint.pad_nets.len() != component.pad_nets.len()
+            || footprint
+                .pad_nets
+                .keys()
+                .collect::<Vec<_>>()
+                != component.pad_nets.keys().collect::<Vec<_>>()
+        {
+            diagnostics.push(conflict(
+                "pad_set_mismatch",
+                format!("requested reference {reference} has a different pad set on the board"),
+                Some(reference),
+            ));
+            continue;
+        }
+        let normalized_board_pads = normalize_pad_nets(&footprint.pad_nets);
+        let normalized_component_pads = normalize_pad_nets(&component.pad_nets);
+        if normalized_board_pads != normalized_component_pads {
+            diagnostics.push(conflict(
+                "pad_net_mismatch",
+                format!("requested reference {reference} has a different logical pad-net mapping"),
+                Some(reference),
+            ));
+            continue;
+        }
+        if old_symbol_path == component.symbol_path {
+            matching_references.push(reference.clone());
+            continue;
+        }
+        if board
+            .footprints
+            .iter()
+            .filter(|candidate| !requested_set.contains(candidate.reference.as_str()))
+            .any(|candidate| candidate.symbol_path.as_deref() == Some(component.symbol_path.as_str()))
+        {
+            diagnostics.push(conflict(
+                "target_identity_in_use",
+                format!(
+                    "schematic identity {} is already used by an unrequested board footprint",
+                    component.symbol_path
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+
+        counts.eligible += 1;
+        changes.push(IdentityRebindChange {
+            reference: reference.clone(),
+            kiid: footprint.kiid.clone(),
+            old_symbol_path: old_symbol_path.to_string(),
+            new_symbol_path: component.symbol_path.clone(),
+            value: component.value.clone(),
+            footprint_id: component.footprint_id.clone(),
+            dnp: component.dnp,
+            pad_nets: normalize_pad_nets(&component.pad_nets),
+            preserve: PreservedBoardState {
+                position: footprint.position,
+                rotation: footprint.rotation,
+                layer: footprint.layer.clone(),
+                locked: footprint.locked,
+            },
+        });
+    }
+
+    if !matching_references.is_empty() && !changes.is_empty() {
+        for reference in matching_references {
+            diagnostics.push(conflict(
+                "identity_already_matches_in_mixed_request",
+                format!(
+                    "requested reference {reference} already matches the schematic identity while other requested references still need rebinding"
+                ),
+                Some(&reference),
+            ));
+        }
+    }
+
+    changes.sort_by(|a, b| a.reference.cmp(&b.reference));
+    counts.planned = changes.len();
+    counts.conflicts = diagnostics.len();
+    if !diagnostics.is_empty() {
+        changes.clear();
+        counts.planned = 0;
+    }
+    let status = if !diagnostics.is_empty() {
+        PlanStatus::Conflict
+    } else if changes.is_empty() {
+        PlanStatus::Noop
+    } else {
+        PlanStatus::Ready
+    };
+    let plan_revision =
+        identity_rebind_plan_revision(netlist_source, &requested_references, &changes, board);
+    IdentityRebindPlan {
+        status,
+        plan_revision,
+        counts,
+        changes,
+        diagnostics,
+    }
+}
+
+fn normalize_pad_nets(pad_nets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    pad_nets
+        .iter()
+        .map(|(pad, net)| (pad.clone(), normalize_root_net(net)))
+        .collect()
+}
+
+fn normalize_root_net(net: &str) -> String {
+    if let Some(stripped) = net.strip_prefix('/') {
+        if !stripped.is_empty() && !stripped.contains('/') {
+            return stripped.to_string();
+        }
+    }
+    net.to_string()
+}
+
+fn valid_symbol_path(path: &str) -> bool {
+    let Some(remainder) = path.strip_prefix('/') else {
+        return false;
+    };
+    if remainder.is_empty() || remainder.ends_with('/') {
+        return false;
+    }
+    remainder
+        .split('/')
+        .all(|segment| !segment.is_empty() && uuid::Uuid::parse_str(segment).is_ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IdentityRebindRevisionSnapshot {
+    requested: Vec<String>,
+    board: Vec<IdentityRebindRevisionBoardSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IdentityRebindRevisionBoardSnapshot {
+    reference: String,
+    kiid: String,
+    symbol_path: String,
+    value: String,
+    footprint_id: String,
+    dnp: bool,
+    pad_nets: BTreeMap<String, String>,
+    position_x: String,
+    position_y: String,
+    rotation: String,
+    layer: String,
+    locked: bool,
+}
+
+fn identity_rebind_plan_revision(
+    netlist_source: &str,
+    requested: &[String],
+    changes: &[IdentityRebindChange],
+    board: &BoardState,
+) -> String {
+    let board_by_reference = board
+        .footprints
+        .iter()
+        .map(|footprint| (footprint.reference.as_str(), footprint))
+        .collect::<HashMap<_, _>>();
+    let mut snapshot = IdentityRebindRevisionSnapshot {
+        requested: requested.to_vec(),
+        board: Vec::new(),
+    };
+    for reference in requested {
+        if let Some(footprint) = board_by_reference.get(reference.as_str()) {
+            snapshot.board.push(IdentityRebindRevisionBoardSnapshot {
+                reference: reference.clone(),
+                kiid: footprint.kiid.clone(),
+                symbol_path: footprint.symbol_path.clone().unwrap_or_default(),
+                value: footprint.value.clone(),
+                footprint_id: footprint.footprint_id.clone(),
+                dnp: footprint.dnp,
+                pad_nets: normalize_pad_nets(&footprint.pad_nets),
+                position_x: footprint.position.x.to_string(),
+                position_y: footprint.position.y.to_string(),
+                rotation: footprint.rotation.to_string(),
+                layer: footprint.layer.clone(),
+                locked: footprint.locked,
+            });
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(netlist_identity(netlist_source));
+    hasher.update(serde_json::to_vec(&snapshot).expect("rebind snapshot serializes"));
+    hasher.update(serde_json::to_vec(changes).expect("rebind changes serialize"));
+    format!("{:x}", hasher.finalize())
 }
 
 /// A stable identity for the design-bearing netlist sections.
@@ -1702,6 +2111,591 @@ mod tests {
                 max_y: 10.0,
             },
         }
+    }
+
+    fn rebind_design_component(
+        reference: &str,
+        symbol_path: &str,
+        value: &str,
+        footprint_id: &str,
+        dnp: bool,
+        pad_nets: &[(&str, &str)],
+    ) -> DesignComponent {
+        DesignComponent {
+            reference: reference.to_string(),
+            value: value.to_string(),
+            footprint_id: footprint_id.to_string(),
+            symbol_path: symbol_path.to_string(),
+            dnp,
+            pad_nets: pad_nets
+                .iter()
+                .map(|(pad, net)| (pad.to_string(), net.to_string()))
+                .collect(),
+        }
+    }
+
+    fn rebind_board_footprint(
+        reference: &str,
+        kiid: &str,
+        symbol_path: Option<&str>,
+        value: &str,
+        footprint_id: &str,
+        dnp: bool,
+        pad_nets: &[(&str, &str)],
+        layer: &str,
+    ) -> BoardFootprint {
+        BoardFootprint {
+            kiid: kiid.to_string(),
+            reference: reference.to_string(),
+            value: value.to_string(),
+            footprint_id: footprint_id.to_string(),
+            symbol_path: symbol_path.map(str::to_string),
+            pad_nets: pad_nets
+                .iter()
+                .map(|(pad, net)| (pad.to_string(), net.to_string()))
+                .collect(),
+            position: Point { x: 1.0, y: 2.0 },
+            rotation: 0.0,
+            layer: layer.to_string(),
+            locked: false,
+            dnp,
+            not_in_schematic: false,
+        }
+    }
+
+    fn identity_rebind_fixture() -> (ExportedDesign, BoardState) {
+        let design = ExportedDesign {
+            components: vec![
+                rebind_design_component(
+                    "D1",
+                    "/22222222-2222-4222-8222-222222222222",
+                    "1N4148WS",
+                    "lh60-core:D_SOD-323_Bottom",
+                    false,
+                    &[("1", "KEY_00"), ("2", "ROW0")],
+                ),
+                rebind_design_component(
+                    "SW1",
+                    "/33333333-3333-4333-8333-333333333333/44444444-4444-4444-8444-444444444444",
+                    "SW_Push",
+                    "Button_Switch_SMD:SW_SPST_SKQG_WithoutStem",
+                    false,
+                    &[("1", "COL0"), ("2", "/ROW0")],
+                ),
+                rebind_design_component(
+                    "R1",
+                    "/55555555-5555-4555-8555-555555555555",
+                    "10k",
+                    "Resistor_SMD:R_0603_1608Metric",
+                    false,
+                    &[("1", "VCC"), ("2", "GND")],
+                ),
+            ],
+            skipped: Vec::new(),
+        };
+        let board = board_with(vec![
+            rebind_board_footprint(
+                "D1",
+                "d1-kiid",
+                Some("/11111111-1111-4111-8111-111111111111"),
+                "1N4148WS",
+                "lh60-core:D_SOD-323_Bottom",
+                false,
+                &[("1", "KEY_00"), ("2", "/ROW0")],
+                "F.Cu",
+            ),
+            rebind_board_footprint(
+                "SW1",
+                "sw1-kiid",
+                Some("/66666666-6666-4666-8666-666666666666"),
+                "SW_Push",
+                "Button_Switch_SMD:SW_SPST_SKQG_WithoutStem",
+                false,
+                &[("1", "COL0"), ("2", "ROW0")],
+                "B.Cu",
+            ),
+            rebind_board_footprint(
+                "R1",
+                "r1-kiid",
+                Some("/77777777-7777-4777-8777-777777777777"),
+                "10k",
+                "Resistor_SMD:R_0603_1608Metric",
+                false,
+                &[("1", "VCC"), ("2", "GND")],
+                "F.Cu",
+            ),
+        ]);
+        (design, board)
+    }
+
+    fn requested_identity_rebind_references() -> Vec<String> {
+        vec!["D1".to_string(), "SW1".to_string()]
+    }
+
+    fn design_component_mut<'a>(
+        design: &'a mut ExportedDesign,
+        reference: &str,
+    ) -> &'a mut DesignComponent {
+        design
+            .components
+            .iter_mut()
+            .find(|component| component.reference == reference)
+            .unwrap_or_else(|| panic!("missing design component {reference}"))
+    }
+
+    fn board_footprint_mut<'a>(
+        board: &'a mut BoardState,
+        reference: &str,
+    ) -> &'a mut BoardFootprint {
+        board
+            .footprints
+            .iter_mut()
+            .find(|footprint| footprint.reference == reference)
+            .unwrap_or_else(|| panic!("missing board footprint {reference}"))
+    }
+
+    #[test]
+    fn identity_rebind_plans_only_exact_equivalent_references() {
+        let (design, board) = identity_rebind_fixture();
+
+        let plan = plan_identity_rebind(
+            "(export (components) (nets))",
+            &design,
+            &board,
+            &requested_identity_rebind_references(),
+        );
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.requested, 2);
+        assert_eq!(plan.counts.eligible, 2);
+        assert_eq!(plan.counts.planned, 2);
+        assert_eq!(plan.counts.conflicts, 0);
+        assert_eq!(
+            plan.changes
+                .iter()
+                .map(|change| change.reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D1", "SW1"],
+        );
+        assert_eq!(
+            plan.changes[0].old_symbol_path,
+            "/11111111-1111-4111-8111-111111111111",
+        );
+        assert_eq!(
+            plan.changes[0].new_symbol_path,
+            "/22222222-2222-4222-8222-222222222222",
+        );
+        assert_eq!(plan.changes[0].preserve.layer, "F.Cu");
+    }
+
+    #[test]
+    fn identity_rebind_conflicts_are_fail_closed() {
+        struct ConflictCase {
+            name: &'static str,
+            mutate: fn(&mut ExportedDesign, &mut BoardState, &mut Vec<String>),
+            code: &'static str,
+        }
+
+        let cases = vec![
+            ConflictCase {
+                name: "missing schematic reference",
+                mutate: |design, _, requested| {
+                    design.components.retain(|component| component.reference != "D1");
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "requested_reference_missing_from_schematic",
+            },
+            ConflictCase {
+                name: "missing board reference",
+                mutate: |_, board, requested| {
+                    board.footprints.retain(|footprint| footprint.reference != "D1");
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "requested_reference_missing_from_board",
+            },
+            ConflictCase {
+                name: "duplicate request",
+                mutate: |_, _, requested| {
+                    *requested = vec!["D1".to_string(), "D1".to_string()];
+                },
+                code: "duplicate_requested_reference",
+            },
+            ConflictCase {
+                name: "missing old identity",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").symbol_path = None;
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "missing_board_identity",
+            },
+            ConflictCase {
+                name: "missing new identity",
+                mutate: |design, _, requested| {
+                    design_component_mut(design, "D1").symbol_path = String::new();
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "missing_schematic_identity",
+            },
+            ConflictCase {
+                name: "mixed already matching identity",
+                mutate: |design, board, requested| {
+                    board_footprint_mut(board, "D1").symbol_path =
+                        Some(design_component_mut(design, "D1").symbol_path.clone());
+                    *requested = requested_identity_rebind_references();
+                },
+                code: "identity_already_matches_in_mixed_request",
+            },
+            ConflictCase {
+                name: "value drift",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").value = "WRONG".to_string();
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "value_mismatch",
+            },
+            ConflictCase {
+                name: "footprint drift",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").footprint_id = "wrong:Footprint".to_string();
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "footprint_mismatch",
+            },
+            ConflictCase {
+                name: "dnp drift",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").dnp = true;
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "dnp_mismatch",
+            },
+            ConflictCase {
+                name: "pad set drift",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").pad_nets.remove("2");
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "pad_set_mismatch",
+            },
+            ConflictCase {
+                name: "pad net drift",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1")
+                        .pad_nets
+                        .insert("2".to_string(), "ROW1".to_string());
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "pad_net_mismatch",
+            },
+            ConflictCase {
+                name: "nested net mismatch",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1")
+                        .pad_nets
+                        .insert("2".to_string(), "/sheet/ROW0".to_string());
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "pad_net_mismatch",
+            },
+            ConflictCase {
+                name: "board only footprint",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").not_in_schematic = true;
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "board_only_footprint",
+            },
+            ConflictCase {
+                name: "duplicate old identity",
+                mutate: |_, board, requested| {
+                    let d1_path = board_footprint_mut(board, "D1").symbol_path.clone();
+                    board_footprint_mut(board, "SW1").symbol_path = d1_path;
+                    *requested = requested_identity_rebind_references();
+                },
+                code: "duplicate_board_identity",
+            },
+            ConflictCase {
+                name: "duplicate new identity",
+                mutate: |design, _, requested| {
+                    let d1_path = design_component_mut(design, "D1").symbol_path.clone();
+                    design_component_mut(design, "SW1").symbol_path = d1_path;
+                    *requested = requested_identity_rebind_references();
+                },
+                code: "duplicate_schematic_identity",
+            },
+            ConflictCase {
+                name: "target identity collides with unrequested board item",
+                mutate: |design, board, requested| {
+                    board_footprint_mut(board, "R1").symbol_path =
+                        Some(design_component_mut(design, "D1").symbol_path.clone());
+                    *requested = requested_identity_rebind_references();
+                },
+                code: "target_identity_in_use",
+            },
+            ConflictCase {
+                name: "invalid old kiid path",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").symbol_path = Some("/not-a-uuid".to_string());
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "invalid_board_identity",
+            },
+            ConflictCase {
+                name: "invalid new kiid path",
+                mutate: |design, _, requested| {
+                    design_component_mut(design, "D1").symbol_path = "/not-a-uuid".to_string();
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "invalid_schematic_identity",
+            },
+            ConflictCase {
+                name: "empty path segment",
+                mutate: |design, _, requested| {
+                    design_component_mut(design, "D1").symbol_path =
+                        "//22222222-2222-4222-8222-222222222222".to_string();
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "invalid_schematic_identity",
+            },
+            ConflictCase {
+                name: "trailing path segment",
+                mutate: |_, board, requested| {
+                    board_footprint_mut(board, "D1").symbol_path =
+                        Some("/11111111-1111-4111-8111-111111111111/".to_string());
+                    *requested = vec!["D1".to_string()];
+                },
+                code: "invalid_board_identity",
+            },
+        ];
+
+        for case in cases {
+            let (mut design, mut board) = identity_rebind_fixture();
+            let mut requested = requested_identity_rebind_references();
+            (case.mutate)(&mut design, &mut board, &mut requested);
+
+            let plan = plan_identity_rebind("(export (components) (nets))", &design, &board, &requested);
+
+            assert_eq!(plan.status, PlanStatus::Conflict, "{}", case.name);
+            assert!(plan.changes.is_empty(), "{}", case.name);
+            assert_eq!(plan.counts.planned, 0, "{}", case.name);
+            assert!(
+                plan.diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == case.code),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn identity_rebind_is_noop_when_every_requested_identity_already_matches() {
+        let (design, mut board) = identity_rebind_fixture();
+        board_footprint_mut(&mut board, "D1").symbol_path =
+            Some(design_component_mut(&mut design.clone(), "D1").symbol_path.clone());
+        board_footprint_mut(&mut board, "SW1").symbol_path =
+            Some(design_component_mut(&mut design.clone(), "SW1").symbol_path.clone());
+
+        let plan = plan_identity_rebind(
+            "(export (components) (nets))",
+            &design,
+            &board,
+            &requested_identity_rebind_references(),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Noop);
+        assert_eq!(plan.counts.planned, 0);
+        assert!(plan.changes.is_empty());
+        assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn identity_rebind_plan_revision_is_stable_for_equivalent_inputs_and_changes_for_drift() {
+        let netlist = |date: &str, tool: &str| {
+            format!(
+                "(export (version \"E\")
+  (design
+    (source \"/tmp/x.kicad_sch\")
+    (date \"{date}\")
+    (tool \"{tool}\")
+  )
+  (components
+    (comp (ref \"D1\") (value \"1N4148WS\") (footprint \"lh60-core:D_SOD-323_Bottom\") (tstamps \"/aaa\"))
+    (comp (ref \"SW1\") (value \"SW_Push\") (footprint \"Button_Switch_SMD:SW_SPST_SKQG_WithoutStem\") (tstamps \"/bbb\"))
+  )
+  (nets
+    (net (code \"1\") (name \"ROW0\") (node (ref \"D1\") (pin \"2\")) (node (ref \"SW1\") (pin \"2\")))
+  ))"
+            )
+        };
+        let (design, board) = identity_rebind_fixture();
+        let requested = requested_identity_rebind_references();
+
+        let base = plan_identity_rebind(
+            &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+            &design,
+            &board,
+            &requested,
+        );
+        let different_header = plan_identity_rebind(
+            &netlist("2026-08-19T10:00:05", "kicad-cli (10.1.0)"),
+            &design,
+            &board,
+            &requested,
+        );
+        assert_eq!(base.plan_revision, different_header.plan_revision);
+
+        let reversed = plan_identity_rebind(
+            &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+            &design,
+            &board,
+            &["SW1".to_string(), "D1".to_string()],
+        );
+        assert_eq!(base.plan_revision, reversed.plan_revision);
+
+        let mut changed_board = board.clone();
+        board_footprint_mut(&mut changed_board, "D1").symbol_path =
+            Some("/88888888-8888-4888-8888-888888888888".to_string());
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &changed_board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_design = design.clone();
+        design_component_mut(&mut changed_design, "D1").symbol_path =
+            "/99999999-9999-4999-8999-999999999999".to_string();
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &changed_design,
+                &board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_design = design.clone();
+        design_component_mut(&mut changed_design, "D1").value = "DIFFERENT".to_string();
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &changed_design,
+                &board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_design = design.clone();
+        design_component_mut(&mut changed_design, "D1").footprint_id = "other:Footprint".to_string();
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &changed_design,
+                &board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_design = design.clone();
+        design_component_mut(&mut changed_design, "D1").dnp = true;
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &changed_design,
+                &board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_design = design.clone();
+        design_component_mut(&mut changed_design, "D1")
+            .pad_nets
+            .insert("2".to_string(), "ROW1".to_string());
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &changed_design,
+                &board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_board = board.clone();
+        board_footprint_mut(&mut changed_board, "D1").kiid = "changed-kiid".to_string();
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &changed_board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_board = board.clone();
+        board_footprint_mut(&mut changed_board, "D1").position.x = 99.0;
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &changed_board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_board = board.clone();
+        board_footprint_mut(&mut changed_board, "D1").layer = "B.Cu".to_string();
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &changed_board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        let mut changed_board = board.clone();
+        board_footprint_mut(&mut changed_board, "D1").locked = true;
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &changed_board,
+                &requested,
+            )
+            .plan_revision
+        );
+
+        assert_ne!(
+            base.plan_revision,
+            plan_identity_rebind(
+                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+                &design,
+                &board,
+                &["D1".to_string()],
+            )
+            .plan_revision
+        );
     }
 
     #[test]
