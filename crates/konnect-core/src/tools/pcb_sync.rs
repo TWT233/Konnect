@@ -229,7 +229,7 @@ struct IdentityRebindApplyContext {
 
 enum IdentityRebindLiveDecision {
     Respond(CallToolResult),
-    Apply(IdentityRebindApplyContext),
+    Apply(Box<IdentityRebindApplyContext>),
 }
 
 fn apply_identity_rebind_context(
@@ -351,14 +351,14 @@ fn plan_live_identity_rebind(
         ));
     }
 
-    Ok(IdentityRebindLiveDecision::Apply(
+    Ok(IdentityRebindLiveDecision::Apply(Box::new(
         IdentityRebindApplyContext {
             plan,
             requested_before_items: requested_items,
             document: snapshot.document.clone(),
             hierarchy_files,
         },
-    ))
+    )))
 }
 
 pub(crate) async fn handle_rebind_pcb_schematic_identities(
@@ -440,7 +440,7 @@ pub(crate) async fn handle_rebind_pcb_schematic_identities(
             )? {
                 IdentityRebindLiveDecision::Respond(result) => Ok(result),
                 IdentityRebindLiveDecision::Apply(context) => {
-                    apply_identity_rebind_context(client, context)
+                    apply_identity_rebind_context(client, *context)
                 }
             }
         },
@@ -2137,10 +2137,11 @@ fn footprint_field_positions_snapshot(
             .definition
             .as_ref()
             .and_then(|definition| definition.description_field.as_ref()),
-    ] {
-        if let Some(field) = field {
-            fields.push(field.encode_to_vec());
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fields.push(field.encode_to_vec());
     }
     Ok(fields)
 }
@@ -3282,6 +3283,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rebind_board_footprint(
         reference: &str,
         kiid: &str,
@@ -4201,6 +4203,11 @@ mod tests {
         requested
     }
 
+    type RevisionDrift = (
+        &'static str,
+        Box<dyn Fn(&mut BTreeMap<String, prost_types::Any>)>,
+    );
+
     #[test]
     fn rebind_revision_refresh_hashes_all_requested_items_for_ready_and_noop() {
         let requested_items = rebind_revision_refresh_requested_items();
@@ -4236,7 +4243,7 @@ mod tests {
         refresh_identity_rebind_revision(&mut base_plan, &requested_items, &document).unwrap();
         let base_revision = base_plan.plan_revision.clone();
 
-        let drift_cases: [(&str, Box<dyn Fn(&mut BTreeMap<String, prost_types::Any>)>); 6] = [
+        let drift_cases: [RevisionDrift; 6] = [
             (
                 "field placement",
                 Box::new(|requested| {
@@ -4962,7 +4969,7 @@ mod tests {
         context.requested_before_items.remove("d1-kiid");
 
         let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
-        let error = apply_identity_rebind_context(&client, context)
+        let error = apply_identity_rebind_context(&client, *context)
             .unwrap_err()
             .to_string();
 
@@ -5015,7 +5022,7 @@ mod tests {
         context.requested_before_items.remove("d1-kiid");
         let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
 
-        let error = apply_identity_rebind_context(&client, context)
+        let error = apply_identity_rebind_context(&client, *context)
             .unwrap_err()
             .to_string();
 
@@ -5271,7 +5278,7 @@ mod tests {
         });
 
         let client = konnect_ipc::KiCadIpcClient::new(&mock.url);
-        let result = apply_identity_rebind_context(&client, context).unwrap();
+        let result = apply_identity_rebind_context(&client, *context).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
 
