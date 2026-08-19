@@ -156,9 +156,15 @@ Normal JSON response:
 changes or diagnostics. A partially matching request is rejected as conflict, not
 partially applied.
 
-The plan revision hashes the saved design-bearing netlist, live board identity and
-field snapshot for every requested reference, sorted requested references, exact
-planned changes, and stable board document identity. It excludes export timestamps.
+Revision construction has two explicit stages. The pure planner produces an
+internal semantic base revision from the saved design-bearing netlist, sorted
+requested references, each requested `BoardFootprint` contract field and exact
+planned changes. The live handler then refreshes that base with the canonical raw
+`FootprintInstance` protobuf for every requested KIID plus the exact open
+`DocumentSpecifier`. Only the refreshed value is returned as public
+`plan_revision` or accepted by apply. This binds fields, attributes, pads,
+graphics, models and the target document without making unrelated board items or
+board bounds part of the requested migration. Export timestamps remain excluded.
 
 ## Apply Transaction
 

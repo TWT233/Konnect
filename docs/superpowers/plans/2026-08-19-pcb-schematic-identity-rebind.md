@@ -86,7 +86,7 @@ The shared public interface is frozen by the approved spec: tool name, input sch
 
 **Interfaces:**
 - Consumes: existing `ExportedDesign`, `DesignComponent`, `BoardState`, `BoardFootprint`, `PreservedBoardState`, `SyncDiagnostic`, `netlist_identity`.
-- Produces: `fn plan_identity_rebind(netlist_source: &str, design: &ExportedDesign, board: &BoardState, requested: &[String]) -> IdentityRebindPlan`; serializable `IdentityRebindChange`, `IdentityRebindCounts`, and stable `plan_revision`.
+- Produces: `fn plan_identity_rebind(netlist_source: &str, design: &ExportedDesign, board: &BoardState, requested: &[String]) -> IdentityRebindPlan`; serializable `IdentityRebindChange`, `IdentityRebindCounts`, and an internal semantic base revision stored in `plan_revision`. R1 must refresh it with raw live items/document before any response or apply.
 
 - [ ] **Step 1: Freeze the success response model in a failing pure test**
 
@@ -213,7 +213,7 @@ Expected first: failures for unimplemented diagnostics. Implement one validation
 
 - [ ] **Step 7: Lock revision stability and drift**
 
-Add tests requiring: same logical netlist with changed export header date/tool yields the same revision; requested-reference order yields the same revision; any requested old/new path, value, footprint, DNP, pad map, board KIID, position/layer/locked, or requested-set change yields a different revision. Hash only the requested snapshot plus netlist structural identity and serialized changes.
+Add tests requiring: same logical netlist with changed export header date/tool yields the same semantic base revision; requested-reference order yields the same base; any requested old/new path, value, footprint, DNP, pad map, board KIID, position/layer/locked, or requested-set change yields a different base. Hash only the requested `BoardFootprint` semantic snapshot plus netlist structural identity and serialized changes. Do not hash board bounds, routed nets, unrelated footprints, raw protobufs, or the document here; R1 owns the final public revision refresh.
 
 - [ ] **Step 8: Run planner and existing sync tests**
 
@@ -245,7 +245,7 @@ git push origin feat/pcb-schematic-identity-rebind
 
 **Interfaces:**
 - Consumes: `plan_identity_rebind(netlist_source: &str, design: &ExportedDesign, board: &BoardState, requested: &[String]) -> IdentityRebindPlan` from R0 and existing `LiveSnapshot` / `attempt_ipc_write`.
-- Produces: `pub(crate) async fn handle_rebind_pcb_schematic_identities(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult>` and the frozen JSON response.
+- Produces: `fn refresh_identity_rebind_revision(plan: &mut IdentityRebindPlan, requested_items: &BTreeMap<String, prost_types::Any>, document: &DocumentSpecifier)` plus `pub(crate) async fn handle_rebind_pcb_schematic_identities(args: &serde_json::Value, ctx: &ToolContext) -> anyhow::Result<CallToolResult>` and the frozen JSON response.
 
 - [ ] **Step 1: Write RED handler tests for dry-run and apply arguments**
 
@@ -268,7 +268,7 @@ Expected: RED because the handler does not exist.
 
 - [ ] **Step 2: Implement saved-hierarchy/netlist/live-snapshot orchestration**
 
-Reuse `saved_hierarchy_files`, `cli::export_netlist`, `parse_exported_netlist`, `apply_saved_symbol_flags`, `snapshot_board`, and `attempt_ipc_write`. Do not duplicate parsing or file-fallback code. Return response coverage exactly as specified:
+Reuse `saved_hierarchy_files`, `cli::export_netlist`, `parse_exported_netlist`, `apply_saved_symbol_flags`, `snapshot_board`, and `attempt_ipc_write`. Do not duplicate parsing or file-fallback code. After planning and before stale-revision comparison or response generation, call `refresh_identity_rebind_revision` with only the requested raw items keyed by KIID and the exact `snapshot.document`. Canonicalize protobuf defaults and heterogeneous child ordering before hashing. The handler never exposes or accepts the unrefreshed R0 base. Return response coverage exactly as specified:
 
 ```rust
 json!({
@@ -311,6 +311,8 @@ Decode the exact live `FootprintInstance`, validate KIID/reference/current old p
 - [ ] **Step 5: Add RED readback/corruption regressions**
 
 Extract a canonical comparison helper that returns a detailed error when any non-identity field differs. Tests must independently mutate position, rotation, layer, locked, reference, value, DNP, footprint definition, pad UUID/number/net/geometry, silk/courtyard graphic, field placement, model and item count. Every mutation must fail; changing only `symbol_path` must pass.
+
+Add revision-refresh tests requiring raw requested field/pad/graphic/model/default drift or document identity drift to change the final revision, while unrelated footprint and board-bound changes do not.
 
 - [ ] **Step 6: Implement one atomic commit and strict readback**
 
