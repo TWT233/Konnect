@@ -181,6 +181,25 @@ struct IdentityRebindPlan {
     diagnostics: Vec<SyncDiagnostic>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityRebindArgs {
+    schematic: PathBuf,
+    board: PathBuf,
+    references: Vec<String>,
+    dry_run: bool,
+    expected_plan_revision: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebindPathFacts {
+    schematic: PathBuf,
+    schematic_exists: bool,
+    board: PathBuf,
+    board_exists: bool,
+}
+
 #[derive(Debug)]
 struct LiveSnapshot {
     state: BoardState,
@@ -425,6 +444,231 @@ fn conflict_result(message: String) -> CallToolResult {
         }],
         is_error: true,
     }
+}
+
+fn invalid_argument_result(field: &str, reason: &str, message: &str) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.to_string(),
+        },
+        message.to_string(),
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_rebind_request(
+    args: &serde_json::Value,
+) -> std::result::Result<IdentityRebindArgs, CallToolResult> {
+    let schematic = args
+        .get("schematic")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "schematic",
+                "required non-empty string",
+                "schematic must be a non-empty path.",
+            )
+        })?;
+    let board = args
+        .get("board")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "board",
+                "required non-empty string",
+                "board must be a non-empty path.",
+            )
+        })?;
+    let references = args
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "references",
+                "required non-empty array of unique non-empty strings",
+                "references must be a non-empty array of unique non-empty strings.",
+            )
+        })?;
+    if references.is_empty() {
+        return Err(invalid_argument_result(
+            "references",
+            "required non-empty array of unique non-empty strings",
+            "references must be a non-empty array of unique non-empty strings.",
+        ));
+    }
+    let mut parsed_references = Vec::with_capacity(references.len());
+    let mut seen = HashSet::new();
+    for reference in references {
+        let reference = reference
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                invalid_argument_result(
+                    "references",
+                    "required non-empty array of unique non-empty strings",
+                    "references must be a non-empty array of unique non-empty strings.",
+                )
+            })?;
+        if !seen.insert(reference) {
+            return Err(invalid_argument_result(
+                "references",
+                "duplicate reference",
+                "references must not contain duplicates.",
+            ));
+        }
+        parsed_references.push(reference.to_string());
+    }
+
+    let dry_run = match args.get("dry_run") {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            invalid_argument_result(
+                "dry_run",
+                "expected boolean",
+                "dry_run must be a boolean when provided.",
+            )
+        })?,
+        None => true,
+    };
+    let expected_plan_revision = match args.get("expected_plan_revision") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    invalid_argument_result(
+                        "expected_plan_revision",
+                        "required non-empty string",
+                        "expected_plan_revision must be a non-empty string when provided.",
+                    )
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
+    if !dry_run && expected_plan_revision.is_none() {
+        return Err(invalid_argument_result(
+            "expected_plan_revision",
+            "required when dry_run is false",
+            "Apply requires the plan revision returned by a current dry run.",
+        ));
+    }
+
+    Ok(IdentityRebindArgs {
+        schematic,
+        board,
+        references: parsed_references,
+        dry_run,
+        expected_plan_revision,
+    })
+}
+
+#[allow(dead_code)]
+fn observe_rebind_paths(request: &IdentityRebindArgs) -> RebindPathFacts {
+    RebindPathFacts {
+        schematic: request.schematic.clone(),
+        schematic_exists: request.schematic.exists(),
+        board: request.board.clone(),
+        board_exists: request.board.exists(),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn require_rebind_paths(facts: &RebindPathFacts) -> std::result::Result<(), CallToolResult> {
+    if !facts.schematic_exists {
+        return Err(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: facts.schematic.display().to_string(),
+            },
+            format!("{} does not exist", facts.schematic.display()),
+        ));
+    }
+    if !facts.board_exists {
+        return Err(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::FileNotFound {
+                path: facts.board.display().to_string(),
+            },
+            format!("{} does not exist", facts.board.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn tool_result_text(result: &CallToolResult) -> Option<&str> {
+    result.content.iter().find_map(|content| match content {
+        ToolContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+fn rebind_preflight_conflict_result(message: String) -> CallToolResult {
+    let value = serde_json::json!({
+        "status": "conflict",
+        "coverage": {
+            "transport": "live_kicad_ipc"
+        },
+        "changes": [],
+        "diagnostics": [{ "code": "preflight_conflict", "message": message }],
+        "undo": serde_json::Value::Null
+    });
+    CallToolResult {
+        content: vec![ToolContent::Text {
+            text: value.to_string(),
+        }],
+        is_error: true,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn require_live_rebind_ipc<T>(result: BoardWrite<T>) -> std::result::Result<T, CallToolResult> {
+    match result {
+        BoardWrite::Ipc(value) => Ok(value),
+        BoardWrite::File => Err(rebind_preflight_conflict_result(
+            "KiCad IPC is unreachable. rebind_pcb_schematic_identities is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry."
+                .to_string(),
+        )),
+        BoardWrite::Refused(result) => Err(rebind_preflight_conflict_result(
+            tool_result_text(&result)
+                .unwrap_or("KiCad refused the rebind request")
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn identity_rebind_response(
+    plan: &IdentityRebindPlan,
+    hierarchy_files: usize,
+    undo: Option<&str>,
+) -> CallToolResult {
+    let status = match plan.status {
+        PlanStatus::Ready => "ready",
+        PlanStatus::Noop => "noop",
+        PlanStatus::Conflict => "conflict",
+    };
+    let value = serde_json::json!({
+        "status": status,
+        "plan_revision": plan.plan_revision,
+        "coverage": {
+            "source": "saved_schematic_hierarchy",
+            "hierarchy_files": hierarchy_files,
+            "transport": "live_kicad_ipc",
+            "atomicity": "single_kicad_undo_commit",
+            "requested": plan.counts.requested,
+            "eligible": plan.counts.eligible,
+            "planned": plan.counts.planned,
+            "applied": plan.counts.applied,
+            "conflicts": plan.counts.conflicts
+        },
+        "changes": plan.changes,
+        "diagnostics": plan.diagnostics,
+        "undo": undo
+    });
+    CallToolResult::json(&value)
 }
 
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
@@ -2058,6 +2302,7 @@ fn build_mutation_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     const ONE_RESISTOR: &str = r#"
 (export
@@ -2276,6 +2521,187 @@ mod tests {
 
     fn parse_identity_rebind_source(source: &str) -> ExportedDesign {
         parse_exported_netlist(source).expect("valid identity-rebind netlist")
+    }
+
+    fn tool_result_json(result: &CallToolResult) -> Value {
+        result
+            .content
+            .iter()
+            .find_map(|content| match content {
+                ToolContent::Text { text } => Some(serde_json::from_str::<Value>(text).unwrap()),
+                _ => None,
+            })
+            .expect("tool result contains JSON text")
+    }
+
+    #[test]
+    fn rebind_request_rejects_missing_empty_and_duplicate_references() {
+        let missing = parse_rebind_request(&json!({
+            "schematic": "/tmp/test.kicad_sch",
+            "board": "/tmp/test.kicad_pcb"
+        }))
+        .expect_err("references are required");
+        let missing_json = tool_result_json(&missing);
+        assert_eq!(missing_json["error"]["kind"], "invalid_argument");
+        assert_eq!(missing_json["error"]["field"], "references");
+
+        let empty = parse_rebind_request(&json!({
+            "schematic": "/tmp/test.kicad_sch",
+            "board": "/tmp/test.kicad_pcb",
+            "references": [""]
+        }))
+        .expect_err("references must be non-empty");
+        let empty_json = tool_result_json(&empty);
+        assert_eq!(empty_json["error"]["kind"], "invalid_argument");
+        assert_eq!(empty_json["error"]["field"], "references");
+
+        let duplicate = parse_rebind_request(&json!({
+            "schematic": "/tmp/test.kicad_sch",
+            "board": "/tmp/test.kicad_pcb",
+            "references": ["D1", "D1"]
+        }))
+        .expect_err("references must be unique");
+        let duplicate_json = tool_result_json(&duplicate);
+        assert_eq!(duplicate_json["error"]["kind"], "invalid_argument");
+        assert_eq!(duplicate_json["error"]["field"], "references");
+
+        let ok = parse_rebind_request(&json!({
+            "schematic": "/tmp/test.kicad_sch",
+            "board": "/tmp/test.kicad_pcb",
+            "references": ["D1", "SW1"]
+        }))
+        .expect("valid request");
+        assert!(ok.dry_run);
+        assert_eq!(ok.references, vec!["D1", "SW1"]);
+        assert_eq!(ok.expected_plan_revision, None);
+    }
+
+    #[test]
+    fn rebind_request_apply_requires_expected_plan_revision() {
+        let result = parse_rebind_request(&json!({
+            "schematic": "/tmp/test.kicad_sch",
+            "board": "/tmp/test.kicad_pcb",
+            "references": ["D1"],
+            "dry_run": false
+        }))
+        .expect_err("apply requires expected_plan_revision");
+
+        let value = tool_result_json(&result);
+        assert_eq!(value["error"]["kind"], "invalid_argument");
+        assert_eq!(value["error"]["field"], "expected_plan_revision");
+    }
+
+    #[test]
+    fn rebind_path_preflight_reports_missing_schematic_before_board() {
+        let facts = RebindPathFacts {
+            schematic: PathBuf::from("/tmp/missing.kicad_sch"),
+            schematic_exists: false,
+            board: PathBuf::from("/tmp/missing.kicad_pcb"),
+            board_exists: false,
+        };
+
+        let result = require_rebind_paths(&facts).expect_err("missing schematic must fail first");
+        let value = tool_result_json(&result);
+        assert_eq!(value["error"]["kind"], "file_not_found");
+        assert_eq!(value["error"]["path"], "/tmp/missing.kicad_sch");
+    }
+
+    #[test]
+    fn rebind_path_preflight_reports_missing_board_when_schematic_exists() {
+        let facts = RebindPathFacts {
+            schematic: PathBuf::from("/tmp/present.kicad_sch"),
+            schematic_exists: true,
+            board: PathBuf::from("/tmp/missing.kicad_pcb"),
+            board_exists: false,
+        };
+
+        let result = require_rebind_paths(&facts).expect_err("missing board must fail");
+        let value = tool_result_json(&result);
+        assert_eq!(value["error"]["kind"], "file_not_found");
+        assert_eq!(value["error"]["path"], "/tmp/missing.kicad_pcb");
+    }
+
+    #[test]
+    fn rebind_transport_gate_reports_file_fallback_as_conflict() {
+        let result = require_live_rebind_ipc::<()>(BoardWrite::File)
+            .expect_err("file fallback must fail closed");
+
+        let value = tool_result_json(&result);
+        assert_eq!(value["status"], "conflict");
+        assert_eq!(value["coverage"]["transport"], "live_kicad_ipc");
+        assert_eq!(value["diagnostics"][0]["code"], "preflight_conflict");
+        assert_eq!(value["changes"], json!([]));
+        assert_eq!(value["undo"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn rebind_transport_gate_wraps_refusal_as_preflight_conflict() {
+        let refusal = CallToolResult::error("KiCad refused the live rebind");
+        let result = require_live_rebind_ipc::<()>(BoardWrite::Refused(refusal))
+            .expect_err("refusal must fail closed");
+
+        let value = tool_result_json(&result);
+        assert_eq!(value["status"], "conflict");
+        assert_eq!(value["coverage"]["transport"], "live_kicad_ipc");
+        assert_eq!(value["diagnostics"][0]["code"], "preflight_conflict");
+        assert_eq!(
+            value["diagnostics"][0]["message"],
+            "KiCad refused the live rebind"
+        );
+        assert_eq!(value["changes"], json!([]));
+        assert_eq!(value["undo"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn rebind_response_formats_ready_dry_run_shape() {
+        let plan = IdentityRebindPlan {
+            status: PlanStatus::Ready,
+            plan_revision: "abc123".to_string(),
+            counts: IdentityRebindCounts {
+                requested: 2,
+                eligible: 2,
+                planned: 2,
+                applied: 0,
+                conflicts: 0,
+            },
+            changes: vec![IdentityRebindChange {
+                reference: "D1".to_string(),
+                kiid: "d1-kiid".to_string(),
+                old_symbol_path: "/11111111-1111-4111-8111-111111111111".to_string(),
+                new_symbol_path: "/22222222-2222-4222-8222-222222222222".to_string(),
+                value: "1N4148WS".to_string(),
+                footprint_id: "lh60-core:D_SOD-323_Bottom".to_string(),
+                dnp: false,
+                pad_nets: BTreeMap::from([
+                    ("1".to_string(), "KEY_00".to_string()),
+                    ("2".to_string(), "ROW0".to_string()),
+                ]),
+                preserve: PreservedBoardState {
+                    position: Point { x: 1.0, y: 2.0 },
+                    rotation: 0.0,
+                    layer: "F.Cu".to_string(),
+                    locked: false,
+                },
+            }],
+            diagnostics: Vec::new(),
+        };
+
+        let result = identity_rebind_response(&plan, 3, None);
+        let value = tool_result_json(&result);
+        assert!(!result.is_error);
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["plan_revision"], "abc123");
+        assert_eq!(value["coverage"]["source"], "saved_schematic_hierarchy");
+        assert_eq!(value["coverage"]["hierarchy_files"], 3);
+        assert_eq!(value["coverage"]["transport"], "live_kicad_ipc");
+        assert_eq!(value["coverage"]["atomicity"], "single_kicad_undo_commit");
+        assert_eq!(value["coverage"]["requested"], 2);
+        assert_eq!(value["coverage"]["eligible"], 2);
+        assert_eq!(value["coverage"]["planned"], 2);
+        assert_eq!(value["coverage"]["applied"], 0);
+        assert_eq!(value["coverage"]["conflicts"], 0);
+        assert_eq!(value["changes"][0]["reference"], "D1");
+        assert_eq!(value["undo"], serde_json::Value::Null);
     }
 
     fn replace_once(source: &str, needle: &str, replacement: &str) -> String {
