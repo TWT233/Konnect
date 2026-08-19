@@ -1366,6 +1366,83 @@ fn identity_rebind_plan_revision(
     format!("{:x}", hasher.finalize())
 }
 
+fn refresh_identity_rebind_revision(
+    plan: &mut IdentityRebindPlan,
+    requested_items: &BTreeMap<String, prost_types::Any>,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    if requested_items.len() != plan.counts.requested {
+        bail!(
+            "requested live footprint count {} does not match plan requested count {}",
+            requested_items.len(),
+            plan.counts.requested
+        );
+    }
+
+    let mut seen_planned_kiids = HashSet::new();
+    for change in &plan.changes {
+        if !seen_planned_kiids.insert(change.kiid.as_str()) {
+            bail!(
+                "identity rebind plan contains duplicate requested KIID {}",
+                change.kiid
+            );
+        }
+        if !requested_items.contains_key(&change.kiid) {
+            bail!("missing requested footprint {}", change.kiid);
+        }
+    }
+
+    let mut snapshots = Vec::new();
+    for (kiid, item) in requested_items {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+            bail!("requested item {kiid} is not a FootprintInstance");
+        }
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .with_context(|| format!("requested item {kiid} is not a valid FootprintInstance"))?;
+        let embedded_kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .unwrap_or_default();
+        if embedded_kiid != kiid {
+            bail!("requested footprint {kiid} has embedded KIID {embedded_kiid}");
+        }
+        snapshots.push((
+            kiid.clone(),
+            canonicalize_footprint_bytes_for_identity_rebind(item, false)?,
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(plan.plan_revision.as_bytes());
+    for (kiid, snapshot) in snapshots {
+        hasher.update(kiid.as_bytes());
+        hasher.update(snapshot);
+    }
+    hasher.update(document.encode_to_vec());
+    plan.plan_revision = format!("{:x}", hasher.finalize());
+    Ok(())
+}
+
+fn rebind_test_document(
+    filename: &str,
+) -> konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
+    use konnect_ipc::gen::kiapi;
+
+    kiapi::common::types::DocumentSpecifier {
+        r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+        project: None,
+        identifier: Some(
+            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                filename.to_string(),
+            ),
+        ),
+    }
+}
+
 /// A stable identity for the design-bearing netlist sections.
 ///
 /// `kicad-cli sch export netlist` stamps `(date "…T14:48:16")` and the
@@ -3616,6 +3693,462 @@ mod tests {
         let changed = plan_identity_rebind(&source, &design, &board_only, &requested);
 
         assert_ne!(base.plan_revision, changed.plan_revision);
+    }
+
+    fn rebind_revision_refresh_fixture_plan(status: PlanStatus) -> IdentityRebindPlan {
+        IdentityRebindPlan {
+            status,
+            plan_revision: "base-rebind-revision".to_string(),
+            counts: IdentityRebindCounts {
+                requested: 2,
+                eligible: 2,
+                planned: 1,
+                applied: 0,
+                conflicts: usize::from(matches!(status, PlanStatus::Conflict)),
+            },
+            changes: vec![IdentityRebindChange {
+                reference: "D1".to_string(),
+                kiid: "rebind-d1-kiid".to_string(),
+                old_symbol_path:
+                    "/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222"
+                        .to_string(),
+                new_symbol_path:
+                    "/33333333-3333-4333-8333-333333333333/44444444-4444-4444-8444-444444444444"
+                        .to_string(),
+                value: "NE555".to_string(),
+                footprint_id: "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm".to_string(),
+                dnp: true,
+                pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
+                preserve: PreservedBoardState {
+                    position: Point { x: 25.0, y: 30.0 },
+                    rotation: 37.5,
+                    layer: "F.Cu".to_string(),
+                    locked: true,
+                },
+            }],
+            diagnostics: if matches!(status, PlanStatus::Conflict) {
+                vec![SyncDiagnostic {
+                    code: "value_mismatch".to_string(),
+                    message: "fixture conflict".to_string(),
+                    reference: Some("D1".to_string()),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn rebind_revision_refresh_requested_items() -> BTreeMap<String, prost_types::Any> {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let (d1_item, _, _) = identity_rebind_fixture_item_and_change();
+        let mut requested = BTreeMap::new();
+        requested.insert("rebind-d1-kiid".to_string(), d1_item);
+
+        let sw1_item = footprint_with_artwork("SW1");
+        let mut sw1 =
+            kiapi::board::types::FootprintInstance::decode(sw1_item.value.as_slice()).unwrap();
+        sw1.id = Some(kiapi::common::types::Kiid {
+            value: "rebind-sw1-kiid".to_string(),
+        });
+        sw1.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![kiapi::common::types::Kiid {
+                value: "55555555-5555-4555-8555-555555555555".to_string(),
+            }],
+            path_human_readable: String::new(),
+        });
+        set_field_text(&mut sw1.reference_field, "Reference", "SW1");
+        set_field_text(&mut sw1.value_field, "Value", "MX");
+        requested.insert(
+            "rebind-sw1-kiid".to_string(),
+            konnect_ipc::builders::pack_any(&sw1, "kiapi.board.types.FootprintInstance"),
+        );
+        requested
+    }
+
+    #[test]
+    fn rebind_revision_refresh_hashes_all_requested_items_for_ready_and_noop() {
+        let requested_items = rebind_revision_refresh_requested_items();
+        let document = rebind_test_document("board-a.kicad_pcb");
+
+        let mut ready_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        let ready_base = ready_plan.plan_revision.clone();
+        refresh_identity_rebind_revision(&mut ready_plan, &requested_items, &document).unwrap();
+        assert_ne!(ready_plan.plan_revision, ready_base);
+
+        let mut noop_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Noop);
+        noop_plan.counts.planned = 0;
+        noop_plan.changes.clear();
+        let noop_base = noop_plan.plan_revision.clone();
+        refresh_identity_rebind_revision(&mut noop_plan, &requested_items, &document).unwrap();
+        assert_ne!(noop_plan.plan_revision, noop_base);
+        assert_eq!(ready_plan.plan_revision, noop_plan.plan_revision);
+    }
+
+    #[test]
+    fn rebind_revision_refresh_changes_for_requested_live_or_document_drift() {
+        use konnect_ipc::builders::vec2;
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let requested_items = rebind_revision_refresh_requested_items();
+        let document = rebind_test_document("board-a.kicad_pcb");
+        let mut base_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        refresh_identity_rebind_revision(&mut base_plan, &requested_items, &document).unwrap();
+        let base_revision = base_plan.plan_revision.clone();
+
+        let drift_cases: [(&str, Box<dyn Fn(&mut BTreeMap<String, prost_types::Any>)>); 6] = [
+            (
+                "field placement",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            footprint
+                                .reference_field
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .position = Some(vec2(999.0, 111.0));
+                        }),
+                    );
+                }),
+            ),
+            (
+                "pad content",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            let pad = footprint
+                                .definition
+                                .as_mut()
+                                .unwrap()
+                                .items
+                                .iter_mut()
+                                .find(|item| {
+                                    konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad")
+                                })
+                                .unwrap();
+                            let mut decoded =
+                                kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+                            decoded.number = "99".to_string();
+                            *pad =
+                                konnect_ipc::builders::pack_any(&decoded, "kiapi.board.types.Pad");
+                        }),
+                    );
+                }),
+            ),
+            (
+                "graphic content",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            let graphic = footprint
+                                .definition
+                                .as_mut()
+                                .unwrap()
+                                .items
+                                .iter_mut()
+                                .find(|item| {
+                                    konnect_ipc::builders::any_is(
+                                        item,
+                                        "kiapi.board.types.BoardGraphicShape",
+                                    )
+                                })
+                                .unwrap();
+                            let mut decoded = kiapi::board::types::BoardGraphicShape::decode(
+                                graphic.value.as_slice(),
+                            )
+                            .unwrap();
+                            decoded.layer = kiapi::board::types::BoardLayer::BlBCrtYd as i32;
+                            *graphic = konnect_ipc::builders::pack_any(
+                                &decoded,
+                                "kiapi.board.types.BoardGraphicShape",
+                            );
+                        }),
+                    );
+                }),
+            ),
+            (
+                "model content",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            let model = footprint
+                                .definition
+                                .as_mut()
+                                .unwrap()
+                                .items
+                                .iter_mut()
+                                .find(|item| {
+                                    konnect_ipc::builders::any_is(
+                                        item,
+                                        "kiapi.board.types.Footprint3DModel",
+                                    )
+                                })
+                                .unwrap();
+                            let mut decoded = kiapi::board::types::Footprint3DModel::decode(
+                                model.value.as_slice(),
+                            )
+                            .unwrap();
+                            decoded.filename = "drifted.step".to_string();
+                            *model = konnect_ipc::builders::pack_any(
+                                &decoded,
+                                "kiapi.board.types.Footprint3DModel",
+                            );
+                        }),
+                    );
+                }),
+            ),
+            (
+                "semantic non-default",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            footprint.orientation =
+                                Some(kiapi::common::types::Angle { value_degrees: 1.0 });
+                        }),
+                    );
+                }),
+            ),
+            (
+                "symbol path",
+                Box::new(|requested| {
+                    let item = requested.get("rebind-d1-kiid").unwrap().clone();
+                    requested.insert(
+                        "rebind-d1-kiid".to_string(),
+                        mutate_rebound_footprint_item(&item, |footprint| {
+                            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                                path: vec![kiapi::common::types::Kiid {
+                                    value: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                                }],
+                                path_human_readable: String::new(),
+                            });
+                        }),
+                    );
+                }),
+            ),
+        ];
+
+        for (name, mutate) in drift_cases {
+            let mut requested = requested_items.clone();
+            mutate(&mut requested);
+            let mut plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+            refresh_identity_rebind_revision(&mut plan, &requested, &document).unwrap();
+            assert_ne!(base_revision, plan.plan_revision, "{name}");
+        }
+
+        for changed_document in [
+            rebind_test_document("board-b.kicad_pcb"),
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
+                r#type:
+                    konnect_ipc::gen::kiapi::common::types::DocumentType::DoctypeSchematic as i32,
+                ..document.clone()
+            },
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
+                project: Some(konnect_ipc::gen::kiapi::common::types::ProjectSpecifier {
+                    name: "other-project".into(),
+                    path: "/tmp/other-project".into(),
+                }),
+                ..document.clone()
+            },
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
+                identifier: Some(
+                    konnect_ipc::gen::kiapi::common::types::document_specifier::Identifier::SheetPath(
+                        konnect_ipc::gen::kiapi::common::types::SheetPath {
+                            path: vec![konnect_ipc::gen::kiapi::common::types::Kiid {
+                                value: "66666666-6666-4666-8666-666666666666".to_string(),
+                            }],
+                            path_human_readable: "/".into(),
+                        },
+                    ),
+                ),
+                ..document.clone()
+            },
+        ] {
+            let mut plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+            refresh_identity_rebind_revision(&mut plan, &requested_items, &changed_document)
+                .unwrap();
+            assert_ne!(base_revision, plan.plan_revision);
+        }
+    }
+
+    #[test]
+    fn rebind_revision_refresh_is_stable_for_semantic_defaults_and_input_order() {
+        use konnect_ipc::gen::kiapi;
+
+        let requested_items = rebind_revision_refresh_requested_items();
+        let document = rebind_test_document("board-a.kicad_pcb");
+        let mut base_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        refresh_identity_rebind_revision(&mut base_plan, &requested_items, &document).unwrap();
+        let base_revision = base_plan.plan_revision.clone();
+
+        let mut semantic_default_items = requested_items.clone();
+        let item = semantic_default_items
+            .get("rebind-sw1-kiid")
+            .unwrap()
+            .clone();
+        semantic_default_items.insert(
+            "rebind-sw1-kiid".to_string(),
+            mutate_rebound_footprint_item(&item, |footprint| {
+                footprint.orientation = Some(kiapi::common::types::Angle::default());
+                footprint.attributes = Some(kiapi::board::types::FootprintAttributes::default());
+                footprint.definition.as_mut().unwrap().attributes =
+                    Some(kiapi::board::types::FootprintAttributes::default());
+            }),
+        );
+        let mut semantic_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        refresh_identity_rebind_revision(&mut semantic_plan, &semantic_default_items, &document)
+            .unwrap();
+        assert_eq!(base_revision, semantic_plan.plan_revision);
+
+        let reversed = requested_items
+            .iter()
+            .rev()
+            .map(|(kiid, item)| (kiid.clone(), item.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut reordered_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        refresh_identity_rebind_revision(&mut reordered_plan, &reversed, &document).unwrap();
+        assert_eq!(base_revision, reordered_plan.plan_revision);
+    }
+
+    #[test]
+    fn rebind_revision_refresh_rejects_count_key_type_and_plan_mismatches() {
+        use konnect_ipc::gen::kiapi;
+
+        let requested_items = rebind_revision_refresh_requested_items();
+        let document = rebind_test_document("board-a.kicad_pcb");
+
+        let mut wrong_count_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        wrong_count_plan.counts.requested = 3;
+        let wrong_count_error =
+            refresh_identity_rebind_revision(&mut wrong_count_plan, &requested_items, &document)
+                .unwrap_err()
+                .to_string();
+        assert!(wrong_count_error.contains("count"), "{wrong_count_error}");
+
+        let mut wrong_type_items = requested_items.clone();
+        let wrong_type = wrong_type_items.get("rebind-d1-kiid").unwrap().clone();
+        wrong_type_items.insert(
+            "rebind-d1-kiid".to_string(),
+            prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+                value: wrong_type.value,
+            },
+        );
+        let wrong_type_error = refresh_identity_rebind_revision(
+            &mut rebind_revision_refresh_fixture_plan(PlanStatus::Ready),
+            &wrong_type_items,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_type_error.contains("FootprintInstance"),
+            "{wrong_type_error}"
+        );
+
+        let mut wrong_key_items = requested_items.clone();
+        let item = wrong_key_items.get("rebind-d1-kiid").unwrap().clone();
+        wrong_key_items.insert(
+            "rebind-d1-kiid".to_string(),
+            mutate_rebound_footprint_item(&item, |footprint| {
+                footprint.id = Some(kiapi::common::types::Kiid {
+                    value: "different-embedded-kiid".to_string(),
+                });
+            }),
+        );
+        let wrong_key_error = refresh_identity_rebind_revision(
+            &mut rebind_revision_refresh_fixture_plan(PlanStatus::Ready),
+            &wrong_key_items,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_key_error.contains("embedded KIID"),
+            "{wrong_key_error}"
+        );
+
+        let mut missing_requested = requested_items.clone();
+        missing_requested.remove("rebind-d1-kiid");
+        let missing_requested_error = refresh_identity_rebind_revision(
+            &mut rebind_revision_refresh_fixture_plan(PlanStatus::Ready),
+            &missing_requested,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_requested_error.contains("count"),
+            "{missing_requested_error}"
+        );
+
+        let mut missing_plan_kiid_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        missing_plan_kiid_plan.changes[0].kiid = "missing-from-requested".to_string();
+        let missing_plan_kiid_error = refresh_identity_rebind_revision(
+            &mut missing_plan_kiid_plan,
+            &requested_items,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_plan_kiid_error.contains("missing requested footprint"),
+            "{missing_plan_kiid_error}"
+        );
+
+        let mut duplicate_plan_kiid_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
+        duplicate_plan_kiid_plan
+            .changes
+            .push(duplicate_plan_kiid_plan.changes[0].clone());
+        duplicate_plan_kiid_plan.counts.planned = duplicate_plan_kiid_plan.changes.len();
+        let duplicate_plan_kiid_error = refresh_identity_rebind_revision(
+            &mut duplicate_plan_kiid_plan,
+            &requested_items,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate_plan_kiid_error.contains("duplicate"),
+            "{duplicate_plan_kiid_error}"
+        );
+
+        let mut invalid_item_bytes = requested_items.clone();
+        invalid_item_bytes.insert(
+            "rebind-d1-kiid".to_string(),
+            prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+                value: vec![0xff],
+            },
+        );
+        let invalid_item_bytes_error = refresh_identity_rebind_revision(
+            &mut rebind_revision_refresh_fixture_plan(PlanStatus::Ready),
+            &invalid_item_bytes,
+            &document,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            invalid_item_bytes_error.contains("valid FootprintInstance"),
+            "{invalid_item_bytes_error}"
+        );
     }
 
     #[test]
