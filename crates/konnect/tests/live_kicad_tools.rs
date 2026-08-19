@@ -4,10 +4,15 @@
 //! This test intentionally crosses every layer: JSON-RPC stdio, tool routing,
 //! platform footprint-library discovery, `.kicad_mod` preparation, and live IPC.
 
+use konnect_ipc::builders::any_is;
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_ipc::gen::kiapi;
 use konnect_sexp::{parse_sexp, SexpNode};
+use prost::Message;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
@@ -282,4 +287,418 @@ fn schematic_sync_apply_then_dry_run_is_noop() {
     );
     let after: Value = serde_json::from_str(after["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(after["status"], "noop", "apply did not converge: {after}");
+}
+
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, saved schematic, and matching open board"]
+fn schematic_identity_rebind_apply_then_dry_run_is_noop() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let schematic = std::env::var("KONNECT_LIVE_KICAD_SCHEMATIC")
+        .expect("KONNECT_LIVE_KICAD_SCHEMATIC must name the saved, closed root schematic");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let refs_str = std::env::var("KONNECT_LIVE_KICAD_REBIND_REFERENCES")
+        .expect("KONNECT_LIVE_KICAD_REBIND_REFERENCES must be comma-separated footprint references to rebind");
+
+    let raw_refs: Vec<String> = refs_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert!(!raw_refs.is_empty(), "at least one reference required");
+    let mut references = BTreeSet::new();
+    for r in raw_refs {
+        assert!(
+            references.insert(r.clone()),
+            "duplicate reference in input: {r}"
+        );
+    }
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let ready = (0..100).any(|_| {
+        if ipc.ping().unwrap_or(false) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        false
+    });
+    assert!(ready, "KiCad IPC socket never became ready");
+
+    let document = ipc
+        .find_open_board(Path::new(&board))
+        .expect("board must be open in KiCad");
+    let items = ipc
+        .get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )
+        .expect("failed to get footprints from board");
+
+    struct SnapshotEntry {
+        reference: String,
+        symbol_path: Option<String>,
+        canonical_bytes: Vec<u8>,
+    }
+
+    fn sheet_path_string(sp: &kiapi::common::types::SheetPath) -> String {
+        assert!(!sp.path.is_empty(), "SheetPath has empty path vector");
+        format!(
+            "/{}",
+            sp.path
+                .iter()
+                .map(|kiid| kiid.value.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    }
+
+    fn reference_text(instance: &kiapi::board::types::FootprintInstance) -> String {
+        instance
+            .reference_field
+            .as_ref()
+            .and_then(|f| f.text.as_ref())
+            .and_then(|bt| bt.text.as_ref())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn canonical_footprint(item: &prost_types::Any) -> Vec<u8> {
+        use konnect_ipc::builders::any_type_name;
+        let type_name = any_type_name(item);
+        if type_name != "kiapi.board.types.FootprintInstance" {
+            return Vec::new();
+        }
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("invalid FootprintInstance");
+
+        // Always ignore symbol_path for canonical equality
+        footprint.symbol_path = None;
+
+        if footprint.orientation == Some(kiapi::common::types::Angle::default()) {
+            footprint.orientation = None;
+        }
+        if footprint.attributes == Some(kiapi::board::types::FootprintAttributes::default()) {
+            footprint.attributes = None;
+        }
+        for field in [
+            &mut footprint.datasheet_field,
+            &mut footprint.description_field,
+        ] {
+            if field.as_ref().and_then(|f| f.text.as_ref())
+                == Some(&kiapi::board::types::BoardText::default())
+            {
+                field.as_mut().unwrap().text = None;
+            }
+            if *field == Some(kiapi::board::types::Field::default()) {
+                *field = None;
+            }
+        }
+        if let Some(definition) = footprint.definition.as_mut() {
+            if definition.attributes == Some(kiapi::board::types::FootprintAttributes::default()) {
+                definition.attributes = None;
+            }
+            for field in [
+                &mut definition.datasheet_field,
+                &mut definition.description_field,
+            ] {
+                if field.as_ref().and_then(|f| f.text.as_ref())
+                    == Some(&kiapi::board::types::BoardText::default())
+                {
+                    field.as_mut().unwrap().text = None;
+                }
+                if *field == Some(kiapi::board::types::Field::default()) {
+                    *field = None;
+                }
+            }
+            let mut keyed: Vec<(String, Vec<u8>, prost_types::Any)> = definition
+                .items
+                .iter()
+                .map(|item| -> (String, Vec<u8>, prost_types::Any) {
+                    let type_url = item.type_url.clone();
+                    let type_name = any_type_name(item);
+                    let value = match type_name {
+                        "kiapi.board.types.Pad" => {
+                            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+                                .expect("decode Pad");
+                            pad.encode_to_vec()
+                        }
+                        "kiapi.board.types.BoardGraphicShape" => {
+                            let shape = kiapi::board::types::BoardGraphicShape::decode(
+                                item.value.as_slice(),
+                            )
+                            .expect("decode BoardGraphicShape");
+                            shape.encode_to_vec()
+                        }
+                        "kiapi.board.types.BoardText" => {
+                            let text =
+                                kiapi::board::types::BoardText::decode(item.value.as_slice())
+                                    .expect("decode BoardText");
+                            text.encode_to_vec()
+                        }
+                        "kiapi.board.types.Footprint3DModel" => {
+                            let model = kiapi::board::types::Footprint3DModel::decode(
+                                item.value.as_slice(),
+                            )
+                            .expect("decode Footprint3DModel");
+                            model.encode_to_vec()
+                        }
+                        "kiapi.board.types.Group" => {
+                            let group = kiapi::board::types::Group::decode(item.value.as_slice())
+                                .expect("decode Group");
+                            group.encode_to_vec()
+                        }
+                        _ => item.value.clone(),
+                    };
+                    (
+                        type_url.clone(),
+                        value.clone(),
+                        prost_types::Any { type_url, value },
+                    )
+                })
+                .collect();
+            keyed.sort_by(|(t1, v1, _), (t2, v2, _)| t1.cmp(t2).then(v1.cmp(v2)));
+            definition.items = keyed.into_iter().map(|(_, _, a)| a).collect();
+        }
+        footprint.encode_to_vec()
+    }
+
+    let mut before: BTreeMap<String, SnapshotEntry> = BTreeMap::new();
+    let mut requested_kiids: BTreeSet<String> = BTreeSet::new();
+
+    for item in &items {
+        assert!(
+            any_is(item, "kiapi.board.types.FootprintInstance"),
+            "expected only FootprintInstance"
+        );
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("failed to decode FootprintInstance");
+
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .unwrap_or_default();
+        assert!(!kiid.is_empty(), "footprint has no KIID");
+        let reference = reference_text(&footprint);
+
+        let entry = SnapshotEntry {
+            reference: reference.clone(),
+            symbol_path: footprint.symbol_path.as_ref().map(sheet_path_string),
+            canonical_bytes: canonical_footprint(item),
+        };
+        assert!(
+            before.insert(kiid.clone(), entry).is_none(),
+            "duplicate KIID in snapshot: {kiid}"
+        );
+        if references.contains(&reference) {
+            requested_kiids.insert(kiid);
+        }
+    }
+
+    for r in &references {
+        assert!(
+            before.values().any(|e| e.reference == *r),
+            "reference {r} not found on open board"
+        );
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "sch_export"}));
+
+    let dry_run = mcp.tool(
+        "rebind_pcb_schematic_identities",
+        json!({
+            "schematic": schematic,
+            "board": board,
+            "references": references,
+            "dry_run": true
+        }),
+    );
+    let dry_run: Value =
+        serde_json::from_str(dry_run["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    assert_eq!(
+        dry_run["status"].as_str().unwrap(),
+        "ready",
+        "expected ready status, got: {dry_run}"
+    );
+    let coverage = &dry_run["coverage"];
+    assert_eq!(
+        coverage["requested"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(
+        coverage["eligible"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(
+        coverage["planned"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(coverage["conflicts"].as_u64().unwrap(), 0);
+    assert_eq!(dry_run["diagnostics"].as_array().unwrap().len(), 0);
+    assert!(!dry_run["plan_revision"].as_str().unwrap().is_empty());
+    assert!(dry_run["undo"].is_null());
+    let changes = dry_run["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), references.len());
+    let change_refs: BTreeSet<String> = changes
+        .iter()
+        .map(|c| c["reference"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(&change_refs, &references);
+
+    let mut ref_to_newpath = BTreeMap::new();
+    let mut ref_to_oldpath = BTreeMap::new();
+    for change in changes {
+        let r = change["reference"].as_str().unwrap();
+        let kiid = change["kiid"].as_str().unwrap();
+        assert!(
+            before.contains_key(kiid),
+            "change kiid {kiid} not in snapshot"
+        );
+        assert!(!change["old_symbol_path"].as_str().unwrap().is_empty());
+        assert!(!change["new_symbol_path"].as_str().unwrap().is_empty());
+        assert_ne!(
+            change["old_symbol_path"].as_str().unwrap(),
+            change["new_symbol_path"].as_str().unwrap(),
+            "old and new symbol path must differ for {r}"
+        );
+        ref_to_newpath.insert(
+            r.to_string(),
+            change["new_symbol_path"].as_str().unwrap().to_string(),
+        );
+        ref_to_oldpath.insert(
+            r.to_string(),
+            change["old_symbol_path"].as_str().unwrap().to_string(),
+        );
+    }
+
+    let revision = dry_run["plan_revision"].as_str().unwrap();
+    let applied = mcp.tool(
+        "rebind_pcb_schematic_identities",
+        json!({
+            "schematic": schematic,
+            "board": board,
+            "references": references,
+            "dry_run": false,
+            "expected_plan_revision": revision
+        }),
+    );
+    let applied: Value =
+        serde_json::from_str(applied["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        applied["status"].as_str().unwrap(),
+        "applied",
+        "expected applied status, got: {applied}"
+    );
+    let coverage = &applied["coverage"];
+    assert_eq!(
+        coverage["requested"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(
+        coverage["eligible"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(
+        coverage["planned"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(
+        coverage["applied"].as_u64().unwrap(),
+        references.len() as u64
+    );
+    assert_eq!(coverage["conflicts"].as_u64().unwrap(), 0);
+    assert_eq!(applied["diagnostics"].as_array().unwrap().len(), 0);
+    assert!(!applied["undo"].as_str().unwrap().is_empty());
+
+    let after_dry = mcp.tool(
+        "rebind_pcb_schematic_identities",
+        json!({
+            "schematic": schematic,
+            "board": board,
+            "references": references,
+            "dry_run": true
+        }),
+    );
+    let after_dry: Value =
+        serde_json::from_str(after_dry["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        after_dry["status"].as_str().unwrap(),
+        "noop",
+        "expected noop after apply, got: {after_dry}"
+    );
+    assert_eq!(after_dry["coverage"]["planned"].as_u64().unwrap(), 0);
+    assert_eq!(after_dry["coverage"]["applied"].as_u64().unwrap(), 0);
+    assert_eq!(after_dry["coverage"]["conflicts"].as_u64().unwrap(), 0);
+    assert_eq!(after_dry["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(after_dry["diagnostics"].as_array().unwrap().len(), 0);
+    assert!(after_dry["undo"].is_null());
+
+    let after_items = ipc
+        .get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )
+        .expect("failed to get footprints from board after apply");
+
+    let mut after: BTreeMap<String, SnapshotEntry> = BTreeMap::new();
+    for item in &after_items {
+        assert!(
+            any_is(item, "kiapi.board.types.FootprintInstance"),
+            "expected only FootprintInstance"
+        );
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .expect("failed to decode FootprintInstance");
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .unwrap_or_default();
+        let reference = reference_text(&footprint);
+        let entry = SnapshotEntry {
+            reference,
+            symbol_path: footprint.symbol_path.as_ref().map(sheet_path_string),
+            canonical_bytes: canonical_footprint(item),
+        };
+        assert!(
+            after.insert(kiid.clone(), entry).is_none(),
+            "duplicate KIID in after-snapshot: {kiid}"
+        );
+    }
+
+    let before_kiids: BTreeSet<&String> = before.keys().collect();
+    let after_kiids: BTreeSet<&String> = after.keys().collect();
+    assert_eq!(&before_kiids, &after_kiids, "KIID set changed unexpectedly");
+
+    for kiid in before_kiids {
+        let before_entry = before.get(kiid).unwrap();
+        let after_entry = after.get(kiid).unwrap();
+
+        if requested_kiids.contains(kiid) {
+            let reference = &before_entry.reference;
+            let new_path = ref_to_newpath.get(reference).unwrap();
+            let old_path = ref_to_oldpath.get(reference).unwrap();
+            assert_eq!(
+                after_entry.symbol_path.as_deref(),
+                Some(new_path.as_str()),
+                "KIID {kiid} reference {reference} new path mismatch"
+            );
+            assert_ne!(
+                after_entry.symbol_path.as_deref(),
+                Some(old_path.as_str()),
+                "KIID {kiid} reference {reference} path was not updated"
+            );
+        } else {
+            assert_eq!(
+                before_entry.symbol_path, after_entry.symbol_path,
+                "unrelated KIID {kiid} has unexpected change to symbol_path"
+            );
+        }
+
+        assert_eq!(
+            before_entry.canonical_bytes, after_entry.canonical_bytes,
+            "KIID {kiid} non-symbol-path fields differ after rebind"
+        );
+    }
 }

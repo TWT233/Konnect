@@ -37,3 +37,5 @@ dirs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+prost.workspace = true
+prost-types.workspace = true
