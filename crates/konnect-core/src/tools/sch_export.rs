@@ -141,6 +141,31 @@ pub fn tools() -> Vec<ToolDef> {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
         ),
+        tool!(
+            "rebind_pcb_schematic_identities",
+            "Exceptionally repair schematic identity bindings on a live KiCad PCB without \
+             mutating any other footprint fields.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
+                    "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
+                    "references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "description": "Footprint references to rebind"
+                    },
+                    "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                },
+                "required": ["schematic", "board", "references"]
+            }),
+            |args, ctx| async move {
+                super::pcb_sync::handle_rebind_pcb_schematic_identities(args, ctx).await
+            }
+        ),
     ]
 }
 
