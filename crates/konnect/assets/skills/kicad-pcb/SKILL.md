@@ -64,18 +64,23 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 Follow this sequence for a clean PCB workflow:
 
 1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry
-2. **Update from schematic** — call `update_pcb_from_schematic` first with
+2. **Exceptional identity rebind** — use `rebind_pcb_schematic_identities` only
+   when a reviewed schematic recreation changed UUIDs while reference, value,
+   footprint, DNP state, and pad nets remain exact. Always run the dry run and
+   the apply against the exact returned revision immediately before the normal
+   PCB sync. It is not a general override, and it never saves the board.
+3. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
    `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
-3. **Place components** — position all footprints
-4. **Route traces** — connect all nets
-5. **Copper pour** — add ground/power zones last
-6. **DRC** — run design rule check
-7. **Save** — `save_project`
+4. **Place components** — position all footprints
+5. **Route traces** — connect all nets
+6. **Copper pour** — add ground/power zones last
+7. **DRC** — run design rule check
+8. **Save** — `save_project`
 
 Do NOT add copper pours before routing is complete — they interfere with interactive routing.
 
@@ -281,9 +286,14 @@ Common DRC errors and fixes:
 4. **Refill zones after changes** — stale zone fills cause phantom DRC errors
 5. **Check DRC before finishing** — run `run_drc()` and resolve all errors
 6. **Use netclasses for consistency** — define track widths per net type, not per trace
-7. **KiCAD normally must be running** — `place_component`, `move_component`, and
+7. **Identity rebind is exceptional** — use
+   `rebind_pcb_schematic_identities` only when reviewed schematic recreation
+   changed UUIDs while reference, value, footprint, DNP state, and pad nets
+   remain exact; always dry-run and apply the exact revision immediately before
+   normal sync; it is not a general override and never saves the board
+8. **KiCAD normally must be running** — `place_component`, `move_component`, and
    `rotate_component` have safe IPC-unreachable file fallbacks; `flip_component`
    requires a closed board; other PCB edits still require the live IPC connection
-8. **Save frequently** — call `save_project` after major operations
-9. **Load toolsets first** — check `get_active_toolsets()` and load what you need
-10. **Copper pour last** — add zones only after routing is substantially complete
+9. **Save frequently** — call `save_project` after major operations
+10. **Load toolsets first** — check `get_active_toolsets()` and load what you need
+11. **Copper pour last** — add zones only after routing is substantially complete
