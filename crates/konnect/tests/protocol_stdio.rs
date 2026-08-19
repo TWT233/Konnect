@@ -261,6 +261,66 @@ fn structured_errors_guide_recovery() {
 }
 
 #[test]
+fn rebind_tool_schema_is_exposed_in_tools_list() {
+    let mut p = McpProcess::spawn();
+    let loaded = p.call_tool("load_toolset", json!({"name": "sch_export"}));
+    assert_ne!(
+        loaded["isError"],
+        json!(true),
+        "load sch_export: {loaded:#?}"
+    );
+
+    let list = p.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "rebind_pcb_schematic_identities")
+        .unwrap_or_else(|| panic!("rebind tool missing from tools/list: {tools:#?}"));
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["required"],
+        json!(["schematic", "board", "references"])
+    );
+    assert_eq!(schema["properties"]["schematic"]["type"], "string");
+    assert_eq!(schema["properties"]["board"]["type"], "string");
+    assert_eq!(schema["properties"]["references"]["type"], "array");
+    assert_eq!(schema["properties"]["references"]["minItems"], 1);
+    assert_eq!(schema["properties"]["references"]["uniqueItems"], true);
+    assert_eq!(schema["properties"]["dry_run"]["type"], "boolean");
+    assert_eq!(schema["properties"]["dry_run"]["default"], true);
+    assert_eq!(
+        schema["properties"]["expected_plan_revision"]["type"],
+        "string"
+    );
+}
+
+#[test]
+fn rebind_apply_without_expected_revision_fails_before_path_check() {
+    let mut p = McpProcess::spawn();
+    let loaded = p.call_tool("load_toolset", json!({"name": "sch_export"}));
+    assert_ne!(
+        loaded["isError"],
+        json!(true),
+        "load sch_export: {loaded:#?}"
+    );
+
+    let result = p.call_tool(
+        "rebind_pcb_schematic_identities",
+        json!({
+            "schematic": "/no/s.kicad_sch",
+            "board": "/no/b.kicad_pcb",
+            "references": ["D1"],
+            "dry_run": false
+        }),
+    );
+    assert_eq!(result["isError"], json!(true), "{result:#?}");
+    let body = McpProcess::tool_body(&result);
+    assert_eq!(body["error"]["kind"], "invalid_argument");
+    assert_eq!(body["error"]["field"], "expected_plan_revision");
+}
+
+#[test]
 fn unknown_method_is_json_rpc_error_not_crash() {
     let mut p = McpProcess::spawn();
     let resp = p.request("tools/definitely_not_a_method", json!({}));
