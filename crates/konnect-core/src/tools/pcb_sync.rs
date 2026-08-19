@@ -782,6 +782,7 @@ fn plan_identity_rebind(
     }
 
     let mut changes = Vec::new();
+    let mut prospective_changes = Vec::new();
     let mut matching_references = Vec::new();
 
     for reference in &requested_references {
@@ -820,6 +821,23 @@ fn plan_identity_rebind(
             ));
             continue;
         };
+        let prospective_change = IdentityRebindChange {
+            reference: reference.clone(),
+            kiid: footprint.kiid.clone(),
+            old_symbol_path: footprint.symbol_path.clone().unwrap_or_default(),
+            new_symbol_path: component.symbol_path.clone(),
+            value: component.value.clone(),
+            footprint_id: component.footprint_id.clone(),
+            dnp: component.dnp,
+            pad_nets: normalize_pad_nets(&component.pad_nets),
+            preserve: PreservedBoardState {
+                position: footprint.position,
+                rotation: footprint.rotation,
+                layer: footprint.layer.clone(),
+                locked: footprint.locked,
+            },
+        };
+        prospective_changes.push(prospective_change.clone());
 
         if footprint.not_in_schematic {
             diagnostics.push(conflict(
@@ -966,22 +984,7 @@ fn plan_identity_rebind(
         }
 
         counts.eligible += 1;
-        changes.push(IdentityRebindChange {
-            reference: reference.clone(),
-            kiid: footprint.kiid.clone(),
-            old_symbol_path: old_symbol_path.to_string(),
-            new_symbol_path: component.symbol_path.clone(),
-            value: component.value.clone(),
-            footprint_id: component.footprint_id.clone(),
-            dnp: component.dnp,
-            pad_nets: normalize_pad_nets(&component.pad_nets),
-            preserve: PreservedBoardState {
-                position: footprint.position,
-                rotation: footprint.rotation,
-                layer: footprint.layer.clone(),
-                locked: footprint.locked,
-            },
-        });
+        changes.push(prospective_change);
     }
 
     if !matching_references.is_empty() && !changes.is_empty() {
@@ -997,6 +1000,7 @@ fn plan_identity_rebind(
     }
 
     changes.sort_by(|a, b| a.reference.cmp(&b.reference));
+    prospective_changes.sort_by(|a, b| a.reference.cmp(&b.reference));
     counts.planned = changes.len();
     counts.conflicts = diagnostics.len();
     if !diagnostics.is_empty() {
@@ -1013,9 +1017,8 @@ fn plan_identity_rebind(
     let plan_revision = identity_rebind_plan_revision(
         netlist_source,
         &requested_references,
-        &changes,
+        &prospective_changes,
         board,
-        design,
     );
     IdentityRebindPlan {
         status,
@@ -1058,7 +1061,6 @@ fn valid_symbol_path(path: &str) -> bool {
 struct IdentityRebindRevisionSnapshot {
     requested: Vec<String>,
     board: Vec<IdentityRebindRevisionBoardSnapshot>,
-    schematic: Vec<IdentityRebindRevisionDesignSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1078,37 +1080,20 @@ struct IdentityRebindRevisionBoardSnapshot {
     locked: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct IdentityRebindRevisionDesignSnapshot {
-    reference: String,
-    symbol_path: String,
-    value: String,
-    footprint_id: String,
-    dnp: bool,
-    pad_nets: BTreeMap<String, String>,
-}
-
 fn identity_rebind_plan_revision(
     netlist_source: &str,
     requested: &[String],
     changes: &[IdentityRebindChange],
     board: &BoardState,
-    design: &ExportedDesign,
 ) -> String {
     let board_by_reference = board
         .footprints
         .iter()
         .map(|footprint| (footprint.reference.as_str(), footprint))
         .collect::<HashMap<_, _>>();
-    let design_by_reference = design
-        .components
-        .iter()
-        .map(|component| (component.reference.as_str(), component))
-        .collect::<HashMap<_, _>>();
     let mut snapshot = IdentityRebindRevisionSnapshot {
         requested: requested.to_vec(),
         board: Vec::new(),
-        schematic: Vec::new(),
     };
     for reference in requested {
         if let Some(footprint) = board_by_reference.get(reference.as_str()) {
@@ -1127,18 +1112,6 @@ fn identity_rebind_plan_revision(
                 layer: footprint.layer.clone(),
                 locked: footprint.locked,
             });
-        }
-        if let Some(component) = design_by_reference.get(reference.as_str()) {
-            snapshot
-                .schematic
-                .push(IdentityRebindRevisionDesignSnapshot {
-                    reference: reference.clone(),
-                    symbol_path: component.symbol_path.clone(),
-                    value: component.value.clone(),
-                    footprint_id: component.footprint_id.clone(),
-                    dnp: component.dnp,
-                    pad_nets: normalize_pad_nets(&component.pad_nets),
-                });
         }
     }
 
@@ -2287,6 +2260,61 @@ mod tests {
         vec!["D1".to_string(), "SW1".to_string()]
     }
 
+    fn identity_rebind_source_and_design(
+        date: &str,
+        tool: &str,
+        d1_symbol_stamp: &str,
+        d1_value: &str,
+        d1_footprint: &str,
+        d1_dnp: bool,
+        d1_pad_2: &str,
+    ) -> (String, ExportedDesign) {
+        let d1_dnp_property = if d1_dnp {
+            "(property (name \"dnp\") (value \"1\"))"
+        } else {
+            ""
+        };
+        let source = format!(
+            r#"(export (version "E")
+  (design
+    (source "/tmp/identity-rebind.kicad_sch")
+    (date "{date}")
+    (tool "{tool}")
+  )
+  (components
+    (comp (ref "D1")
+      (value "{d1_value}")
+      (footprint "{d1_footprint}")
+      (sheetpath (tstamps "/"))
+      (tstamps "{d1_symbol_stamp}")
+      {d1_dnp_property})
+    (comp (ref "SW1")
+      (value "SW_Push")
+      (footprint "Button_Switch_SMD:SW_SPST_SKQG_WithoutStem")
+      (sheetpath (tstamps "/33333333-3333-4333-8333-333333333333/"))
+      (tstamps "44444444-4444-4444-8444-444444444444"))
+    (comp (ref "R1")
+      (value "10k")
+      (footprint "Resistor_SMD:R_0603_1608Metric")
+      (sheetpath (tstamps "/"))
+      (tstamps "55555555-5555-4555-8555-555555555555")))
+  (nets
+    (net (code "1") (name "KEY_00")
+      (node (ref "D1") (pin "1")))
+    (net (code "2") (name "{d1_pad_2}")
+      (node (ref "D1") (pin "2"))
+      (node (ref "SW1") (pin "2")))
+    (net (code "3") (name "COL0")
+      (node (ref "SW1") (pin "1")))
+    (net (code "4") (name "VCC")
+      (node (ref "R1") (pin "1")))
+    (net (code "5") (name "GND")
+      (node (ref "R1") (pin "2")))))"#
+        );
+        let design = parse_exported_netlist(&source).expect("valid identity-rebind netlist");
+        (source, design)
+    }
+
     fn design_component_mut<'a>(
         design: &'a mut ExportedDesign,
         reference: &str,
@@ -2576,42 +2604,34 @@ mod tests {
 
     #[test]
     fn identity_rebind_plan_revision_is_stable_for_equivalent_inputs_and_changes_for_drift() {
-        let netlist = |date: &str, tool: &str| {
-            format!(
-                "(export (version \"E\")
-  (design
-    (source \"/tmp/x.kicad_sch\")
-    (date \"{date}\")
-    (tool \"{tool}\")
-  )
-  (components
-    (comp (ref \"D1\") (value \"1N4148WS\") (footprint \"lh60-core:D_SOD-323_Bottom\") (tstamps \"/aaa\"))
-    (comp (ref \"SW1\") (value \"SW_Push\") (footprint \"Button_Switch_SMD:SW_SPST_SKQG_WithoutStem\") (tstamps \"/bbb\"))
-  )
-  (nets
-    (net (code \"1\") (name \"ROW0\") (node (ref \"D1\") (pin \"2\")) (node (ref \"SW1\") (pin \"2\")))
-  ))"
-            )
-        };
-        let (design, board) = identity_rebind_fixture();
+        let (source, design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:00",
+            "kicad-cli (10.0.5)",
+            "22222222-2222-4222-8222-222222222222",
+            "1N4148WS",
+            "lh60-core:D_SOD-323_Bottom",
+            false,
+            "ROW0",
+        );
+        let (_, board) = identity_rebind_fixture();
         let requested = requested_identity_rebind_references();
 
-        let base = plan_identity_rebind(
-            &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-            &design,
-            &board,
-            &requested,
+        let base = plan_identity_rebind(&source, &design, &board, &requested);
+        let (header_source, header_design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:05",
+            "kicad-cli (10.1.0)",
+            "22222222-2222-4222-8222-222222222222",
+            "1N4148WS",
+            "lh60-core:D_SOD-323_Bottom",
+            false,
+            "ROW0",
         );
-        let different_header = plan_identity_rebind(
-            &netlist("2026-08-19T10:00:05", "kicad-cli (10.1.0)"),
-            &design,
-            &board,
-            &requested,
-        );
+        let different_header =
+            plan_identity_rebind(&header_source, &header_design, &board, &requested);
         assert_eq!(base.plan_revision, different_header.plan_revision);
 
         let reversed = plan_identity_rebind(
-            &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
+            &source,
             &design,
             &board,
             &["SW1".to_string(), "D1".to_string()],
@@ -2623,157 +2643,95 @@ mod tests {
             Some("/88888888-8888-4888-8888-888888888888".to_string());
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &changed_board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &changed_board, &requested).plan_revision
         );
 
-        let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1").symbol_path =
-            "/99999999-9999-4999-8999-999999999999".to_string();
+        let (path_source, path_design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:00",
+            "kicad-cli (10.0.5)",
+            "99999999-9999-4999-8999-999999999999",
+            "1N4148WS",
+            "lh60-core:D_SOD-323_Bottom",
+            false,
+            "ROW0",
+        );
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &changed_design,
-                &board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&path_source, &path_design, &board, &requested).plan_revision
         );
 
-        let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1").value = "DIFFERENT".to_string();
-        assert_ne!(
-            base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &changed_design,
-                &board,
-                &requested,
-            )
-            .plan_revision
-        );
-
-        let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1").footprint_id =
-            "other:Footprint".to_string();
-        assert_ne!(
-            base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &changed_design,
-                &board,
-                &requested,
-            )
-            .plan_revision
-        );
-
-        let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1").dnp = true;
-        assert_ne!(
-            base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &changed_design,
-                &board,
-                &requested,
-            )
-            .plan_revision
-        );
-
-        let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1")
-            .pad_nets
-            .insert("2".to_string(), "ROW1".to_string());
-        assert_ne!(
-            base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &changed_design,
-                &board,
-                &requested,
-            )
-            .plan_revision
-        );
+        for (value, footprint, dnp, pad_2) in [
+            ("DIFFERENT", "lh60-core:D_SOD-323_Bottom", false, "ROW0"),
+            ("1N4148WS", "other:Footprint", false, "ROW0"),
+            ("1N4148WS", "lh60-core:D_SOD-323_Bottom", true, "ROW0"),
+            ("1N4148WS", "lh60-core:D_SOD-323_Bottom", false, "ROW1"),
+        ] {
+            let (changed_source, changed_design) = identity_rebind_source_and_design(
+                "2026-08-19T10:00:00",
+                "kicad-cli (10.0.5)",
+                "22222222-2222-4222-8222-222222222222",
+                value,
+                footprint,
+                dnp,
+                pad_2,
+            );
+            assert_ne!(
+                base.plan_revision,
+                plan_identity_rebind(&changed_source, &changed_design, &board, &requested)
+                    .plan_revision
+            );
+        }
 
         let mut changed_board = board.clone();
         board_footprint_mut(&mut changed_board, "D1").kiid = "changed-kiid".to_string();
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &changed_board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &changed_board, &requested).plan_revision
         );
 
         let mut changed_board = board.clone();
         board_footprint_mut(&mut changed_board, "D1").position.x = 99.0;
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &changed_board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &changed_board, &requested).plan_revision
         );
 
         let mut changed_board = board.clone();
         board_footprint_mut(&mut changed_board, "D1").layer = "B.Cu".to_string();
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &changed_board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &changed_board, &requested).plan_revision
         );
 
         let mut changed_board = board.clone();
         board_footprint_mut(&mut changed_board, "D1").locked = true;
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &changed_board,
-                &requested,
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &changed_board, &requested).plan_revision
         );
 
         assert_ne!(
             base.plan_revision,
-            plan_identity_rebind(
-                &netlist("2026-08-19T10:00:00", "kicad-cli (10.0.5)"),
-                &design,
-                &board,
-                &["D1".to_string()],
-            )
-            .plan_revision
+            plan_identity_rebind(&source, &design, &board, &["D1".to_string()]).plan_revision
         );
     }
 
     #[test]
     fn identity_rebind_conflict_revisions_change_with_distinct_requested_design_inputs() {
-        let netlist = "(export (components) (nets))";
-        let (design, board) = identity_rebind_fixture();
+        let (_, board) = identity_rebind_fixture();
         let requested = vec!["D1".to_string()];
 
-        let mut wrong_value = design.clone();
-        design_component_mut(&mut wrong_value, "D1").value = "WRONG".to_string();
-        let value_conflict = plan_identity_rebind(netlist, &wrong_value, &board, &requested);
+        let (wrong_value_source, wrong_value_design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:00",
+            "kicad-cli (10.0.5)",
+            "22222222-2222-4222-8222-222222222222",
+            "WRONG",
+            "lh60-core:D_SOD-323_Bottom",
+            false,
+            "ROW0",
+        );
+        let value_conflict =
+            plan_identity_rebind(&wrong_value_source, &wrong_value_design, &board, &requested);
         assert_eq!(value_conflict.status, PlanStatus::Conflict);
         assert!(value_conflict.changes.is_empty());
         assert!(value_conflict
@@ -2781,11 +2739,21 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.code == "value_mismatch"));
 
-        let mut wrong_footprint = design.clone();
-        design_component_mut(&mut wrong_footprint, "D1").footprint_id =
-            "wrong:Footprint".to_string();
-        let footprint_conflict =
-            plan_identity_rebind(netlist, &wrong_footprint, &board, &requested);
+        let (wrong_footprint_source, wrong_footprint_design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:00",
+            "kicad-cli (10.0.5)",
+            "22222222-2222-4222-8222-222222222222",
+            "1N4148WS",
+            "wrong:Footprint",
+            false,
+            "ROW0",
+        );
+        let footprint_conflict = plan_identity_rebind(
+            &wrong_footprint_source,
+            &wrong_footprint_design,
+            &board,
+            &requested,
+        );
         assert_eq!(footprint_conflict.status, PlanStatus::Conflict);
         assert!(footprint_conflict.changes.is_empty());
         assert!(footprint_conflict
