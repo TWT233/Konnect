@@ -1578,6 +1578,369 @@ fn update_footprint_item(
     ))
 }
 
+fn rebind_footprint_item(
+    item: &prost_types::Any,
+    change: &IdentityRebindChange,
+) -> Result<prost_types::Any> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        bail!("identity rebind requires a FootprintInstance item");
+    }
+
+    let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        .context("KiCad returned an invalid footprint item")?;
+    if footprint.id.as_ref().map(|id| id.value.as_str()) != Some(change.kiid.as_str()) {
+        bail!(
+            "planned footprint {} no longer matches the live board item",
+            change.kiid
+        );
+    }
+    if field_text(&footprint.reference_field) != change.reference {
+        bail!(
+            "planned footprint {} no longer has reference {}",
+            change.kiid,
+            change.reference
+        );
+    }
+    let current_path = footprint
+        .symbol_path
+        .as_ref()
+        .map(sheet_path_string)
+        .unwrap_or_default();
+    if current_path != change.old_symbol_path {
+        bail!(
+            "planned footprint {} no longer has schematic identity {}",
+            change.kiid,
+            change.old_symbol_path
+        );
+    }
+    if !valid_symbol_path(&change.new_symbol_path) {
+        bail!(
+            "planned footprint {} has invalid target schematic identity {}",
+            change.kiid,
+            change.new_symbol_path
+        );
+    }
+
+    let mut rebound = footprint.clone();
+    rebound.symbol_path = Some(kiapi::common::types::SheetPath {
+        path: change
+            .new_symbol_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| kiapi::common::types::Kiid {
+                value: segment.to_string(),
+            })
+            .collect(),
+        path_human_readable: String::new(),
+    });
+
+    Ok(konnect_ipc::builders::pack_any(
+        &rebound,
+        "kiapi.board.types.FootprintInstance",
+    ))
+}
+
+fn canonicalize_identity_rebind_child(
+    item: &prost_types::Any,
+) -> Result<(String, Vec<u8>, prost_types::Any)> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    let type_url = item.type_url.clone();
+    let type_name = konnect_ipc::builders::any_type_name(item);
+    let value = match type_name {
+        "kiapi.board.types.Pad" => {
+            let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+                .context("cannot decode pad child for identity rebind canonicalization")?;
+            pad.encode_to_vec()
+        }
+        "kiapi.board.types.BoardGraphicShape" => {
+            let shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+                .context("cannot decode graphic child for identity rebind canonicalization")?;
+            shape.encode_to_vec()
+        }
+        "kiapi.board.types.BoardText" => {
+            let text = kiapi::board::types::BoardText::decode(item.value.as_slice())
+                .context("cannot decode text child for identity rebind canonicalization")?;
+            text.encode_to_vec()
+        }
+        "kiapi.board.types.Footprint3DModel" => {
+            let model = kiapi::board::types::Footprint3DModel::decode(item.value.as_slice())
+                .context("cannot decode model child for identity rebind canonicalization")?;
+            model.encode_to_vec()
+        }
+        "kiapi.board.types.Group" => {
+            let group = kiapi::board::types::Group::decode(item.value.as_slice())
+                .context("cannot decode group child for identity rebind canonicalization")?;
+            group.encode_to_vec()
+        }
+        _ => item.value.clone(),
+    };
+    Ok((
+        type_url.clone(),
+        value.clone(),
+        prost_types::Any { type_url, value },
+    ))
+}
+
+fn canonicalize_footprint_for_identity_rebind(
+    item: &prost_types::Any,
+    ignore_symbol_path: bool,
+) -> Result<konnect_ipc::gen::kiapi::board::types::FootprintInstance> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        bail!("identity rebind requires a FootprintInstance item");
+    }
+    let mut footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        .context("KiCad returned an invalid footprint item")?;
+    if ignore_symbol_path {
+        footprint.symbol_path = None;
+    }
+    if footprint.orientation == Some(kiapi::common::types::Angle::default()) {
+        footprint.orientation = None;
+    }
+    if footprint.attributes == Some(kiapi::board::types::FootprintAttributes::default()) {
+        footprint.attributes = None;
+    }
+    for field in [
+        &mut footprint.datasheet_field,
+        &mut footprint.description_field,
+    ] {
+        if field.as_ref().and_then(|field| field.text.as_ref())
+            == Some(&kiapi::board::types::BoardText::default())
+        {
+            field.as_mut().unwrap().text = None;
+        }
+        if *field == Some(kiapi::board::types::Field::default()) {
+            *field = None;
+        }
+    }
+    if let Some(definition) = footprint.definition.as_mut() {
+        if definition.attributes == Some(kiapi::board::types::FootprintAttributes::default()) {
+            definition.attributes = None;
+        }
+        for field in [
+            &mut definition.datasheet_field,
+            &mut definition.description_field,
+        ] {
+            if field.as_ref().and_then(|field| field.text.as_ref())
+                == Some(&kiapi::board::types::BoardText::default())
+            {
+                field.as_mut().unwrap().text = None;
+            }
+            if *field == Some(kiapi::board::types::Field::default()) {
+                *field = None;
+            }
+        }
+        let mut keyed = definition
+            .items
+            .iter()
+            .map(canonicalize_identity_rebind_child)
+            .collect::<Result<Vec<_>>>()?;
+        keyed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        definition.items = keyed.into_iter().map(|(_, _, item)| item).collect();
+    }
+    Ok(footprint)
+}
+
+fn canonicalize_footprint_bytes_for_identity_rebind(
+    item: &prost_types::Any,
+    ignore_symbol_path: bool,
+) -> Result<Vec<u8>> {
+    use prost::Message;
+
+    Ok(canonicalize_footprint_for_identity_rebind(item, ignore_symbol_path)?.encode_to_vec())
+}
+
+fn footprint_field_positions_snapshot(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> Result<Vec<Vec<u8>>> {
+    use prost::Message;
+
+    let mut fields = Vec::new();
+    for field in [
+        footprint.reference_field.as_ref(),
+        footprint.value_field.as_ref(),
+        footprint.datasheet_field.as_ref(),
+        footprint.description_field.as_ref(),
+        footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.reference_field.as_ref()),
+        footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.value_field.as_ref()),
+        footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.datasheet_field.as_ref()),
+        footprint
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.description_field.as_ref()),
+    ] {
+        if let Some(field) = field {
+            fields.push(field.encode_to_vec());
+        }
+    }
+    Ok(fields)
+}
+
+fn canonical_identity_rebind_children_by_type<T>(
+    items: &[prost_types::Any],
+    expected_type: &str,
+) -> Result<Vec<Vec<u8>>>
+where
+    T: prost::Message + Default,
+{
+    let mut values = Vec::new();
+    for item in items {
+        if !konnect_ipc::builders::any_is(item, expected_type) {
+            continue;
+        }
+        let decoded = T::decode(item.value.as_slice())
+            .with_context(|| format!("cannot decode {expected_type}"))?;
+        values.push(decoded.encode_to_vec());
+    }
+    values.sort();
+    Ok(values)
+}
+
+fn verify_rebound_footprint(
+    before: &prost_types::Any,
+    after: &prost_types::Any,
+    expected_new_path: &str,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+
+    let canonical_before = canonicalize_footprint_for_identity_rebind(before, false)?;
+    let canonical_after = canonicalize_footprint_for_identity_rebind(after, false)?;
+
+    let rebound_path = canonical_after
+        .symbol_path
+        .as_ref()
+        .map(sheet_path_string)
+        .unwrap_or_default();
+    if rebound_path != expected_new_path {
+        bail!("symbol_path changed unexpectedly: expected {expected_new_path}, got {rebound_path}");
+    }
+
+    let canonical_before_no_path = canonicalize_footprint_bytes_for_identity_rebind(before, true)?;
+    let canonical_after_no_path = canonicalize_footprint_bytes_for_identity_rebind(after, true)?;
+    if canonical_before_no_path == canonical_after_no_path {
+        return Ok(());
+    }
+
+    if canonical_before.position != canonical_after.position {
+        bail!("position changed during identity rebind readback");
+    }
+    if canonical_before.orientation != canonical_after.orientation {
+        bail!("orientation changed during identity rebind readback");
+    }
+    if canonical_before.layer != canonical_after.layer {
+        bail!("layer changed during identity rebind readback");
+    }
+    if canonical_before.locked != canonical_after.locked {
+        bail!("locked state changed during identity rebind readback");
+    }
+    if field_text(&canonical_before.reference_field) != field_text(&canonical_after.reference_field)
+    {
+        bail!("reference changed during identity rebind readback");
+    }
+    if field_text(&canonical_before.value_field) != field_text(&canonical_after.value_field) {
+        bail!("value changed during identity rebind readback");
+    }
+    if canonical_before.attributes != canonical_after.attributes
+        || canonical_before
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.attributes.as_ref())
+            != canonical_after
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.attributes.as_ref())
+    {
+        bail!("attributes changed during identity rebind readback");
+    }
+    if canonical_before
+        .definition
+        .as_ref()
+        .and_then(|definition| definition.id.as_ref())
+        != canonical_after
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+    {
+        bail!("footprint definition id changed during identity rebind readback");
+    }
+    if footprint_field_positions_snapshot(&canonical_before)?
+        != footprint_field_positions_snapshot(&canonical_after)?
+    {
+        bail!("field placement changed during identity rebind readback");
+    }
+
+    let before_definition = canonical_before
+        .definition
+        .as_ref()
+        .context("board footprint has no library definition")?;
+    let after_definition = canonical_after
+        .definition
+        .as_ref()
+        .context("board footprint has no library definition")?;
+
+    if before_definition.items.len() != after_definition.items.len() {
+        bail!("definition item count changed during identity rebind readback");
+    }
+
+    let before_pads = canonical_identity_rebind_children_by_type::<kiapi::board::types::Pad>(
+        &before_definition.items,
+        "kiapi.board.types.Pad",
+    )?;
+    let after_pads = canonical_identity_rebind_children_by_type::<kiapi::board::types::Pad>(
+        &after_definition.items,
+        "kiapi.board.types.Pad",
+    )?;
+    if before_pads != after_pads {
+        bail!("pad content changed during identity rebind readback");
+    }
+
+    let before_graphics =
+        canonical_identity_rebind_children_by_type::<kiapi::board::types::BoardGraphicShape>(
+            &before_definition.items,
+            "kiapi.board.types.BoardGraphicShape",
+        )?;
+    let after_graphics =
+        canonical_identity_rebind_children_by_type::<kiapi::board::types::BoardGraphicShape>(
+            &after_definition.items,
+            "kiapi.board.types.BoardGraphicShape",
+        )?;
+    if before_graphics != after_graphics {
+        bail!("graphic content changed during identity rebind readback");
+    }
+
+    let before_models =
+        canonical_identity_rebind_children_by_type::<kiapi::board::types::Footprint3DModel>(
+            &before_definition.items,
+            "kiapi.board.types.Footprint3DModel",
+        )?;
+    let after_models =
+        canonical_identity_rebind_children_by_type::<kiapi::board::types::Footprint3DModel>(
+            &after_definition.items,
+            "kiapi.board.types.Footprint3DModel",
+        )?;
+    if before_models != after_models {
+        bail!("model content changed during identity rebind readback");
+    }
+
+    bail!("non-identity footprint state changed during identity rebind readback");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_footprint_fields(
     footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
@@ -3409,6 +3772,714 @@ mod tests {
             value: format!("{}-kiid", reference.to_lowercase()),
         });
         konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    fn identity_rebind_fixture_item_and_change() -> (prost_types::Any, IdentityRebindChange, String)
+    {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let old_symbol_path =
+            "/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222";
+        let new_symbol_path =
+            "/33333333-3333-4333-8333-333333333333/44444444-4444-4444-8444-444444444444";
+        let item = footprint_with_artwork("D1");
+        let mut footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        footprint.id = Some(kiapi::common::types::Kiid {
+            value: "rebind-d1-kiid".to_string(),
+        });
+        footprint.orientation = Some(kiapi::common::types::Angle {
+            value_degrees: 37.5,
+        });
+        footprint.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: old_symbol_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| kiapi::common::types::Kiid {
+                    value: segment.to_string(),
+                })
+                .collect(),
+            path_human_readable: "old-human-readable".to_string(),
+        });
+        footprint
+            .attributes
+            .get_or_insert_with(Default::default)
+            .do_not_populate = true;
+        let definition = footprint.definition.as_mut().unwrap();
+        definition
+            .attributes
+            .get_or_insert_with(Default::default)
+            .do_not_populate = true;
+        definition.items.push(konnect_ipc::builders::pack_any(
+            &kiapi::board::types::Footprint3DModel::default(),
+            "kiapi.board.types.Footprint3DModel",
+        ));
+
+        let item =
+            konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let change = IdentityRebindChange {
+            reference: "D1".to_string(),
+            kiid: "rebind-d1-kiid".to_string(),
+            old_symbol_path: old_symbol_path.to_string(),
+            new_symbol_path: new_symbol_path.to_string(),
+            value: "NE555".to_string(),
+            footprint_id: "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm".to_string(),
+            dnp: true,
+            pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
+            preserve: PreservedBoardState {
+                position: Point { x: 25.0, y: 30.0 },
+                rotation: 37.5,
+                layer: "F.Cu".to_string(),
+                locked: true,
+            },
+        };
+        (item, change, new_symbol_path.to_string())
+    }
+
+    fn mutate_rebound_footprint_item(
+        item: &prost_types::Any,
+        mutate: impl FnOnce(&mut konnect_ipc::gen::kiapi::board::types::FootprintInstance),
+    ) -> prost_types::Any {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let mut footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        mutate(&mut footprint);
+        konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
+    }
+
+    #[test]
+    fn rebind_footprint_item_changes_only_symbol_path() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let (before_item, change, expected_new_path) = identity_rebind_fixture_item_and_change();
+
+        let updated = rebind_footprint_item(&before_item, &change).unwrap();
+
+        let mut before =
+            kiapi::board::types::FootprintInstance::decode(before_item.value.as_slice()).unwrap();
+        let mut after =
+            kiapi::board::types::FootprintInstance::decode(updated.value.as_slice()).unwrap();
+
+        let rebound_path = after.symbol_path.take().expect("rebound symbol_path");
+        assert_eq!(
+            sheet_path_string(&rebound_path),
+            expected_new_path,
+            "rebind must write the exact structured KIID sequence"
+        );
+        assert!(
+            rebound_path.path_human_readable.is_empty(),
+            "rebind must clear human-readable sheet path"
+        );
+
+        before.symbol_path = None;
+        after.symbol_path = None;
+        assert_eq!(
+            before, after,
+            "rebind must preserve every non-identity footprint field"
+        );
+    }
+
+    #[test]
+    fn rebind_footprint_item_rejects_wrong_type_kiid_reference_old_or_invalid_new_path() {
+        use konnect_ipc::gen::kiapi;
+
+        struct Case {
+            name: &'static str,
+            mutate_item: fn(&prost_types::Any) -> prost_types::Any,
+            mutate_change: fn(&mut IdentityRebindChange),
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "wrong any type",
+                mutate_item: |item| prost_types::Any {
+                    type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+                    value: item.value.clone(),
+                },
+                mutate_change: |_| {},
+                expected: "FootprintInstance",
+            },
+            Case {
+                name: "wrong kiid",
+                mutate_item: |_| {
+                    let (item, _, _) = identity_rebind_fixture_item_and_change();
+                    mutate_rebound_footprint_item(&item, |footprint| {
+                        footprint.id = Some(kiapi::common::types::Kiid {
+                            value: "wrong-kiid".to_string(),
+                        });
+                    })
+                },
+                mutate_change: |_| {},
+                expected: "rebind-d1-kiid",
+            },
+            Case {
+                name: "wrong reference",
+                mutate_item: |_| {
+                    let (item, _, _) = identity_rebind_fixture_item_and_change();
+                    mutate_rebound_footprint_item(&item, |footprint| {
+                        set_field_text(&mut footprint.reference_field, "Reference", "D9");
+                    })
+                },
+                mutate_change: |_| {},
+                expected: "reference D1",
+            },
+            Case {
+                name: "wrong old path",
+                mutate_item: |_| {
+                    let (item, _, _) = identity_rebind_fixture_item_and_change();
+                    mutate_rebound_footprint_item(&item, |footprint| {
+                        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                            path: vec![kiapi::common::types::Kiid {
+                                value: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                            }],
+                            path_human_readable: String::new(),
+                        });
+                    })
+                },
+                mutate_change: |_| {},
+                expected: "schematic identity",
+            },
+            Case {
+                name: "invalid uuid segment",
+                mutate_item: |item| item.clone(),
+                mutate_change: |change| {
+                    change.new_symbol_path =
+                        "/not-a-uuid/44444444-4444-4444-8444-444444444444".to_string();
+                },
+                expected: "invalid target schematic identity",
+            },
+            Case {
+                name: "empty segment",
+                mutate_item: |item| item.clone(),
+                mutate_change: |change| {
+                    change.new_symbol_path =
+                        "/33333333-3333-4333-8333-333333333333//44444444-4444-4444-8444-444444444444".to_string();
+                },
+                expected: "invalid target schematic identity",
+            },
+            Case {
+                name: "trailing slash",
+                mutate_item: |item| item.clone(),
+                mutate_change: |change| {
+                    change.new_symbol_path =
+                        "/33333333-3333-4333-8333-333333333333/44444444-4444-4444-8444-444444444444/".to_string();
+                },
+                expected: "invalid target schematic identity",
+            },
+        ];
+
+        for case in cases {
+            let (base_item, mut change, _) = identity_rebind_fixture_item_and_change();
+            let item = (case.mutate_item)(&base_item);
+            (case.mutate_change)(&mut change);
+
+            let error = rebind_footprint_item(&item, &change)
+                .expect_err(case.name)
+                .to_string();
+            assert!(
+                error.contains(case.expected),
+                "{}: expected error containing {:?}, got {:?}",
+                case.name,
+                case.expected,
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn rebind_readback_accepts_only_expected_symbol_path_change() {
+        let (before_item, change, expected_new_path) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+
+        verify_rebound_footprint(&before_item, &rebound_item, &expected_new_path).unwrap();
+
+        let error = verify_rebound_footprint(
+            &before_item,
+            &rebound_item,
+            "/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("symbol_path"), "{error}");
+    }
+
+    #[test]
+    fn rebind_readback_rejects_every_non_identity_mutation() {
+        use konnect_ipc::builders::vec2;
+        use konnect_ipc::gen::kiapi;
+
+        struct Case {
+            name: &'static str,
+            mutate: fn(&mut kiapi::board::types::FootprintInstance),
+            expected_message: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "position",
+                mutate: |footprint| {
+                    footprint.position = Some(vec2(99.0, 30.0));
+                },
+                expected_message: "position",
+            },
+            Case {
+                name: "orientation",
+                mutate: |footprint| {
+                    footprint.orientation = Some(kiapi::common::types::Angle {
+                        value_degrees: 91.0,
+                    });
+                },
+                expected_message: "orientation",
+            },
+            Case {
+                name: "reference",
+                mutate: |footprint| {
+                    set_field_text(&mut footprint.reference_field, "Reference", "D999");
+                },
+                expected_message: "reference",
+            },
+            Case {
+                name: "layer",
+                mutate: |footprint| {
+                    footprint.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+                },
+                expected_message: "layer",
+            },
+            Case {
+                name: "locked",
+                mutate: |footprint| {
+                    footprint.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                },
+                expected_message: "locked",
+            },
+            Case {
+                name: "value",
+                mutate: |footprint| {
+                    set_field_text(&mut footprint.value_field, "Value", "DIFFERENT");
+                },
+                expected_message: "value",
+            },
+            Case {
+                name: "dnp",
+                mutate: |footprint| {
+                    footprint
+                        .attributes
+                        .get_or_insert_with(Default::default)
+                        .do_not_populate = false;
+                    footprint
+                        .definition
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .get_or_insert_with(Default::default)
+                        .do_not_populate = false;
+                },
+                expected_message: "attributes",
+            },
+            Case {
+                name: "definition id",
+                mutate: |footprint| {
+                    footprint
+                        .definition
+                        .as_mut()
+                        .unwrap()
+                        .id
+                        .as_mut()
+                        .unwrap()
+                        .entry_name = "Different_Entry".to_string();
+                },
+                expected_message: "definition id",
+            },
+            Case {
+                name: "pad uuid",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let pad = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+                    decoded.id = Some(kiapi::common::types::Kiid {
+                        value: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                    });
+                    *pad = konnect_ipc::builders::pack_any(&decoded, "kiapi.board.types.Pad");
+                },
+                expected_message: "pad",
+            },
+            Case {
+                name: "pad number",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let pad = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+                    decoded.number = "99".to_string();
+                    *pad = konnect_ipc::builders::pack_any(&decoded, "kiapi.board.types.Pad");
+                },
+                expected_message: "pad",
+            },
+            Case {
+                name: "pad net",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let pad = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+                    decoded.net = Some(kiapi::board::types::Net {
+                        code: Some(kiapi::board::types::NetCode { value: 99 }),
+                        name: "DIFF_NET".to_string(),
+                    });
+                    *pad = konnect_ipc::builders::pack_any(&decoded, "kiapi.board.types.Pad");
+                },
+                expected_message: "pad",
+            },
+            Case {
+                name: "pad geometry position",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let pad = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::Pad::decode(pad.value.as_slice()).unwrap();
+                    decoded.position = Some(vec2(123.0, 456.0));
+                    *pad = konnect_ipc::builders::pack_any(&decoded, "kiapi.board.types.Pad");
+                },
+                expected_message: "pad",
+            },
+            Case {
+                name: "graphic content",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let graphic = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| {
+                            konnect_ipc::builders::any_is(
+                                item,
+                                "kiapi.board.types.BoardGraphicShape",
+                            )
+                        })
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::BoardGraphicShape::decode(graphic.value.as_slice())
+                            .unwrap();
+                    decoded.layer = kiapi::board::types::BoardLayer::BlFCrtYd as i32;
+                    *graphic = konnect_ipc::builders::pack_any(
+                        &decoded,
+                        "kiapi.board.types.BoardGraphicShape",
+                    );
+                },
+                expected_message: "graphic",
+            },
+            Case {
+                name: "field placement",
+                mutate: |footprint| {
+                    let board_text = footprint
+                        .reference_field
+                        .as_mut()
+                        .unwrap()
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .text
+                        .as_mut()
+                        .unwrap();
+                    board_text.position = Some(vec2(777.0, 888.0));
+                },
+                expected_message: "field placement",
+            },
+            Case {
+                name: "model",
+                mutate: |footprint| {
+                    let definition = footprint.definition.as_mut().unwrap();
+                    let model = definition
+                        .items
+                        .iter_mut()
+                        .find(|item| {
+                            konnect_ipc::builders::any_is(
+                                item,
+                                "kiapi.board.types.Footprint3DModel",
+                            )
+                        })
+                        .unwrap();
+                    let mut decoded =
+                        kiapi::board::types::Footprint3DModel::decode(model.value.as_slice())
+                            .unwrap();
+                    decoded.filename = "different-model.step".to_string();
+                    decoded.visible = !decoded.visible;
+                    *model = konnect_ipc::builders::pack_any(
+                        &decoded,
+                        "kiapi.board.types.Footprint3DModel",
+                    );
+                },
+                expected_message: "model",
+            },
+            Case {
+                name: "item count",
+                mutate: |footprint| {
+                    footprint.definition.as_mut().unwrap().items.pop();
+                },
+                expected_message: "item count",
+            },
+        ];
+
+        let (before_item, change, expected_new_path) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+
+        for case in cases {
+            let corrupted = mutate_rebound_footprint_item(&rebound_item, case.mutate);
+            let error = verify_rebound_footprint(&before_item, &corrupted, &expected_new_path)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(case.expected_message),
+                "{}: expected {error} to mention {}",
+                case.name,
+                case.expected_message
+            );
+        }
+    }
+
+    #[test]
+    fn rebind_readback_accepts_semantic_child_reordering_and_preserves_unknown_any() {
+        let (before_item, change, expected_new_path) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+
+        let reordered = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            let items = &mut footprint.definition.as_mut().unwrap().items;
+            items.reverse();
+        });
+        verify_rebound_footprint(&before_item, &reordered, &expected_new_path).unwrap();
+
+        let unknown_any = prost_types::Any {
+            type_url: "type.googleapis.com/example.UnknownFootprintChild".to_string(),
+            value: vec![1, 2, 3, 4],
+        };
+        let before_with_unknown = mutate_rebound_footprint_item(&before_item, |footprint| {
+            footprint
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .push(unknown_any.clone());
+        });
+        let after_with_unknown = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            let items = &mut footprint.definition.as_mut().unwrap().items;
+            items.push(unknown_any.clone());
+            items.rotate_right(1);
+        });
+        verify_rebound_footprint(
+            &before_with_unknown,
+            &after_with_unknown,
+            &expected_new_path,
+        )
+        .unwrap();
+
+        let mutated_unknown_payload =
+            mutate_rebound_footprint_item(&after_with_unknown, |footprint| {
+                let unknown = footprint
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| {
+                        item.type_url == "type.googleapis.com/example.UnknownFootprintChild"
+                    })
+                    .unwrap();
+                unknown.value = vec![9, 9, 9];
+            });
+        let payload_error = verify_rebound_footprint(
+            &before_with_unknown,
+            &mutated_unknown_payload,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(payload_error.contains("non-identity"), "{payload_error}");
+
+        let mutated_unknown_type =
+            mutate_rebound_footprint_item(&after_with_unknown, |footprint| {
+                let unknown = footprint
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| {
+                        item.type_url == "type.googleapis.com/example.UnknownFootprintChild"
+                    })
+                    .unwrap();
+                unknown.type_url = "type.googleapis.com/example.OtherUnknown".to_string();
+            });
+        let type_error = verify_rebound_footprint(
+            &before_with_unknown,
+            &mutated_unknown_type,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(type_error.contains("non-identity"), "{type_error}");
+    }
+
+    #[test]
+    fn rebind_readback_treats_optional_default_messages_as_semantically_equal() {
+        use konnect_ipc::gen::kiapi;
+
+        let (before_item, change, expected_new_path) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+
+        let orientation_pair_before = mutate_rebound_footprint_item(&before_item, |footprint| {
+            footprint.orientation = Some(kiapi::common::types::Angle::default());
+        });
+        let orientation_pair_after = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            footprint.orientation = None;
+        });
+        verify_rebound_footprint(
+            &orientation_pair_before,
+            &orientation_pair_after,
+            &expected_new_path,
+        )
+        .unwrap();
+        let orientation_non_default =
+            mutate_rebound_footprint_item(&orientation_pair_after, |footprint| {
+                footprint.orientation = Some(kiapi::common::types::Angle { value_degrees: 1.0 });
+            });
+        let orientation_error = verify_rebound_footprint(
+            &orientation_pair_before,
+            &orientation_non_default,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            orientation_error.contains("orientation"),
+            "{orientation_error}"
+        );
+
+        let instance_attributes_before = mutate_rebound_footprint_item(&before_item, |footprint| {
+            footprint.attributes = Some(kiapi::board::types::FootprintAttributes::default());
+        });
+        let instance_attributes_after = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            footprint.attributes = None;
+        });
+        verify_rebound_footprint(
+            &instance_attributes_before,
+            &instance_attributes_after,
+            &expected_new_path,
+        )
+        .unwrap();
+        let instance_attributes_non_default =
+            mutate_rebound_footprint_item(&instance_attributes_after, |footprint| {
+                footprint
+                    .attributes
+                    .get_or_insert_with(Default::default)
+                    .do_not_populate = true;
+            });
+        let instance_attributes_error = verify_rebound_footprint(
+            &instance_attributes_before,
+            &instance_attributes_non_default,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            instance_attributes_error.contains("attributes"),
+            "{instance_attributes_error}"
+        );
+
+        let definition_attributes_before =
+            mutate_rebound_footprint_item(&before_item, |footprint| {
+                footprint.definition.as_mut().unwrap().attributes =
+                    Some(kiapi::board::types::FootprintAttributes::default());
+            });
+        let definition_attributes_after =
+            mutate_rebound_footprint_item(&rebound_item, |footprint| {
+                footprint.definition.as_mut().unwrap().attributes = None;
+            });
+        verify_rebound_footprint(
+            &definition_attributes_before,
+            &definition_attributes_after,
+            &expected_new_path,
+        )
+        .unwrap();
+        let definition_attributes_non_default =
+            mutate_rebound_footprint_item(&definition_attributes_after, |footprint| {
+                footprint
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .get_or_insert_with(Default::default)
+                    .do_not_populate = true;
+            });
+        let definition_attributes_error = verify_rebound_footprint(
+            &definition_attributes_before,
+            &definition_attributes_non_default,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            definition_attributes_error.contains("attributes"),
+            "{definition_attributes_error}"
+        );
+
+        let field_default_before = mutate_rebound_footprint_item(&before_item, |footprint| {
+            footprint.datasheet_field = Some(kiapi::board::types::Field {
+                text: Some(kiapi::board::types::BoardText::default()),
+                ..Default::default()
+            });
+        });
+        let field_default_after = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            footprint.datasheet_field = None;
+        });
+        verify_rebound_footprint(
+            &field_default_before,
+            &field_default_after,
+            &expected_new_path,
+        )
+        .unwrap();
+        let field_non_default = mutate_rebound_footprint_item(&field_default_after, |footprint| {
+            footprint.datasheet_field = Some(kiapi::board::types::Field {
+                name: "Datasheet".to_string(),
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "not-default".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        });
+        let field_error = verify_rebound_footprint(
+            &field_default_before,
+            &field_non_default,
+            &expected_new_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(field_error.contains("field placement"), "{field_error}");
     }
 
     /// Tally a footprint definition's children by the protobuf type they
