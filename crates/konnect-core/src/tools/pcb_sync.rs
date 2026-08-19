@@ -175,6 +175,8 @@ struct IdentityRebindChange {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct IdentityRebindPlan {
     status: PlanStatus,
+    #[serde(skip)]
+    semantic_base_revision: String,
     plan_revision: String,
     counts: IdentityRebindCounts,
     changes: Vec<IdentityRebindChange>,
@@ -1266,11 +1268,19 @@ fn plan_identity_rebind(
     );
     IdentityRebindPlan {
         status,
+        semantic_base_revision: plan_revision.clone(),
         plan_revision,
         counts,
         changes,
         diagnostics,
     }
+}
+
+fn update_framed(hasher: &mut Sha256, tag: &[u8], bytes: &[u8]) {
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn normalize_pad_nets(pad_nets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -1417,12 +1427,21 @@ fn refresh_identity_rebind_revision(
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(plan.plan_revision.as_bytes());
+    update_framed(
+        &mut hasher,
+        b"domain",
+        b"konnect.identity-rebind.live-revision.v1",
+    );
+    update_framed(
+        &mut hasher,
+        b"semantic_base_revision",
+        plan.semantic_base_revision.as_bytes(),
+    );
     for (kiid, snapshot) in snapshots {
-        hasher.update(kiid.as_bytes());
-        hasher.update(snapshot);
+        update_framed(&mut hasher, b"requested_kiid", kiid.as_bytes());
+        update_framed(&mut hasher, b"requested_snapshot", &snapshot);
     }
-    hasher.update(document.encode_to_vec());
+    update_framed(&mut hasher, b"document", &document.encode_to_vec());
     plan.plan_revision = format!("{:x}", hasher.finalize());
     Ok(())
 }
@@ -3137,6 +3156,7 @@ mod tests {
     fn rebind_response_formats_ready_dry_run_shape() {
         let plan = IdentityRebindPlan {
             status: PlanStatus::Ready,
+            semantic_base_revision: "abc123".to_string(),
             plan_revision: "abc123".to_string(),
             counts: IdentityRebindCounts {
                 requested: 2,
@@ -3698,6 +3718,7 @@ mod tests {
     fn rebind_revision_refresh_fixture_plan(status: PlanStatus) -> IdentityRebindPlan {
         IdentityRebindPlan {
             status,
+            semantic_base_revision: "base-rebind-revision".to_string(),
             plan_revision: "base-rebind-revision".to_string(),
             counts: IdentityRebindCounts {
                 requested: 2,
@@ -3784,6 +3805,10 @@ mod tests {
         refresh_identity_rebind_revision(&mut noop_plan, &requested_items, &document).unwrap();
         assert_ne!(noop_plan.plan_revision, noop_base);
         assert_eq!(ready_plan.plan_revision, noop_plan.plan_revision);
+
+        let first_revision = ready_plan.plan_revision.clone();
+        refresh_identity_rebind_revision(&mut ready_plan, &requested_items, &document).unwrap();
+        assert_eq!(first_revision, ready_plan.plan_revision);
     }
 
     #[test]
@@ -4017,13 +4042,17 @@ mod tests {
             .unwrap();
         assert_eq!(base_revision, semantic_plan.plan_revision);
 
-        let reversed = requested_items
-            .iter()
-            .rev()
-            .map(|(kiid, item)| (kiid.clone(), item.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let mut reordered = requested_items.clone();
+        let d1_item = reordered.get("rebind-d1-kiid").unwrap().clone();
+        reordered.insert(
+            "rebind-d1-kiid".to_string(),
+            mutate_rebound_footprint_item(&d1_item, |footprint| {
+                let items = &mut footprint.definition.as_mut().unwrap().items;
+                items.reverse();
+            }),
+        );
         let mut reordered_plan = rebind_revision_refresh_fixture_plan(PlanStatus::Ready);
-        refresh_identity_rebind_revision(&mut reordered_plan, &reversed, &document).unwrap();
+        refresh_identity_rebind_revision(&mut reordered_plan, &reordered, &document).unwrap();
         assert_eq!(base_revision, reordered_plan.plan_revision);
     }
 
