@@ -2141,27 +2141,6 @@ mod tests {
         }
     }
 
-    fn rebind_design_component(
-        reference: &str,
-        symbol_path: &str,
-        value: &str,
-        footprint_id: &str,
-        dnp: bool,
-        pad_nets: &[(&str, &str)],
-    ) -> DesignComponent {
-        DesignComponent {
-            reference: reference.to_string(),
-            value: value.to_string(),
-            footprint_id: footprint_id.to_string(),
-            symbol_path: symbol_path.to_string(),
-            dnp,
-            pad_nets: pad_nets
-                .iter()
-                .map(|(pad, net)| (pad.to_string(), net.to_string()))
-                .collect(),
-        }
-    }
-
     fn rebind_board_footprint(
         reference: &str,
         kiid: &str,
@@ -2191,36 +2170,16 @@ mod tests {
         }
     }
 
-    fn identity_rebind_fixture() -> (ExportedDesign, BoardState) {
-        let design = ExportedDesign {
-            components: vec![
-                rebind_design_component(
-                    "D1",
-                    "/22222222-2222-4222-8222-222222222222",
-                    "1N4148WS",
-                    "lh60-core:D_SOD-323_Bottom",
-                    false,
-                    &[("1", "KEY_00"), ("2", "ROW0")],
-                ),
-                rebind_design_component(
-                    "SW1",
-                    "/33333333-3333-4333-8333-333333333333/44444444-4444-4444-8444-444444444444",
-                    "SW_Push",
-                    "Button_Switch_SMD:SW_SPST_SKQG_WithoutStem",
-                    false,
-                    &[("1", "COL0"), ("2", "/ROW0")],
-                ),
-                rebind_design_component(
-                    "R1",
-                    "/55555555-5555-4555-8555-555555555555",
-                    "10k",
-                    "Resistor_SMD:R_0603_1608Metric",
-                    false,
-                    &[("1", "VCC"), ("2", "GND")],
-                ),
-            ],
-            skipped: Vec::new(),
-        };
+    fn identity_rebind_fixture() -> (String, ExportedDesign, BoardState) {
+        let (source, design) = identity_rebind_source_and_design(
+            "2026-08-19T10:00:00",
+            "kicad-cli (10.0.5)",
+            "22222222-2222-4222-8222-222222222222",
+            "1N4148WS",
+            "lh60-core:D_SOD-323_Bottom",
+            false,
+            "ROW0",
+        );
         let board = board_with(vec![
             rebind_board_footprint(
                 "D1",
@@ -2253,7 +2212,7 @@ mod tests {
                 "F.Cu",
             ),
         ]);
-        (design, board)
+        (source, design, board)
     }
 
     fn requested_identity_rebind_references() -> Vec<String> {
@@ -2315,6 +2274,57 @@ mod tests {
         (source, design)
     }
 
+    fn parse_identity_rebind_source(source: &str) -> ExportedDesign {
+        parse_exported_netlist(source).expect("valid identity-rebind netlist")
+    }
+
+    fn replace_once(source: &str, needle: &str, replacement: &str) -> String {
+        assert!(source.contains(needle), "missing source snippet: {needle}");
+        source.replacen(needle, replacement, 1)
+    }
+
+    fn identity_rebind_source_without_d1(source: &str) -> String {
+        let source = replace_once(source, "(comp (ref \"D1\")", "(comp (ref \"DX1\")");
+        let source = replace_once(
+            source.as_str(),
+            "(node (ref \"D1\") (pin \"1\"))",
+            "(node (ref \"DX1\") (pin \"1\"))",
+        );
+        replace_once(
+            source.as_str(),
+            "(node (ref \"D1\") (pin \"2\"))",
+            "(node (ref \"DX1\") (pin \"2\"))",
+        )
+    }
+
+    fn identity_rebind_source_with_duplicate_sw1_identity(source: &str) -> String {
+        replace_once(
+            source,
+            "      (sheetpath (tstamps \"/33333333-3333-4333-8333-333333333333/\"))\n      (tstamps \"44444444-4444-4444-8444-444444444444\"))",
+            "      (sheetpath (tstamps \"/\"))\n      (tstamps \"22222222-2222-4222-8222-222222222222\"))",
+        )
+    }
+
+    fn identity_rebind_source_with_invalid_d1_identity(source: &str) -> String {
+        replace_once(
+            source,
+            "(tstamps \"22222222-2222-4222-8222-222222222222\")",
+            "(tstamps \"not-a-uuid\")",
+        )
+    }
+
+    fn identity_rebind_source_with_duplicate_d1_reference(source: &str) -> String {
+        replace_once(source, "(comp (ref \"SW1\")", "(comp (ref \"D1\")")
+    }
+
+    fn identity_rebind_source_without_d1_symbol_timestamp(source: &str) -> String {
+        replace_once(
+            source,
+            "      (tstamps \"22222222-2222-4222-8222-222222222222\")\n",
+            "",
+        )
+    }
+
     fn design_component_mut<'a>(
         design: &'a mut ExportedDesign,
         reference: &str,
@@ -2339,10 +2349,10 @@ mod tests {
 
     #[test]
     fn identity_rebind_plans_only_exact_equivalent_references() {
-        let (design, board) = identity_rebind_fixture();
+        let (source, design, board) = identity_rebind_fixture();
 
         let plan = plan_identity_rebind(
-            "(export (components) (nets))",
+            &source,
             &design,
             &board,
             &requested_identity_rebind_references(),
@@ -2374,193 +2384,191 @@ mod tests {
     fn identity_rebind_conflicts_are_fail_closed() {
         struct ConflictCase {
             name: &'static str,
-            mutate: fn(&mut ExportedDesign, &mut BoardState, &mut Vec<String>),
+            mutate_source: Option<fn(&str) -> String>,
+            mutate_board: fn(&mut BoardState),
+            mutate_requested: fn(&mut Vec<String>),
             code: &'static str,
         }
 
         let cases = vec![
             ConflictCase {
                 name: "missing schematic reference",
-                mutate: |design, _, requested| {
-                    design
-                        .components
-                        .retain(|component| component.reference != "D1");
-                    *requested = vec!["D1".to_string()];
-                },
+                mutate_source: Some(identity_rebind_source_without_d1),
+                mutate_board: |_| {},
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "requested_reference_missing_from_schematic",
             },
             ConflictCase {
                 name: "missing board reference",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board
                         .footprints
                         .retain(|footprint| footprint.reference != "D1");
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "requested_reference_missing_from_board",
             },
             ConflictCase {
                 name: "duplicate request",
-                mutate: |_, _, requested| {
-                    *requested = vec!["D1".to_string(), "D1".to_string()];
-                },
+                mutate_source: None,
+                mutate_board: |_| {},
+                mutate_requested: |requested| *requested = vec!["D1".to_string(), "D1".to_string()],
                 code: "duplicate_requested_reference",
             },
             ConflictCase {
                 name: "missing old identity",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").symbol_path = None;
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "missing_board_identity",
             },
             ConflictCase {
-                name: "missing new identity",
-                mutate: |design, _, requested| {
-                    design_component_mut(design, "D1").symbol_path = String::new();
-                    *requested = vec!["D1".to_string()];
-                },
-                code: "missing_schematic_identity",
-            },
-            ConflictCase {
                 name: "mixed already matching identity",
-                mutate: |design, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").symbol_path =
-                        Some(design_component_mut(design, "D1").symbol_path.clone());
-                    *requested = requested_identity_rebind_references();
+                        Some("/22222222-2222-4222-8222-222222222222".to_string());
                 },
+                mutate_requested: |requested| *requested = requested_identity_rebind_references(),
                 code: "identity_already_matches_in_mixed_request",
             },
             ConflictCase {
                 name: "value drift",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").value = "WRONG".to_string();
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "value_mismatch",
             },
             ConflictCase {
                 name: "footprint drift",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").footprint_id = "wrong:Footprint".to_string();
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "footprint_mismatch",
             },
             ConflictCase {
                 name: "dnp drift",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").dnp = true;
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "dnp_mismatch",
             },
             ConflictCase {
                 name: "pad set drift",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").pad_nets.remove("2");
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "pad_set_mismatch",
             },
             ConflictCase {
                 name: "pad net drift",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1")
                         .pad_nets
                         .insert("2".to_string(), "ROW1".to_string());
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "pad_net_mismatch",
             },
             ConflictCase {
                 name: "nested net mismatch",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1")
                         .pad_nets
                         .insert("2".to_string(), "/sheet/ROW0".to_string());
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "pad_net_mismatch",
             },
             ConflictCase {
                 name: "board only footprint",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").not_in_schematic = true;
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "board_only_footprint",
             },
             ConflictCase {
                 name: "duplicate old identity",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     let d1_path = board_footprint_mut(board, "D1").symbol_path.clone();
                     board_footprint_mut(board, "SW1").symbol_path = d1_path;
-                    *requested = requested_identity_rebind_references();
                 },
+                mutate_requested: |requested| *requested = requested_identity_rebind_references(),
                 code: "duplicate_board_identity",
             },
             ConflictCase {
                 name: "duplicate new identity",
-                mutate: |design, _, requested| {
-                    let d1_path = design_component_mut(design, "D1").symbol_path.clone();
-                    design_component_mut(design, "SW1").symbol_path = d1_path;
-                    *requested = requested_identity_rebind_references();
-                },
+                mutate_source: Some(identity_rebind_source_with_duplicate_sw1_identity),
+                mutate_board: |_| {},
+                mutate_requested: |requested| *requested = requested_identity_rebind_references(),
                 code: "duplicate_schematic_identity",
             },
             ConflictCase {
                 name: "target identity collides with unrequested board item",
-                mutate: |design, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "R1").symbol_path =
-                        Some(design_component_mut(design, "D1").symbol_path.clone());
-                    *requested = requested_identity_rebind_references();
+                        Some("/22222222-2222-4222-8222-222222222222".to_string());
                 },
+                mutate_requested: |requested| *requested = requested_identity_rebind_references(),
                 code: "target_identity_in_use",
             },
             ConflictCase {
                 name: "invalid old kiid path",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").symbol_path = Some("/not-a-uuid".to_string());
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "invalid_board_identity",
             },
             ConflictCase {
                 name: "invalid new kiid path",
-                mutate: |design, _, requested| {
-                    design_component_mut(design, "D1").symbol_path = "/not-a-uuid".to_string();
-                    *requested = vec!["D1".to_string()];
-                },
-                code: "invalid_schematic_identity",
-            },
-            ConflictCase {
-                name: "empty path segment",
-                mutate: |design, _, requested| {
-                    design_component_mut(design, "D1").symbol_path =
-                        "//22222222-2222-4222-8222-222222222222".to_string();
-                    *requested = vec!["D1".to_string()];
-                },
+                mutate_source: Some(identity_rebind_source_with_invalid_d1_identity),
+                mutate_board: |_| {},
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "invalid_schematic_identity",
             },
             ConflictCase {
                 name: "trailing path segment",
-                mutate: |_, board, requested| {
+                mutate_source: None,
+                mutate_board: |board| {
                     board_footprint_mut(board, "D1").symbol_path =
                         Some("/11111111-1111-4111-8111-111111111111/".to_string());
-                    *requested = vec!["D1".to_string()];
                 },
+                mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "invalid_board_identity",
             },
         ];
 
         for case in cases {
-            let (mut design, mut board) = identity_rebind_fixture();
+            let (source, _, mut board) = identity_rebind_fixture();
+            let source = case
+                .mutate_source
+                .map(|mutate| mutate(&source))
+                .unwrap_or(source);
+            let design = parse_identity_rebind_source(&source);
             let mut requested = requested_identity_rebind_references();
-            (case.mutate)(&mut design, &mut board, &mut requested);
+            (case.mutate_board)(&mut board);
+            (case.mutate_requested)(&mut requested);
 
-            let plan =
-                plan_identity_rebind("(export (components) (nets))", &design, &board, &requested);
+            let plan = plan_identity_rebind(&source, &design, &board, &requested);
 
             assert_eq!(plan.status, PlanStatus::Conflict, "{}", case.name);
             assert!(plan.changes.is_empty(), "{}", case.name);
@@ -2577,7 +2585,7 @@ mod tests {
 
     #[test]
     fn identity_rebind_is_noop_when_every_requested_identity_already_matches() {
-        let (design, mut board) = identity_rebind_fixture();
+        let (source, design, mut board) = identity_rebind_fixture();
         board_footprint_mut(&mut board, "D1").symbol_path = Some(
             design_component_mut(&mut design.clone(), "D1")
                 .symbol_path
@@ -2590,7 +2598,7 @@ mod tests {
         );
 
         let plan = plan_identity_rebind(
-            "(export (components) (nets))",
+            &source,
             &design,
             &board,
             &requested_identity_rebind_references(),
@@ -2613,7 +2621,7 @@ mod tests {
             false,
             "ROW0",
         );
-        let (_, board) = identity_rebind_fixture();
+        let (_, _, board) = identity_rebind_fixture();
         let requested = requested_identity_rebind_references();
 
         let base = plan_identity_rebind(&source, &design, &board, &requested);
@@ -2718,7 +2726,7 @@ mod tests {
 
     #[test]
     fn identity_rebind_conflict_revisions_change_with_distinct_requested_design_inputs() {
-        let (_, board) = identity_rebind_fixture();
+        let (_, _, board) = identity_rebind_fixture();
         let requested = vec!["D1".to_string()];
 
         let (wrong_value_source, wrong_value_design) = identity_rebind_source_and_design(
@@ -2769,38 +2777,48 @@ mod tests {
 
     #[test]
     fn identity_rebind_plan_revision_changes_when_requested_not_in_schematic_changes() {
-        let netlist = "(export (components) (nets))";
-        let (design, board) = identity_rebind_fixture();
+        let (source, design, board) = identity_rebind_fixture();
         let requested = vec!["D1".to_string()];
 
-        let base = plan_identity_rebind(netlist, &design, &board, &requested);
+        let base = plan_identity_rebind(&source, &design, &board, &requested);
         let mut board_only = board.clone();
         board_footprint_mut(&mut board_only, "D1").not_in_schematic = true;
-        let changed = plan_identity_rebind(netlist, &design, &board_only, &requested);
+        let changed = plan_identity_rebind(&source, &design, &board_only, &requested);
 
         assert_ne!(base.plan_revision, changed.plan_revision);
     }
 
     #[test]
-    fn identity_rebind_requested_duplicate_schematic_reference_conflicts() {
-        let (mut design, board) = identity_rebind_fixture();
-        let duplicate = design_component_mut(&mut design, "D1").clone();
-        design.components.push(duplicate);
+    fn duplicate_schematic_references_are_rejected_by_parser() {
+        let (source, _, _) = identity_rebind_fixture();
+        let duplicate = identity_rebind_source_with_duplicate_d1_reference(&source);
 
-        let plan = plan_identity_rebind(
-            "(export (components) (nets))",
-            &design,
-            &board,
-            &["D1".to_string()],
+        let error = parse_exported_netlist(&duplicate).unwrap_err().to_string();
+
+        assert!(
+            error.contains("duplicate component reference D1"),
+            "{error}"
         );
+    }
 
-        assert_eq!(plan.status, PlanStatus::Conflict);
-        assert!(plan.changes.is_empty());
-        assert_eq!(plan.counts.planned, 0);
-        assert!(plan
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "duplicate_schematic_reference"));
+    #[test]
+    fn missing_schematic_identity_is_rejected_by_parser() {
+        let (source, _, _) = identity_rebind_fixture();
+        let missing_identity = identity_rebind_source_without_d1_symbol_timestamp(&source);
+
+        let error = parse_exported_netlist(&missing_identity)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("component has no symbol timestamp"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn empty_path_segment_is_rejected_by_symbol_path_validation() {
+        assert!(!valid_symbol_path("//22222222-2222-4222-8222-222222222222"));
     }
 
     #[test]
