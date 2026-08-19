@@ -2264,6 +2264,141 @@ fn verify_rebound_footprint(
     bail!("non-identity footprint state changed during identity rebind readback");
 }
 
+fn decode_identity_rebind_footprint_item(
+    item: &prost_types::Any,
+    context: &str,
+) -> Result<konnect_ipc::gen::kiapi::board::types::FootprintInstance> {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    if !konnect_ipc::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+        bail!("{context} is not a FootprintInstance");
+    }
+    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+        .with_context(|| format!("{context} is not a decodable FootprintInstance"))
+}
+
+fn verify_identity_rebind_readback(
+    before_by_kiid: &BTreeMap<String, prost_types::Any>,
+    after_items: &[prost_types::Any],
+    changes: &[IdentityRebindChange],
+) -> Result<()> {
+    let mut seen_change_kiids = HashSet::new();
+    let mut seen_change_refs = HashSet::new();
+    let mut seen_change_paths = HashSet::new();
+    for change in changes {
+        if !seen_change_kiids.insert(change.kiid.as_str()) {
+            bail!(
+                "duplicate requested KIID {} in change contract",
+                change.kiid
+            );
+        }
+        if !seen_change_refs.insert(change.reference.as_str()) {
+            bail!(
+                "duplicate requested reference {} in change contract",
+                change.reference
+            );
+        }
+        if !seen_change_paths.insert(change.new_symbol_path.as_str()) {
+            bail!(
+                "duplicate target identity {} in change contract",
+                change.new_symbol_path
+            );
+        }
+    }
+
+    let mut before_decoded = BTreeMap::new();
+    for (kiid, item) in before_by_kiid {
+        let footprint = decode_identity_rebind_footprint_item(
+            item,
+            &format!("before requested footprint {kiid}"),
+        )?;
+        let embedded_kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.as_str())
+            .unwrap_or_default();
+        if embedded_kiid.is_empty() {
+            bail!("before requested footprint {kiid} has empty embedded KIID");
+        }
+        if embedded_kiid != kiid {
+            bail!(
+                "before requested footprint key {kiid} does not match embedded KIID {embedded_kiid}"
+            );
+        }
+        before_decoded.insert(kiid.clone(), item.clone());
+    }
+
+    let mut after_by_kiid = BTreeMap::new();
+    let mut target_path_owner: HashMap<String, Vec<String>> = HashMap::new();
+    for (index, item) in after_items.iter().enumerate() {
+        let footprint =
+            decode_identity_rebind_footprint_item(item, &format!("after item #{index}"))?;
+        let embedded_kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .unwrap_or_default();
+        if embedded_kiid.is_empty() {
+            bail!("after item #{index} has empty embedded KIID");
+        }
+        if after_by_kiid.contains_key(&embedded_kiid) {
+            bail!("duplicate after KIID {embedded_kiid}");
+        }
+        if let Some(path) = footprint.symbol_path.as_ref().map(sheet_path_string) {
+            target_path_owner
+                .entry(path)
+                .or_default()
+                .push(embedded_kiid.clone());
+        }
+        after_by_kiid.insert(embedded_kiid, item.clone());
+    }
+
+    if changes.len() != before_by_kiid.len() {
+        bail!(
+            "requested readback contract mismatch: {} changes but {} requested before items",
+            changes.len(),
+            before_by_kiid.len()
+        );
+    }
+
+    for change in changes {
+        let before = before_decoded
+            .get(&change.kiid)
+            .with_context(|| format!("missing requested before footprint {}", change.kiid))?;
+        let after = after_by_kiid
+            .get(&change.kiid)
+            .with_context(|| format!("missing requested after footprint {}", change.kiid))?;
+        let after_decoded = decode_identity_rebind_footprint_item(
+            after,
+            &format!("after requested footprint {}", change.kiid),
+        )?;
+        let after_reference = field_text(&after_decoded.reference_field);
+        if after_reference != change.reference {
+            bail!(
+                "requested after footprint {} has reference {}, expected {}",
+                change.kiid,
+                after_reference,
+                change.reference
+            );
+        }
+        let owners = target_path_owner
+            .get(&change.new_symbol_path)
+            .with_context(|| format!("missing target identity {}", change.new_symbol_path))?;
+        if owners.len() != 1 || owners[0] != change.kiid {
+            bail!(
+                "target identity {} is owned by {:?}, expected only {}",
+                change.new_symbol_path,
+                owners,
+                change.kiid
+            );
+        }
+        verify_rebound_footprint(before, after, &change.new_symbol_path)?;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_footprint_fields(
     footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
@@ -5595,6 +5730,225 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(field_error.contains("field placement"), "{field_error}");
+    }
+
+    #[test]
+    fn rebind_collection_readback_accepts_exact_requested_changes_and_unrelated_items() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let (unrelated_before, _, _) = identity_rebind_fixture_item_and_change();
+        let unrelated_after = mutate_rebound_footprint_item(&unrelated_before, |footprint| {
+            use konnect_ipc::gen::kiapi;
+            set_field_text(&mut footprint.reference_field, "Reference", "U7");
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: "unrelated-u7-kiid".to_string(),
+            });
+            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                path: vec![kiapi::common::types::Kiid {
+                    value: "77777777-7777-4777-8777-777777777777".to_string(),
+                }],
+                path_human_readable: String::new(),
+            });
+        });
+
+        verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item, unrelated_after],
+            &[change],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_missing_or_duplicate_requested_kiid() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item.clone());
+
+        let missing_error =
+            verify_identity_rebind_readback(&before_by_kiid, &[], std::slice::from_ref(&change))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            missing_error.contains("missing requested after footprint"),
+            "{missing_error}"
+        );
+
+        let duplicate_after = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            use konnect_ipc::gen::kiapi;
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: change.kiid.clone(),
+            });
+        });
+        let duplicate_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item, duplicate_after],
+            &[change],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate_error.contains("duplicate after KIID"),
+            "{duplicate_error}"
+        );
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_bad_type_empty_kiid_or_reference() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item.clone());
+
+        let wrong_type = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Pad".to_string(),
+            value: Vec::new(),
+        };
+        let wrong_type_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[wrong_type],
+            std::slice::from_ref(&change),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_type_error.contains("not a FootprintInstance"),
+            "{wrong_type_error}"
+        );
+
+        let empty_kiid = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            footprint.id = None;
+        });
+        let empty_kiid_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[empty_kiid],
+            std::slice::from_ref(&change),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            empty_kiid_error.contains("empty embedded KIID"),
+            "{empty_kiid_error}"
+        );
+
+        let wrong_reference = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            set_field_text(&mut footprint.reference_field, "Reference", "D9");
+        });
+        let wrong_reference_error =
+            verify_identity_rebind_readback(&before_by_kiid, &[wrong_reference], &[change])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            wrong_reference_error.contains("expected D1"),
+            "{wrong_reference_error}"
+        );
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_non_identity_corruption() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let corrupted = mutate_rebound_footprint_item(&rebound_item, |footprint| {
+            use konnect_ipc::builders::vec2;
+            footprint.position = Some(vec2(321.0, 654.0));
+        });
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let error = verify_identity_rebind_readback(&before_by_kiid, &[corrupted], &[change])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("position changed"), "{error}");
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_duplicate_target_identity_globally() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let (other_before, _, _) = identity_rebind_fixture_item_and_change();
+        let colliding_after = mutate_rebound_footprint_item(&other_before, |footprint| {
+            use konnect_ipc::gen::kiapi;
+            set_field_text(&mut footprint.reference_field, "Reference", "U8");
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: "unrelated-u8-kiid".to_string(),
+            });
+            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                path: change
+                    .new_symbol_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| kiapi::common::types::Kiid {
+                        value: segment.to_string(),
+                    })
+                    .collect(),
+                path_human_readable: String::new(),
+            });
+        });
+
+        let error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item, colliding_after],
+            &[change],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("target identity"), "{error}");
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_duplicate_change_contract() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let duplicate_kiid_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            std::slice::from_ref(&rebound_item),
+            &[change.clone(), change.clone()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate_kiid_error.contains("duplicate requested KIID"),
+            "{duplicate_kiid_error}"
+        );
+
+        let mut duplicate_reference = change.clone();
+        duplicate_reference.kiid = "another-kiid".to_string();
+        let duplicate_reference_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            std::slice::from_ref(&rebound_item),
+            &[change.clone(), duplicate_reference],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate_reference_error.contains("duplicate requested reference"),
+            "{duplicate_reference_error}"
+        );
+
+        let mut duplicate_path = change.clone();
+        duplicate_path.kiid = "another-kiid".to_string();
+        duplicate_path.reference = "D2".to_string();
+        let duplicate_path_error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item],
+            &[change, duplicate_path],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            duplicate_path_error.contains("duplicate target identity"),
+            "{duplicate_path_error}"
+        );
     }
 
     /// Tally a footprint definition's children by the protobuf type they
