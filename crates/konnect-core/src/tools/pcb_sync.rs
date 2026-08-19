@@ -1812,6 +1812,30 @@ where
     Ok(values)
 }
 
+fn canonical_unknown_identity_rebind_children(
+    items: &[prost_types::Any],
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut values = Vec::new();
+    for item in items {
+        let type_name = konnect_ipc::builders::any_type_name(item);
+        if matches!(
+            type_name,
+            "kiapi.board.types.Pad"
+                | "kiapi.board.types.BoardGraphicShape"
+                | "kiapi.board.types.BoardText"
+                | "kiapi.board.types.Footprint3DModel"
+                | "kiapi.board.types.Group"
+        ) {
+            continue;
+        }
+
+        let (type_url, value, _) = canonicalize_identity_rebind_child(item)?;
+        values.push((type_url, value));
+    }
+    values.sort();
+    Ok(values)
+}
+
 fn verify_rebound_footprint(
     before: &prost_types::Any,
     after: &prost_types::Any,
@@ -1936,6 +1960,23 @@ fn verify_rebound_footprint(
         )?;
     if before_models != after_models {
         bail!("model content changed during identity rebind readback");
+    }
+
+    let before_unknown = canonical_unknown_identity_rebind_children(&before_definition.items)?;
+    let after_unknown = canonical_unknown_identity_rebind_children(&after_definition.items)?;
+    if before_unknown != after_unknown {
+        let before_unknown_types = before_unknown
+            .iter()
+            .map(|(type_url, _)| type_url.clone())
+            .collect::<Vec<_>>();
+        let after_unknown_types = after_unknown
+            .iter()
+            .map(|(type_url, _)| type_url.clone())
+            .collect::<Vec<_>>();
+        if before_unknown_types != after_unknown_types {
+            bail!("unknown footprint child type changed during identity rebind readback");
+        }
+        bail!("unknown footprint child payload changed during identity rebind readback");
     }
 
     bail!("non-identity footprint state changed during identity rebind readback");
@@ -4315,7 +4356,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(payload_error.contains("non-identity"), "{payload_error}");
+        assert!(
+            payload_error.contains("unknown footprint child payload"),
+            "{payload_error}"
+        );
 
         let mutated_unknown_type =
             mutate_rebound_footprint_item(&after_with_unknown, |footprint| {
@@ -4338,7 +4382,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(type_error.contains("non-identity"), "{type_error}");
+        assert!(
+            type_error.contains("unknown footprint child type"),
+            "{type_error}"
+        );
     }
 
     #[test]
