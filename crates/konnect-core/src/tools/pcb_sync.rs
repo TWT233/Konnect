@@ -1702,6 +1702,7 @@ fn refresh_identity_rebind_revision(
     Ok(())
 }
 
+#[cfg(test)]
 fn rebind_test_document(
     filename: &str,
 ) -> konnect_ipc::gen::kiapi::common::types::DocumentSpecifier {
