@@ -324,6 +324,9 @@ fn schematic_identity_rebind_apply_then_dry_run_is_noop() {
     });
     assert!(ready, "KiCad IPC socket never became ready");
 
+    let board_file_before =
+        std::fs::read(&board).expect("failed to read board file before identity rebind");
+
     let document = ipc
         .find_open_board(Path::new(&board))
         .expect("board must be open in KiCad");
@@ -701,4 +704,11 @@ fn schematic_identity_rebind_apply_then_dry_run_is_noop() {
             "KIID {kiid} non-symbol-path fields differ after rebind"
         );
     }
+
+    let board_file_after =
+        std::fs::read(&board).expect("failed to read board file after identity rebind");
+    assert_eq!(
+        board_file_before, board_file_after,
+        "identity rebind must not save the board file; in-memory mutation only"
+    );
 }
