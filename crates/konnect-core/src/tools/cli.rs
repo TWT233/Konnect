@@ -33,19 +33,23 @@ pub struct ErcViolation {
     /// Every item the rule caught, in report order. A `pin_to_pin` violation
     /// always names two pins and the second is regularly the actionable one,
     /// so keeping only the first hid what explains the violation.
-    pub items: Vec<ErcItem>,
+    pub items: Vec<ReportItem>,
 }
 
-/// One item involved in an ERC violation.
+/// One item involved in an ERC or DRC violation. Both reports use the same
+/// item shape, so both parsers decode it the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErcItem {
+pub struct ReportItem {
     pub description: String,
-    pub pos: Option<ErcPos>,
+    pub pos: Option<ReportPos>,
+    /// Absent rather than null when KiCad names no item id, which is the
+    /// shape both the ERC and DRC responses have always had.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErcPos {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ReportPos {
     pub x: f64,
     pub y: f64,
 }
@@ -62,7 +66,13 @@ pub struct DrcViolation {
     /// per violation, so this is the first item's — which is what the report
     /// used to try to read from a top-level `pos` field that does not exist,
     /// making every position `null`.
-    pub pos: Option<ErcPos>,
+    pub pos: Option<ReportPos>,
+    /// Every item the rule caught, in report order. The prose description of
+    /// an `unconnected_items` violation is a constant, so the pads and the net
+    /// its items name are the only record of what is unrouted — and two
+    /// violations sharing a rule, a description and a first position differ
+    /// nowhere else.
+    pub items: Vec<ReportItem>,
 }
 
 /// Everything `kicad-cli pcb drc` reports, not just the part Konnect used to
@@ -194,10 +204,10 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             continue;
         };
         for v in violations {
-            let items: Vec<ErcItem> = v
+            let items: Vec<ReportItem> = v
                 .get("items")
                 .and_then(|i| i.as_array())
-                .map(|items| items.iter().map(parse_erc_item).collect())
+                .map(|items| items.iter().map(parse_report_item).collect())
                 .unwrap_or_default();
             let mut description = v["description"].as_str().unwrap_or("").to_string();
             // The per-item description names the offender ("Symbol R1 Pin 1…")
@@ -221,17 +231,22 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
     out
 }
 
-fn parse_erc_item(item: &serde_json::Value) -> ErcItem {
-    ErcItem {
+/// Decode one item of an ERC or DRC violation — the two reports spell it the
+/// same way.
+fn parse_report_item(item: &serde_json::Value) -> ReportItem {
+    ReportItem {
         description: item["description"].as_str().unwrap_or("").to_string(),
-        pos: item.get("pos").and_then(|p| {
-            Some(ErcPos {
-                x: p["x"].as_f64()?,
-                y: p["y"].as_f64()?,
-            })
-        }),
+        pos: parse_item_pos(item),
         uuid: item["uuid"].as_str().map(String::from),
     }
+}
+
+fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
+    let pos = item.get("pos")?;
+    Some(ReportPos {
+        x: pos["x"].as_f64()?,
+        y: pos["y"].as_f64()?,
+    })
 }
 
 // ─── DRC ─────────────────────────────────────────────────────────────────────
@@ -271,21 +286,20 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
             raw.get(key)?
                 .as_array()?
                 .iter()
-                .map(|v| DrcViolation {
-                    severity: v["severity"].as_str().unwrap_or("error").to_string(),
-                    description: v["description"].as_str().unwrap_or("").to_string(),
-                    rule: v["type"].as_str().unwrap_or("").to_string(),
-                    // The position lives on each involved item; a violation has
-                    // no `pos` of its own.
-                    pos: v["items"].as_array().and_then(|items| {
-                        items.iter().find_map(|item| {
-                            let p = item.get("pos")?;
-                            Some(ErcPos {
-                                x: p["x"].as_f64()?,
-                                y: p["y"].as_f64()?,
-                            })
-                        })
-                    }),
+                .map(|v| {
+                    let items: Vec<ReportItem> = v["items"]
+                        .as_array()
+                        .map(|items| items.iter().map(parse_report_item).collect())
+                        .unwrap_or_default();
+                    DrcViolation {
+                        severity: v["severity"].as_str().unwrap_or("error").to_string(),
+                        description: v["description"].as_str().unwrap_or("").to_string(),
+                        rule: v["type"].as_str().unwrap_or("").to_string(),
+                        // The position lives on each involved item; a violation
+                        // has no `pos` of its own.
+                        pos: items.iter().find_map(|item| item.pos),
+                        items,
+                    }
                 })
                 .collect(),
         )
@@ -857,6 +871,54 @@ mod drc_parse_tests {
         let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
         assert_eq!(unconnected.rule, "unconnected_items");
         assert!(unconnected.pos.is_some());
+    }
+
+    /// `unconnected_items` says "Missing connection between items" and nothing
+    /// else; the pads and the net live in the items, so dropping them left the
+    /// caller with "something, somewhere, is unrouted".
+    #[test]
+    fn a_violation_keeps_every_item_it_names() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
+
+        assert_eq!(unconnected.description, "Missing connection between items");
+        assert_eq!(unconnected.items.len(), 2);
+        assert_eq!(
+            unconnected.items[0].description,
+            "PTH pad 1 [Net-(P3-P1)] of C1"
+        );
+        assert_eq!(
+            unconnected.items[1].description,
+            "PTH pad 1 [Net-(P3-P1)] of P3"
+        );
+        assert!(unconnected.items.iter().all(|item| item.uuid.is_some()));
+        assert!(unconnected.items.iter().all(|item| item.pos.is_some()));
+
+        // The violation's own position stays the first item's.
+        let pos = unconnected.pos.as_ref().unwrap();
+        let first = unconnected.items[0].pos.as_ref().unwrap();
+        assert_eq!((pos.x, pos.y), (first.x, first.y));
+    }
+
+    /// The two `silk_edge_clearance` violations share a severity, a rule, a
+    /// description and a first-item position. Without the items they serialise
+    /// identically, and a caller cannot tell there are two problems.
+    #[test]
+    fn two_violations_alike_but_for_their_items_stay_distinguishable() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let (first, second) = (&report.violations[0], &report.violations[1]);
+
+        assert_eq!(first.rule, second.rule);
+        assert_eq!(first.description, second.description);
+        assert_eq!(
+            serde_json::to_value(&first.items[0]).unwrap(),
+            serde_json::to_value(&second.items[0]).unwrap()
+        );
+        assert_ne!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(second).unwrap(),
+            "two different problems must not serialise byte-identically"
+        );
     }
 
     /// A report missing `violations` is not a DRC report. Defaulting it to an

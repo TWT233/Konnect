@@ -276,7 +276,7 @@ async fn handle_export_netlist_summary(
 }
 
 /// ERC positions ride on the entry itself as `x`/`y`, not as a nested object.
-fn flatten_pos(entry: &mut serde_json::Value, pos: Option<&cli::ErcPos>) {
+fn flatten_pos(entry: &mut serde_json::Value, pos: Option<&cli::ReportPos>) {
     if let Some(pos) = pos {
         entry["x"] = json!(pos.x);
         entry["y"] = json!(pos.y);

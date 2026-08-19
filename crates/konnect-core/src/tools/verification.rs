@@ -231,7 +231,8 @@ async fn handle_run_drc(
                 "severity": v.severity,
                 "rule": v.rule,
                 "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
+                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                "items": v.items
             })).collect::<Vec<_>>()
         }))
         .unwrap(),
