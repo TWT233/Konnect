@@ -745,6 +745,14 @@ fn plan_identity_rebind(
         .iter()
         .map(|component| (component.reference.as_str(), component))
         .collect::<HashMap<_, _>>();
+    let duplicate_design_references =
+        design
+            .components
+            .iter()
+            .fold(HashMap::<&str, usize>::new(), |mut counts, component| {
+                *counts.entry(component.reference.as_str()).or_insert(0) += 1;
+                counts
+            });
     let mut board_by_reference = HashMap::new();
     for footprint in &board.footprints {
         board_by_reference
@@ -785,6 +793,17 @@ fn plan_identity_rebind(
             ));
             continue;
         };
+        if duplicate_design_references
+            .get(reference.as_str())
+            .is_some_and(|count| *count > 1)
+        {
+            diagnostics.push(conflict(
+                "duplicate_schematic_reference",
+                format!("requested reference {reference} appears more than once in the schematic"),
+                Some(reference),
+            ));
+            continue;
+        }
         let Some(board_matches) = board_by_reference.get(reference.as_str()) else {
             diagnostics.push(conflict(
                 "requested_reference_missing_from_board",
@@ -903,10 +922,7 @@ fn plan_identity_rebind(
             continue;
         }
         if footprint.pad_nets.len() != component.pad_nets.len()
-            || footprint
-                .pad_nets
-                .keys()
-                .collect::<Vec<_>>()
+            || footprint.pad_nets.keys().collect::<Vec<_>>()
                 != component.pad_nets.keys().collect::<Vec<_>>()
         {
             diagnostics.push(conflict(
@@ -934,7 +950,9 @@ fn plan_identity_rebind(
             .footprints
             .iter()
             .filter(|candidate| !requested_set.contains(candidate.reference.as_str()))
-            .any(|candidate| candidate.symbol_path.as_deref() == Some(component.symbol_path.as_str()))
+            .any(|candidate| {
+                candidate.symbol_path.as_deref() == Some(component.symbol_path.as_str())
+            })
         {
             diagnostics.push(conflict(
                 "target_identity_in_use",
@@ -992,8 +1010,13 @@ fn plan_identity_rebind(
     } else {
         PlanStatus::Ready
     };
-    let plan_revision =
-        identity_rebind_plan_revision(netlist_source, &requested_references, &changes, board);
+    let plan_revision = identity_rebind_plan_revision(
+        netlist_source,
+        &requested_references,
+        &changes,
+        board,
+        design,
+    );
     IdentityRebindPlan {
         status,
         plan_revision,
@@ -1035,6 +1058,7 @@ fn valid_symbol_path(path: &str) -> bool {
 struct IdentityRebindRevisionSnapshot {
     requested: Vec<String>,
     board: Vec<IdentityRebindRevisionBoardSnapshot>,
+    schematic: Vec<IdentityRebindRevisionDesignSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1045,6 +1069,7 @@ struct IdentityRebindRevisionBoardSnapshot {
     value: String,
     footprint_id: String,
     dnp: bool,
+    not_in_schematic: bool,
     pad_nets: BTreeMap<String, String>,
     position_x: String,
     position_y: String,
@@ -1053,20 +1078,37 @@ struct IdentityRebindRevisionBoardSnapshot {
     locked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IdentityRebindRevisionDesignSnapshot {
+    reference: String,
+    symbol_path: String,
+    value: String,
+    footprint_id: String,
+    dnp: bool,
+    pad_nets: BTreeMap<String, String>,
+}
+
 fn identity_rebind_plan_revision(
     netlist_source: &str,
     requested: &[String],
     changes: &[IdentityRebindChange],
     board: &BoardState,
+    design: &ExportedDesign,
 ) -> String {
     let board_by_reference = board
         .footprints
         .iter()
         .map(|footprint| (footprint.reference.as_str(), footprint))
         .collect::<HashMap<_, _>>();
+    let design_by_reference = design
+        .components
+        .iter()
+        .map(|component| (component.reference.as_str(), component))
+        .collect::<HashMap<_, _>>();
     let mut snapshot = IdentityRebindRevisionSnapshot {
         requested: requested.to_vec(),
         board: Vec::new(),
+        schematic: Vec::new(),
     };
     for reference in requested {
         if let Some(footprint) = board_by_reference.get(reference.as_str()) {
@@ -1077,6 +1119,7 @@ fn identity_rebind_plan_revision(
                 value: footprint.value.clone(),
                 footprint_id: footprint.footprint_id.clone(),
                 dnp: footprint.dnp,
+                not_in_schematic: footprint.not_in_schematic,
                 pad_nets: normalize_pad_nets(&footprint.pad_nets),
                 position_x: footprint.position.x.to_string(),
                 position_y: footprint.position.y.to_string(),
@@ -1084,6 +1127,18 @@ fn identity_rebind_plan_revision(
                 layer: footprint.layer.clone(),
                 locked: footprint.locked,
             });
+        }
+        if let Some(component) = design_by_reference.get(reference.as_str()) {
+            snapshot
+                .schematic
+                .push(IdentityRebindRevisionDesignSnapshot {
+                    reference: reference.clone(),
+                    symbol_path: component.symbol_path.clone(),
+                    value: component.value.clone(),
+                    footprint_id: component.footprint_id.clone(),
+                    dnp: component.dnp,
+                    pad_nets: normalize_pad_nets(&component.pad_nets),
+                });
         }
     }
 
@@ -2299,7 +2354,9 @@ mod tests {
             ConflictCase {
                 name: "missing schematic reference",
                 mutate: |design, _, requested| {
-                    design.components.retain(|component| component.reference != "D1");
+                    design
+                        .components
+                        .retain(|component| component.reference != "D1");
                     *requested = vec!["D1".to_string()];
                 },
                 code: "requested_reference_missing_from_schematic",
@@ -2307,7 +2364,9 @@ mod tests {
             ConflictCase {
                 name: "missing board reference",
                 mutate: |_, board, requested| {
-                    board.footprints.retain(|footprint| footprint.reference != "D1");
+                    board
+                        .footprints
+                        .retain(|footprint| footprint.reference != "D1");
                     *requested = vec!["D1".to_string()];
                 },
                 code: "requested_reference_missing_from_board",
@@ -2472,7 +2531,8 @@ mod tests {
             let mut requested = requested_identity_rebind_references();
             (case.mutate)(&mut design, &mut board, &mut requested);
 
-            let plan = plan_identity_rebind("(export (components) (nets))", &design, &board, &requested);
+            let plan =
+                plan_identity_rebind("(export (components) (nets))", &design, &board, &requested);
 
             assert_eq!(plan.status, PlanStatus::Conflict, "{}", case.name);
             assert!(plan.changes.is_empty(), "{}", case.name);
@@ -2490,10 +2550,16 @@ mod tests {
     #[test]
     fn identity_rebind_is_noop_when_every_requested_identity_already_matches() {
         let (design, mut board) = identity_rebind_fixture();
-        board_footprint_mut(&mut board, "D1").symbol_path =
-            Some(design_component_mut(&mut design.clone(), "D1").symbol_path.clone());
-        board_footprint_mut(&mut board, "SW1").symbol_path =
-            Some(design_component_mut(&mut design.clone(), "SW1").symbol_path.clone());
+        board_footprint_mut(&mut board, "D1").symbol_path = Some(
+            design_component_mut(&mut design.clone(), "D1")
+                .symbol_path
+                .clone(),
+        );
+        board_footprint_mut(&mut board, "SW1").symbol_path = Some(
+            design_component_mut(&mut design.clone(), "SW1")
+                .symbol_path
+                .clone(),
+        );
 
         let plan = plan_identity_rebind(
             "(export (components) (nets))",
@@ -2594,7 +2660,8 @@ mod tests {
         );
 
         let mut changed_design = design.clone();
-        design_component_mut(&mut changed_design, "D1").footprint_id = "other:Footprint".to_string();
+        design_component_mut(&mut changed_design, "D1").footprint_id =
+            "other:Footprint".to_string();
         assert_ne!(
             base.plan_revision,
             plan_identity_rebind(
@@ -2696,6 +2763,76 @@ mod tests {
             )
             .plan_revision
         );
+    }
+
+    #[test]
+    fn identity_rebind_conflict_revisions_change_with_distinct_requested_design_inputs() {
+        let netlist = "(export (components) (nets))";
+        let (design, board) = identity_rebind_fixture();
+        let requested = vec!["D1".to_string()];
+
+        let mut wrong_value = design.clone();
+        design_component_mut(&mut wrong_value, "D1").value = "WRONG".to_string();
+        let value_conflict = plan_identity_rebind(netlist, &wrong_value, &board, &requested);
+        assert_eq!(value_conflict.status, PlanStatus::Conflict);
+        assert!(value_conflict.changes.is_empty());
+        assert!(value_conflict
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "value_mismatch"));
+
+        let mut wrong_footprint = design.clone();
+        design_component_mut(&mut wrong_footprint, "D1").footprint_id =
+            "wrong:Footprint".to_string();
+        let footprint_conflict =
+            plan_identity_rebind(netlist, &wrong_footprint, &board, &requested);
+        assert_eq!(footprint_conflict.status, PlanStatus::Conflict);
+        assert!(footprint_conflict.changes.is_empty());
+        assert!(footprint_conflict
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "footprint_mismatch"));
+
+        assert_ne!(
+            value_conflict.plan_revision,
+            footprint_conflict.plan_revision
+        );
+    }
+
+    #[test]
+    fn identity_rebind_plan_revision_changes_when_requested_not_in_schematic_changes() {
+        let netlist = "(export (components) (nets))";
+        let (design, board) = identity_rebind_fixture();
+        let requested = vec!["D1".to_string()];
+
+        let base = plan_identity_rebind(netlist, &design, &board, &requested);
+        let mut board_only = board.clone();
+        board_footprint_mut(&mut board_only, "D1").not_in_schematic = true;
+        let changed = plan_identity_rebind(netlist, &design, &board_only, &requested);
+
+        assert_ne!(base.plan_revision, changed.plan_revision);
+    }
+
+    #[test]
+    fn identity_rebind_requested_duplicate_schematic_reference_conflicts() {
+        let (mut design, board) = identity_rebind_fixture();
+        let duplicate = design_component_mut(&mut design, "D1").clone();
+        design.components.push(duplicate);
+
+        let plan = plan_identity_rebind(
+            "(export (components) (nets))",
+            &design,
+            &board,
+            &["D1".to_string()],
+        );
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.planned, 0);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "duplicate_schematic_reference"));
     }
 
     #[test]
