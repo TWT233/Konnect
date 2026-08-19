@@ -1142,6 +1142,12 @@ impl konnect_schematic_editor::library::SymbolLibrarySource for KiCadSymbolSourc
 /// Indentation-agnostic: KiCad's own writers emit tab-indented, CRLF-terminated
 /// tables while this crate's writer uses two spaces, so a fixed literal such as
 /// `"\n  (lib "` silently matches nothing in a real `fp-lib-table`.
+///
+/// Each entry is located textually and then *parsed*, so a field is read from
+/// the tree rather than scraped out of the block: an escaped quote inside a
+/// `descr` no longer truncates the value, and a field KiCad wrote across a line
+/// break is still found. Locating entries textually keeps a malformed one from
+/// discarding the rest of the table.
 fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
     let mut libs = Vec::new();
     // Each entry: (lib (name "NICK") (type "...") (uri "...") (options "") (descr "..."))
@@ -1150,17 +1156,18 @@ fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
             continue;
         };
         let block = &content[block_start..block_end];
+        let Ok(entry) = parse_sexp(block) else {
+            tracing::warn!("lib-table entry at byte {block_start} does not parse — skipped");
+            continue;
+        };
 
-        let nickname = extract_sexp_string(block, "name").unwrap_or_default();
-        let uri = extract_sexp_string(block, "uri").unwrap_or_default();
-        let lib_type = extract_sexp_string(block, "type").unwrap_or_default();
-        let descr = extract_sexp_string(block, "descr").unwrap_or_default();
+        let field = |tag: &str| entry.find_str(tag).unwrap_or_default().to_string();
 
         libs.push(json!({
-            "nickname": nickname,
-            "uri": uri,
-            "type": lib_type,
-            "description": descr
+            "nickname": field("name"),
+            "uri": field("uri"),
+            "type": field("type"),
+            "description": field("descr")
         }));
     }
     libs
@@ -1506,14 +1513,6 @@ pub(crate) fn resolve_footprint_path(
         },
         attempted_list
     ))
-}
-
-/// Extract a quoted string value from `(key "value")` within a block.
-fn extract_sexp_string(block: &str, key: &str) -> Option<String> {
-    let pat = format!("({} \"", key);
-    let start = block.find(&pat)? + pat.len();
-    let end = block[start..].find('"')? + start;
-    Some(block[start..end].to_string())
 }
 
 async fn handle_register_footprint_library(
@@ -3577,25 +3576,34 @@ async fn handle_get_footprint_info(
     let content = tokio::fs::read_to_string(&path).await?;
     let footprint = parse_sexp(&content)?;
 
-    // Parse basic info: description, pads
-    let description = extract_sexp_string(&content, "descr").unwrap_or_default();
-    let fp_name = extract_sexp_string(&content, "footprint").unwrap_or_else(|| {
-        path.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
-
-    // KiCad controls indentation and line endings, so these properties must be
-    // read from the parsed footprint rather than inferred from source text.
-    // Pads and models are direct children of a `(footprint ...)` node.
-    let pad_count = footprint.find_all("pad").len();
+    // KiCad controls indentation and line endings, so every field here is read
+    // from the parsed footprint rather than inferred from source text — a
+    // `descr` mentioning a pad must not be counted as one. The name is the
+    // root node's first datum; pads, models and graphics are its direct
+    // children.
+    let description = footprint.find_str("descr").unwrap_or_default().to_string();
+    let fp_name = footprint
+        .get(1)
+        .and_then(|node| node.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        });
+    let pad_count = footprint
+        .children()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|node| node.head() == Some("pad"))
+        .count();
     let has_courtyard = footprint
         .children()
         .unwrap_or(&[])
         .iter()
         .any(|node| matches!(node.find_str("layer"), Some("B.CrtYd" | "F.CrtYd")));
-    let has_3d = !footprint.find_all("model").is_empty();
+    let has_3d = footprint.find("model").is_some();
 
     let mut response = json!({
         "name": fp_name,
@@ -3813,10 +3821,20 @@ mod tests {
 
     /// A lib-table in the exact shape KiCad writes it: CRLF-terminated and
     /// TAB-indented.
+    ///
+    /// Field values are escaped the way `quote_lib_table_string` writes them,
+    /// because a tempdir path is interpolated here and on Windows it contains
+    /// backslashes: an unescaped `…\template-fp-lib-table` reads back with a
+    /// TAB, so the entry pointed at a file that does not exist.
     fn kicad_style_table(kind: &str, entries: &[(&str, &str, &str)]) -> String {
         let body: String = entries
             .iter()
             .map(|(nick, ty, uri)| {
+                let (nick, ty, uri) = (
+                    escape_library_string(nick),
+                    escape_library_string(ty),
+                    escape_library_string(uri),
+                );
                 format!(
                     "\t(lib (name \"{nick}\") (type \"{ty}\") (uri \"{uri}\") (options \"\") (descr \"\"))\r\n"
                 )
@@ -3984,6 +4002,76 @@ mod tests {
         let libs = parse_lib_table(content);
         assert_eq!(libs.len(), 1);
         assert_eq!(libs[0]["nickname"], "Local");
+    }
+
+    #[test]
+    fn parse_lib_table_keeps_an_escaped_quote_in_a_description() {
+        // Regression: fields were scraped with a substring scan that stopped at
+        // the first raw `"`, so an escaped quote truncated the value — a descr
+        // of `0.1" pitch` came back as `0.1\`. The parser decodes the escape.
+        let content = "(fp_lib_table\n\t(lib (name \"Headers\") (type \"KiCad\") \
+             (uri \"/tmp/h.pretty\") (options \"\") (descr \"0.1\\\" pitch headers\"))\n)\n";
+
+        let libs = parse_lib_table(content);
+        assert_eq!(libs.len(), 1, "parsed: {libs:?}");
+        assert_eq!(libs[0]["description"], "0.1\" pitch headers");
+        assert_eq!(libs[0]["uri"], "/tmp/h.pretty");
+    }
+
+    #[test]
+    fn parse_lib_table_reads_a_field_split_across_lines() {
+        // The scan required the literal `(name "` — one space, quote next. A
+        // table written with the value on its own line matched nothing and the
+        // entry came back with every field empty.
+        let content = concat!(
+            "(fp_lib_table\n",
+            "  (lib\n",
+            "    (name\n",
+            "      \"Split\")\n",
+            "    (type \"KiCad\")\n",
+            "    (uri \"/tmp/split.pretty\"))\n",
+            ")\n",
+        );
+
+        let libs = parse_lib_table(content);
+        assert_eq!(libs.len(), 1, "parsed: {libs:?}");
+        assert_eq!(libs[0]["nickname"], "Split");
+        assert_eq!(libs[0]["uri"], "/tmp/split.pretty");
+    }
+
+    #[test]
+    fn parse_lib_table_reads_an_escaped_windows_uri() {
+        // A Windows URI is a string full of escape introducers, and the one
+        // that bites is a path component starting with `t`: written escaped —
+        // which is how KiCad and `quote_lib_table_string` write it — it must
+        // come back as a backslash and a `t`, not a TAB.
+        let content = concat!(
+            "(fp_lib_table\r\n",
+            "\t(lib (name \"Parts\") (type \"Table\")",
+            " (uri \"C:\\\\Users\\\\me\\\\template-fp-lib-table\")",
+            " (options \"\") (descr \"\"))\r\n",
+            ")\r\n",
+        );
+
+        let libs = parse_lib_table(content);
+        assert_eq!(libs.len(), 1, "parsed: {libs:?}");
+        assert_eq!(libs[0]["uri"], r"C:\Users\me\template-fp-lib-table");
+    }
+
+    #[test]
+    fn parse_lib_table_skips_only_the_entry_that_does_not_parse() {
+        // Entries are located textually so one unbalanced block cannot discard
+        // the rest of the table, which a whole-file parse would.
+        let content = concat!(
+            "(fp_lib_table\n",
+            "  (lib (name \"Good\") (type \"KiCad\") (uri \"/tmp/good.pretty\"))\n",
+            "  (lib (name \"Bad\" (type \"KiCad\")\n",
+            ")\n",
+        );
+
+        let libs = parse_lib_table(content);
+        assert_eq!(libs.len(), 1, "parsed: {libs:?}");
+        assert_eq!(libs[0]["nickname"], "Good");
     }
 
     #[test]
