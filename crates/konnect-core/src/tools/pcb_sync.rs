@@ -232,13 +232,61 @@ enum IdentityRebindLiveDecision {
     Apply(IdentityRebindApplyContext),
 }
 
-fn apply_identity_rebind_context_unavailable(
-    _context: IdentityRebindApplyContext,
-) -> CallToolResult {
-    CallToolResult::error(
-        "identity rebind apply execution is not installed in this internal build step; R1c-A replaces this placeholder"
-            .to_string(),
-    )
+fn apply_identity_rebind_context(
+    client: &konnect_ipc::KiCadIpcClient,
+    context: IdentityRebindApplyContext,
+) -> Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let IdentityRebindApplyContext {
+        mut plan,
+        requested_before_items,
+        document,
+        hierarchy_files,
+    } = context;
+
+    if plan.status != PlanStatus::Ready {
+        bail!("identity rebind apply requires a ready plan");
+    }
+    if plan.counts.planned != plan.changes.len() {
+        bail!(
+            "identity rebind apply requires planned count {} to equal change count {}",
+            plan.counts.planned,
+            plan.changes.len()
+        );
+    }
+    if requested_before_items.len() != plan.changes.len() {
+        bail!(
+            "identity rebind apply requires requested before item count {} to equal change count {}",
+            requested_before_items.len(),
+            plan.changes.len()
+        );
+    }
+
+    let mut updates = Vec::with_capacity(plan.changes.len());
+    for change in &plan.changes {
+        let before = requested_before_items
+            .get(&change.kiid)
+            .with_context(|| format!("missing requested before footprint {}", change.kiid))?;
+        updates.push(rebind_footprint_item(before, change)?);
+    }
+    if updates.len() != plan.changes.len() {
+        bail!(
+            "identity rebind apply built {} updates for {} requested changes",
+            updates.len(),
+            plan.changes.len()
+        );
+    }
+
+    client.run_commit("Rebind PCB schematic identities", |client| {
+        client.update_items_in(document.clone(), updates)?;
+        Ok(())
+    })?;
+
+    let after_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+    verify_identity_rebind_readback(&requested_before_items, &after_items, &plan.changes)?;
+
+    Ok(identity_rebind_applied_response(&mut plan, hierarchy_files))
 }
 
 fn plan_live_identity_rebind(
@@ -392,7 +440,7 @@ pub(crate) async fn handle_rebind_pcb_schematic_identities(
             )? {
                 IdentityRebindLiveDecision::Respond(result) => Ok(result),
                 IdentityRebindLiveDecision::Apply(context) => {
-                    Ok(apply_identity_rebind_context_unavailable(context))
+                    apply_identity_rebind_context(client, context)
                 }
             }
         },
@@ -856,6 +904,28 @@ fn identity_rebind_response(
         "diagnostics": plan.diagnostics,
         "undo": undo
     });
+    CallToolResult::json(&value)
+}
+
+fn identity_rebind_applied_response(
+    plan: &mut IdentityRebindPlan,
+    hierarchy_files: usize,
+) -> CallToolResult {
+    plan.status = PlanStatus::Ready;
+    plan.counts.applied = plan.counts.planned;
+    plan.counts.conflicts = 0;
+    plan.diagnostics.clear();
+
+    let mut value: serde_json::Value = serde_json::from_str(
+        tool_result_text(&identity_rebind_response(
+            plan,
+            hierarchy_files,
+            Some("KiCad undo reverts the whole identity rebind apply."),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    value["status"] = serde_json::Value::String("applied".to_string());
     CallToolResult::json(&value)
 }
 
@@ -3123,7 +3193,11 @@ fn build_mutation_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nng::options::Options;
+    use prost::Message;
     use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const ONE_RESISTOR: &str = r#"
 (export
@@ -4733,6 +4807,76 @@ mod tests {
         )
     }
 
+    struct RebindMockKicad {
+        url: String,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_rebind_mock<F>(respond: F) -> RebindMockKicad
+    where
+        F: Fn(
+                konnect_ipc::gen::kiapi::common::ApiRequest,
+            ) -> Option<konnect_ipc::gen::kiapi::common::ApiResponse>
+            + Send
+            + 'static,
+    {
+        static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://rebind-mock-{}",
+            NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let thread = std::thread::spawn(move || {
+            while let Ok(msg) = socket.recv() {
+                let request =
+                    match konnect_ipc::gen::kiapi::common::ApiRequest::decode(msg.as_slice()) {
+                        Ok(request) => request,
+                        Err(_) => break,
+                    };
+                match respond(request) {
+                    Some(response) => {
+                        let out = nng::Message::from(response.encode_to_vec().as_slice());
+                        if socket.send(out).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        RebindMockKicad {
+            url,
+            _thread: thread,
+        }
+    }
+
+    fn rebind_ok_response() -> konnect_ipc::gen::kiapi::common::ApiResponse {
+        use konnect_ipc::gen::kiapi;
+
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message: None,
+        }
+    }
+
+    fn rebind_reply_with(inner: prost_types::Any) -> konnect_ipc::gen::kiapi::common::ApiResponse {
+        konnect_ipc::gen::kiapi::common::ApiResponse {
+            message: Some(inner),
+            ..rebind_ok_response()
+        }
+    }
+
     #[tokio::test]
     async fn rebind_handler_argument_and_path_gates_run_before_external_io() {
         let ctx = rebind_handler_test_ctx();
@@ -4778,7 +4922,167 @@ mod tests {
     }
 
     #[test]
-    fn rebind_handler_placeholder_matching_apply_returns_error_not_applied() {
+    fn rebind_handler_matching_apply_uses_actual_apply_function() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let dry_run_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+        let dry_run_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &dry_run_request, 2).unwrap();
+        let IdentityRebindLiveDecision::Respond(dry_run_result) = dry_run_decision else {
+            panic!("expected dry-run response");
+        };
+        let dry_run_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&dry_run_result).unwrap()).unwrap();
+        let expected_revision = dry_run_value["plan_revision"].as_str().unwrap().to_string();
+
+        let apply_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: false,
+            expected_plan_revision: Some(expected_revision),
+        };
+        let apply_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &apply_request, 2).unwrap();
+        let IdentityRebindLiveDecision::Apply(mut context) = apply_decision else {
+            panic!("expected apply context");
+        };
+        context.requested_before_items.remove("d1-kiid");
+
+        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
+        let error = apply_identity_rebind_context(&client, context)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("requested before item count")
+                || error.contains("missing requested before footprint")
+                || error.contains("FootprintInstance"),
+            "{error}"
+        );
+        assert!(!error.contains("not installed"), "{error}");
+    }
+
+    #[test]
+    fn rebind_apply_build_failure_sends_no_commit() {
+        let (source, design, board) = identity_rebind_fixture();
+        let snapshot = LiveSnapshot {
+            state: board,
+            items: rebind_handler_requested_items(),
+            net_codes: BTreeMap::new(),
+            document: rebind_test_document("board-a.kicad_pcb"),
+        };
+        let dry_run_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: true,
+            expected_plan_revision: None,
+        };
+        let dry_run_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &dry_run_request, 2).unwrap();
+        let IdentityRebindLiveDecision::Respond(dry_run_result) = dry_run_decision else {
+            panic!("expected dry-run response");
+        };
+        let dry_run_value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&dry_run_result).unwrap()).unwrap();
+        let expected_revision = dry_run_value["plan_revision"].as_str().unwrap().to_string();
+
+        let apply_request = IdentityRebindArgs {
+            schematic: PathBuf::from("/tmp/test.kicad_sch"),
+            board: PathBuf::from("/tmp/test.kicad_pcb"),
+            references: requested_identity_rebind_references(),
+            dry_run: false,
+            expected_plan_revision: Some(expected_revision),
+        };
+        let apply_decision =
+            plan_live_identity_rebind(&source, &design, &snapshot, &apply_request, 2).unwrap();
+        let IdentityRebindLiveDecision::Apply(mut context) = apply_decision else {
+            panic!("expected apply context");
+        };
+        context.requested_before_items.remove("d1-kiid");
+        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
+
+        let error = apply_identity_rebind_context(&client, context)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("requested before item count")
+                || error.contains("missing requested before footprint")
+                || error.contains("FootprintInstance"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("BeginCommit")
+                && !error.contains("connect")
+                && !error.contains("dial")
+                && !error.contains("NNG"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rebind_apply_success_response_builder_reports_applied_counts_and_undo() {
+        let mut plan = IdentityRebindPlan {
+            status: PlanStatus::Ready,
+            semantic_base_revision: "apply-semantic-base".to_string(),
+            plan_revision: "apply-plan-revision".to_string(),
+            counts: IdentityRebindCounts {
+                requested: 2,
+                eligible: 2,
+                planned: 2,
+                applied: 0,
+                conflicts: 0,
+            },
+            changes: vec![identity_rebind_fixture_item_and_change().1, {
+                let mut change = identity_rebind_fixture_item_and_change().1;
+                change.reference = "SW1".to_string();
+                change.kiid = "rebind-sw1-kiid".to_string();
+                change.old_symbol_path =
+                    "/55555555-5555-4555-8555-555555555555/66666666-6666-4666-8666-666666666666"
+                        .to_string();
+                change.new_symbol_path =
+                    "/77777777-7777-4777-8777-777777777777/88888888-8888-4888-8888-888888888888"
+                        .to_string();
+                change
+            }],
+            diagnostics: vec![],
+        };
+
+        let result = identity_rebind_applied_response(&mut plan, 3);
+        let value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
+
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["coverage"]["applied"], 2);
+        assert_eq!(value["coverage"]["planned"], 2);
+        assert_eq!(value["coverage"]["conflicts"], 0);
+        assert_eq!(value["coverage"]["source"], "saved_schematic_hierarchy");
+        assert_eq!(value["coverage"]["transport"], "live_kicad_ipc");
+        assert_eq!(value["coverage"]["atomicity"], "single_kicad_undo_commit");
+        assert_eq!(value["diagnostics"], serde_json::json!([]));
+        assert!(
+            value["undo"].as_str().is_some_and(|undo| !undo.is_empty()),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn rebind_apply_runs_one_commit_one_update_and_reads_same_document() {
+        use konnect_ipc::gen::kiapi;
+
         let (source, design, board) = identity_rebind_fixture();
         let snapshot = LiveSnapshot {
             state: board,
@@ -4809,16 +5113,202 @@ mod tests {
             dry_run: false,
             expected_plan_revision: Some(expected_revision),
         };
-        let decision =
+        let apply_decision =
             plan_live_identity_rebind(&source, &design, &snapshot, &apply_request, 5).unwrap();
-        let IdentityRebindLiveDecision::Apply(context) = decision else {
+        let IdentityRebindLiveDecision::Apply(mut context) = apply_decision else {
             panic!("expected apply context");
         };
-        let result = apply_identity_rebind_context_unavailable(context);
-        assert!(result.is_error);
-        let text = tool_result_text(&result).unwrap();
-        assert!(text.contains("not installed"), "{text}");
-        assert!(!text.contains("applied"), "{text}");
+        let requested_before_items = context
+            .plan
+            .changes
+            .iter()
+            .map(|change| {
+                let template = context
+                    .requested_before_items
+                    .get(&change.kiid)
+                    .or_else(|| context.requested_before_items.values().next())
+                    .expect("template before item");
+                (
+                    change.kiid.clone(),
+                    rebind_before_item_for_change(template, change),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        context.requested_before_items = requested_before_items;
+
+        let current_items = Arc::new(Mutex::new(
+            context
+                .requested_before_items
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let captured_updates = Arc::new(Mutex::new(
+            Vec::<kiapi::common::commands::UpdateItems>::new(),
+        ));
+        let commit_actions = Arc::new(Mutex::new(
+            Vec::<kiapi::common::commands::CommitAction>::new(),
+        ));
+        let command_names = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_documents = Arc::new(Mutex::new(
+            Vec::<kiapi::common::types::DocumentSpecifier>::new(),
+        ));
+
+        let requested_after_items = context
+            .plan
+            .changes
+            .iter()
+            .map(|change| {
+                let before = context
+                    .requested_before_items
+                    .get(&change.kiid)
+                    .expect("before item for change");
+                rebind_footprint_item(before, change).expect("rebound item")
+            })
+            .collect::<Vec<_>>();
+        let expected_changes = context.plan.changes.clone();
+        let expected_document = context.document.clone();
+
+        let current_items_for_mock = Arc::clone(&current_items);
+        let captured_updates_for_mock = Arc::clone(&captured_updates);
+        let commit_actions_for_mock = Arc::clone(&commit_actions);
+        let command_names_for_mock = Arc::clone(&command_names);
+        let captured_documents_for_mock = Arc::clone(&captured_documents);
+        let mock = spawn_rebind_mock(move |request| {
+            use kiapi::common::commands::{
+                BeginCommitResponse, CommitAction, EndCommit, EndCommitResponse, GetItems,
+                GetItemsResponse, ItemStatus, ItemStatusCode, ItemUpdateResult, UpdateItems,
+                UpdateItemsResponse,
+            };
+
+            let command_name = request.message.as_ref().map(|msg| msg.type_url.clone());
+            if let Some(name) = command_name.as_ref() {
+                command_names_for_mock
+                    .lock()
+                    .unwrap()
+                    .push(name.rsplit('.').next().unwrap_or(name.as_str()).to_string());
+            }
+
+            match command_name.as_deref() {
+                Some("type.googleapis.com/kiapi.common.commands.BeginCommit") => {
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &BeginCommitResponse {
+                            id: Some(kiapi::common::types::Kiid {
+                                value: "commit-1".to_string(),
+                            }),
+                        },
+                        "kiapi.common.commands.BeginCommitResponse",
+                    )))
+                }
+                Some("type.googleapis.com/kiapi.common.commands.UpdateItems") => {
+                    let message = request.message.as_ref().unwrap();
+                    let update = UpdateItems::decode(message.value.as_slice()).unwrap();
+                    let document = update
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.document.clone())
+                        .expect("update document");
+                    captured_documents_for_mock.lock().unwrap().push(document);
+                    captured_updates_for_mock
+                        .lock()
+                        .unwrap()
+                        .push(update.clone());
+                    *current_items_for_mock.lock().unwrap() = update.items.clone();
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &UpdateItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: update
+                                .items
+                                .iter()
+                                .cloned()
+                                .map(|item| ItemUpdateResult {
+                                    status: Some(ItemStatus {
+                                        code: ItemStatusCode::IscOk as i32,
+                                        error_message: String::new(),
+                                    }),
+                                    item: Some(item),
+                                })
+                                .collect(),
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    )))
+                }
+                Some("type.googleapis.com/kiapi.common.commands.EndCommit") => {
+                    let message = request.message.as_ref().unwrap();
+                    let end = EndCommit::decode(message.value.as_slice()).unwrap();
+                    commit_actions_for_mock
+                        .lock()
+                        .unwrap()
+                        .push(CommitAction::try_from(end.action).unwrap());
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    )))
+                }
+                Some("type.googleapis.com/kiapi.common.commands.GetItems") => {
+                    let message = request.message.as_ref().unwrap();
+                    let get = GetItems::decode(message.value.as_slice()).unwrap();
+                    let document = get
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.document.clone())
+                        .expect("get document");
+                    captured_documents_for_mock.lock().unwrap().push(document);
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: current_items_for_mock.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                Some(other) => panic!("unexpected command {other}"),
+                None => panic!("missing request message"),
+            }
+        });
+
+        let client = konnect_ipc::KiCadIpcClient::new(&mock.url);
+        let result = apply_identity_rebind_context(&client, context).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(tool_result_text(&result).unwrap()).unwrap();
+
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["coverage"]["applied"], 2);
+        assert_eq!(value["coverage"]["planned"], 2);
+
+        let recorded_updates = captured_updates.lock().unwrap();
+        assert_eq!(recorded_updates.len(), 1);
+        assert_eq!(recorded_updates[0].items.len(), expected_changes.len());
+        let recorded_items = recorded_updates[0].items.clone();
+        drop(recorded_updates);
+
+        for (recorded, expected) in recorded_items.iter().zip(requested_after_items.iter()) {
+            assert_eq!(recorded, expected);
+        }
+
+        let recorded_actions = commit_actions.lock().unwrap().clone();
+        assert_eq!(
+            recorded_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+
+        let recorded_documents = captured_documents.lock().unwrap().clone();
+        assert_eq!(recorded_documents.len(), 2);
+        assert_eq!(recorded_documents[0], expected_document);
+        assert_eq!(recorded_documents[1], expected_document);
+
+        let recorded_commands = command_names.lock().unwrap().clone();
+        assert_eq!(
+            recorded_commands,
+            vec![
+                "BeginCommit".to_string(),
+                "UpdateItems".to_string(),
+                "EndCommit".to_string(),
+                "GetItems".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -5080,6 +5570,33 @@ mod tests {
             },
         };
         (item, change, new_symbol_path.to_string())
+    }
+
+    fn rebind_before_item_for_change(
+        template: &prost_types::Any,
+        change: &IdentityRebindChange,
+    ) -> prost_types::Any {
+        mutate_rebound_footprint_item(template, |footprint| {
+            footprint.id = Some(konnect_ipc::gen::kiapi::common::types::Kiid {
+                value: change.kiid.clone(),
+            });
+            set_field_text(
+                &mut footprint.reference_field,
+                "Reference",
+                &change.reference,
+            );
+            footprint.symbol_path = Some(konnect_ipc::gen::kiapi::common::types::SheetPath {
+                path: change
+                    .old_symbol_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| konnect_ipc::gen::kiapi::common::types::Kiid {
+                        value: segment.to_string(),
+                    })
+                    .collect(),
+                path_human_readable: String::new(),
+            });
+        })
     }
 
     fn mutate_rebound_footprint_item(
