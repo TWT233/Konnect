@@ -467,6 +467,12 @@ struct InstanceFlagState {
 }
 
 #[derive(Debug)]
+enum InstanceFlagReadError {
+    Missing,
+    Invalid(String),
+}
+
+#[derive(Debug)]
 struct PropertyVisibilityState {
     visible: bool,
     hide_start: Option<usize>,
@@ -649,7 +655,7 @@ fn flag_state_in_symbol(
     symbol_start: usize,
     symbol_end: usize,
     kind: InstanceFlagKind,
-) -> Result<InstanceFlagState, String> {
+) -> Result<InstanceFlagState, InstanceFlagReadError> {
     let symbol = &content[symbol_start..symbol_end];
     let mut matches = Vec::new();
 
@@ -661,7 +667,7 @@ fn flag_state_in_symbol(
     }
 
     match matches.len() {
-        0 => Err(format!("component is missing direct '{}' node", kind.key())),
+        0 => Err(InstanceFlagReadError::Missing),
         1 => {
             let (child_start, _child_end, child) = matches[0];
             let prefix = format!("({} ", kind.key());
@@ -669,21 +675,21 @@ fn flag_state_in_symbol(
                 .strip_prefix(&prefix)
                 .and_then(|rest| rest.strip_suffix(')'))
             else {
-                return Err(format!(
+                return Err(InstanceFlagReadError::Invalid(format!(
                     "component has malformed direct '{}' node '{}'",
                     kind.key(),
                     child.trim()
-                ));
+                )));
             };
             let value = match value_text {
                 "yes" => true,
                 "no" => false,
                 _ => {
-                    return Err(format!(
+                    return Err(InstanceFlagReadError::Invalid(format!(
                         "component has malformed direct '{}' node '{}'",
                         kind.key(),
                         child.trim()
-                    ))
+                    )))
                 }
             };
             let token_start = symbol_start + child_start + prefix.len();
@@ -694,10 +700,22 @@ fn flag_state_in_symbol(
                 token_end,
             })
         }
-        _ => Err(format!(
+        _ => Err(InstanceFlagReadError::Invalid(format!(
             "component has multiple direct '{}' nodes",
             kind.key()
-        )),
+        ))),
+    }
+}
+
+fn describe_instance_flag_read_error(
+    kind: InstanceFlagKind,
+    error: InstanceFlagReadError,
+) -> String {
+    match error {
+        InstanceFlagReadError::Missing => {
+            format!("component is missing direct '{}' node", kind.key())
+        }
+        InstanceFlagReadError::Invalid(reason) => reason,
     }
 }
 
@@ -1083,21 +1101,38 @@ fn prepare_batch_component_update(
             if requested.is_some() {
                 continue;
             }
-            let states: Result<Vec<_>, _> = symbol_blocks
-                .iter()
-                .map(|(symbol_start, symbol_end)| {
-                    flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
-                })
-                .collect();
-            if let Ok(states) = states {
-                let first = states[0].value;
-                if states.iter().any(|state| state.value != first) {
-                    return Err(format!(
-                        "component '{}' flag '{}' differs across units",
-                        request.reference,
-                        kind.key()
-                    ));
+            let mut states = Vec::with_capacity(symbol_blocks.len());
+            let mut missing = 0;
+            for (symbol_start, symbol_end) in &symbol_blocks {
+                match flag_state_in_symbol(content, *symbol_start, *symbol_end, kind) {
+                    Ok(state) => states.push(state),
+                    Err(InstanceFlagReadError::Missing) => missing += 1,
+                    Err(error) => {
+                        return Err(format!(
+                            "component '{}' {}",
+                            request.reference,
+                            describe_instance_flag_read_error(kind, error)
+                        ))
+                    }
                 }
+            }
+            if missing == symbol_blocks.len() {
+                continue;
+            }
+            if missing > 0 {
+                return Err(format!(
+                    "component '{}' flag '{}' is present on only some units",
+                    request.reference,
+                    kind.key()
+                ));
+            }
+            let first = states[0].value;
+            if states.iter().any(|state| state.value != first) {
+                return Err(format!(
+                    "component '{}' flag '{}' differs across units",
+                    request.reference,
+                    kind.key()
+                ));
             }
         }
 
@@ -1157,8 +1192,12 @@ fn prepare_batch_component_update(
                 let mut states = Vec::with_capacity(symbol_blocks.len());
                 for (symbol_start, symbol_end) in &symbol_blocks {
                     let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
-                        .map_err(|reason| {
-                            format!("component '{}' {}", request.reference, reason)
+                        .map_err(|error| {
+                            format!(
+                                "component '{}' {}",
+                                request.reference,
+                                describe_instance_flag_read_error(kind, error)
+                            )
                         })?;
                     states.push(state);
                 }
@@ -1226,10 +1265,11 @@ fn build_verified_batch_component_response(
             let mut final_states = Vec::with_capacity(symbol_blocks.len());
             for (symbol_start, symbol_end) in &symbol_blocks {
                 let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, *kind)
-                    .map_err(|reason| {
+                    .map_err(|error| {
                         format!(
                             "post-write validation for component '{}' failed: {}; inspect/reload the schematic",
-                            verification.reference, reason
+                            verification.reference,
+                            describe_instance_flag_read_error(*kind, error)
                         )
                     })?;
                 final_states.push(state.value);
@@ -1262,17 +1302,38 @@ fn build_verified_batch_component_response(
                 continue;
             }
             let mut values = Vec::with_capacity(symbol_blocks.len());
-            let mut available = true;
+            let mut missing = 0;
             for (symbol_start, symbol_end) in &symbol_blocks {
                 match flag_state_in_symbol(content, *symbol_start, *symbol_end, kind) {
                     Ok(state) => values.push(state.value),
-                    Err(_) => {
-                        available = false;
-                        break;
+                    Err(InstanceFlagReadError::Missing) => missing += 1,
+                    Err(error) => {
+                        return Err(format!(
+                            "post-write validation for component '{}' failed: {}; inspect/reload the schematic",
+                            verification.reference,
+                            describe_instance_flag_read_error(kind, error)
+                        ))
                     }
                 }
             }
-            if available && values.windows(2).all(|pair| pair[0] == pair[1]) {
+            if missing == symbol_blocks.len() {
+                continue;
+            }
+            if missing > 0 {
+                return Err(format!(
+                    "post-write validation for component '{}' failed: flag '{}' is present on only some units; inspect/reload the schematic",
+                    verification.reference,
+                    kind.key()
+                ));
+            }
+            if !values.windows(2).all(|pair| pair[0] == pair[1]) {
+                return Err(format!(
+                    "post-write validation for component '{}' failed: flag '{}' differs across units; inspect/reload the schematic",
+                    verification.reference,
+                    kind.key()
+                ));
+            }
+            if !values.is_empty() {
                 final_flags.insert(kind.key().to_string(), json!(values[0]));
             }
         }
@@ -3605,6 +3666,27 @@ mod batch_component_flag_tests {
         out
     }
 
+    fn replace_flag_node_in_reference(
+        content: &str,
+        reference: &str,
+        kind: InstanceFlagKind,
+        replacement: &str,
+    ) -> String {
+        let (symbol_start, symbol_end) = find_all_symbol_instance_blocks(content, reference)
+            .into_iter()
+            .next()
+            .expect("fixture reference exists");
+        let symbol = &content[symbol_start..symbol_end];
+        let atom = format!("    {}", default_flag_atom(kind));
+        let flag_start = symbol.find(&atom).expect("fixture flag exists");
+        let mut out = content.to_string();
+        out.replace_range(
+            symbol_start + flag_start..symbol_start + flag_start + atom.len(),
+            replacement,
+        );
+        out
+    }
+
     const SCH_FLAGS: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 20 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg2\")\n    (property \"Reference\" \"#FLG02\" (at 20 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 20 12 0))\n    (property \"Footprint\" \"\" (at 20 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 30 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg3\")\n    (property \"Reference\" \"#FLG03\" (at 30 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 30 12 0))\n    (property \"Footprint\" \"\" (at 30 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 80 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\" (at 80 8 0))\n    (property \"Value\" \"10k\" (at 80 12 0))\n    (property \"Footprint\" \"\" (at 80 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
 
     const SCH_FLAGS_MISSING_ON_BOARD: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
@@ -3693,6 +3775,112 @@ mod batch_component_flag_tests {
             );
             let after = std::fs::read_to_string(&path).unwrap();
             assert!(after.contains(expected_fragment), "{after}");
+        }
+    }
+
+    #[tokio::test]
+    async fn field_only_edit_rejects_duplicate_omitted_on_board_without_writing() {
+        let content = replace_flag_node_in_reference(
+            SCH_FLAGS,
+            "#FLG01",
+            InstanceFlagKind::OnBoard,
+            "    (on_board yes)\n    (on_board no)\n",
+        );
+        let (_dir, path) =
+            write_fixture("field-only-duplicate-omitted-on-board.kicad_sch", &content);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{"reference": "#FLG01", "value": "PWR_FLAG_NEW"}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn field_only_edit_rejects_malformed_omitted_dnp_without_writing() {
+        let content = replace_flag_node_in_reference(
+            SCH_FLAGS,
+            "#FLG01",
+            InstanceFlagKind::Dnp,
+            "    (dnp maybe)\n",
+        );
+        let (_dir, path) = write_fixture("field-only-malformed-omitted-dnp.kicad_sch", &content);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{"reference": "#FLG01", "footprint": "Test:Flag"}]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_rejects_malformed_or_duplicate_omitted_flags_without_writing() {
+        for (name, content) in [
+            (
+                "mixed-duplicate-omitted-on-board.kicad_sch",
+                replace_flag_node_in_reference(
+                    SCH_FLAGS,
+                    "R1",
+                    InstanceFlagKind::OnBoard,
+                    "    (on_board yes)\n    (on_board no)\n",
+                ),
+            ),
+            (
+                "mixed-malformed-omitted-dnp.kicad_sch",
+                replace_flag_node_in_reference(
+                    SCH_FLAGS,
+                    "R1",
+                    InstanceFlagKind::Dnp,
+                    "    (dnp maybe)\n",
+                ),
+            ),
+        ] {
+            let (_dir, path) = write_fixture(name, &content);
+            let before = std::fs::read_to_string(&path).unwrap();
+
+            let result = handle_batch_edit(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "edits": [
+                        {"reference": "#FLG01", "on_board": false},
+                        {"reference": "R1", "value": "22k"}
+                    ]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{name}: {result:?}");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         }
     }
 
@@ -3847,6 +4035,24 @@ mod batch_component_flag_tests {
             error.contains("multiple direct 'on_board' nodes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn verified_flag_response_rejects_malformed_unrequested_flag_with_reload_guidance() {
+        let requests = parse_batch_component_edit_requests(&[json!({
+            "reference": "#FLG01",
+            "on_board": false
+        })])
+        .expect("valid request");
+        let prepared =
+            prepare_batch_component_update(SCH_FLAGS, &requests).expect("request prevalidates");
+        let malformed = prepared.content.replacen("(dnp no)", "(dnp maybe)", 1);
+
+        let error = build_verified_batch_component_response(&malformed, &prepared)
+            .expect_err("malformed unrequested flag must fail closed");
+
+        assert!(error.contains("inspect/reload"), "{error}");
+        assert!(error.contains("malformed direct 'dnp'"), "{error}");
     }
 
     #[tokio::test]
