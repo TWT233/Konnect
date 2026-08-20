@@ -1687,17 +1687,100 @@ impl KiCadIpcClient {
             .context("No bounding box returned from KiCAD")
     }
 
+    /// Return the union of KiCAD's bounding boxes for an explicit set of
+    /// top-level board-item KIIDs in one open document.
+    ///
+    /// `GetBoundingBox.items` is not an optional filter: KiCAD iterates that
+    /// exact list and returns one `(id, box)` pair per item it can resolve.
+    /// An empty request therefore has no bounds, and a partial or reordered
+    /// response is refused rather than being mistaken for a whole-board box.
+    pub fn get_item_extents_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_ids: &[String],
+        include_child_text: bool,
+    ) -> Result<Option<IpcBoardExtents>> {
+        if item_ids.is_empty() {
+            return Ok(None);
+        }
+        let requested = item_ids
+            .iter()
+            .map(|value| kiapi::common::types::Kiid {
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cmd = kiapi::common::commands::GetBoundingBox {
+            header: Some(header_for(document)),
+            items: requested.clone(),
+            mode: if include_child_text {
+                kiapi::common::commands::BoundingBoxMode::BbmItemAndChildText as i32
+            } else {
+                kiapi::common::commands::BoundingBoxMode::BbmItemOnly as i32
+            },
+        };
+        let resp_any = self.send_command(&cmd, "kiapi.common.commands.GetBoundingBox")?;
+        let any = resp_any.context("KiCAD returned no GetBoundingBox response payload")?;
+        let resp: kiapi::common::commands::GetBoundingBoxResponse = unpack_any(&any)?;
+        if resp.items != requested || resp.boxes.len() != requested.len() {
+            anyhow::bail!(
+                "KiCAD returned incomplete or reordered bounding boxes: requested {}, ids {}, boxes {}",
+                requested.len(),
+                resp.items.len(),
+                resp.boxes.len()
+            );
+        }
+
+        let mut min_x = i64::MAX;
+        let mut min_y = i64::MAX;
+        let mut max_x = i64::MIN;
+        let mut max_y = i64::MIN;
+        for (id, bbox) in resp.items.iter().zip(&resp.boxes) {
+            let position = bbox.position.as_ref().with_context(|| {
+                format!("KiCAD returned no bounding-box position for {}", id.value)
+            })?;
+            let size = bbox
+                .size
+                .as_ref()
+                .with_context(|| format!("KiCAD returned no bounding-box size for {}", id.value))?;
+            let x2 = position
+                .x_nm
+                .checked_add(size.x_nm)
+                .with_context(|| format!("KiCAD bounding-box X overflow for {}", id.value))?;
+            let y2 = position
+                .y_nm
+                .checked_add(size.y_nm)
+                .with_context(|| format!("KiCAD bounding-box Y overflow for {}", id.value))?;
+            min_x = min_x.min(position.x_nm.min(x2));
+            min_y = min_y.min(position.y_nm.min(y2));
+            max_x = max_x.max(position.x_nm.max(x2));
+            max_y = max_y.max(position.y_nm.max(y2));
+        }
+        Ok(Some(IpcBoardExtents {
+            min: IpcVector2 {
+                x: nm_to_mm(min_x),
+                y: nm_to_mm(min_y),
+            },
+            max: IpcVector2 {
+                x: nm_to_mm(max_x),
+                y: nm_to_mm(max_y),
+            },
+        }))
+    }
+
     /// Return no bounds for a completely empty board instead of treating the
     /// valid empty `GetBoundingBox` response as an IPC failure.
     pub fn get_optional_board_extents_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
     ) -> Result<Option<IpcBoardExtents>> {
-        // Use GetBoundingBox with no specific items = board extents
+        // Kept for compatibility with the existing all-object extents tool.
+        // KiCAD 10 returns no boxes for this empty item list, so that caller
+        // falls back to its file-based computation.  Physical outline users
+        // must call get_item_extents_in with explicit Edge.Cuts KIIDs.
         let header = header_for(document);
         let cmd = kiapi::common::commands::GetBoundingBox {
             header: Some(header),
-            items: vec![], // empty = all items
+            items: vec![],
             mode: kiapi::common::commands::BoundingBoxMode::BbmItemOnly as i32,
         };
         let resp_any = self.send_command(&cmd, "kiapi.common.commands.GetBoundingBox")?;
@@ -1708,26 +1791,14 @@ impl KiCadIpcClient {
                 let size = bbox.size.as_ref();
                 return Ok(Some(IpcBoardExtents {
                     min: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0),
+                        x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0),
+                        y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0),
                     },
                     max: IpcVector2 {
-                        x: pos
-                            .map(|p| crate::builders::nm_to_mm(p.x_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.x_nm))
-                                .unwrap_or(0.0),
-                        y: pos
-                            .map(|p| crate::builders::nm_to_mm(p.y_nm))
-                            .unwrap_or(0.0)
-                            + size
-                                .map(|s| crate::builders::nm_to_mm(s.y_nm))
-                                .unwrap_or(0.0),
+                        x: pos.map(|p| nm_to_mm(p.x_nm)).unwrap_or(0.0)
+                            + size.map(|s| nm_to_mm(s.x_nm)).unwrap_or(0.0),
+                        y: pos.map(|p| nm_to_mm(p.y_nm)).unwrap_or(0.0)
+                            + size.map(|s| nm_to_mm(s.y_nm)).unwrap_or(0.0),
                     },
                 }));
             }

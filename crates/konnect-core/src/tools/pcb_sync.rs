@@ -530,8 +530,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         &board,
         what,
         move |client| {
-            let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut snapshot = snapshot_board(client, &ipc_board)?;
+            let mut plan =
+                plan_sync_with_outline_bounds(client, &netlist_source, &design, &mut snapshot)?;
             let prepared = match prepare_additions(&library_board, &plan) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -2961,6 +2962,63 @@ fn snapshot_pad_contract(
     Ok((pad_numbers, pad_nets))
 }
 
+fn board_outline_bounds(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+) -> Result<Bounds> {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+    use konnect_ipc::gen::kiapi;
+
+    let mut edge_ids = Vec::new();
+    for item in client.get_items_in(document.clone(), ObjectType::KotPcbShape)? {
+        if !konnect_ipc::builders::any_is(&item, "kiapi.board.types.BoardGraphicShape") {
+            bail!("KiCad returned a non-BoardGraphicShape for a PCB shape query");
+        }
+        let shape = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            .context("KiCad returned an unreadable board shape")?;
+        if shape.layer != kiapi::board::types::BoardLayer::BlEdgeCuts as i32 {
+            continue;
+        }
+        let id = shape
+            .id
+            .map(|id| id.value)
+            .filter(|id| !id.is_empty())
+            .context("KiCad returned an Edge.Cuts shape without a KIID")?;
+        edge_ids.push(id);
+    }
+    if edge_ids.is_empty() {
+        bail!("the live board has no Edge.Cuts shapes to define its outline");
+    }
+    let extents = client
+        .get_item_extents_in(document.clone(), &edge_ids, false)?
+        .context("KiCad returned no bounding boxes for the live Edge.Cuts shapes")?;
+    Ok(Bounds {
+        min_x: extents.min.x,
+        min_y: extents.min.y,
+        max_x: extents.max.x,
+        max_y: extents.max.y,
+    })
+}
+
+fn plan_sync_with_outline_bounds(
+    client: &konnect_ipc::KiCadIpcClient,
+    netlist_source: &str,
+    design: &ExportedDesign,
+    snapshot: &mut LiveSnapshot,
+) -> Result<SyncPlan> {
+    let initial = plan_sync(netlist_source, design, &snapshot.state);
+    if initial.status != PlanStatus::Ready
+        || !initial
+            .changes
+            .iter()
+            .any(|change| matches!(change, PlannedChange::Add { .. }))
+    {
+        return Ok(initial);
+    }
+    snapshot.state.bounds = board_outline_bounds(client, &snapshot.document)?;
+    Ok(plan_sync(netlist_source, design, &snapshot.state))
+}
+
 fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<LiveSnapshot> {
     use kiapi::common::types::KiCadObjectType as ObjectType;
     use konnect_ipc::gen::kiapi;
@@ -3056,21 +3114,19 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             *routed_nets.entry(net.clone()).or_insert(0) += 1;
         }
     }
-    let extents = client
-        .get_optional_board_extents_in(document.clone())?
-        .unwrap_or(konnect_ipc::IpcBoardExtents {
-            min: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
-            max: konnect_ipc::IpcVector2 { x: 0.0, y: 0.0 },
-        });
     Ok(LiveSnapshot {
         state: BoardState {
             footprints,
             routed_nets,
+            // Identity rebind shares this snapshot but never stages new
+            // footprints.  Only normal schematic sync may require a physical
+            // board outline; keep that dependency out of the identity-only
+            // workflow and fill it only when normal sync plans an addition.
             bounds: Bounds {
-                min_x: extents.min.x,
-                min_y: extents.min.y,
-                max_x: extents.max.x,
-                max_y: extents.max.y,
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 0.0,
+                max_y: 0.0,
             },
         },
         items,
@@ -5116,6 +5172,183 @@ mod tests {
             message: Some(inner),
             ..rebind_ok_response()
         }
+    }
+
+    #[test]
+    fn snapshot_board_uses_explicit_edge_cuts_kiids_for_physical_bounds() {
+        use konnect_ipc::gen::kiapi;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("outline.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))\n").unwrap();
+        let document = rebind_test_document(board.to_str().unwrap());
+        let edge_ids = vec![
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            "22222222-2222-4222-8222-222222222222".to_string(),
+            "33333333-3333-4333-8333-333333333333".to_string(),
+            "44444444-4444-4444-8444-444444444444".to_string(),
+        ];
+        let requested_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+        let requested_ids_for_mock = Arc::clone(&requested_ids);
+        let document_for_mock = document.clone();
+        let edge_ids_for_mock = edge_ids.clone();
+
+        let mock = spawn_rebind_mock(move |request| {
+            use kiapi::common::commands::{
+                GetBoundingBox, GetBoundingBoxResponse, GetItems, GetItemsResponse,
+                GetOpenDocumentsResponse,
+            };
+            use kiapi::common::types::KiCadObjectType as ObjectType;
+
+            let message = request.message.as_ref().expect("request command");
+            match konnect_ipc::builders::any_type_name(message) {
+                "kiapi.common.commands.GetOpenDocuments" => {
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &GetOpenDocumentsResponse {
+                            documents: vec![document_for_mock.clone()],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )))
+                }
+                "kiapi.common.commands.GetItems" => {
+                    let command = GetItems::decode(message.value.as_slice()).unwrap();
+                    let items = if command.types == vec![ObjectType::KotPcbShape as i32] {
+                        edge_ids_for_mock
+                            .iter()
+                            .enumerate()
+                            .map(|(index, id)| {
+                                let (x1, y1, x2, y2) = match index {
+                                    0 => (0.0, 0.0, 285.75, 0.0),
+                                    1 => (285.75, 0.0, 285.75, 95.25),
+                                    2 => (285.75, 95.25, 0.0, 95.25),
+                                    _ => (0.0, 95.25, 0.0, 0.0),
+                                };
+                                let mut shape = konnect_ipc::builders::board_segment(
+                                    "Edge.Cuts",
+                                    0.05,
+                                    x1,
+                                    y1,
+                                    x2,
+                                    y2,
+                                );
+                                shape.id = Some(kiapi::common::types::Kiid { value: id.clone() });
+                                konnect_ipc::builders::pack_any(
+                                    &shape,
+                                    "kiapi.board.types.BoardGraphicShape",
+                                )
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    )))
+                }
+                "kiapi.board.commands.GetNets" => {
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::NetsResponse { nets: vec![] },
+                        "kiapi.board.commands.NetsResponse",
+                    )))
+                }
+                "kiapi.common.commands.GetBoundingBox" => {
+                    let command = GetBoundingBox::decode(message.value.as_slice()).unwrap();
+                    let ids = command
+                        .items
+                        .iter()
+                        .map(|id| id.value.clone())
+                        .collect::<Vec<_>>();
+                    *requested_ids_for_mock.lock().unwrap() = ids.clone();
+                    let boxes = if ids == edge_ids_for_mock {
+                        vec![
+                            kiapi::common::types::Box2 {
+                                position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
+                                size: Some(konnect_ipc::builders::vec2(285.75, 0.0)),
+                            },
+                            kiapi::common::types::Box2 {
+                                position: Some(konnect_ipc::builders::vec2(285.75, 0.0)),
+                                size: Some(konnect_ipc::builders::vec2(0.0, 95.25)),
+                            },
+                            kiapi::common::types::Box2 {
+                                position: Some(konnect_ipc::builders::vec2(0.0, 95.25)),
+                                size: Some(konnect_ipc::builders::vec2(285.75, 0.0)),
+                            },
+                            kiapi::common::types::Box2 {
+                                position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
+                                size: Some(konnect_ipc::builders::vec2(0.0, 95.25)),
+                            },
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                        &GetBoundingBoxResponse {
+                            items: command.items,
+                            boxes,
+                        },
+                        "kiapi.common.commands.GetBoundingBoxResponse",
+                    )))
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        });
+
+        let client = konnect_ipc::KiCadIpcClient::new(&mock.url);
+        let mut snapshot = snapshot_board(&client, &board).unwrap();
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/sheet/new")],
+            skipped: Vec::new(),
+        };
+        let plan =
+            plan_sync_with_outline_bounds(&client, "netlist", &design, &mut snapshot).unwrap();
+
+        assert_eq!(*requested_ids.lock().unwrap(), edge_ids);
+        assert_eq!(
+            snapshot.state.bounds,
+            Bounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 285.75,
+                max_y: 95.25,
+            }
+        );
+        assert!(plan.changes.iter().any(|change| matches!(
+            change,
+            PlannedChange::Add { position, .. } if position.x > 285.75
+        )));
+    }
+
+    #[test]
+    fn normal_sync_refuses_to_stage_additions_without_live_edge_cuts() {
+        use konnect_ipc::gen::kiapi;
+
+        let document = rebind_test_document("outline-missing.kicad_pcb");
+        let mock = spawn_rebind_mock(|request| {
+            let message = request.message.as_ref().expect("request command");
+            assert_eq!(
+                konnect_ipc::builders::any_type_name(message),
+                "kiapi.common.commands.GetItems"
+            );
+            Some(rebind_reply_with(konnect_ipc::builders::pack_any(
+                &kiapi::common::commands::GetItemsResponse {
+                    header: None,
+                    status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                    items: vec![],
+                },
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        });
+
+        let error = board_outline_bounds(&konnect_ipc::KiCadIpcClient::new(&mock.url), &document)
+            .expect_err("normal sync additions need a live physical outline")
+            .to_string();
+
+        assert!(error.contains("no Edge.Cuts shapes"), "{error}");
     }
 
     #[tokio::test]

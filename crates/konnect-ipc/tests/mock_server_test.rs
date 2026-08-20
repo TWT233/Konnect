@@ -801,6 +801,41 @@ fn placement_targets_the_named_board_among_several_open() {
     );
 }
 
+#[test]
+fn explicit_item_extents_reject_an_incomplete_bounding_box_response() {
+    let mock = spawn_mock(|request| {
+        let message = request.message.expect("request must pack a command");
+        assert_eq!(
+            builders::any_type_name(&message),
+            "kiapi.common.commands.GetBoundingBox"
+        );
+        let command =
+            kiapi::common::commands::GetBoundingBox::decode(message.value.as_slice()).unwrap();
+        assert_eq!(
+            command
+                .items
+                .iter()
+                .map(|id| id.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edge-1"]
+        );
+        Some(reply_with(builders::pack_any(
+            &kiapi::common::commands::GetBoundingBoxResponse {
+                items: command.items,
+                boxes: vec![],
+            },
+            "kiapi.common.commands.GetBoundingBoxResponse",
+        )))
+    });
+
+    let error = KiCadIpcClient::new(&mock.url)
+        .get_item_extents_in(doc_for("target.kicad_pcb"), &["edge-1".to_string()], false)
+        .expect_err("one requested item needs one returned bounding box")
+        .to_string();
+
+    assert!(error.contains("incomplete or reordered"), "{error}");
+}
+
 fn doc_for(filename: &str) -> kiapi::common::types::DocumentSpecifier {
     kiapi::common::types::DocumentSpecifier {
         r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
