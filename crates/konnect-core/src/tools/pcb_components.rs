@@ -2541,6 +2541,71 @@ fn live_pad_json(
     Ok(pads)
 }
 
+#[cfg(test)]
+fn test_text_value(text: &str) -> kiapi::common::types::Text {
+    kiapi::common::types::Text {
+        text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+fn test_field_with_text(text: &str) -> kiapi::board::types::Field {
+    kiapi::board::types::Field {
+        text: Some(kiapi::board::types::BoardText {
+            text: Some(test_text_value(text)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+fn test_live_pad(
+    number: &str,
+    x: f64,
+    y: f64,
+    net: Option<kiapi::board::types::Net>,
+) -> prost_types::Any {
+    konnect_ipc::builders::pack_any(
+        &kiapi::board::types::Pad {
+            number: number.to_string(),
+            net,
+            position: Some(konnect_ipc::builders::vec2(x, y)),
+            ..Default::default()
+        },
+        "kiapi.board.types.Pad",
+    )
+}
+
+#[cfg(test)]
+fn test_live_footprint(
+    reference: &str,
+    value: &str,
+    lib_id: &str,
+    x: f64,
+    y: f64,
+    layer: kiapi::board::types::BoardLayer,
+    items: Vec<prost_types::Any>,
+) -> kiapi::board::types::FootprintInstance {
+    let (library_nickname, entry_name) = lib_id.split_once(':').expect("Library:Footprint");
+    kiapi::board::types::FootprintInstance {
+        reference_field: Some(test_field_with_text(reference)),
+        value_field: Some(test_field_with_text(value)),
+        position: Some(konnect_ipc::builders::vec2(x, y)),
+        layer: layer as i32,
+        definition: Some(kiapi::board::types::Footprint {
+            id: Some(kiapi::common::types::LibraryIdentifier {
+                library_nickname: library_nickname.to_string(),
+                entry_name: entry_name.to_string(),
+            }),
+            items,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 async fn handle_place_array(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -4497,67 +4562,6 @@ mod tests {
         }
     }
 
-    fn text_value(text: &str) -> kiapi::common::types::Text {
-        kiapi::common::types::Text {
-            text: text.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn field_with_text(text: &str) -> kiapi::board::types::Field {
-        kiapi::board::types::Field {
-            text: Some(kiapi::board::types::BoardText {
-                text: Some(text_value(text)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn live_pad(
-        number: &str,
-        x: f64,
-        y: f64,
-        net: Option<kiapi::board::types::Net>,
-    ) -> prost_types::Any {
-        konnect_ipc::builders::pack_any(
-            &kiapi::board::types::Pad {
-                number: number.to_string(),
-                net,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
-                ..Default::default()
-            },
-            "kiapi.board.types.Pad",
-        )
-    }
-
-    fn live_footprint(
-        reference: &str,
-        value: &str,
-        lib_id: &str,
-        x: f64,
-        y: f64,
-        layer: kiapi::board::types::BoardLayer,
-        items: Vec<prost_types::Any>,
-    ) -> kiapi::board::types::FootprintInstance {
-        let (library_nickname, entry_name) = lib_id.split_once(':').expect("Library:Footprint");
-        kiapi::board::types::FootprintInstance {
-            reference_field: Some(field_with_text(reference)),
-            value_field: Some(field_with_text(value)),
-            position: Some(konnect_ipc::builders::vec2(x, y)),
-            layer: layer as i32,
-            definition: Some(kiapi::board::types::Footprint {
-                id: Some(kiapi::common::types::LibraryIdentifier {
-                    library_nickname: library_nickname.to_string(),
-                    entry_name: entry_name.to_string(),
-                }),
-                items,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
     fn query_items_response(
         items: Vec<kiapi::board::types::FootprintInstance>,
     ) -> kiapi::common::ApiResponse {
@@ -4583,50 +4587,56 @@ mod tests {
     async fn get_component_pads_reads_the_live_footprint_from_the_requested_board() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("target.kicad_pcb");
-        std::fs::write(
-            &board,
-            "(kicad_pcb\n  (version 20260206)\n  (footprint \"DiskOnly\"\n    (layer \"F.Cu\")\n    (at 1 2 0)\n    (property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\"))\n  )\n)\n",
-        )
-        .unwrap();
+        assert!(
+            !board.exists(),
+            "the requested board path must not exist on disk"
+        );
 
         let requested = board.clone();
         let mock = spawn_query_mock(move |req| {
             let msg = req.message.expect("request must pack a command");
-            if msg.type_url.ends_with("GetOpenDocuments") {
-                return Some(query_reply_with(konnect_ipc::builders::pack_any(
-                    &kiapi::common::commands::GetOpenDocumentsResponse {
-                        documents: vec![board_doc(&requested)],
-                    },
-                    "kiapi.common.commands.GetOpenDocumentsResponse",
-                )));
+            match konnect_ipc::builders::any_type_name(&msg) {
+                "kiapi.common.commands.GetOpenDocuments" => {
+                    Some(query_reply_with(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![board_doc(&requested)],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )))
+                }
+                "kiapi.common.commands.GetItems" => {
+                    Some(query_items_response(vec![test_live_footprint(
+                        "R1",
+                        "Conn",
+                        "Conn:USB",
+                        10.0,
+                        20.0,
+                        kiapi::board::types::BoardLayer::BlFCu,
+                        vec![
+                            test_live_pad(
+                                "1",
+                                123.0,
+                                456.0,
+                                Some(kiapi::board::types::Net {
+                                    name: "GND".to_string(),
+                                    ..Default::default()
+                                }),
+                            ),
+                            test_live_pad(
+                                "2",
+                                124.0,
+                                456.0,
+                                Some(kiapi::board::types::Net::default()),
+                            ),
+                            konnect_ipc::builders::pack_any(
+                                &kiapi::board::types::BoardGraphicShape::default(),
+                                "kiapi.board.types.BoardGraphicShape",
+                            ),
+                        ],
+                    )]))
+                }
+                _ => None,
             }
-            if msg.type_url.ends_with("GetItems") {
-                return Some(query_items_response(vec![live_footprint(
-                    "R1",
-                    "Conn",
-                    "Conn:USB",
-                    10.0,
-                    20.0,
-                    kiapi::board::types::BoardLayer::BlFCu,
-                    vec![
-                        live_pad(
-                            "1",
-                            123.0,
-                            456.0,
-                            Some(kiapi::board::types::Net {
-                                name: "GND".to_string(),
-                                ..Default::default()
-                            }),
-                        ),
-                        live_pad("2", 124.0, 456.0, Some(kiapi::board::types::Net::default())),
-                        konnect_ipc::builders::pack_any(
-                            &kiapi::board::types::BoardGraphicShape::default(),
-                            "kiapi.board.types.BoardGraphicShape",
-                        ),
-                    ],
-                )]));
-            }
-            None
         });
         let result = handle_get_component_pads(
             &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
@@ -4662,58 +4672,60 @@ mod tests {
         let seen_documents_in_mock = seen_documents.clone();
         let mock = spawn_query_mock(move |req| {
             let msg = req.message.expect("request must pack a command");
-            if msg.type_url.ends_with("GetOpenDocuments") {
-                return Some(query_reply_with(konnect_ipc::builders::pack_any(
-                    &kiapi::common::commands::GetOpenDocumentsResponse {
-                        documents: vec![board_doc(&board_a), board_doc(&target_b)],
-                    },
-                    "kiapi.common.commands.GetOpenDocumentsResponse",
-                )));
+            match konnect_ipc::builders::any_type_name(&msg) {
+                "kiapi.common.commands.GetOpenDocuments" => {
+                    Some(query_reply_with(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![board_doc(&board_a), board_doc(&target_b)],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    )))
+                }
+                "kiapi.common.commands.GetItems" => {
+                    let get_items =
+                        kiapi::common::commands::GetItems::decode(msg.value.as_slice()).unwrap();
+                    let document = get_items
+                        .header
+                        .as_ref()
+                        .and_then(|header| header.document.as_ref())
+                        .and_then(|document| match document.identifier.as_ref() {
+                            Some(
+                                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                    filename,
+                                ),
+                            ) => Some(filename.clone()),
+                            _ => None,
+                        })
+                        .unwrap();
+                    seen_documents_in_mock
+                        .lock()
+                        .unwrap()
+                        .push(document.clone());
+                    let items = if document == target_b.display().to_string() {
+                        vec![test_live_footprint(
+                            "J1",
+                            "Conn",
+                            "Conn:USB",
+                            50.0,
+                            60.0,
+                            kiapi::board::types::BoardLayer::BlBCu,
+                            vec![],
+                        )]
+                    } else {
+                        vec![test_live_footprint(
+                            "A1",
+                            "Wrong",
+                            "Wrong:Board",
+                            1.0,
+                            2.0,
+                            kiapi::board::types::BoardLayer::BlFCu,
+                            vec![],
+                        )]
+                    };
+                    Some(query_items_response(items))
+                }
+                _ => None,
             }
-            if msg.type_url.ends_with("GetItems") {
-                let get_items =
-                    kiapi::common::commands::GetItems::decode(msg.value.as_slice()).unwrap();
-                let document = get_items
-                    .header
-                    .as_ref()
-                    .and_then(|header| header.document.as_ref())
-                    .and_then(|document| match document.identifier.as_ref() {
-                        Some(
-                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
-                                filename,
-                            ),
-                        ) => Some(filename.clone()),
-                        _ => None,
-                    })
-                    .unwrap();
-                seen_documents_in_mock
-                    .lock()
-                    .unwrap()
-                    .push(document.clone());
-                let items = if document == target_b.display().to_string() {
-                    vec![live_footprint(
-                        "J1",
-                        "Conn",
-                        "Conn:USB",
-                        50.0,
-                        60.0,
-                        kiapi::board::types::BoardLayer::BlBCu,
-                        vec![],
-                    )]
-                } else {
-                    vec![live_footprint(
-                        "A1",
-                        "Wrong",
-                        "Wrong:Board",
-                        1.0,
-                        2.0,
-                        kiapi::board::types::BoardLayer::BlFCu,
-                        vec![],
-                    )]
-                };
-                return Some(query_items_response(items));
-            }
-            None
         });
 
         let result = handle_get_component_list(
@@ -5007,63 +5019,16 @@ mod field_placement_tests {
 mod pad_net_shape_tests {
     use super::*;
 
-    fn live_pad_for_test(
-        number: &str,
-        x: f64,
-        y: f64,
-        net: Option<kiapi::board::types::Net>,
-    ) -> prost_types::Any {
-        konnect_ipc::builders::pack_any(
-            &kiapi::board::types::Pad {
-                number: number.to_string(),
-                net,
-                position: Some(konnect_ipc::builders::vec2(x, y)),
-                ..Default::default()
-            },
-            "kiapi.board.types.Pad",
-        )
-    }
-
-    fn live_footprint_for_test(
-        items: Vec<prost_types::Any>,
-    ) -> kiapi::board::types::FootprintInstance {
-        kiapi::board::types::FootprintInstance {
-            reference_field: Some(kiapi::board::types::Field {
-                text: Some(kiapi::board::types::BoardText {
-                    text: Some(kiapi::common::types::Text {
-                        text: "R1".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            value_field: Some(kiapi::board::types::Field {
-                text: Some(kiapi::board::types::BoardText {
-                    text: Some(kiapi::common::types::Text {
-                        text: "Value".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            position: Some(konnect_ipc::builders::vec2(100.0, 100.0)),
-            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
-            definition: Some(kiapi::board::types::Footprint {
-                id: Some(kiapi::common::types::LibraryIdentifier {
-                    library_nickname: "Test".to_string(),
-                    entry_name: "Pad".to_string(),
-                }),
-                items,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
     fn pads_of(items: Vec<prost_types::Any>) -> serde_json::Value {
-        let footprint = live_footprint_for_test(items);
+        let footprint = test_live_footprint(
+            "R1",
+            "Value",
+            "Test:Pad",
+            100.0,
+            100.0,
+            kiapi::board::types::BoardLayer::BlFCu,
+            items,
+        );
         let pads = live_pad_json(&footprint).expect("live pads");
         serde_json::json!({
             "reference": "R1",
@@ -5085,7 +5050,7 @@ mod pad_net_shape_tests {
         y: f64,
         net: Option<kiapi::board::types::Net>,
     ) -> prost_types::Any {
-        live_pad_for_test(number, x, y, net)
+        test_live_pad(number, x, y, net)
     }
 
     #[tokio::test]
@@ -5133,13 +5098,21 @@ mod pad_net_shape_tests {
 
     #[tokio::test]
     async fn a_typed_pad_missing_its_position_is_refused() {
-        let footprint = live_footprint_for_test(vec![konnect_ipc::builders::pack_any(
-            &kiapi::board::types::Pad {
-                number: "1".to_string(),
-                ..Default::default()
-            },
-            "kiapi.board.types.Pad",
-        )]);
+        let footprint = test_live_footprint(
+            "R1",
+            "Value",
+            "Test:Pad",
+            100.0,
+            100.0,
+            kiapi::board::types::BoardLayer::BlFCu,
+            vec![konnect_ipc::builders::pack_any(
+                &kiapi::board::types::Pad {
+                    number: "1".to_string(),
+                    ..Default::default()
+                },
+                "kiapi.board.types.Pad",
+            )],
+        );
         let error = live_pad_json(&footprint).expect_err("missing pad position must fail closed");
         assert!(error.to_string().contains("without a position"), "{error}");
     }
