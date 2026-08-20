@@ -355,6 +355,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "match_all",
         "replace_existing",
         "roundrect_rratio",
+        // Instance-flag names: these are schematic attribute nodes/parameters,
+        // not MCP tool names. They are intentionally documented in prose.
+        "in_bom",
+        "on_board",
     ];
 
     let mut phantom = Vec::new();
