@@ -7526,7 +7526,7 @@ mod tests {
     #[test]
     fn added_footprint_copies_library_exclude_from_position_files_without_setting_bom_or_dnp() {
         let footprint = build_added_footprint_from_library(
-            &library_socket_footprint(" exclude_from_pos_files"),
+            &library_socket_footprint(" exclude_from_pos_files dnp"),
             "J1",
             false,
         );
