@@ -1931,23 +1931,19 @@ fn component_pad_numbers(component_node: &SexpNode) -> (Vec<String>, bool) {
     let Some(units) = component_node.find("units") else {
         return (Vec::new(), false);
     };
-    let mut saw_pins_section = false;
-    let numbers = units
-        .find_all("unit")
-        .into_iter()
-        .flat_map(|unit| {
-            if let Some(pins) = unit.find("pins") {
-                saw_pins_section = true;
-                pins.find_all("pin")
-            } else {
-                Vec::new()
-            }
-        })
-        .filter_map(|pin| pin.find_str("num"))
-        .filter(|number| !number.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    (normalized_pad_numbers(numbers), saw_pins_section)
+    let mut numbers = Vec::new();
+    for unit in units.find_all("unit") {
+        let Some(pins) = unit.find("pins") else {
+            return (normalized_pad_numbers(numbers), false);
+        };
+        for pin in pins.find_all("pin") {
+            let Some(number) = pin.find_str("num").filter(|number| !number.is_empty()) else {
+                return (normalized_pad_numbers(numbers), false);
+            };
+            numbers.push(number.to_string());
+        }
+    }
+    (normalized_pad_numbers(numbers), true)
 }
 
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
@@ -3764,6 +3760,14 @@ mod tests {
         )
     }
 
+    fn identity_rebind_source_with_partial_d1_unit_pins(source: &str) -> String {
+        replace_once(
+            source,
+            "      (units (unit (name \"1\") (pins (pin (num \"1\")) (pin (num \"2\")))))",
+            "      (units (unit (name \"A\") (pins (pin (num \"1\")))) (unit (name \"B\")))",
+        )
+    }
+
     fn identity_rebind_source_without_units(source: &str) -> String {
         source
             .replace(
@@ -3783,6 +3787,14 @@ mod tests {
         design
             .components
             .iter_mut()
+            .find(|component| component.reference == reference)
+            .unwrap_or_else(|| panic!("missing design component {reference}"))
+    }
+
+    fn design_component<'a>(design: &'a ExportedDesign, reference: &str) -> &'a DesignComponent {
+        design
+            .components
+            .iter()
             .find(|component| component.reference == reference)
             .unwrap_or_else(|| panic!("missing design component {reference}"))
     }
@@ -3879,6 +3891,32 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "pad_set_unverified"));
+    }
+
+    #[test]
+    fn identity_rebind_rejects_partial_multi_unit_pin_metadata() {
+        let (source, _, mut board) = identity_rebind_fixture();
+        let source = identity_rebind_source_with_partial_d1_unit_pins(&source);
+        let design = parse_identity_rebind_source(&source);
+        let component = design_component(&design, "D1");
+        let footprint = board_footprint_mut(&mut board, "D1");
+        footprint.pad_numbers = normalized_pad_numbers(["1"]);
+        footprint.pad_nets.remove("2");
+
+        let plan = plan_identity_rebind(&source, &design, &board, &["D1".to_string()]);
+        let has_unverified_diagnostic = plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "pad_set_unverified");
+
+        assert_eq!(
+            (
+                component.pad_numbers_complete,
+                plan.status,
+                has_unverified_diagnostic
+            ),
+            (false, PlanStatus::Conflict, true)
+        );
     }
 
     #[test]
