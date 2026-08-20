@@ -357,6 +357,7 @@ fn find_symbol_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
 ///
 /// Multi-unit parts repeat their fields in every unit's block and KiCad expects
 /// those copies to agree, so a field edit has to rewrite all of them.
+#[cfg(test)]
 fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize, usize)> {
     find_all_symbol_instance_blocks(content, reference)
         .into_iter()
@@ -576,6 +577,64 @@ fn property_name_from_block(block: &str) -> Option<&str> {
     let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+fn property_value_range_in_property_block(
+    content: &str,
+    property_start: usize,
+    property_end: usize,
+) -> Result<(usize, usize), String> {
+    let property = &content[property_start..property_end];
+    let prefix = "(property ";
+    let Some(after_tag) = property.strip_prefix(prefix) else {
+        return Err(format!("malformed property block '{}'", property.trim()));
+    };
+    let Some(after_name_open) = after_tag.strip_prefix('"') else {
+        return Err(format!("malformed property block '{}'", property.trim()));
+    };
+    let Some(name_end) = after_name_open.find('"') else {
+        return Err(format!("malformed property block '{}'", property.trim()));
+    };
+    let after_name = &after_name_open[name_end + 1..];
+    let Some(value_open_rel) = after_name.find('"') else {
+        return Err(format!(
+            "property block '{}' is missing value",
+            property.trim()
+        ));
+    };
+    let value_start = property_start + prefix.len() + 1 + name_end + 1 + value_open_rel + 1;
+    let Some(value_end_rel) = content[value_start..].find('"') else {
+        return Err(format!(
+            "property block '{}' has unterminated value",
+            property.trim()
+        ));
+    };
+    Ok((value_start, value_start + value_end_rel))
+}
+
+fn strict_field_value_ranges(
+    content: &str,
+    reference: &str,
+    field: &str,
+) -> Result<Vec<(usize, usize)>, String> {
+    let symbol_blocks = find_all_symbol_instance_blocks(content, reference);
+    if symbol_blocks.is_empty() {
+        return Err(format!("component '{}' not found", reference));
+    }
+
+    let mut ranges = Vec::with_capacity(symbol_blocks.len());
+    for (symbol_start, symbol_end) in symbol_blocks {
+        let (property_start, property_end) =
+            symbol_property_range(content, symbol_start, symbol_end, field)
+                .map_err(|reason| format!("component '{}' {}", reference, reason))?;
+        let value_range =
+            property_value_range_in_property_block(content, property_start, property_end).map_err(
+                |reason| format!("component '{}' field '{}' {}", reference, field, reason),
+            )?;
+        ranges.push(value_range);
+    }
+
+    Ok(ranges)
 }
 
 fn flag_state_in_symbol(
@@ -1065,13 +1124,7 @@ fn prepare_batch_component_update(
         );
 
         for (field, new_val) in field_specs {
-            let ranges = field_value_ranges(content, &request.reference, &field);
-            if ranges.is_empty() {
-                return Err(format!(
-                    "component '{}' field '{}' not found",
-                    request.reference, field
-                ));
-            }
+            let ranges = strict_field_value_ranges(content, &request.reference, &field)?;
             let units = ranges.len();
             let field_changed = ranges
                 .iter()
@@ -3429,6 +3482,10 @@ mod batch_component_flag_tests {
 
     const SCH_FLAGS_MULTI_UNIT_INCONSISTENT: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
 
+    const SCH_MULTI_UNIT_MISSING_VALUE_ON_ONE_UNIT: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_MULTI_UNIT_DUPLICATE_VALUE_ON_ONE_UNIT: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Value\" \"74HC14_ALT\" (at 50 13 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
     #[test]
     fn batch_edit_schematic_components_schema_exposes_instance_flags() {
         let tool = tools()
@@ -3659,6 +3716,94 @@ mod batch_component_flag_tests {
                     {"reference": "R1", "value": "22k"},
                     {"reference": "#FLG99", "on_board": false}
                 ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn missing_requested_field_on_one_unit_rejects_without_writing() {
+        let (_dir, path) = write_fixture(
+            "flags-multi-unit-missing-value.kicad_sch",
+            SCH_MULTI_UNIT_MISSING_VALUE_ON_ONE_UNIT,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "U1",
+                    "value": "74HC14D"
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn duplicate_requested_field_on_one_unit_rejects_without_writing() {
+        let (_dir, path) = write_fixture(
+            "flags-multi-unit-duplicate-value.kicad_sch",
+            SCH_MULTI_UNIT_DUPLICATE_VALUE_ON_ONE_UNIT,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "U1",
+                    "value": "74HC14D"
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mixed_field_and_flag_batch_rejects_when_one_unit_field_is_missing() {
+        let (_dir, path) = write_fixture(
+            "flags-multi-unit-mixed-missing-value.kicad_sch",
+            SCH_MULTI_UNIT_MISSING_VALUE_ON_ONE_UNIT,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "U1",
+                    "value": "74HC14D",
+                    "on_board": false
+                }]
             }),
             &test_ctx(),
         )
