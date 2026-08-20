@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**205 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
+**206 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 205 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 206 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -271,8 +271,8 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, and `rotate_component` can safely fall
   back to a closed board file when IPC is unreachable. `flip_component`
-  intentionally requires a closed board because KiCAD IPC has no native
-  footprint-flip command.
+  and `batch_set_component_poses` intentionally require a closed board because
+  KiCAD IPC has no native footprint-flip or atomic pose transaction.
 
 ## License: free for the little guys
 
@@ -312,8 +312,8 @@ with that board first; most PCB tools talk to the running PCB editor. Only an
 unreachable KiCAD produces that message: if KiCAD is running and the tool
 refuses anyway, the error is the tool's own reason for refusing.
 `place_component`, `move_component`, and `rotate_component` can fall back to a
-closed board file when no KiCAD process is reachable; `flip_component`
-requires one, and refuses while KiCAD holds that board open.
+closed board file when no KiCAD process is reachable; `flip_component` and
+`batch_set_component_poses` require one, and refuse while KiCAD holds that board open.
 
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
 that don't appear after `load_toolset`, and transaction recovery.

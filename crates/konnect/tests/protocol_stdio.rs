@@ -296,6 +296,43 @@ fn rebind_tool_schema_is_exposed_in_tools_list() {
 }
 
 #[test]
+fn batch_component_pose_schema_is_exposed_in_tools_list() {
+    let mut p = McpProcess::spawn();
+    let loaded = p.call_tool("load_toolset", json!({"name": "pcb_components"}));
+    assert_ne!(
+        loaded["isError"],
+        json!(true),
+        "load pcb_components: {loaded:#?}"
+    );
+
+    let list = p.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "batch_set_component_poses")
+        .unwrap_or_else(|| panic!("batch pose tool missing from tools/list: {tools:#?}"));
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["board", "placements"]));
+    assert_eq!(schema["properties"]["board"]["type"], "string");
+    let placements = &schema["properties"]["placements"];
+    assert_eq!(placements["type"], "array");
+    let item = &placements["items"];
+    assert_eq!(item["type"], "object");
+    assert_eq!(item["additionalProperties"], false);
+    assert_eq!(
+        item["required"],
+        json!(["reference", "x", "y", "rotation", "layer"])
+    );
+    assert_eq!(item["properties"]["reference"]["type"], "string");
+    for field in ["x", "y", "rotation"] {
+        assert_eq!(item["properties"][field]["type"], "number");
+    }
+    assert_eq!(item["properties"]["layer"]["enum"], json!(["F.Cu", "B.Cu"]));
+}
+
+#[test]
 fn rebind_apply_without_expected_revision_fails_before_path_check() {
     let mut p = McpProcess::spawn();
     let loaded = p.call_tool("load_toolset", json!({"name": "sch_export"}));

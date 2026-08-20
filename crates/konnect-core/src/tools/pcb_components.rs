@@ -8,7 +8,9 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
 use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
-use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, require_array, require_f64, require_str, require_u64, ToolContext, ToolDef,
+};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_ipc::gen::kiapi;
@@ -16,7 +18,7 @@ use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, new_uuid,
     read_consistent, write_atomic_if_unchanged,
 };
-use konnect_sexp::SexpEdit;
+use konnect_sexp::{SexpEdit, SexpError};
 use prost::Message;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -619,7 +621,8 @@ fn board_footprint_sexp(
     out.push_str(&content[name_span.end..]);
 
     if rotation != 0.0 {
-        out = apply_rotation_to_children(&out, rotation);
+        out = apply_rotation_to_children_checked(&out, rotation)
+            .map_err(|error| format!("Cannot rotate footprint {lib_id}: {error:#}"))?;
     }
     if let Some(reference) = reference {
         replace_reference(&mut out, reference).map_err(|error| error.to_string())?;
@@ -703,7 +706,10 @@ fn pretty_dir_nickname(dir: &Path) -> Option<String> {
 ///
 /// Text is additionally kept readable: KiCad flips an angle that would leave a
 /// label upside down by 180°, so a -90° footprint carries `90` on its reference.
-fn apply_rotation_to_children(content: &str, rotation: f64) -> String {
+fn apply_rotation_to_children_checked(content: &str, rotation: f64) -> anyhow::Result<String> {
+    if !rotation.is_finite() {
+        anyhow::bail!("rotation delta is not finite");
+    }
     let mut out = content.to_string();
 
     for tag in ["pad", "property", "fp_text"] {
@@ -725,36 +731,49 @@ fn apply_rotation_to_children(content: &str, rotation: f64) -> String {
             let Some((astart, aend)) = find_balanced_block(&out, at_start) else {
                 continue;
             };
-            let Some(rewritten) = rotate_at_block(&out[astart..aend], rotation, readable) else {
-                continue;
-            };
+            let rewritten = rotate_at_block_checked(&out[astart..aend], rotation, readable)?;
             out.replace_range(astart..aend, &rewritten);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Rewrite `(at x y [angle])`, adding `rotation` to the angle.
 ///
 /// Returns `None` when the block does not look like a positional `at`.
-fn rotate_at_block(block: &str, rotation: f64, readable: bool) -> Option<String> {
-    let inner = block.strip_prefix('(')?.strip_suffix(')')?;
+fn rotate_at_block_checked(block: &str, rotation: f64, readable: bool) -> anyhow::Result<String> {
+    let inner = block
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .context("expected a parenthesized (at ...) block")?;
     let mut parts = inner.split_whitespace();
-    if parts.next()? != "at" {
-        return None;
+    if parts.next() != Some("at") {
+        anyhow::bail!("expected an (at ...) block");
     }
-    let x: f64 = parts.next()?.parse().ok()?;
-    let y: f64 = parts.next()?.parse().ok()?;
-    let existing: f64 = parts.next().and_then(|a| a.parse().ok()).unwrap_or(0.0);
+    let x: f64 = parts.next().context("(at ...) is missing X")?.parse()?;
+    let y: f64 = parts.next().context("(at ...) is missing Y")?.parse()?;
+    let existing: f64 = parts.next().map(str::parse).transpose()?.unwrap_or(0.0);
     if parts.next().is_some() {
-        return None; // `(at …)` with unexpected extra tokens — leave alone.
+        anyhow::bail!("(at ...) has unexpected extra tokens");
     }
+    finite_pose_number(x, "child X position")?;
+    finite_pose_number(y, "child Y position")?;
+    finite_pose_number(existing, "child rotation")?;
+    finite_pose_number(rotation, "rotation delta")?;
 
-    let mut angle = (existing + rotation).rem_euclid(360.0);
+    let sum = existing + rotation;
+    finite_pose_number(sum, "derived child rotation")?;
+    let mut angle = sum.rem_euclid(360.0);
+    finite_pose_number(angle, "normalized child rotation")?;
     if readable && angle > 90.0 && angle <= 270.0 {
         angle -= 180.0;
     }
-    Some(format_at(x, y, angle))
+    Ok(format_at(x, y, angle))
+}
+
+#[cfg(test)]
+fn rotate_at_block(block: &str, rotation: f64, readable: bool) -> Option<String> {
+    rotate_at_block_checked(block, rotation, readable).ok()
 }
 
 /// Normalise a footprint's *root* orientation the way KiCad's writer does,
@@ -776,6 +795,24 @@ fn normalize_root_angle(degrees: f64) -> f64 {
     } else {
         wrapped
     }
+}
+
+fn finite_pose_number(value: f64, label: &str) -> anyhow::Result<f64> {
+    if !value.is_finite() {
+        anyhow::bail!("{label} is not finite");
+    }
+    Ok(value)
+}
+
+fn negate_finite_pose_number(value: f64, label: &str) -> anyhow::Result<f64> {
+    finite_pose_number(value, label)?;
+    finite_pose_number(-value, &format!("derived {label}"))
+}
+
+fn subtract_finite_pose_numbers(left: f64, right: f64, label: &str) -> anyhow::Result<f64> {
+    finite_pose_number(left, label)?;
+    finite_pose_number(right, label)?;
+    finite_pose_number(left - right, &format!("derived {label}"))
 }
 
 /// Render `(at x y angle)`, dropping a zero angle as KiCad's writer does and
@@ -959,6 +996,272 @@ enum FootprintPlacementUpdate {
     Rotate { rotation: f64 },
 }
 
+#[derive(Debug, Clone)]
+struct BatchComponentPoseRequest {
+    reference: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    layer: String,
+}
+
+#[derive(Debug)]
+struct BatchComponentPoseEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+    changed: bool,
+    pose: (f64, f64, f64, String),
+}
+
+#[derive(Debug)]
+struct PreparedBatchComponentPoses {
+    content: String,
+    updated_count: usize,
+    placements: Vec<serde_json::Value>,
+    changed: Vec<bool>,
+}
+
+#[derive(Debug)]
+enum BatchComponentPoseError {
+    Invalid(String),
+    Conflict,
+    FileNotFound,
+    Read { reason: String },
+    Parse { reason: String },
+    Integrity { reason: String },
+    Persistence { reason: String },
+}
+
+impl BatchComponentPoseError {
+    fn read(error: SexpError) -> Self {
+        match error {
+            SexpError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::FileNotFound
+            }
+            error => Self::Read {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    fn parse(error: impl std::fmt::Display) -> Self {
+        Self::Parse {
+            reason: error.to_string(),
+        }
+    }
+
+    fn integrity(error: impl std::fmt::Display) -> Self {
+        Self::Integrity {
+            reason: error.to_string(),
+        }
+    }
+
+    fn persistence(error: impl std::fmt::Display) -> Self {
+        Self::Persistence {
+            reason: error.to_string(),
+        }
+    }
+
+    fn after_write(self) -> Self {
+        match self {
+            Self::Conflict | Self::Persistence { .. } => self,
+            Self::Invalid(reason)
+            | Self::Read { reason }
+            | Self::Parse { reason }
+            | Self::Integrity { reason } => Self::Persistence { reason },
+            Self::FileNotFound => Self::Persistence {
+                reason: "persisted board was not found during readback".to_string(),
+            },
+        }
+    }
+
+    fn into_result(self, board_path: &Path) -> CallToolResult {
+        match self {
+            Self::Invalid(reason) => invalid_batch_component_pose_arg(reason),
+            Self::Conflict => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::Conflict {
+                    paths: vec![board_path.display().to_string()],
+                },
+                format!(
+                    "Write conflict: '{}' changed since it was read; reload and retry.",
+                    board_path.display()
+                ),
+            ),
+            Self::FileNotFound => CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::FileNotFound {
+                    path: board_path.display().to_string(),
+                },
+                format!("Board file '{}' was not found.", board_path.display()),
+            ),
+            Self::Read { reason } => batch_component_pose_handler_error(
+                "read",
+                board_path,
+                &reason,
+                format!("Could not read '{}': {reason}", board_path.display()),
+            ),
+            Self::Parse { reason } => batch_component_pose_handler_error(
+                "parse",
+                board_path,
+                &reason,
+                format!("Could not parse '{}': {reason}", board_path.display()),
+            ),
+            Self::Integrity { reason } => batch_component_pose_handler_error(
+                "integrity",
+                board_path,
+                &reason,
+                format!(
+                    "Board '{}' is unsafe to edit: {reason}",
+                    board_path.display()
+                ),
+            ),
+            Self::Persistence { reason } => batch_component_pose_handler_error(
+                "persistence",
+                board_path,
+                &reason,
+                format!(
+                    "Could not persist or verify '{}': {reason}",
+                    board_path.display()
+                ),
+            ),
+        }
+    }
+}
+
+fn batch_component_pose_handler_error(
+    phase: &str,
+    board_path: &Path,
+    reason: &str,
+    message: String,
+) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::HandlerError {
+            reason: format!(
+                "phase={phase}; path={}; reason={reason}",
+                board_path.display()
+            ),
+        },
+        message,
+    )
+}
+
+fn invalid_batch_component_pose_arg(reason: impl Into<String>) -> CallToolResult {
+    invalid_batch_component_pose_field("placements", reason)
+}
+
+fn invalid_batch_component_pose_field(
+    field: impl Into<String>,
+    reason: impl Into<String>,
+) -> CallToolResult {
+    let field = field.into();
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::InvalidArgument {
+            field: field.clone(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn canonical_six_decimal_pose_number(value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let serialized = format!("{value:.6}");
+    let reparsed = serialized.parse::<f64>().ok()?;
+    (reparsed == value).then_some(if reparsed == 0.0 { 0.0 } else { reparsed })
+}
+
+fn parse_batch_component_pose_requests(
+    placements: &[serde_json::Value],
+) -> Result<Vec<BatchComponentPoseRequest>, CallToolResult> {
+    let mut requests = Vec::with_capacity(placements.len());
+    let mut seen = HashSet::with_capacity(placements.len());
+
+    for (index, placement) in placements.iter().enumerate() {
+        let Some(object) = placement.as_object() else {
+            return Err(invalid_batch_component_pose_arg(format!(
+                "placement {index} must be an object"
+            )));
+        };
+        for key in object.keys() {
+            if !matches!(key.as_str(), "reference" | "x" | "y" | "rotation" | "layer") {
+                return Err(invalid_batch_component_pose_arg(format!(
+                    "placement {index} has unknown key '{key}'"
+                )));
+            }
+        }
+
+        let reference = object
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reference| !reference.is_empty())
+            .ok_or_else(|| {
+                invalid_batch_component_pose_arg(format!(
+                    "placement {index} requires a non-empty string 'reference'"
+                ))
+            })?
+            .to_string();
+
+        let canonical_number = |field: &str| -> Result<f64, CallToolResult> {
+            let field_path = format!("placements[{index}].{field}");
+            let value = object
+                .get(field)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    invalid_batch_component_pose_arg(format!(
+                        "placement {index} requires numeric '{field}'"
+                    ))
+                })?;
+            if !value.is_finite() {
+                return Err(invalid_batch_component_pose_arg(format!(
+                    "placement {index} requires finite '{field}'"
+                )));
+            }
+            canonical_six_decimal_pose_number(value).ok_or_else(|| {
+                invalid_batch_component_pose_field(
+                    field_path,
+                    format!(
+                        "placement {index} '{field}' must be exactly representable with at most six decimal places"
+                    ),
+                )
+            })
+        };
+        let x = canonical_number("x")?;
+        let y = canonical_number("y")?;
+        let rotation = canonical_number("rotation")?;
+        let layer = object
+            .get("layer")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                invalid_batch_component_pose_arg(format!(
+                    "placement {index} requires string 'layer'"
+                ))
+            })?;
+        if !matches!(layer, "F.Cu" | "B.Cu") {
+            return Err(invalid_batch_component_pose_arg(format!(
+                "placement {index} layer must be F.Cu or B.Cu, got '{layer}'"
+            )));
+        }
+        if !seen.insert(reference.clone()) {
+            return Err(invalid_batch_component_pose_arg(format!(
+                "reference '{reference}' appears more than once in the request"
+            )));
+        }
+
+        requests.push(BatchComponentPoseRequest {
+            reference,
+            x,
+            y,
+            rotation,
+            layer: layer.to_string(),
+        });
+    }
+
+    Ok(requests)
+}
+
 /// Why a closed-board placement update could not be applied.
 ///
 /// The handlers have to tell a caller's mistake — a reference that is not on
@@ -1087,13 +1390,17 @@ fn update_footprint_placement(
         anyhow::bail!("footprint must contain exactly one root placement (at ...) block");
     };
     let at = konnect_sexp::parse_sexp(&footprint[*at_start..*at_end])?;
-    let old_x = at
-        .get_f64(1)
-        .context("footprint root placement has an invalid X position")?;
-    let old_y = at
-        .get_f64(2)
-        .context("footprint root placement has an invalid Y position")?;
-    let old_rotation = at.get_f64(3).unwrap_or(0.0);
+    let old_x = finite_pose_number(
+        at.get_f64(1)
+            .context("footprint root placement has an invalid X position")?,
+        "footprint root X position",
+    )?;
+    let old_y = finite_pose_number(
+        at.get_f64(2)
+            .context("footprint root placement has an invalid Y position")?,
+        "footprint root Y position",
+    )?;
+    let old_rotation = finite_pose_number(at.get_f64(3).unwrap_or(0.0), "footprint root rotation")?;
 
     // A move preserves the existing orientation *exactly as spelled* — it is
     // not this tool's business to renormalise an angle the caller did not ask
@@ -1104,6 +1411,9 @@ fn update_footprint_placement(
             (old_x, old_y, normalize_root_angle(rotation))
         }
     };
+    finite_pose_number(x, "final footprint root X position")?;
+    finite_pose_number(y, "final footprint root Y position")?;
+    finite_pose_number(rotation, "final footprint root rotation")?;
 
     // Replace the root `(at …)` FIRST, while `at_start`/`at_end` still index
     // the string they were measured against.
@@ -1133,7 +1443,8 @@ fn update_footprint_placement(
     let updated = match update {
         FootprintPlacementUpdate::Move { .. } => updated,
         FootprintPlacementUpdate::Rotate { rotation } => {
-            apply_rotation_to_children(&updated, rotation - old_rotation)
+            let delta = finite_pose_number(rotation - old_rotation, "rotation delta")?;
+            apply_rotation_to_children_checked(&updated, delta)?
         }
     };
     let parsed = konnect_sexp::parse_sexp(&updated)?;
@@ -1141,6 +1452,308 @@ fn update_footprint_placement(
         anyhow::bail!("placement update changed the footprint root");
     }
     Ok(updated)
+}
+
+fn footprint_pose(footprint: &str) -> anyhow::Result<(f64, f64, f64, String)> {
+    let (at_start, at_end) = exactly_one_direct_child(footprint, "footprint", "at")?;
+    let (x, y, rotation, _) = at_components(&footprint[at_start..at_end])?;
+    Ok((
+        finite_pose_number(x, "footprint root X position")?,
+        finite_pose_number(y, "footprint root Y position")?,
+        finite_pose_number(rotation, "footprint root rotation")?,
+        footprint_layer(footprint)?,
+    ))
+}
+
+fn index_board_footprint_references(
+    content: &str,
+) -> Result<HashMap<String, Vec<(usize, usize)>>, BatchComponentPoseError> {
+    let mut footprints: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (start, end, tag) in
+        direct_children_with_tags(content, "kicad_pcb").map_err(BatchComponentPoseError::parse)?
+    {
+        if tag != "footprint" {
+            continue;
+        }
+        let footprint = konnect_sexp::parse_sexp(&content[start..end])
+            .map_err(BatchComponentPoseError::parse)?;
+        if let Some(reference) = footprint_reference(&footprint) {
+            footprints.entry(reference).or_default().push((start, end));
+        }
+    }
+    Ok(footprints)
+}
+
+fn requested_footprint_range(
+    footprints: &HashMap<String, Vec<(usize, usize)>>,
+    reference: &str,
+) -> Result<(usize, usize), BatchComponentPoseError> {
+    match footprints.get(reference).map(Vec::as_slice) {
+        None | Some([]) => Err(BatchComponentPoseError::Invalid(format!(
+            "no footprint '{reference}' on this board"
+        ))),
+        Some(&[(start, end)]) => Ok((start, end)),
+        Some(_) => Err(BatchComponentPoseError::Invalid(format!(
+            "footprint reference '{reference}' appears more than once on the board"
+        ))),
+    }
+}
+
+fn transform_batch_component_pose(
+    content: &str,
+    request: &BatchComponentPoseRequest,
+    start: usize,
+    end: usize,
+) -> Result<BatchComponentPoseEdit, BatchComponentPoseError> {
+    let original = &content[start..end];
+    let (current_x, current_y, current_rotation, current_layer) = footprint_pose(original)
+        .map_err(|error| {
+            BatchComponentPoseError::integrity(format!(
+                "footprint '{}': {error:#}",
+                request.reference
+            ))
+        })?;
+    if !matches!(current_layer.as_str(), "F.Cu" | "B.Cu") {
+        return Err(BatchComponentPoseError::integrity(format!(
+            "footprint '{}' sits on unsupported root layer '{}'",
+            request.reference, current_layer
+        )));
+    }
+    let already_at_requested_pose = current_x == request.x
+        && current_y == request.y
+        && normalize_root_angle(current_rotation) == normalize_root_angle(request.rotation)
+        && current_layer == request.layer;
+    if already_at_requested_pose {
+        return Ok(BatchComponentPoseEdit {
+            start,
+            end,
+            replacement: original.to_string(),
+            changed: false,
+            pose: (current_x, current_y, current_rotation, current_layer),
+        });
+    }
+
+    let sided = if current_layer == request.layer {
+        original.to_string()
+    } else {
+        flip_footprint_block(original).map_err(|error| {
+            BatchComponentPoseError::integrity(format!(
+                "footprint '{}': {error:#}",
+                request.reference
+            ))
+        })?
+    };
+    let rotated = update_footprint_placement(
+        &sided,
+        FootprintPlacementUpdate::Rotate {
+            rotation: request.rotation,
+        },
+    )
+    .map_err(|error| {
+        BatchComponentPoseError::integrity(format!("footprint '{}': {error:#}", request.reference))
+    })?;
+    let replacement = update_footprint_placement(
+        &rotated,
+        FootprintPlacementUpdate::Move {
+            x: request.x,
+            y: request.y,
+        },
+    )
+    .map_err(|error| {
+        BatchComponentPoseError::integrity(format!("footprint '{}': {error:#}", request.reference))
+    })?;
+    let pose = footprint_pose(&replacement).map_err(|error| {
+        BatchComponentPoseError::integrity(format!("footprint '{}': {error:#}", request.reference))
+    })?;
+    Ok(BatchComponentPoseEdit {
+        start,
+        end,
+        changed: replacement != original,
+        replacement,
+        pose,
+    })
+}
+
+fn readback_batch_component_pose(
+    content: &str,
+    footprints: &HashMap<String, Vec<(usize, usize)>>,
+    request: &BatchComponentPoseRequest,
+    changed: bool,
+) -> Result<serde_json::Value, BatchComponentPoseError> {
+    let [(start, end)] = footprints
+        .get(&request.reference)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    else {
+        return Err(BatchComponentPoseError::integrity(format!(
+            "persisted board must contain exactly one footprint '{}', but found {}",
+            request.reference,
+            footprints
+                .get(&request.reference)
+                .map_or(0, std::vec::Vec::len)
+        )));
+    };
+    let (x, y, rotation, layer) = footprint_pose(&content[*start..*end]).map_err(|error| {
+        BatchComponentPoseError::integrity(format!(
+            "persisted footprint '{}': {error:#}",
+            request.reference
+        ))
+    })?;
+    if x != request.x
+        || y != request.y
+        || normalize_root_angle(rotation) != normalize_root_angle(request.rotation)
+        || layer != request.layer
+    {
+        return Err(BatchComponentPoseError::persistence(format!(
+            "persisted pose for footprint '{}' does not match the requested pose",
+            request.reference
+        )));
+    }
+    Ok(json!({
+        "reference": request.reference,
+        "x": x,
+        "y": y,
+        "rotation": rotation,
+        "layer": layer,
+        "changed": changed,
+    }))
+}
+
+fn extract_batch_component_pose_placements(
+    content: &str,
+    requests: &[BatchComponentPoseRequest],
+    changed: &[bool],
+) -> Result<Vec<serde_json::Value>, BatchComponentPoseError> {
+    if changed.len() != requests.len() {
+        return Err(BatchComponentPoseError::integrity(
+            "internal batch pose result length mismatch",
+        ));
+    }
+    if let Err(reason) = check_single_board_form(content) {
+        return Err(BatchComponentPoseError::parse(format!(
+            "persisted board is unusable: {reason}"
+        )));
+    }
+
+    let footprints = index_board_footprint_references(content)?;
+
+    let mut placements = Vec::with_capacity(requests.len());
+    for (request, changed) in requests.iter().zip(changed.iter().copied()) {
+        placements.push(readback_batch_component_pose(
+            content,
+            &footprints,
+            request,
+            changed,
+        )?);
+    }
+    Ok(placements)
+}
+
+fn prepare_batch_component_poses(
+    content: &str,
+    requests: &[BatchComponentPoseRequest],
+) -> Result<PreparedBatchComponentPoses, BatchComponentPoseError> {
+    if let Err(reason) = check_single_board_form(content) {
+        return Err(BatchComponentPoseError::parse(format!(
+            "board is unusable: {reason}"
+        )));
+    }
+
+    let footprints = index_board_footprint_references(content)?;
+    let targets = requests
+        .iter()
+        .map(|request| requested_footprint_range(&footprints, &request.reference))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut edits = Vec::with_capacity(requests.len());
+    let mut placements = Vec::with_capacity(requests.len());
+    let mut changed_flags = Vec::with_capacity(requests.len());
+    let mut updated_count = 0usize;
+    for (request, (start, end)) in requests.iter().zip(targets) {
+        let prepared = transform_batch_component_pose(content, request, start, end)?;
+        let (x, y, rotation, layer) = prepared.pose;
+        let changed = prepared.changed;
+        if changed {
+            updated_count += 1;
+            edits.push(SexpEdit::replace(
+                prepared.start,
+                prepared.end,
+                prepared.replacement,
+            ));
+        }
+        placements.push(json!({
+            "reference": request.reference,
+            "x": x,
+            "y": y,
+            "rotation": rotation,
+            "layer": layer,
+            "changed": changed,
+        }));
+        changed_flags.push(changed);
+    }
+
+    let updated = apply_edits(content.to_string(), edits);
+    if let Err(reason) = check_single_board_form(&updated) {
+        return Err(BatchComponentPoseError::integrity(format!(
+            "the batch would produce an unusable board: {reason}"
+        )));
+    }
+    Ok(PreparedBatchComponentPoses {
+        content: updated,
+        updated_count,
+        placements,
+        changed: changed_flags,
+    })
+}
+
+fn set_closed_board_component_poses_with_writer<F>(
+    board_path: &Path,
+    requests: &[BatchComponentPoseRequest],
+    mut writer: F,
+) -> Result<PreparedBatchComponentPoses, BatchComponentPoseError>
+where
+    F: FnMut(&Path, &str, &str) -> Result<(), SexpError>,
+{
+    let content = read_consistent(board_path).map_err(BatchComponentPoseError::read)?;
+    let prepared = prepare_batch_component_poses(&content, requests)?;
+    let changed_content = prepared.content != content;
+    if changed_content {
+        match writer(board_path, &content, &prepared.content) {
+            Ok(()) => {}
+            Err(SexpError::Conflict { .. }) => return Err(BatchComponentPoseError::Conflict),
+            Err(error) => return Err(BatchComponentPoseError::persistence(error)),
+        }
+    }
+    let persisted = if !changed_content {
+        content
+    } else {
+        read_consistent(board_path)
+            .map_err(BatchComponentPoseError::read)
+            .map_err(BatchComponentPoseError::after_write)?
+    };
+    let placements =
+        extract_batch_component_pose_placements(&persisted, requests, &prepared.changed).map_err(
+            |error| {
+                if changed_content {
+                    error.after_write()
+                } else {
+                    error
+                }
+            },
+        )?;
+    Ok(PreparedBatchComponentPoses {
+        content: persisted,
+        updated_count: prepared.updated_count,
+        placements,
+        changed: prepared.changed,
+    })
+}
+
+fn set_closed_board_component_poses(
+    board_path: &Path,
+    requests: &[BatchComponentPoseRequest],
+) -> Result<PreparedBatchComponentPoses, BatchComponentPoseError> {
+    set_closed_board_component_poses_with_writer(board_path, requests, persist_board_replacement)
 }
 
 fn direct_children_with_tags(
@@ -1349,13 +1962,18 @@ fn flip_text_block(block: &str, tag: &str) -> anyhow::Result<String> {
     } else {
         toggle_text_mirror(&block[effects_start..effects_end])?
     };
+    let mirrored_y = negate_finite_pose_number(y, "text Y position")?;
+    let mirrored_angle =
+        normalize_angle(subtract_finite_pose_numbers(180.0, angle, "text rotation")?);
+    finite_pose_number(x, "text X position")?;
+    finite_pose_number(mirrored_angle, "normalized text rotation")?;
     Ok(apply_edits(
         block.to_string(),
         vec![
             SexpEdit::replace(
                 at_start,
                 at_end,
-                format_at_with_suffix(x, -y, normalize_angle(180.0 - angle), &suffix),
+                format_at_with_suffix(x, mirrored_y, mirrored_angle, &suffix),
             ),
             SexpEdit::replace(
                 layer_start,
@@ -1382,12 +2000,18 @@ fn flip_graphic_block(block: &str, tag: &str) -> anyhow::Result<String> {
         points.push((
             start,
             end,
-            point
-                .get_f64(1)
-                .with_context(|| format!("({point_tag} ...) has an invalid X position"))?,
-            -point
-                .get_f64(2)
-                .with_context(|| format!("({point_tag} ...) has an invalid Y position"))?,
+            finite_pose_number(
+                point
+                    .get_f64(1)
+                    .with_context(|| format!("({point_tag} ...) has an invalid X position"))?,
+                &format!("{point_tag} X position"),
+            )?,
+            negate_finite_pose_number(
+                point
+                    .get_f64(2)
+                    .with_context(|| format!("({point_tag} ...) has an invalid Y position"))?,
+                &format!("{point_tag} Y position"),
+            )?,
         ));
     }
     let source_order: Vec<usize> = if tag == "fp_arc" {
@@ -1422,9 +2046,15 @@ fn flip_poly_block(block: &str) -> anyhow::Result<String> {
             anyhow::bail!("fp_poly contains unsupported point block '{tag}'");
         }
         let point = konnect_sexp::parse_sexp(&pts[start..end])?;
-        let x = point.get_f64(1).context("(xy ...) has an invalid X")?;
-        let y = point.get_f64(2).context("(xy ...) has an invalid Y")?;
-        point_edits.push(SexpEdit::replace(start, end, format_xy("xy", x, -y)));
+        let x = finite_pose_number(
+            point.get_f64(1).context("(xy ...) has an invalid X")?,
+            "polygon X position",
+        )?;
+        let y = negate_finite_pose_number(
+            point.get_f64(2).context("(xy ...) has an invalid Y")?,
+            "polygon Y position",
+        )?;
+        point_edits.push(SexpEdit::replace(start, end, format_xy("xy", x, y)));
     }
     let mirrored_pts = apply_edits(pts.to_string(), point_edits);
     let (layer_start, layer_end) = exactly_one_direct_child(block, "fp_poly", "layer")?;
@@ -1463,6 +2093,10 @@ fn flip_pad_block(block: &str) -> anyhow::Result<String> {
     }
     let (at_start, at_end) = exactly_one_direct_child(block, "pad", "at")?;
     let (x, y, angle, suffix) = at_components(&block[at_start..at_end])?;
+    let mirrored_y = negate_finite_pose_number(y, "pad Y position")?;
+    let mirrored_angle = normalize_angle(negate_finite_pose_number(angle, "pad rotation")?);
+    finite_pose_number(x, "pad X position")?;
+    finite_pose_number(mirrored_angle, "normalized pad rotation")?;
     let (layers_start, layers_end) = exactly_one_direct_child(block, "pad", "layers")?;
     Ok(apply_edits(
         block.to_string(),
@@ -1470,7 +2104,7 @@ fn flip_pad_block(block: &str) -> anyhow::Result<String> {
             SexpEdit::replace(
                 at_start,
                 at_end,
-                format_at_with_suffix(x, -y, normalize_angle(-angle), &suffix),
+                format_at_with_suffix(x, mirrored_y, mirrored_angle, &suffix),
             ),
             SexpEdit::replace(
                 layers_start,
@@ -1510,7 +2144,10 @@ fn refuse_model_a_flip_would_move(block: &str) -> anyhow::Result<()> {
         // along unchanged, so a non-zero value there is not a problem.
         let moved: &[usize] = if tag == "offset" { &[2] } else { &[1, 2] };
         for &index in moved {
-            let value = xyz.get_f64(index).unwrap_or(0.0);
+            let value = finite_pose_number(
+                xyz.get_f64(index).unwrap_or(0.0),
+                &format!("3D model {tag}.{}", fields[index - 1]),
+            )?;
             if value != 0.0 {
                 anyhow::bail!(
                     "the 3D model's {tag}.{} is {value}, and a flip would have to move it; \
@@ -1530,13 +2167,18 @@ fn flip_footprint_block(footprint: &str) -> anyhow::Result<String> {
     }
     let (root_at_start, root_at_end) = exactly_one_direct_child(footprint, "footprint", "at")?;
     let (x, y, angle, suffix) = at_components(&footprint[root_at_start..root_at_end])?;
+    finite_pose_number(x, "footprint root X position")?;
+    finite_pose_number(y, "footprint root Y position")?;
+    let mirrored_root_angle =
+        normalize_angle_180(negate_finite_pose_number(angle, "footprint root rotation")?);
+    finite_pose_number(mirrored_root_angle, "normalized footprint root rotation")?;
     let (root_layer_start, root_layer_end) =
         exactly_one_direct_child(footprint, "footprint", "layer")?;
     let mut edits = vec![
         SexpEdit::replace(
             root_at_start,
             root_at_end,
-            format_at_with_suffix(x, y, normalize_angle_180(-angle), &suffix),
+            format_at_with_suffix(x, y, mirrored_root_angle, &suffix),
         ),
         SexpEdit::replace(
             root_layer_start,
@@ -1788,6 +2430,36 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "layer"]
             }),
             |args, ctx| async move { handle_flip_component(args, ctx).await }
+        ),
+        tool!(
+            "batch_set_component_poses",
+            "Atomically set the absolute position, rotation, and F.Cu/B.Cu side of multiple \
+             existing footprints on a closed board. The complete request is validated before \
+             one revision-checked file write; any invalid placement leaves the board untouched.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "board": { "type": "string" },
+                    "placements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "rotation": { "type": "number" },
+                                "layer": { "type": "string", "enum": ["F.Cu", "B.Cu"] }
+                            },
+                            "required": ["reference", "x", "y", "rotation", "layer"]
+                        }
+                    }
+                },
+                "required": ["board", "placements"]
+            }),
+            |args, ctx| async move { handle_batch_set_component_poses(args, ctx).await }
         ),
         tool!(
             "delete_component",
@@ -2098,7 +2770,17 @@ async fn handle_place_component(
                 board.parent(),
             ) {
                 Ok(sexp) => sexp,
-                Err(message) => return Ok(CallToolResult::error(message)),
+                Err(message) => {
+                    return Ok(CallToolResult::error_kind(
+                        crate::mcp::error::ToolErrorKind::HandlerError {
+                            reason: format!(
+                                "phase=prepare_file_fallback; path={}; reason={message}",
+                                board.display()
+                            ),
+                        },
+                        message,
+                    ))
+                }
             };
             insert_into_board(&board, std::slice::from_ref(&sexp))?;
             Ok(CallToolResult::json(&json!({
@@ -2333,6 +3015,42 @@ async fn handle_flip_component(
                         see it."
         }))),
         Err(error) => Ok(error.into_result()),
+    }
+}
+
+async fn handle_batch_set_component_poses(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let placements = match require_array(args, "placements") {
+        Ok(placements) => placements,
+        Err(error) => return Ok(error),
+    };
+    let requests = match parse_batch_component_pose_requests(placements) {
+        Ok(requests) => requests,
+        Err(error) => return Ok(error),
+    };
+
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "batch component pose update",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+
+    match set_closed_board_component_poses(&board, &requests) {
+        Ok(prepared) => Ok(CallToolResult::json(&json!({
+            "source": "file",
+            "atomic": true,
+            "changed": prepared.updated_count > 0,
+            "updated_count": prepared.updated_count,
+            "placements": prepared.placements,
+        }))),
+        Err(error) => Ok(error.into_result(&board)),
     }
 }
 
@@ -3308,6 +4026,43 @@ mod tests {
             0,
             "board is no longer balanced:\n{written}"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_library_footprint_rotation_returns_structured_error_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = fallback_fixture(tmp.path());
+        let before = std::fs::read_to_string(&board).unwrap();
+        let footprint = tmp
+            .path()
+            .join("Resistor_SMD.pretty/R_0805_2012Metric.kicad_mod");
+        let malformed = library_footprint().replace("(at -0.9125 0)", "(at NaN 0)");
+        std::fs::write(footprint, malformed).unwrap();
+
+        let result = handle_place_component(
+            &json!({
+                "board": board.to_string_lossy(),
+                "footprint": "Resistor_SMD:R_0805_2012Metric",
+                "reference": "R7",
+                "x": 50.0,
+                "y": 60.0,
+                "rotation": 90.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("handler_error")
+        );
+        assert!(json_body(&result)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("phase=prepare_file_fallback"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
 
     #[tokio::test]
@@ -4897,7 +5652,7 @@ mod tests {
         // KiCad stores each pad's absolute orientation: a footprint placed at
         // -90 carries 270 on its pads, while pad positions stay in unrotated
         // footprint-local coordinates.
-        let out = apply_rotation_to_children(&library_footprint(), -90.0);
+        let out = apply_rotation_to_children_checked(&library_footprint(), -90.0).unwrap();
         assert!(out.contains("(at -0.9125 0 270)"), "{out}");
         // Position is unchanged; only the angle was added.
         assert!(
@@ -4910,7 +5665,7 @@ mod tests {
     fn text_angles_are_kept_readable_in_file_fallback() {
         // A -90 footprint would put text at 270, which reads upside down, so
         // KiCad flips it by 180 to 90 — matching what pcbnew writes.
-        let out = apply_rotation_to_children(&library_footprint(), -90.0);
+        let out = apply_rotation_to_children_checked(&library_footprint(), -90.0).unwrap();
         assert!(out.contains("(at 0 -1.65 90)"), "reference text:\n{out}");
         assert!(out.contains("(at 0 1.65 90)"), "value text:\n{out}");
     }
@@ -5007,6 +5762,812 @@ mod tests {
             board_content,
             "board file must be left untouched"
         );
+    }
+
+    fn pose(reference: &str, x: f64, y: f64, rotation: f64, layer: &str) -> serde_json::Value {
+        json!({
+            "reference": reference,
+            "x": x,
+            "y": y,
+            "rotation": rotation,
+            "layer": layer,
+        })
+    }
+
+    fn footprint_with_reference(reference: &str) -> String {
+        FLIP_FOOTPRINT.replace(
+            "(property \"Reference\" \"U1\"",
+            &format!("(property \"Reference\" \"{reference}\""),
+        )
+    }
+
+    fn json_body(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result_text(result)).expect("tool result must be JSON")
+    }
+
+    #[tokio::test]
+    async fn batch_pose_late_invalid_item_is_structured_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("late-invalid.kicad_pcb");
+        let u2 = footprint_with_reference("U2");
+        let before = flip_board(&[FLIP_FOOTPRINT, &u2], "\n");
+        std::fs::write(&board, &before).unwrap();
+
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    pose("U1", 40.0, 50.0, 60.0, "B.Cu"),
+                    {"reference": "U2", "x": "late-invalid", "y": 2.0, "rotation": 3.0, "layer": "F.Cu"}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        let body = json_body(&result);
+        assert_eq!(body["error"]["field"], json!("placements"));
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("placement 1"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_missing_reference_and_ambiguous_board_all_write_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unique_board = tmp.path().join("unique.kicad_pcb");
+        let unique_before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        std::fs::write(&unique_board, &unique_before).unwrap();
+
+        for placements in [
+            json!([
+                pose("U1", 1.0, 2.0, 3.0, "F.Cu"),
+                pose("U1", 4.0, 5.0, 6.0, "B.Cu")
+            ]),
+            json!([pose("U404", 1.0, 2.0, 3.0, "F.Cu")]),
+        ] {
+            let result = handle_batch_set_component_poses(
+                &json!({"board": unique_board.to_string_lossy(), "placements": placements}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            assert_eq!(
+                std::fs::read_to_string(&unique_board).unwrap(),
+                unique_before
+            );
+        }
+
+        let ambiguous_board = tmp.path().join("ambiguous.kicad_pcb");
+        let ambiguous_before = flip_board(&[FLIP_FOOTPRINT, FLIP_FOOTPRINT], "\n");
+        std::fs::write(&ambiguous_board, &ambiguous_before).unwrap();
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": ambiguous_board.to_string_lossy(),
+                "placements": [pose("U1", 1.0, 2.0, 3.0, "F.Cu")]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(
+            std::fs::read_to_string(ambiguous_board).unwrap(),
+            ambiguous_before
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_and_identical_batch_poses_are_successful_byte_identical_no_ops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("noop.kicad_pcb");
+        let before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        std::fs::write(&board, &before).unwrap();
+
+        for placements in [json!([]), json!([pose("U1", 10.0, 20.0, 30.0, "F.Cu")])] {
+            let result = handle_batch_set_component_poses(
+                &json!({"board": board.to_string_lossy(), "placements": placements}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+            let body = json_body(&result);
+            assert_eq!(body["source"], json!("file"));
+            assert_eq!(body["atomic"], json!(true));
+            assert_eq!(body["changed"], json!(false));
+            assert_eq!(body["updated_count"], json!(0));
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_pose_sides_end_at_absolute_rotations_with_correct_child_angles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("mixed.kicad_pcb");
+        let u2_front = footprint_with_reference("U2");
+        let u2_back = flip_footprint_block(&u2_front).unwrap();
+        let u3 = footprint_with_reference("U3");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT, &u2_back, &u3], "\n")).unwrap();
+
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [
+                    pose("U1", 101.0, 102.0, 47.0, "B.Cu"),
+                    pose("U2", 201.0, 202.0, -63.0, "F.Cu"),
+                    pose("U3", 301.0, 302.0, 112.5, "F.Cu")
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body = json_body(&result);
+        assert_eq!(body["source"], json!("file"));
+        assert_eq!(body["atomic"], json!(true));
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(body["updated_count"], json!(3));
+        assert_eq!(
+            body["placements"],
+            json!([
+                {"reference":"U1","x":101.0,"y":102.0,"rotation":47.0,"layer":"B.Cu","changed":true},
+                {"reference":"U2","x":201.0,"y":202.0,"rotation":-63.0,"layer":"F.Cu","changed":true},
+                {"reference":"U3","x":301.0,"y":302.0,"rotation":112.5,"layer":"F.Cu","changed":true}
+            ])
+        );
+
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 101 102 47)"), "{written}");
+        assert!(
+            written.contains("(at 2 -3 27)"),
+            "U1 child angle: {written}"
+        );
+        assert!(written.contains("(at 201 202 -63)"), "{written}");
+        assert!(
+            written.contains("(at 2 3 317)"),
+            "U2 child angle: {written}"
+        );
+        assert!(written.contains("(at 301 302 112.5)"), "{written}");
+        assert!(
+            written.contains("(at 2 3 132.5)"),
+            "U3 child angle: {written}"
+        );
+    }
+
+    #[test]
+    fn multi_placement_batch_calls_the_atomic_writer_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("one-write.kicad_pcb");
+        let u2 = footprint_with_reference("U2");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT, &u2], "\n")).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([
+                pose("U1", 41.0, 51.0, 61.0, "B.Cu"),
+                pose("U2", 42.0, 52.0, 62.0, "F.Cu")
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        let mut writes = 0usize;
+
+        let prepared = set_closed_board_component_poses_with_writer(
+            &board,
+            &requests,
+            |path, expected, replacement| {
+                writes += 1;
+                persist_board_replacement(path, expected, replacement)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(writes, 1);
+        assert_eq!(prepared.updated_count, 2);
+    }
+
+    #[test]
+    fn changed_batch_returns_the_pose_parsed_from_the_persisted_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("readback.kicad_pcb");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT], "\n")).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([pose("U1", 40.0, 50.0, 180.0, "F.Cu")])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let prepared = set_closed_board_component_poses_with_writer(
+            &board,
+            &requests,
+            |path, _expected, replacement| {
+                let persisted = replacement.replace("(at 40 50 180)", "(at 40 50 -180)");
+                assert_ne!(persisted, replacement);
+                std::fs::write(path, persisted).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.placements[0]["rotation"], json!(-180.0));
+    }
+
+    #[test]
+    fn post_write_pose_mismatch_is_detected_after_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("readback-mismatch.kicad_pcb");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT], "\n")).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([pose("U1", 40.0, 50.0, 60.0, "F.Cu")])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let result = set_closed_board_component_poses_with_writer(
+            &board,
+            &requests,
+            |path, _expected, replacement| {
+                let persisted = replacement.replace("(at 40 50 60)", "(at 41 50 60)");
+                assert_ne!(persisted, replacement);
+                std::fs::write(path, persisted).unwrap();
+                Ok(())
+            },
+        );
+
+        let error = result.expect_err("post-write mismatch must fail readback");
+        let response = error.into_result(&board);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&response).as_deref(),
+            Some("handler_error")
+        );
+        assert!(json_body(&response)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("phase=persistence"));
+        assert!(std::fs::read_to_string(board)
+            .unwrap()
+            .contains("(at 41 50 60)"));
+    }
+
+    #[tokio::test]
+    async fn pose_values_beyond_six_decimal_precision_are_rejected_without_writing() {
+        let cases = [
+            (
+                json!([pose("U1", 1.0000004, 2.0, 3.0, "F.Cu")]),
+                "placements[0].x",
+            ),
+            (
+                json!([
+                    pose("U1", 1.0, 2.0, 3.0, "F.Cu"),
+                    pose("U2", 4.0, 5.0, 45.0000004, "F.Cu")
+                ]),
+                "placements[1].rotation",
+            ),
+        ];
+
+        for (placements, expected_field) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = tmp.path().join("precision.kicad_pcb");
+            let u2 = footprint_with_reference("U2");
+            let before = flip_board(&[FLIP_FOOTPRINT, &u2], "\n");
+            std::fs::write(&board, &before).unwrap();
+
+            let result = handle_batch_set_component_poses(
+                &json!({"board": board.to_string_lossy(), "placements": placements}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument")
+            );
+            assert_eq!(json_body(&result)["error"]["field"], expected_field);
+            assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn six_decimal_pose_values_round_trip_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("precision-ok.kicad_pcb");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT], "\n")).unwrap();
+
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [pose("U1", 1.234567, -2.345678, 47.123456, "F.Cu")]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        assert_eq!(
+            json_body(&result)["placements"][0],
+            json!({
+                "reference": "U1",
+                "x": 1.234567,
+                "y": -2.345678,
+                "rotation": 47.123456,
+                "layer": "F.Cu",
+                "changed": true
+            })
+        );
+    }
+
+    #[test]
+    fn late_missing_and_late_ambiguous_targets_never_call_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let missing_board = tmp.path().join("late-missing.kicad_pcb");
+        let missing_before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        std::fs::write(&missing_board, &missing_before).unwrap();
+        let missing_requests = parse_batch_component_pose_requests(
+            json!([
+                pose("U1", 40.0, 50.0, 60.0, "F.Cu"),
+                pose("U404", 41.0, 51.0, 61.0, "F.Cu")
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        let missing = set_closed_board_component_poses_with_writer(
+            &missing_board,
+            &missing_requests,
+            |_, _, _| panic!("late missing target must not invoke the writer"),
+        );
+        assert!(matches!(missing, Err(BatchComponentPoseError::Invalid(_))));
+        assert_eq!(
+            std::fs::read_to_string(&missing_board).unwrap(),
+            missing_before
+        );
+
+        let ambiguous_board = tmp.path().join("late-ambiguous.kicad_pcb");
+        let u2 = footprint_with_reference("U2");
+        let ambiguous_before = flip_board(&[FLIP_FOOTPRINT, &u2, &u2], "\n");
+        std::fs::write(&ambiguous_board, &ambiguous_before).unwrap();
+        let ambiguous_requests = parse_batch_component_pose_requests(
+            json!([
+                pose("U1", 40.0, 50.0, 60.0, "F.Cu"),
+                pose("U2", 41.0, 51.0, 61.0, "F.Cu")
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        let ambiguous = set_closed_board_component_poses_with_writer(
+            &ambiguous_board,
+            &ambiguous_requests,
+            |_, _, _| panic!("late ambiguous target must not invoke the writer"),
+        );
+        assert!(matches!(
+            ambiguous,
+            Err(BatchComponentPoseError::Invalid(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&ambiguous_board).unwrap(),
+            ambiguous_before
+        );
+    }
+
+    #[test]
+    fn extreme_finite_rotation_delta_is_rejected_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("rotation-overflow.kicad_pcb");
+        let extreme = FLIP_FOOTPRINT.replace("(at 10 20 30)", "(at 10 20 -1.7976931348623157e308)");
+        let before = flip_board(&[&extreme], "\n");
+        std::fs::write(&board, &before).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([pose("U1", 40.0, 50.0, f64::MAX, "F.Cu")])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let error = set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+            panic!("a non-finite rotation delta must not reach the writer")
+        })
+        .expect_err("opposite finite rotations must not overflow into board text");
+        let response = error.into_result(&board);
+
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&response).as_deref(),
+            Some("handler_error")
+        );
+        let body = json_body(&response);
+        let reason = body["error"]["reason"].as_str().unwrap().to_string();
+        assert!(reason.contains("phase=integrity"));
+        assert!(reason.contains(&board.display().to_string()));
+        assert!(reason.contains("rotation delta"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[test]
+    fn non_finite_existing_root_pose_is_rejected_before_writing() {
+        for (root_at, field) in [
+            ("(at NaN 20 30)", "X position"),
+            ("(at 10 inf 30)", "Y position"),
+            ("(at 10 20 -inf)", "rotation"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = tmp.path().join("non-finite.kicad_pcb");
+            let malformed = FLIP_FOOTPRINT.replace("(at 10 20 30)", root_at);
+            let before = flip_board(&[&malformed], "\n");
+            std::fs::write(&board, &before).unwrap();
+            let requests = parse_batch_component_pose_requests(
+                json!([pose("U1", 40.0, 50.0, 60.0, "F.Cu")])
+                    .as_array()
+                    .unwrap(),
+            )
+            .unwrap();
+
+            let error =
+                set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+                    panic!("a non-finite root pose must not reach the writer")
+                })
+                .expect_err("non-finite stored pose must fail closed");
+            let response = error.into_result(&board);
+
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&response).as_deref(),
+                Some("handler_error")
+            );
+            let reason = json_body(&response)["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(reason.contains("U1") && reason.contains(field), "{reason}");
+            assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn batch_pose_read_parse_and_persistence_failures_are_structured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([pose("U1", 40.0, 50.0, 60.0, "F.Cu")])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let unreadable = tmp.path().join("directory.kicad_pcb");
+        std::fs::create_dir(&unreadable).unwrap();
+        let read_error = set_closed_board_component_poses(&unreadable, &requests)
+            .expect_err("reading a directory as a board must fail")
+            .into_result(&unreadable);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&read_error).as_deref(),
+            Some("handler_error")
+        );
+        let read_reason = json_body(&read_error)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            read_reason.contains("phase=read")
+                && read_reason.contains(&unreadable.display().to_string())
+        );
+
+        let malformed = tmp.path().join("malformed.kicad_pcb");
+        let malformed_before = "(kicad_pcb (version 20260206)";
+        std::fs::write(&malformed, malformed_before).unwrap();
+        let parse_error = set_closed_board_component_poses(&malformed, &requests)
+            .expect_err("an unbalanced board must fail parsing")
+            .into_result(&malformed);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&parse_error).as_deref(),
+            Some("handler_error")
+        );
+        assert!(json_body(&parse_error)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("phase=parse"));
+        assert_eq!(
+            std::fs::read_to_string(&malformed).unwrap(),
+            malformed_before
+        );
+
+        let board = tmp.path().join("persistence.kicad_pcb");
+        let before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        std::fs::write(&board, &before).unwrap();
+        let persistence_error =
+            set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+                Err(SexpError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected persistence denial",
+                )))
+            })
+            .expect_err("a non-conflict writer failure must stay typed")
+            .into_result(&board);
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&persistence_error).as_deref(),
+            Some("handler_error")
+        );
+        assert!(json_body(&persistence_error)["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("phase=persistence"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[test]
+    fn late_unsupported_geometry_never_calls_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("late-unsupported.kicad_pcb");
+        let u2 =
+            footprint_with_reference("U2").replace("roundrect (at 2 3 50)", "custom (at 2 3 50)");
+        let before = flip_board(&[FLIP_FOOTPRINT, &u2], "\n");
+        std::fs::write(&board, &before).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([
+                pose("U1", 40.0, 50.0, 60.0, "F.Cu"),
+                pose("U2", 41.0, 51.0, 61.0, "B.Cu")
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+            panic!("late unsupported geometry must not invoke the writer")
+        })
+        .expect_err("the custom pad cannot be flipped safely");
+        let response = error.into_result(&board);
+
+        assert_eq!(
+            crate::mcp::error::extract_error_kind(&response).as_deref(),
+            Some("handler_error")
+        );
+        assert!(result_text(&response).contains("custom pads"));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
+    }
+
+    #[test]
+    fn non_finite_flip_geometry_is_rejected_before_writing() {
+        for (label, footprint) in [
+            (
+                "graphic NaN",
+                FLIP_FOOTPRINT.replace("(start 1 2)", "(start NaN 2)"),
+            ),
+            (
+                "polygon infinity",
+                FLIP_FOOTPRINT.replace("(xy 1 2)", "(xy 1 inf)"),
+            ),
+            (
+                "text rotation infinity",
+                FLIP_FOOTPRINT.replace("(at 1 -2 40)", "(at 1 -2 -inf)"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = tmp.path().join("non-finite-flip.kicad_pcb");
+            let before = flip_board(&[&footprint], "\n");
+            std::fs::write(&board, &before).unwrap();
+            let requests = parse_batch_component_pose_requests(
+                json!([pose("U1", 40.0, 50.0, 60.0, "B.Cu")])
+                    .as_array()
+                    .unwrap(),
+            )
+            .unwrap();
+
+            let error =
+                set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+                    panic!("{label} must not invoke the writer")
+                })
+                .unwrap_err();
+            let response = error.into_result(&board);
+
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&response).as_deref(),
+                Some("handler_error"),
+                "{label}"
+            );
+            assert!(json_body(&response)["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("phase=integrity"));
+            assert_eq!(std::fs::read_to_string(board).unwrap(), before, "{label}");
+        }
+    }
+
+    #[test]
+    fn every_changed_path_readback_failure_is_persistence_typed() {
+        for (label, persist) in [
+            (
+                "malformed board",
+                Box::new(|_: &str| "(kicad_pcb".to_string()) as Box<dyn Fn(&str) -> String>,
+            ),
+            (
+                "missing requested footprint",
+                Box::new(|replacement: &str| {
+                    replacement.replace(
+                        "(property \"Reference\" \"U1\"",
+                        "(property \"Reference\" \"U404\"",
+                    )
+                }),
+            ),
+            (
+                "non-finite persisted root",
+                Box::new(|replacement: &str| {
+                    replacement.replace("(at 40 50 60)", "(at NaN 50 60)")
+                }),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let board = tmp.path().join("readback-failure.kicad_pcb");
+            std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT], "\n")).unwrap();
+            let requests = parse_batch_component_pose_requests(
+                json!([pose("U1", 40.0, 50.0, 60.0, "F.Cu")])
+                    .as_array()
+                    .unwrap(),
+            )
+            .unwrap();
+
+            let error = set_closed_board_component_poses_with_writer(
+                &board,
+                &requests,
+                |path, _expected, replacement| {
+                    std::fs::write(path, persist(replacement)).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            let response = error.into_result(&board);
+
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&response).as_deref(),
+                Some("handler_error"),
+                "{label}"
+            );
+            let reason = json_body(&response)["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(reason.contains("phase=persistence"), "{label}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_six_decimal_pose_normalizes_negative_zero_in_bytes_and_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("negative-zero.kicad_pcb");
+        std::fs::write(&board, flip_board(&[FLIP_FOOTPRINT], "\n")).unwrap();
+
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [pose("U1", 1.234567, -0.0, 47.123456, "F.Cu")]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let written = std::fs::read_to_string(board).unwrap();
+        assert!(written.contains("(at 1.234567 0 47.123456)"), "{written}");
+        assert_eq!(
+            json_body(&result)["placements"][0]["y"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            0.0f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn empty_and_identical_batches_skip_the_atomic_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("zero-writes.kicad_pcb");
+        let noncanonical = FLIP_FOOTPRINT.replace("(at 10 20 30)", "(at 10.000000 20.0 30.0)");
+        let before = flip_board(&[&noncanonical], "\n");
+        std::fs::write(&board, &before).unwrap();
+
+        for placements in [json!([]), json!([pose("U1", 10.0, 20.0, 30.0, "F.Cu")])] {
+            let requests =
+                parse_batch_component_pose_requests(placements.as_array().unwrap()).unwrap();
+            let prepared =
+                set_closed_board_component_poses_with_writer(&board, &requests, |_, _, _| {
+                    panic!("a no-op must not invoke the writer")
+                })
+                .unwrap();
+            assert_eq!(prepared.updated_count, 0);
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn concurrent_batch_pose_drift_refuses_and_preserves_newer_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("drift.kicad_pcb");
+        let before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        let newer = before.replace("(net 0 \"\")", "(net 0 \"\")\n  (net 1 \"GND\")");
+        std::fs::write(&board, &before).unwrap();
+        let requests = parse_batch_component_pose_requests(
+            json!([pose("U1", 40.0, 50.0, 60.0, "B.Cu")])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = set_closed_board_component_poses_with_writer(
+            &board,
+            &requests,
+            |path, expected, replacement| {
+                std::fs::write(path, &newer).unwrap();
+                persist_board_replacement(path, expected, replacement)
+            },
+        );
+
+        assert!(matches!(outcome, Err(BatchComponentPoseError::Conflict)));
+        assert_eq!(std::fs::read_to_string(board).unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn target_board_open_refuses_after_one_query_and_writes_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("open.kicad_pcb");
+        let before = flip_board(&[FLIP_FOOTPRINT], "\n");
+        std::fs::write(&board, &before).unwrap();
+        let requested = board.clone();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_in_mock = calls.clone();
+        let mock = spawn_query_mock(move |request| {
+            let message = request.message.expect("request has a command");
+            assert_eq!(
+                konnect_ipc::builders::any_type_name(&message),
+                "kiapi.common.commands.GetOpenDocuments"
+            );
+            calls_in_mock.fetch_add(1, Ordering::SeqCst);
+            Some(query_reply_with(konnect_ipc::builders::pack_any(
+                &kiapi::common::commands::GetOpenDocumentsResponse {
+                    documents: vec![board_doc(&requested)],
+                },
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        });
+
+        let result = handle_batch_set_component_poses(
+            &json!({
+                "board": board.to_string_lossy(),
+                "placements": [pose("U1", 40.0, 50.0, 60.0, "B.Cu")]
+            }),
+            &query_test_ctx(mock.url),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("currently holds this board open"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_to_string(board).unwrap(), before);
     }
 }
 
@@ -5402,5 +6963,40 @@ mod required_count_tests {
         .await
         .expect("no anyhow");
         assert!(result.is_error, "an explicit zero must still be rejected");
+    }
+}
+
+#[cfg(test)]
+mod batch_component_pose_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn batch_set_component_poses_has_the_frozen_schema() {
+        let definition = tools()
+            .into_iter()
+            .find(|tool| tool.name == "batch_set_component_poses")
+            .expect("batch_set_component_poses must be registered");
+        let schema = definition.input_schema;
+
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!(["board", "placements"]));
+        assert_eq!(schema["properties"]["board"]["type"], json!("string"));
+
+        let placements = &schema["properties"]["placements"];
+        assert_eq!(placements["type"], json!("array"));
+        let item = &placements["items"];
+        assert_eq!(item["type"], json!("object"));
+        assert_eq!(item["additionalProperties"], json!(false));
+        assert_eq!(
+            item["required"],
+            json!(["reference", "x", "y", "rotation", "layer"])
+        );
+        assert_eq!(item["properties"]["reference"]["type"], json!("string"));
+        for field in ["x", "y", "rotation"] {
+            assert_eq!(item["properties"][field]["type"], json!("number"));
+        }
+        assert_eq!(item["properties"]["layer"]["enum"], json!(["F.Cu", "B.Cu"]));
     }
 }

@@ -19,14 +19,15 @@ ALL modifications go through MCP tools — never edit .kicad_pcb files directly.
 Most PCB layout operations require KiCAD to be running with the board file open. The IPC
 connection communicates with the running KiCAD instance in real-time.
 
-`place_component`, `move_component`, `rotate_component`, and `flip_component` are
-narrow exceptions for closed boards. Placement, move, and rotation fall back when
-IPC is unreachable. Flip intentionally requires IPC to be unreachable because KiCAD's
-typed IPC API has no native footprint-flip command. The file paths use revision-aware
-atomic writes: placement preserves pads, graphics, attributes, and models; moves
-preserve the existing angle; rotations update the footprint and its child angles;
-flips mirror supported geometry and swap front/back layers. If KiCAD is reachable and
-rejects a request, the fallback stays disabled to avoid racing a live editor.
+`place_component`, `move_component`, `rotate_component`, `flip_component`, and
+`batch_set_component_poses` are narrow exceptions for closed boards. Placement, move,
+and rotation fall back when IPC is unreachable. Flip and batch poses are closed-board-only
+because KiCAD's typed IPC API has no native atomic footprint flip/pose transaction. The
+file paths use revision-aware atomic writes: placement preserves pads, graphics,
+attributes, and models; moves preserve the existing angle; rotations update the
+footprint and its child angles; flips mirror supported geometry and swap front/back
+layers; batch poses prevalidate every target and perform at most one write. If KiCAD
+holds the target board open, closed-board edits are refused to avoid racing a live editor.
 
 If connection fails:
 - Tell the user to open KiCAD and load the project
@@ -41,12 +42,12 @@ Before any PCB work, load the required toolsets:
 
 ```
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
-load_toolset('pcb_components')   # place, move, rotate, align footprints
+load_toolset('pcb_components')   # place, atomically batch-pose, move, rotate, align footprints
 load_toolset('pcb_routing')      # traces, vias, differential pairs
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
-Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
+Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: batch_set_component_poses, place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
 
 Load additional toolsets as needed:
 
@@ -76,7 +77,7 @@ Follow this sequence for a clean PCB workflow:
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
-4. **Place components** — position all footprints
+4. **Place components** — position all footprints; use `batch_set_component_poses` when several existing footprints must change pose together
 5. **Route traces** — connect all nets
 6. **Copper pour** — add ground/power zones last
 7. **DRC** — run design rule check
@@ -105,6 +106,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
 | `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |
+| `batch_set_component_poses` | Atomically set absolute position, rotation, and side for multiple footprints on a closed board |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 
@@ -292,8 +294,9 @@ Common DRC errors and fixes:
    remain exact; always dry-run and apply the exact revision immediately before
    normal sync; it is not a general override and never saves the board
 8. **KiCAD normally must be running** — `place_component`, `move_component`, and
-   `rotate_component` have safe IPC-unreachable file fallbacks; `flip_component`
-   requires a closed board; other PCB edits still require the live IPC connection
+   `rotate_component` have safe IPC-unreachable file fallbacks; `flip_component` and
+   `batch_set_component_poses` require a closed board; other PCB edits still require
+   the live IPC connection
 9. **Save frequently** — call `save_project` after major operations
 10. **Load toolsets first** — check `get_active_toolsets()` and load what you need
 11. **Copper pour last** — add zones only after routing is substantially complete
