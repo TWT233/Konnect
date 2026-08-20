@@ -2933,6 +2933,34 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
     Ok(())
 }
 
+fn snapshot_pad_contract(
+    items: &[prost_types::Any],
+) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+    use konnect_ipc::gen::kiapi;
+
+    let mut pad_numbers = Vec::new();
+    let mut pad_nets = BTreeMap::new();
+    for child in items {
+        // Same discriminator as `apply_footprint_fields`, for the same
+        // reason: a graphic decodes happily as an empty pad.
+        if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+            continue;
+        }
+        let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+            .context("KiCad returned an unreadable pad")?;
+        if pad.number.is_empty() {
+            continue;
+        }
+        pad_numbers.push(pad.number.clone());
+        if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
+            pad_nets.insert(pad.number, net.name);
+        }
+    }
+    pad_numbers.sort();
+    pad_numbers.dedup();
+    Ok((pad_numbers, pad_nets))
+}
+
 fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<LiveSnapshot> {
     use kiapi::common::types::KiCadObjectType as ObjectType;
     use konnect_ipc::gen::kiapi;
@@ -2954,32 +2982,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             .definition
             .as_ref()
             .context("KiCad returned a footprint without a definition")?;
-        let mut pad_numbers = Vec::new();
-        let mut pad_nets = BTreeMap::new();
-        for child in &definition.items {
-            // Same discriminator as `apply_footprint_fields`, for the same
-            // reason: a graphic decodes happily as an empty pad.
-            //
-            // No test covers this one, and deliberately so — it has no
-            // observable effect today. A graphic decoded as a pad has
-            // `net: None`, so the filter below drops it anyway, and this
-            // function never writes. It is here because the next person to add
-            // a field to this loop should not have to rediscover why reading
-            // `definition.items` untyped is unsafe. Neutering it changes
-            // nothing, which is the honest result.
-            if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
-                continue;
-            }
-            let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
-                continue;
-            };
-            pad_numbers.push(pad.number.clone());
-            if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
-                pad_nets.insert(pad.number, net.name);
-            }
-        }
-        pad_numbers.sort();
-        pad_numbers.dedup();
+        let (pad_numbers, pad_nets) = snapshot_pad_contract(&definition.items)?;
         let position = footprint.position.as_ref();
         footprints.push(BoardFootprint {
             kiid: kiid.clone(),
@@ -7012,6 +7015,74 @@ mod tests {
             text.contains("U3") && text.contains("cannot read"),
             "must say the pad is unreadable, not that it is missing: {text}"
         );
+    }
+
+    #[test]
+    fn snapshot_pad_contract_ignores_unnumbered_mechanical_pads() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let mut footprint = kiapi::board::types::FootprintInstance::decode(
+            footprint_with_artwork("SW1").value.as_slice(),
+        )
+        .unwrap();
+        let items = &mut footprint.definition.as_mut().unwrap().items;
+        let electrical_pad = items
+            .iter()
+            .find(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .unwrap()
+            .clone();
+        let mut pad_one =
+            kiapi::board::types::Pad::decode(electrical_pad.value.as_slice()).unwrap();
+        pad_one.number = "1".to_string();
+        pad_one.net = Some(kiapi::board::types::Net {
+            code: None,
+            name: "COL0".to_string(),
+        });
+        let mut pad_two = pad_one.clone();
+        pad_two.number = "2".to_string();
+        pad_two.net = None;
+        let mut mechanical_pad = pad_one.clone();
+        mechanical_pad.number.clear();
+        mechanical_pad.net = Some(kiapi::board::types::Net {
+            code: None,
+            name: "SHOULD_NOT_APPEAR".to_string(),
+        });
+        items.extend([
+            konnect_ipc::builders::pack_any(&pad_one, "kiapi.board.types.Pad"),
+            konnect_ipc::builders::pack_any(&pad_one, "kiapi.board.types.Pad"),
+            konnect_ipc::builders::pack_any(&pad_two, "kiapi.board.types.Pad"),
+            konnect_ipc::builders::pack_any(&pad_two, "kiapi.board.types.Pad"),
+            konnect_ipc::builders::pack_any(&mechanical_pad, "kiapi.board.types.Pad"),
+        ]);
+
+        let (pad_numbers, pad_nets) = snapshot_pad_contract(items).unwrap();
+
+        assert_eq!(pad_numbers, vec!["1".to_string(), "2".to_string()]);
+        assert!(!pad_nets.contains_key(""));
+        assert_eq!(pad_nets.get("1").map(String::as_str), Some("COL0"));
+        assert!(!pad_nets.contains_key("2"));
+    }
+
+    #[test]
+    fn snapshot_pad_contract_rejects_an_undecodable_declared_pad() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let footprint = kiapi::board::types::FootprintInstance::decode(
+            footprint_with_artwork("U4").value.as_slice(),
+        )
+        .unwrap();
+        let mut items = footprint.definition.unwrap().items;
+        let pad = items
+            .iter_mut()
+            .find(|child| konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad"))
+            .unwrap();
+        pad.value = vec![0xff, 0xff, 0xff];
+
+        let error = snapshot_pad_contract(&items).unwrap_err().to_string();
+
+        assert!(error.contains("unreadable pad"), "{error}");
     }
 
     #[test]
