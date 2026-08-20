@@ -218,6 +218,7 @@ struct PreparedFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     fields: konnect_ipc::IpcFieldPlacement,
+    attributes: konnect_ipc::gen::kiapi::board::types::FootprintAttributes,
     width: f64,
     height: f64,
 }
@@ -3187,6 +3188,7 @@ fn prepare_additions(board: &Path, plan: &SyncPlan) -> Result<BTreeMap<String, P
         let pads = super::pcb_components::extract_pad_definitions(&source)?;
         let graphics = super::pcb_components::extract_graphic_definitions(&source)?;
         let fields = super::pcb_components::extract_field_placement(&source);
+        let attributes = extract_footprint_attributes(&source)?;
         let (width, height) = footprint_dimensions(&pads, &graphics);
         prepared.insert(
             footprint_id.clone(),
@@ -3194,12 +3196,51 @@ fn prepare_additions(board: &Path, plan: &SyncPlan) -> Result<BTreeMap<String, P
                 pads,
                 graphics,
                 fields,
+                attributes,
                 width,
                 height,
             },
         );
     }
     Ok(prepared)
+}
+
+fn extract_footprint_attributes(
+    source: &str,
+) -> Result<konnect_ipc::gen::kiapi::board::types::FootprintAttributes> {
+    use konnect_ipc::gen::kiapi;
+
+    let footprint = konnect_sexp::parse_sexp(source)?;
+    let mut attributes = kiapi::board::types::FootprintAttributes::default();
+    let Some(attr) = footprint.find("attr") else {
+        return Ok(attributes);
+    };
+    for value in attr
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .filter_map(konnect_sexp::SexpNode::as_str)
+    {
+        match value {
+            "through_hole" => {
+                attributes.mounting_style =
+                    kiapi::board::types::FootprintMountingStyle::FmsThroughHole as i32;
+            }
+            "smd" => {
+                attributes.mounting_style =
+                    kiapi::board::types::FootprintMountingStyle::FmsSmd as i32;
+            }
+            "exclude_from_pos_files" => attributes.exclude_from_position_files = true,
+            "exclude_from_bom" => attributes.exclude_from_bill_of_materials = true,
+            "allow_missing_courtyard" => {
+                attributes.exempt_from_courtyard_requirement = true;
+            }
+            "dnp" => attributes.do_not_populate = true,
+            _ => {}
+        }
+    }
+    Ok(attributes)
 }
 
 fn footprint_dimensions(
@@ -3319,6 +3360,12 @@ fn build_mutation_items(
                 )?;
                 let mut footprint =
                     kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                footprint.attributes = Some(part.attributes.clone());
+                footprint
+                    .definition
+                    .as_mut()
+                    .context("new footprint has no library definition")?
+                    .attributes = Some(part.attributes.clone());
                 apply_footprint_fields(
                     &mut footprint,
                     reference,
@@ -3438,6 +3485,83 @@ mod tests {
                 max_y: 10.0,
             },
         }
+    }
+
+    const EMPTY_TEST_BOARD: &str =
+        "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n\t(net 0 \"\")\n)\n";
+
+    fn add_path_fixture_board(dir: &Path, footprint_source: &str) -> std::path::PathBuf {
+        let pretty = dir.join("Test.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("Socket.kicad_mod"), footprint_source).unwrap();
+        std::fs::write(
+            dir.join("fp-lib-table"),
+            format!(
+                "(fp_lib_table\n  (version 7)\n  (lib (name \"Test\") (type \"KiCad\") (uri \"{}\") (options \"\") (descr \"\"))\n)\n",
+                pretty.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let board = dir.join("fixture.kicad_pcb");
+        std::fs::write(&board, EMPTY_TEST_BOARD).unwrap();
+        board
+    }
+
+    fn library_socket_footprint(attr_clause: &str) -> String {
+        format!(
+            r#"(footprint "Socket" (version 20221018) (generator pcbnew)
+  (layer "F.Cu")
+  (attr through_hole{attr_clause})
+  (property "Reference" "REF**" (at 0 -8.5 0) (layer "F.SilkS"))
+  (property "Value" "Socket" (at 0 8.5 0) (layer "F.Fab"))
+  (pad "1" thru_hole circle (at 0 0) (size 4 4) (drill 3) (layers "*.Cu" "*.Mask"))
+)
+"#
+        )
+    }
+
+    fn add_change(reference: &str, dnp: bool) -> PlannedChange {
+        PlannedChange::Add {
+            reference: reference.to_string(),
+            value: "Socket".to_string(),
+            footprint_id: "Test:Socket".to_string(),
+            symbol_path: format!("/root/{reference}"),
+            dnp,
+            pad_nets: BTreeMap::new(),
+            position: Point { x: 20.0, y: 30.0 },
+        }
+    }
+
+    fn build_added_footprint_from_library(
+        footprint_source: &str,
+        reference: &str,
+        dnp: bool,
+    ) -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = add_path_fixture_board(dir.path(), footprint_source);
+        let plan = SyncPlan {
+            status: PlanStatus::Ready,
+            plan_revision: "test-plan".to_string(),
+            counts: SyncCounts::default(),
+            changes: vec![add_change(reference, dnp)],
+            diagnostics: Vec::new(),
+        };
+        let prepared = prepare_additions(&board, &plan).unwrap();
+        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
+        let snapshot = LiveSnapshot {
+            state: board_with(Vec::new()),
+            items: BTreeMap::new(),
+            net_codes: BTreeMap::new(),
+            document: kiapi::common::types::DocumentSpecifier::default(),
+        };
+        let (creates, updates) =
+            build_mutation_items(&client, &plan, &prepared, &snapshot).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(creates.len(), 1);
+        kiapi::board::types::FootprintInstance::decode(creates[0].value.as_slice()).unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7397,6 +7521,56 @@ mod tests {
             .unwrap();
         assert_eq!(pad.net.as_ref().unwrap().name, "VCC");
         assert_eq!(pad.net.as_ref().unwrap().code.as_ref().unwrap().value, 7);
+    }
+
+    #[test]
+    fn added_footprint_copies_library_exclude_from_position_files_without_setting_bom_or_dnp() {
+        let footprint = build_added_footprint_from_library(
+            &library_socket_footprint(" exclude_from_pos_files"),
+            "J1",
+            false,
+        );
+
+        let instance_attributes = footprint.attributes.as_ref().expect("instance attributes");
+        assert!(instance_attributes.exclude_from_position_files);
+        assert!(!instance_attributes.exclude_from_bill_of_materials);
+        assert!(!instance_attributes.do_not_populate);
+
+        let definition_attributes = footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .expect("definition attributes");
+        assert!(definition_attributes.exclude_from_position_files);
+        assert!(!definition_attributes.exclude_from_bill_of_materials);
+        assert!(!definition_attributes.do_not_populate);
+    }
+
+    #[test]
+    fn added_footprint_copies_library_bom_exclusion_but_keeps_dnp_owned_by_schematic() {
+        let footprint = build_added_footprint_from_library(
+            &library_socket_footprint(" exclude_from_pos_files exclude_from_bom"),
+            "J2",
+            true,
+        );
+
+        let instance_attributes = footprint.attributes.as_ref().expect("instance attributes");
+        assert!(instance_attributes.exclude_from_position_files);
+        assert!(instance_attributes.exclude_from_bill_of_materials);
+        assert!(instance_attributes.do_not_populate);
+
+        let definition_attributes = footprint
+            .definition
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .expect("definition attributes");
+        assert!(definition_attributes.exclude_from_position_files);
+        assert!(definition_attributes.exclude_from_bill_of_materials);
+        assert!(definition_attributes.do_not_populate);
     }
 
     #[test]
