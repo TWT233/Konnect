@@ -434,6 +434,23 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
             }
         }
     }
+    for text in footprint.find_all("fp_text") {
+        let Some(role) = text.get(1).and_then(|node| node.as_str()) else {
+            continue;
+        };
+        let Ok((position, rotation)) = text_at(text, "fp_text") else {
+            continue;
+        };
+        match role {
+            "reference" if placement.reference_at.is_none() => {
+                placement.reference_at = Some((position.0, position.1, rotation));
+            }
+            "value" if placement.value_at.is_none() => {
+                placement.value_at = Some((position.0, position.1, rotation));
+            }
+            _ => {}
+        }
+    }
     placement
 }
 
@@ -5005,6 +5022,47 @@ mod field_placement_tests {
         let placement = extract_field_placement(source);
         assert_eq!(placement.reference_at, Some((0.0, -1.43, 0.0)));
         assert_eq!(placement.value_at, Some((0.0, 1.43, 0.0)));
+    }
+
+    #[test]
+    fn field_anchors_are_read_from_standard_fp_text_reference_and_value() {
+        let source = r#"(footprint "Socket"
+  (fp_text reference "REF**" (at 0 -8.5 180) (layer "F.SilkS"))
+  (fp_text value "Socket" (at 0 8.5 90) (layer "F.Fab"))
+)"#;
+
+        let placement = extract_field_placement(source);
+
+        assert_eq!(placement.reference_at, Some((0.0, -8.5, 180.0)));
+        assert_eq!(placement.value_at, Some((0.0, 8.5, 90.0)));
+    }
+
+    #[test]
+    fn property_field_anchors_override_legacy_fp_text_positions() {
+        let source = r#"(footprint "Mixed"
+  (property "Reference" "REF**" (at 1 -2 0) (layer "F.SilkS"))
+  (property "Value" "Mixed" (at 1 2 0) (layer "F.Fab"))
+  (fp_text reference "REF**" (at 0 -8.5 180) (layer "F.SilkS"))
+  (fp_text value "Mixed" (at 0 8.5 90) (layer "F.Fab"))
+)"#;
+
+        let placement = extract_field_placement(source);
+
+        assert_eq!(placement.reference_at, Some((1.0, -2.0, 0.0)));
+        assert_eq!(placement.value_at, Some((1.0, 2.0, 0.0)));
+    }
+
+    #[test]
+    fn malformed_or_anchorless_text_fields_fall_back_to_defaults() {
+        let malformed = r#"(footprint "Malformed"
+  (fp_text reference "REF**" (layer "F.SilkS"))
+  (fp_text value "Malformed" (at not-a-number 8.5 90) (layer "F.Fab"))
+)"#;
+
+        let placement = extract_field_placement(malformed);
+
+        assert_eq!(placement.reference_at, None);
+        assert_eq!(placement.value_at, None);
     }
 
     #[test]
