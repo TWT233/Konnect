@@ -83,7 +83,7 @@ Konnect/
 │   │           ├── sch_wiring.rs     # 20 tools (incl. connect_pins, power symbol embedding)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 13 tools (single-read/single-write atomic operations)
-│   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
+│   │           ├── sch_export.rs     # 8 tools (SVG/PDF/netlist/ERC/PCB sync)
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
