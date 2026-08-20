@@ -11,11 +11,13 @@ use crate::tools::pcb_board::{attempt_ipc_write, BoardWrite};
 use crate::tools::{get_path, require_f64, require_str, require_u64, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_ipc::gen::kiapi;
 use konnect_sexp::writer::{
     apply_edits, find_balanced_block, find_block_starts, find_direct_child_blocks, new_uuid,
     read_consistent, write_atomic_if_unchanged,
 };
 use konnect_sexp::SexpEdit;
+use prost::Message;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -2374,7 +2376,7 @@ async fn handle_find_component(
 
 async fn handle_get_component_pads(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let reference = match require_str(args, "reference") {
@@ -2382,60 +2384,24 @@ async fn handle_get_component_pads(
         Err(e) => return Ok(e),
     };
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = konnect_sexp::parser::parse_sexp(&content)?;
-
-    // Find the footprint with matching reference
-    let fp_node = tree.find_all("footprint").into_iter().find(|fp| {
-        fp.find_all("property").iter().any(|p| {
-            p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                && p.get(2).and_then(|n| n.as_str()) == Some(reference.as_str())
-        })
-    });
-
-    let fp_node = match fp_node {
-        Some(n) => n,
-        None => {
+    let requested_board = board_path.clone();
+    let lookup_reference = reference.clone();
+    let pads = match with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&requested_board)?;
+        let footprint = live_footprint_instance(c, document, &lookup_reference)?;
+        live_pad_json(&footprint)
+    })
+    .await?
+    {
+        Ok(pads) => pads,
+        Err(konnect_ipc::IpcFailure::Unreachable(msg)) => {
             return Ok(CallToolResult::error(format!(
-                "Footprint '{}' not found",
-                reference
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                msg
             )))
         }
+        Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
     };
-
-    let fp_at = fp_node.find("at");
-    let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
-    let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
-    let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
-
-    let pads: Vec<serde_json::Value> = fp_node
-        .find_all("pad")
-        .iter()
-        .filter_map(|pad| {
-            let number = pad.get(1)?.as_str()?.to_string();
-            let pad_at = pad.find("at")?;
-            let local_x = pad_at.get_f64(1)?;
-            let local_y = pad_at.get_f64(2)?;
-            // Transform local pad coords to board space (rotation only).
-            // Uses the canonical KiCAD transform — see konnect_sexp::geometry.
-            let (board_x, board_y) =
-                konnect_sexp::geometry::transform_pad(local_x, local_y, fp_x, fp_y, fp_rot);
-            // Three outcomes, deliberately distinguishable. No (net …) node at
-            // all is an unconnected pad, and "" says so. A node we can read
-            // gives its name. A node that is present but unreadable gives
-            // null — previously it gave "" too, so a fully connected KiCad 10
-            // pad was indistinguishable from an unconnected one. See
-            // konnect_sexp::net for the two shapes.
-            let net = match pad.find("net") {
-                None => json!(""),
-                Some(node) => match konnect_sexp::net::net_name(node) {
-                    Some(name) => json!(name),
-                    None => serde_json::Value::Null,
-                },
-            };
-            Some(json!({ "number": number, "x": board_x, "y": board_y, "net": net }))
-        })
-        .collect();
 
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pad_count": pads.len(), "pads": pads }),
@@ -2471,10 +2437,25 @@ async fn handle_get_pad_position(
 }
 
 async fn handle_get_component_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fps = ipc!(ctx, _args, |c| c.list_footprints());
+    let requested_board = get_path(args, "board")?;
+    let fps = match with_ipc_classified(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&requested_board)?;
+        c.list_footprints_in(document)
+    })
+    .await?
+    {
+        Ok(fps) => fps,
+        Err(konnect_ipc::IpcFailure::Unreachable(msg)) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                msg
+            )))
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(msg)) => return Ok(CallToolResult::error(msg)),
+    };
     let items: Vec<serde_json::Value> = fps
         .iter()
         .map(|fp| {
@@ -2490,6 +2471,74 @@ async fn handle_get_component_list(
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "components": items }),
     ))
+}
+
+fn live_footprint_instance(
+    client: &KiCadIpcClient,
+    document: kiapi::common::types::DocumentSpecifier,
+    reference: &str,
+) -> anyhow::Result<kiapi::board::types::FootprintInstance> {
+    let items = client.get_items_in(
+        document,
+        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+    )?;
+    for item in items {
+        if !konnect_ipc::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+            continue;
+        }
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("KiCad returned an invalid footprint item")?;
+        let current_reference = footprint
+            .reference_field
+            .as_ref()
+            .and_then(|field| field.text.as_ref())
+            .and_then(|board_text| board_text.text.as_ref())
+            .map(|text| text.text.as_str())
+            .unwrap_or("");
+        if current_reference == reference {
+            return Ok(footprint);
+        }
+    }
+    anyhow::bail!("Footprint '{}' not found", reference)
+}
+
+fn typed_pad_net_json(net: Option<&kiapi::board::types::Net>) -> serde_json::Value {
+    match net {
+        None => json!(""),
+        Some(net) if !net.name.is_empty() => json!(net.name),
+        Some(net) if net.code.as_ref().is_some_and(|code| code.value == 0) => json!(""),
+        Some(_) => serde_json::Value::Null,
+    }
+}
+
+fn live_pad_json(
+    footprint: &kiapi::board::types::FootprintInstance,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let items = footprint
+        .definition
+        .as_ref()
+        .map(|definition| &definition.items)
+        .into_iter()
+        .flatten();
+    let mut pads = Vec::new();
+    for item in items {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad") {
+            continue;
+        }
+        let pad = kiapi::board::types::Pad::decode(item.value.as_slice())
+            .context("KiCad returned an invalid pad item")?;
+        let position = pad.position.context(format!(
+            "KiCad returned pad '{}' without a position",
+            pad.number
+        ))?;
+        pads.push(json!({
+            "number": pad.number,
+            "x": position.x_nm as f64 / 1_000_000.0,
+            "y": position.y_nm as f64 / 1_000_000.0,
+            "net": typed_pad_net_json(pad.net.as_ref()),
+        }));
+    }
+    Ok(pads)
 }
 
 async fn handle_place_array(
@@ -2811,6 +2860,9 @@ async fn handle_get_board_2d_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const FOOTPRINT: &str = r#"(footprint "R_0402"
   (version 20240108)
@@ -4357,6 +4409,331 @@ mod tests {
         url
     }
 
+    struct QueryMockKicad {
+        url: String,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    fn query_ok_response() -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            status: Some(kiapi::common::ApiResponseStatus {
+                status: kiapi::common::ApiStatusCode::AsOk as i32,
+                error_message: String::new(),
+            }),
+            header: None,
+            message: None,
+        }
+    }
+
+    fn query_reply_with(inner: prost_types::Any) -> kiapi::common::ApiResponse {
+        kiapi::common::ApiResponse {
+            message: Some(inner),
+            ..query_ok_response()
+        }
+    }
+
+    fn spawn_query_mock<F>(respond: F) -> QueryMockKicad
+    where
+        F: Fn(kiapi::common::ApiRequest) -> Option<kiapi::common::ApiResponse> + Send + 'static,
+    {
+        static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let url = format!(
+            "inproc://pcb-components-query-{}",
+            NEXT_MOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        use nng::options::Options;
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(Duration::from_secs(20)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+        let thread = std::thread::spawn(move || {
+            while let Ok(msg) = socket.recv() {
+                let request = match kiapi::common::ApiRequest::decode(msg.as_slice()) {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                match respond(request) {
+                    Some(response) => {
+                        let out = nng::Message::from(response.encode_to_vec().as_slice());
+                        if socket.send(out).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+        QueryMockKicad {
+            url,
+            _thread: thread,
+        }
+    }
+
+    fn query_test_ctx(ipc_address: String) -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn board_doc(path: &Path) -> kiapi::common::types::DocumentSpecifier {
+        kiapi::common::types::DocumentSpecifier {
+            r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+            project: None,
+            identifier: Some(
+                kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    path.display().to_string(),
+                ),
+            ),
+        }
+    }
+
+    fn text_value(text: &str) -> kiapi::common::types::Text {
+        kiapi::common::types::Text {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn field_with_text(text: &str) -> kiapi::board::types::Field {
+        kiapi::board::types::Field {
+            text: Some(kiapi::board::types::BoardText {
+                text: Some(text_value(text)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn live_pad(
+        number: &str,
+        x: f64,
+        y: f64,
+        net: Option<kiapi::board::types::Net>,
+    ) -> prost_types::Any {
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::Pad {
+                number: number.to_string(),
+                net,
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )
+    }
+
+    fn live_footprint(
+        reference: &str,
+        value: &str,
+        lib_id: &str,
+        x: f64,
+        y: f64,
+        layer: kiapi::board::types::BoardLayer,
+        items: Vec<prost_types::Any>,
+    ) -> kiapi::board::types::FootprintInstance {
+        let (library_nickname, entry_name) = lib_id.split_once(':').expect("Library:Footprint");
+        kiapi::board::types::FootprintInstance {
+            reference_field: Some(field_with_text(reference)),
+            value_field: Some(field_with_text(value)),
+            position: Some(konnect_ipc::builders::vec2(x, y)),
+            layer: layer as i32,
+            definition: Some(kiapi::board::types::Footprint {
+                id: Some(kiapi::common::types::LibraryIdentifier {
+                    library_nickname: library_nickname.to_string(),
+                    entry_name: entry_name.to_string(),
+                }),
+                items,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn query_items_response(
+        items: Vec<kiapi::board::types::FootprintInstance>,
+    ) -> kiapi::common::ApiResponse {
+        query_reply_with(konnect_ipc::builders::pack_any(
+            &kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: items
+                    .into_iter()
+                    .map(|item| {
+                        konnect_ipc::builders::pack_any(
+                            &item,
+                            "kiapi.board.types.FootprintInstance",
+                        )
+                    })
+                    .collect(),
+            },
+            "kiapi.common.commands.GetItemsResponse",
+        ))
+    }
+
+    #[tokio::test]
+    async fn get_component_pads_reads_the_live_footprint_from_the_requested_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n  (version 20260206)\n  (footprint \"DiskOnly\"\n    (layer \"F.Cu\")\n    (at 1 2 0)\n    (property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\"))\n  )\n)\n",
+        )
+        .unwrap();
+
+        let requested = board.clone();
+        let mock = spawn_query_mock(move |req| {
+            let msg = req.message.expect("request must pack a command");
+            if msg.type_url.ends_with("GetOpenDocuments") {
+                return Some(query_reply_with(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![board_doc(&requested)],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )));
+            }
+            if msg.type_url.ends_with("GetItems") {
+                return Some(query_items_response(vec![live_footprint(
+                    "R1",
+                    "Conn",
+                    "Conn:USB",
+                    10.0,
+                    20.0,
+                    kiapi::board::types::BoardLayer::BlFCu,
+                    vec![
+                        live_pad(
+                            "1",
+                            123.0,
+                            456.0,
+                            Some(kiapi::board::types::Net {
+                                name: "GND".to_string(),
+                                ..Default::default()
+                            }),
+                        ),
+                        live_pad("2", 124.0, 456.0, Some(kiapi::board::types::Net::default())),
+                        konnect_ipc::builders::pack_any(
+                            &kiapi::board::types::BoardGraphicShape::default(),
+                            "kiapi.board.types.BoardGraphicShape",
+                        ),
+                    ],
+                )]));
+            }
+            None
+        });
+        let result = handle_get_component_pads(
+            &json!({ "board": board.to_string_lossy(), "reference": "R1" }),
+            &query_test_ctx(mock.url),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["reference"], json!("R1"));
+        assert_eq!(body["pad_count"], json!(2));
+        assert_eq!(
+            body["pads"][0],
+            json!({"number":"1","x":123.0,"y":456.0,"net":"GND"})
+        );
+        assert_eq!(
+            body["pads"][1],
+            json!({"number":"2","x":124.0,"y":456.0,"net":null})
+        );
+    }
+
+    #[tokio::test]
+    async fn get_component_list_honors_the_requested_open_board_not_the_first_open_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board_a = dir.path().join("a.kicad_pcb");
+        let board_b = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board_a, "(kicad_pcb (version 20260206))\n").unwrap();
+        std::fs::write(&board_b, "(kicad_pcb (version 20260206))\n").unwrap();
+
+        let target_b = board_b.clone();
+        let seen_documents: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_documents_in_mock = seen_documents.clone();
+        let mock = spawn_query_mock(move |req| {
+            let msg = req.message.expect("request must pack a command");
+            if msg.type_url.ends_with("GetOpenDocuments") {
+                return Some(query_reply_with(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: vec![board_doc(&board_a), board_doc(&target_b)],
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )));
+            }
+            if msg.type_url.ends_with("GetItems") {
+                let get_items =
+                    kiapi::common::commands::GetItems::decode(msg.value.as_slice()).unwrap();
+                let document = get_items
+                    .header
+                    .as_ref()
+                    .and_then(|header| header.document.as_ref())
+                    .and_then(|document| match document.identifier.as_ref() {
+                        Some(
+                            kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                filename,
+                            ),
+                        ) => Some(filename.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                seen_documents_in_mock
+                    .lock()
+                    .unwrap()
+                    .push(document.clone());
+                let items = if document == target_b.display().to_string() {
+                    vec![live_footprint(
+                        "J1",
+                        "Conn",
+                        "Conn:USB",
+                        50.0,
+                        60.0,
+                        kiapi::board::types::BoardLayer::BlBCu,
+                        vec![],
+                    )]
+                } else {
+                    vec![live_footprint(
+                        "A1",
+                        "Wrong",
+                        "Wrong:Board",
+                        1.0,
+                        2.0,
+                        kiapi::board::types::BoardLayer::BlFCu,
+                        vec![],
+                    )]
+                };
+                return Some(query_items_response(items));
+            }
+            None
+        });
+
+        let result = handle_get_component_list(
+            &json!({ "board": board_b.to_string_lossy() }),
+            &query_test_ctx(mock.url),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{:?}", result.content);
+        let body: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(body["count"], json!(1));
+        assert_eq!(body["components"][0]["reference"], json!("J1"));
+        assert_eq!(body["components"][0]["layer"], json!("B.Cu"));
+        assert_eq!(
+            seen_documents.lock().unwrap().as_slice(),
+            &[board_b.display().to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn a_reachable_kicad_that_rejects_never_touches_the_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4629,109 +5006,179 @@ mod field_placement_tests {
 #[cfg(test)]
 mod pad_net_shape_tests {
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
-    use std::sync::Arc;
 
-    fn test_ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
+    fn live_pad_for_test(
+        number: &str,
+        x: f64,
+        y: f64,
+        net: Option<kiapi::board::types::Net>,
+    ) -> prost_types::Any {
+        konnect_ipc::builders::pack_any(
+            &kiapi::board::types::Pad {
+                number: number.to_string(),
+                net,
+                position: Some(konnect_ipc::builders::vec2(x, y)),
+                ..Default::default()
             },
-            Arc::new(ToolRouter::new()),
+            "kiapi.board.types.Pad",
         )
     }
 
-    async fn pads_of(board: &str) -> serde_json::Value {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("board.kicad_pcb");
-        std::fs::write(&path, board).unwrap();
-        let result = handle_get_component_pads(
-            &json!({ "board": path.to_str().unwrap(), "reference": "R1" }),
-            &test_ctx(),
-        )
-        .await
-        .expect("handler should succeed");
-        let body = match &result.content[0] {
-            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
-            _ => panic!("expected text content"),
-        };
-        serde_json::from_str(&body).unwrap()
+    fn live_footprint_for_test(
+        items: Vec<prost_types::Any>,
+    ) -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance {
+            reference_field: Some(kiapi::board::types::Field {
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "R1".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            value_field: Some(kiapi::board::types::Field {
+                text: Some(kiapi::board::types::BoardText {
+                    text: Some(kiapi::common::types::Text {
+                        text: "Value".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            position: Some(konnect_ipc::builders::vec2(100.0, 100.0)),
+            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+            definition: Some(kiapi::board::types::Footprint {
+                id: Some(kiapi::common::types::LibraryIdentifier {
+                    library_nickname: "Test".to_string(),
+                    entry_name: "Pad".to_string(),
+                }),
+                items,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
-    fn board_with_pads(pads: &str) -> String {
-        format!(
-            "(kicad_pcb\n\t(version 20260206)\n\t(footprint \"TestPad\"\n\t\t(layer \"F.Cu\")\n\t\t(at 100 100)\n\
-             \t\t(property \"Reference\" \"R1\" (at 0 0 0) (layer \"F.SilkS\"))\n{pads}\t)\n)\n"
-        )
+    fn pads_of(items: Vec<prost_types::Any>) -> serde_json::Value {
+        let footprint = live_footprint_for_test(items);
+        let pads = live_pad_json(&footprint).expect("live pads");
+        serde_json::json!({
+            "reference": "R1",
+            "pad_count": pads.len(),
+            "pads": pads,
+        })
     }
 
-    /// The reported bug: KiCad 10 puts the name at index 1, the old reader
-    /// took index 2, and `.unwrap_or("")` turned that miss into a plausible
-    /// empty string — so a fully connected pad looked exactly like an
-    /// unconnected one.
+    fn named_net(name: &str) -> kiapi::board::types::Net {
+        kiapi::board::types::Net {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn pad(
+        number: &str,
+        x: f64,
+        y: f64,
+        net: Option<kiapi::board::types::Net>,
+    ) -> prost_types::Any {
+        live_pad_for_test(number, x, y, net)
+    }
+
     #[tokio::test]
-    async fn kicad_10_pads_report_their_net_names() {
-        let pads = pads_of(&board_with_pads(
-            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net \"GND\"))\n\
-             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net \"VCC\"))\n",
-        ))
-        .await;
+    async fn typed_live_pads_report_their_net_names() {
+        let pads = pads_of(vec![
+            pad("1", 99.0, 100.0, Some(named_net("GND"))),
+            pad("2", 101.0, 100.0, Some(named_net("VCC"))),
+        ]);
         assert_eq!(pads["pads"][0]["net"], json!("GND"));
         assert_eq!(pads["pads"][1]["net"], json!("VCC"));
+        assert_eq!(pads["pads"][0]["x"], json!(99.0));
+        assert_eq!(pads["pads"][0]["y"], json!(100.0));
     }
 
     #[tokio::test]
-    async fn legacy_pads_still_report_their_net_names() {
-        let pads = pads_of(&board_with_pads(
-            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 1 \"GND\"))\n\
-             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net 2 \"VCC\"))\n",
-        ))
-        .await;
-        assert_eq!(pads["pads"][0]["net"], json!("GND"));
-        assert_eq!(pads["pads"][1]["net"], json!("VCC"));
+    async fn only_exact_pad_type_urls_are_decoded() {
+        let pads = pads_of(vec![
+            pad("1", 123.0, 456.0, Some(named_net("GND"))),
+            konnect_ipc::builders::pack_any(
+                &kiapi::board::types::BoardGraphicShape::default(),
+                "kiapi.board.types.BoardGraphicShape",
+            ),
+            prost_types::Any {
+                type_url: "type.googleapis.com/vendorx.kiapi.board.types.Pad".to_string(),
+                value: kiapi::board::types::Pad {
+                    number: "999".to_string(),
+                    position: Some(konnect_ipc::builders::vec2(0.0, 0.0)),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            },
+        ]);
+        assert_eq!(pads["pad_count"], json!(1));
+        assert_eq!(pads["pads"][0]["number"], json!("1"));
     }
 
     /// A pad with no net node is genuinely unconnected, and "" says so. This
     /// is the one case where the empty string is the right answer, which is
     /// why the unreadable case must not share it.
     #[tokio::test]
-    async fn a_pad_with_no_net_node_reports_an_empty_name() {
-        let pads = pads_of(&board_with_pads(
-            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1))\n",
-        ))
-        .await;
+    async fn a_typed_pad_with_no_net_reports_an_empty_name() {
+        let pads = pads_of(vec![pad("1", 99.0, 100.0, None)]);
         assert_eq!(pads["pads"][0]["net"], json!(""));
+    }
+
+    #[tokio::test]
+    async fn a_typed_pad_missing_its_position_is_refused() {
+        let footprint = live_footprint_for_test(vec![konnect_ipc::builders::pack_any(
+            &kiapi::board::types::Pad {
+                number: "1".to_string(),
+                ..Default::default()
+            },
+            "kiapi.board.types.Pad",
+        )]);
+        let error = live_pad_json(&footprint).expect_err("missing pad position must fail closed");
+        assert!(error.to_string().contains("without a position"), "{error}");
     }
 
     /// Present but unreadable is now loud. A bare `(net 1)` reference names no
     /// net, and null forces a caller to notice rather than concluding the pad
     /// is floating.
     #[tokio::test]
-    async fn a_net_node_we_cannot_read_reports_null_not_empty() {
-        let pads = pads_of(&board_with_pads(
-            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 1))\n\
-             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net))\n",
-        ))
-        .await;
+    async fn a_typed_pad_with_an_unreadable_net_reports_null_not_empty() {
+        let pads = pads_of(vec![
+            pad("1", 99.0, 100.0, Some(kiapi::board::types::Net::default())),
+            pad(
+                "2",
+                101.0,
+                100.0,
+                Some(kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: 7 }),
+                    ..Default::default()
+                }),
+            ),
+        ]);
         assert_eq!(pads["pads"][0]["net"], serde_json::Value::Null);
         assert_eq!(pads["pads"][1]["net"], serde_json::Value::Null);
     }
 
-    /// The unconnected pseudo-net is named, and its name is empty — that is a
-    /// real answer, not a failure, so it must not become null.
+    /// The unconnected pseudo-net is carried as code 0 with an empty name, and
+    /// remains the empty-string branch for compatibility with the existing
+    /// public contract.
     #[tokio::test]
     async fn the_unconnected_pseudo_net_reports_an_empty_name() {
-        let pads = pads_of(&board_with_pads(
-            "\t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net 0 \"\"))\n",
-        ))
-        .await;
+        let pads = pads_of(vec![pad(
+            "1",
+            99.0,
+            100.0,
+            Some(kiapi::board::types::Net {
+                code: Some(kiapi::board::types::NetCode { value: 0 }),
+                name: String::new(),
+            }),
+        )]);
         assert_eq!(pads["pads"][0]["net"], json!(""));
     }
 }
