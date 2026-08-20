@@ -525,6 +525,12 @@ pub(crate) fn extract_graphic_definitions(
         if text_hidden(text) {
             continue;
         }
+        if matches!(
+            text.get(1).and_then(konnect_sexp::SexpNode::as_str),
+            Some("reference") | Some("value")
+        ) {
+            continue;
+        }
         let content = text
             .get(2)
             .and_then(konnect_sexp::SexpNode::as_str)
@@ -3032,6 +3038,8 @@ mod tests {
   (fp_circle (center 0 0) (end 0.25 0) (stroke (width 0.1) (type solid)) (fill yes) (layer "F.Fab"))
   (fp_arc (start -0.3 0) (mid 0 -0.3) (end 0.3 0) (stroke (width 0.12) (type solid)) (layer "F.SilkS"))
   (fp_poly (pts (xy -0.2 -0.2) (xy 0.2 -0.2) (xy 0.2 0.2)) (stroke (width 0.1) (type solid)) (fill yes) (layer "F.Fab"))
+  (fp_text reference "REF**" (at 0 -1 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "R_0402" (at 0 1 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
   (fp_text user "${REFERENCE}" (at 0 1.17 0) (layer "F.Fab") (effects (font (size 0.26 0.26) (thickness 0.04))))
   (fp_text user "secret" (at 0 0 0) (layer "F.Fab") (hide yes) (effects (font (size 0.26 0.26))))
   (pad "1" smd roundrect (at -0.5 0) (size 0.5 0.5)
@@ -3090,7 +3098,7 @@ mod tests {
 
         // Exactly one visible text: the fab ${REFERENCE}. The hidden fp_text,
         // the hidden Datasheet property, and the Reference/Value properties
-        // (carried as first-class fields) are all excluded.
+        // and fp_texts (carried as first-class fields) are all excluded.
         let texts: Vec<_> = graphics
             .iter()
             .filter(|g| matches!(g, Graphic::Text { .. }))
