@@ -6860,6 +6860,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_saved_symbol_flags_skips_three_footprintless_flags_in_sync_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("flags.kicad_sch");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (instances\n      (project \"flags\"\n        (path \"/root\"\n          (reference \"#FLG01\")\n          (unit 1)\n        )\n      )\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 20 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-flg2\")\n    (property \"Reference\" \"#FLG02\" (at 20 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 20 12 0))\n    (instances\n      (project \"flags\"\n        (path \"/root\"\n          (reference \"#FLG02\")\n          (unit 1)\n        )\n      )\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 30 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-flg3\")\n    (property \"Reference\" \"#FLG03\" (at 30 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 30 12 0))\n    (instances\n      (project \"flags\"\n        (path \"/root\"\n          (reference \"#FLG03\")\n          (unit 1)\n        )\n      )\n    )\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n",
+        )
+        .unwrap();
+
+        let mut design = ExportedDesign {
+            components: vec![
+                DesignComponent {
+                    reference: "#FLG01".to_string(),
+                    value: "PWR_FLAG".to_string(),
+                    footprint_id: String::new(),
+                    symbol_path: "/root/sym-flg1".to_string(),
+                    dnp: false,
+                    pad_nets: BTreeMap::new(),
+                },
+                DesignComponent {
+                    reference: "#FLG02".to_string(),
+                    value: "PWR_FLAG".to_string(),
+                    footprint_id: String::new(),
+                    symbol_path: "/root/sym-flg2".to_string(),
+                    dnp: false,
+                    pad_nets: BTreeMap::new(),
+                },
+                DesignComponent {
+                    reference: "#FLG03".to_string(),
+                    value: "PWR_FLAG".to_string(),
+                    footprint_id: String::new(),
+                    symbol_path: "/root/sym-flg3".to_string(),
+                    dnp: false,
+                    pad_nets: BTreeMap::new(),
+                },
+            ],
+            skipped: Vec::new(),
+        };
+
+        apply_saved_symbol_flags(&[schematic], &mut design).expect("saved flags load");
+
+        assert_eq!(design.components.len(), 0);
+        assert_eq!(design.skipped.len(), 3);
+        let plan = plan_sync("netlist", &design, &board_with(Vec::new()));
+        assert_eq!(plan.counts.skipped_by_flag.planned, 3);
+    }
+
+    #[test]
     fn reference_only_possible_rename_is_a_conflict() {
         let design = ExportedDesign {
             components: vec![resistor("R2", "/sheet/existing")],

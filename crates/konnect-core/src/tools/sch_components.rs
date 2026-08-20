@@ -28,6 +28,33 @@ use konnect_sexp::{
 };
 use serde_json::json;
 
+fn schematic_component_json(
+    sym: &cse::schematic::symbol::Symbol,
+    include_uuid: bool,
+) -> serde_json::Value {
+    let (x, y) = sym.position();
+    let rotation = sym.at.rotation.unwrap_or(0.0);
+    let mirror = sym.mirror.as_deref().unwrap_or("");
+    let mut value = json!({
+        "reference": sym.reference().unwrap_or("?"),
+        "value": sym.value_str().unwrap_or(""),
+        "footprint": sym.footprint().unwrap_or(""),
+        "lib_id": sym.lib_id,
+        "x": x,
+        "y": y,
+        "rotation": rotation,
+        "mirror_x": mirror.contains('x'),
+        "mirror_y": mirror.contains('y'),
+        "in_bom": sym.in_bom,
+        "on_board": sym.on_board,
+        "dnp": sym.dnp
+    });
+    if include_uuid {
+        value["uuid"] = json!(sym.uuid);
+    }
+    value
+}
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -960,23 +987,7 @@ async fn handle_get_schematic_component(
     let sch = cse::Schematic::load(&sch_path)?;
 
     match sch.symbols.by_reference(&reference) {
-        Some(sym) => {
-            let (x, y) = sym.position();
-            let rotation = sym.at.rotation.unwrap_or(0.0);
-            let mirror = sym.mirror.as_deref().unwrap_or("");
-            Ok(CallToolResult::json(&json!({
-                "reference": sym.reference().unwrap_or("?"),
-                "value": sym.value_str().unwrap_or(""),
-                "footprint": sym.footprint().unwrap_or(""),
-                "lib_id": sym.lib_id,
-                "x": x,
-                "y": y,
-                "rotation": rotation,
-                "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y'),
-                "uuid": sym.uuid
-            })))
-        }
+        Some(sym) => Ok(CallToolResult::json(&schematic_component_json(sym, true))),
         None => Ok(CallToolResult::error(format!(
             "Component '{}' not found",
             reference
@@ -994,22 +1005,7 @@ async fn handle_list_schematic_components(
     let items: Vec<serde_json::Value> = sch
         .symbols
         .iter()
-        .map(|sym| {
-            let (x, y) = sym.position();
-            let rotation = sym.at.rotation.unwrap_or(0.0);
-            let mirror = sym.mirror.as_deref().unwrap_or("");
-            json!({
-                "reference": sym.reference().unwrap_or("?"),
-                "value": sym.value_str().unwrap_or(""),
-                "footprint": sym.footprint().unwrap_or(""),
-                "lib_id": sym.lib_id,
-                "x": x,
-                "y": y,
-                "rotation": rotation,
-                "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y')
-            })
-        })
+        .map(|sym| schematic_component_json(sym, false))
         .collect();
 
     Ok(CallToolResult::json(&json!({
@@ -3470,5 +3466,97 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_flags {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn result_body(result: &CallToolResult) -> Value {
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text content: {result:?}");
+        };
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    fn write_fixture(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    const SCH: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 40 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\" (at 40 8 0))\n    (property \"Value\" \"10k\" (at 40 12 0))\n    (property \"Footprint\" \"Resistor_SMD:R_0603_1608Metric\" (at 40 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    #[tokio::test]
+    async fn get_schematic_component_reports_exact_instance_flags() {
+        let (_dir, path) = write_fixture("instance-flags-get.kicad_sch", SCH);
+        let result = handle_get_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "#FLG01"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["in_bom"], json!(true));
+        assert_eq!(body["on_board"], json!(false));
+        assert_eq!(body["dnp"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn list_schematic_components_reports_exact_instance_flags_for_each_item() {
+        let (_dir, path) = write_fixture("instance-flags-list.kicad_sch", SCH);
+        let result = handle_list_schematic_components(
+            &json!({
+                "schematic": path.display().to_string()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        let components = body["components"].as_array().expect("components array");
+        let flg = components
+            .iter()
+            .find(|component| component["reference"] == json!("#FLG01"))
+            .expect("flag component");
+        let resistor = components
+            .iter()
+            .find(|component| component["reference"] == json!("R1"))
+            .expect("resistor component");
+
+        assert_eq!(flg["in_bom"], json!(true));
+        assert_eq!(flg["on_board"], json!(false));
+        assert_eq!(flg["dnp"], json!(false));
+        assert_eq!(resistor["in_bom"], json!(true));
+        assert_eq!(resistor["on_board"], json!(true));
+        assert_eq!(resistor["dnp"], json!(false));
     }
 }
