@@ -37,6 +37,8 @@ struct DesignComponent {
     footprint_id: String,
     symbol_path: String,
     dnp: bool,
+    pad_numbers_complete: bool,
+    pad_numbers: Vec<String>,
     pad_nets: BTreeMap<String, String>,
 }
 
@@ -61,6 +63,7 @@ struct BoardFootprint {
     value: String,
     footprint_id: String,
     symbol_path: Option<String>,
+    pad_numbers: Vec<String>,
     pad_nets: BTreeMap<String, String>,
     position: Point,
     rotation: f64,
@@ -222,7 +225,7 @@ struct PreparedFootprint {
 #[derive(Debug, Clone)]
 struct IdentityRebindApplyContext {
     plan: IdentityRebindPlan,
-    requested_before_items: BTreeMap<String, prost_types::Any>,
+    before_items: BTreeMap<String, prost_types::Any>,
     document: konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
     hierarchy_files: usize,
 }
@@ -240,7 +243,7 @@ fn apply_identity_rebind_context(
 
     let IdentityRebindApplyContext {
         mut plan,
-        requested_before_items,
+        before_items,
         document,
         hierarchy_files,
     } = context;
@@ -255,17 +258,9 @@ fn apply_identity_rebind_context(
             plan.changes.len()
         );
     }
-    if requested_before_items.len() != plan.changes.len() {
-        bail!(
-            "identity rebind apply requires requested before item count {} to equal change count {}",
-            requested_before_items.len(),
-            plan.changes.len()
-        );
-    }
-
     let mut updates = Vec::with_capacity(plan.changes.len());
     for change in &plan.changes {
-        let before = requested_before_items
+        let before = before_items
             .get(&change.kiid)
             .with_context(|| format!("missing requested before footprint {}", change.kiid))?;
         updates.push(rebind_footprint_item(before, change)?);
@@ -284,7 +279,7 @@ fn apply_identity_rebind_context(
     })?;
 
     let after_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
-    verify_identity_rebind_readback(&requested_before_items, &after_items, &plan.changes)?;
+    verify_identity_rebind_readback(&before_items, &after_items, &plan.changes)?;
 
     Ok(identity_rebind_applied_response(&mut plan, hierarchy_files))
 }
@@ -354,7 +349,7 @@ fn plan_live_identity_rebind(
     Ok(IdentityRebindLiveDecision::Apply(Box::new(
         IdentityRebindApplyContext {
             plan,
-            requested_before_items: requested_items,
+            before_items: snapshot.items.clone(),
             document: snapshot.document.clone(),
             hierarchy_files,
         },
@@ -1128,9 +1123,9 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
 
         let mut changed_pads = 0usize;
         let pad_numbers = component
-            .pad_nets
-            .keys()
-            .chain(footprint.pad_nets.keys())
+            .pad_numbers
+            .iter()
+            .chain(footprint.pad_numbers.iter())
             .collect::<std::collections::BTreeSet<_>>();
         for number in pad_numbers {
             let new_net = component
@@ -1441,10 +1436,17 @@ fn plan_identity_rebind(
             ));
             continue;
         }
-        if footprint.pad_nets.len() != component.pad_nets.len()
-            || footprint.pad_nets.keys().collect::<Vec<_>>()
-                != component.pad_nets.keys().collect::<Vec<_>>()
-        {
+        if !component.pad_numbers_complete {
+            diagnostics.push(conflict(
+                "pad_set_unverified",
+                format!(
+                    "requested reference {reference} schematic export does not include a complete pad set"
+                ),
+                Some(reference),
+            ));
+            continue;
+        }
+        if footprint.pad_numbers != component.pad_numbers {
             diagnostics.push(conflict(
                 "pad_set_mismatch",
                 format!("requested reference {reference} has a different pad set on the board"),
@@ -1452,8 +1454,10 @@ fn plan_identity_rebind(
             ));
             continue;
         }
-        let normalized_board_pads = normalize_pad_nets(&footprint.pad_nets);
-        let normalized_component_pads = normalize_pad_nets(&component.pad_nets);
+        let normalized_board_pads =
+            normalize_pad_nets_for_numbers(&footprint.pad_numbers, &footprint.pad_nets);
+        let normalized_component_pads =
+            normalize_pad_nets_for_numbers(&component.pad_numbers, &component.pad_nets);
         if normalized_board_pads != normalized_component_pads {
             diagnostics.push(conflict(
                 "pad_net_mismatch",
@@ -1546,6 +1550,31 @@ fn normalize_pad_nets(pad_nets: &BTreeMap<String, String>) -> BTreeMap<String, S
         .collect()
 }
 
+fn normalize_pad_nets_for_numbers(
+    pad_numbers: &[String],
+    pad_nets: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    pad_numbers
+        .iter()
+        .map(|pad| {
+            (
+                pad.clone(),
+                pad_nets
+                    .get(pad)
+                    .map(|net| normalize_root_net(net))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn normalized_pad_numbers(pad_numbers: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
+    let mut pad_numbers = pad_numbers.into_iter().map(Into::into).collect::<Vec<_>>();
+    pad_numbers.sort();
+    pad_numbers.dedup();
+    pad_numbers
+}
+
 fn normalize_root_net(net: &str) -> String {
     if let Some(stripped) = net.strip_prefix('/') {
         if !stripped.is_empty() && !stripped.contains('/') {
@@ -1582,6 +1611,7 @@ struct IdentityRebindRevisionBoardSnapshot {
     footprint_id: String,
     dnp: bool,
     not_in_schematic: bool,
+    pad_numbers: Vec<String>,
     pad_nets: BTreeMap<String, String>,
     position_x: String,
     position_y: String,
@@ -1615,6 +1645,7 @@ fn identity_rebind_plan_revision(
                 footprint_id: footprint.footprint_id.clone(),
                 dnp: footprint.dnp,
                 not_in_schematic: footprint.not_in_schematic,
+                pad_numbers: footprint.pad_numbers.clone(),
                 pad_nets: normalize_pad_nets(&footprint.pad_nets),
                 position_x: footprint.position.x.to_string(),
                 position_y: footprint.position.y.to_string(),
@@ -1841,6 +1872,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
                 || property.get(1).and_then(SexpNode::as_str) == Some("dnp")
         });
 
+        let (pad_numbers, pad_numbers_complete) = component_pad_numbers(component_node);
         let index = components.len();
         by_reference.insert(reference.clone(), index);
         components.push(DesignComponent {
@@ -1849,6 +1881,8 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             footprint_id: required_value(component_node, "footprint")?,
             symbol_path,
             dnp,
+            pad_numbers_complete,
+            pad_numbers,
             pad_nets: BTreeMap::new(),
         });
     }
@@ -1876,11 +1910,44 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             }
         }
     }
+    for component in &mut components {
+        component.pad_numbers = if component.pad_numbers.is_empty() {
+            normalized_pad_numbers(component.pad_nets.keys().cloned())
+        } else {
+            normalized_pad_numbers(component.pad_numbers.iter().cloned())
+        };
+        for pad in &component.pad_numbers {
+            component.pad_nets.entry(pad.clone()).or_default();
+        }
+    }
 
     Ok(ExportedDesign {
         components,
         skipped: Vec::new(),
     })
+}
+
+fn component_pad_numbers(component_node: &SexpNode) -> (Vec<String>, bool) {
+    let Some(units) = component_node.find("units") else {
+        return (Vec::new(), false);
+    };
+    let mut saw_pins_section = false;
+    let numbers = units
+        .find_all("unit")
+        .into_iter()
+        .flat_map(|unit| {
+            if let Some(pins) = unit.find("pins") {
+                saw_pins_section = true;
+                pins.find_all("pin")
+            } else {
+                Vec::new()
+            }
+        })
+        .filter_map(|pin| pin.find_str("num"))
+        .filter(|number| !number.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (normalized_pad_numbers(numbers), saw_pins_section)
 }
 
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
@@ -2381,22 +2448,18 @@ fn verify_identity_rebind_readback(
 
     let mut before_decoded = BTreeMap::new();
     for (kiid, item) in before_by_kiid {
-        let footprint = decode_identity_rebind_footprint_item(
-            item,
-            &format!("before requested footprint {kiid}"),
-        )?;
+        let footprint =
+            decode_identity_rebind_footprint_item(item, &format!("before footprint {kiid}"))?;
         let embedded_kiid = footprint
             .id
             .as_ref()
             .map(|id| id.value.as_str())
             .unwrap_or_default();
         if embedded_kiid.is_empty() {
-            bail!("before requested footprint {kiid} has empty embedded KIID");
+            bail!("before footprint {kiid} has empty embedded KIID");
         }
         if embedded_kiid != kiid {
-            bail!(
-                "before requested footprint key {kiid} does not match embedded KIID {embedded_kiid}"
-            );
+            bail!("before footprint key {kiid} does not match embedded KIID {embedded_kiid}");
         }
         before_decoded.insert(kiid.clone(), item.clone());
     }
@@ -2426,12 +2489,21 @@ fn verify_identity_rebind_readback(
         after_by_kiid.insert(embedded_kiid, item.clone());
     }
 
-    if changes.len() != before_by_kiid.len() {
-        bail!(
-            "requested readback contract mismatch: {} changes but {} requested before items",
-            changes.len(),
-            before_by_kiid.len()
-        );
+    let before_kiids = before_decoded.keys().collect::<HashSet<_>>();
+    let after_kiids = after_by_kiid.keys().collect::<HashSet<_>>();
+    if let Some(lost) = before_kiids.difference(&after_kiids).next() {
+        let kind = if changes
+            .iter()
+            .any(|change| change.kiid.as_str() == lost.as_str())
+        {
+            "requested"
+        } else {
+            "unrelated"
+        };
+        bail!("missing {kind} after footprint {lost}");
+    }
+    if let Some(gained) = after_kiids.difference(&before_kiids).next() {
+        bail!("unexpected unrelated after footprint {gained}");
     }
 
     for change in changes {
@@ -2466,6 +2538,24 @@ fn verify_identity_rebind_readback(
             );
         }
         verify_rebound_footprint(before, after, &change.new_symbol_path)?;
+    }
+
+    let changed_kiids = changes
+        .iter()
+        .map(|change| change.kiid.as_str())
+        .collect::<HashSet<_>>();
+    for (kiid, before) in before_by_kiid {
+        if changed_kiids.contains(kiid.as_str()) {
+            continue;
+        }
+        let after = after_by_kiid
+            .get(kiid)
+            .with_context(|| format!("missing unrelated after footprint {kiid}"))?;
+        let before_bytes = canonicalize_footprint_bytes_for_identity_rebind(before, false)?;
+        let after_bytes = canonicalize_footprint_bytes_for_identity_rebind(after, false)?;
+        if before_bytes != after_bytes {
+            bail!("unrelated footprint {kiid} changed during identity rebind readback");
+        }
     }
 
     Ok(())
@@ -2530,9 +2620,11 @@ fn apply_footprint_fields(
                 format!("footprint {reference} has a pad KiCad sent in a form Konnect cannot read")
             })?;
         seen_pads.insert(pad.number.clone());
-        pad.net = pad_nets
-            .get(&pad.number)
-            .map(|name| kiapi::board::types::Net {
+        pad.net = pad_nets.get(&pad.number).and_then(|name| {
+            if name.is_empty() {
+                return None;
+            }
+            Some(kiapi::board::types::Net {
                 // Net codes are KiCad-internal. Preserve a resolved live code
                 // when one exists; for a schematic-only net, the name is the
                 // public identity and lets KiCad create the new board net.
@@ -2541,7 +2633,8 @@ fn apply_footprint_fields(
                     .copied()
                     .map(|value| kiapi::board::types::NetCode { value }),
                 name: name.clone(),
-            });
+            })
+        });
         *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
     }
     for number in pad_nets.keys() {
@@ -2865,6 +2958,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             .definition
             .as_ref()
             .context("KiCad returned a footprint without a definition")?;
+        let mut pad_numbers = Vec::new();
         let mut pad_nets = BTreeMap::new();
         for child in &definition.items {
             // Same discriminator as `apply_footprint_fields`, for the same
@@ -2883,10 +2977,13 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
                 continue;
             };
+            pad_numbers.push(pad.number.clone());
             if let Some(net) = pad.net.filter(|net| !net.name.is_empty()) {
                 pad_nets.insert(pad.number, net.name);
             }
         }
+        pad_numbers.sort();
+        pad_numbers.dedup();
         let position = footprint.position.as_ref();
         footprints.push(BoardFootprint {
             kiid: kiid.clone(),
@@ -2898,6 +2995,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
                 .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
                 .unwrap_or_default(),
             symbol_path: footprint.symbol_path.as_ref().map(sheet_path_string),
+            pad_numbers,
             pad_nets,
             position: Point {
                 x: position
@@ -3210,7 +3308,7 @@ mod tests {
       (footprint "Resistor_SMD:R_0603_1608Metric")
       (sheetpath (names "/Power/") (tstamps "/sheet-uuid/"))
       (tstamps "symbol-uuid")
-      (units (unit (name "A") (pins (pin (num "1")) (pin (num "2")))))))
+      (units (unit (name "A") (pins (pin (num "1")) (pin (num "2")) (pin (num "3")))))))
   (nets
     (net (code "1") (name "/Power/VCC") (class "Default")
       (node (ref "R1") (pin "1") (pintype "passive")))
@@ -3233,6 +3331,7 @@ mod tests {
             Some("/Power/VCC")
         );
         assert_eq!(component.pad_nets.get("2").map(String::as_str), Some("GND"));
+        assert_eq!(component.pad_nets.get("3").map(String::as_str), Some(""));
         assert!(!component.dnp);
     }
 
@@ -3243,6 +3342,8 @@ mod tests {
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
             dnp: false,
+            pad_numbers_complete: true,
+            pad_numbers: normalized_pad_numbers(["1", "2"]),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -3257,6 +3358,7 @@ mod tests {
             value: "10k".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.map(str::to_string),
+            pad_numbers: normalized_pad_numbers(["1", "2"]),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -3300,6 +3402,7 @@ mod tests {
             value: value.to_string(),
             footprint_id: footprint_id.to_string(),
             symbol_path: symbol_path.map(str::to_string),
+            pad_numbers: normalized_pad_numbers(pad_nets.iter().map(|(pad, _)| *pad)),
             pad_nets: pad_nets
                 .iter()
                 .map(|(pad, net)| (pad.to_string(), net.to_string()))
@@ -3389,17 +3492,20 @@ mod tests {
       (footprint "{d1_footprint}")
       (sheetpath (tstamps "/"))
       (tstamps "{d1_symbol_stamp}")
+      (units (unit (name "1") (pins (pin (num "1")) (pin (num "2")))))
       {d1_dnp_property})
     (comp (ref "SW1")
       (value "SW_Push")
       (footprint "Button_Switch_SMD:SW_SPST_SKQG_WithoutStem")
       (sheetpath (tstamps "/33333333-3333-4333-8333-333333333333/"))
-      (tstamps "44444444-4444-4444-8444-444444444444"))
+      (tstamps "44444444-4444-4444-8444-444444444444")
+      (units (unit (name "1") (pins (pin (num "1")) (pin (num "2"))))))
     (comp (ref "R1")
       (value "10k")
       (footprint "Resistor_SMD:R_0603_1608Metric")
       (sheetpath (tstamps "/"))
-      (tstamps "55555555-5555-4555-8555-555555555555")))
+      (tstamps "55555555-5555-4555-8555-555555555555")
+      (units (unit (name "1") (pins (pin (num "1")) (pin (num "2")))))))
   (nets
     (net (code "1") (name "KEY_00")
       (node (ref "D1") (pin "1")))
@@ -3625,8 +3731,8 @@ mod tests {
     fn identity_rebind_source_with_duplicate_sw1_identity(source: &str) -> String {
         replace_once(
             source,
-            "      (sheetpath (tstamps \"/33333333-3333-4333-8333-333333333333/\"))\n      (tstamps \"44444444-4444-4444-8444-444444444444\"))",
-            "      (sheetpath (tstamps \"/\"))\n      (tstamps \"22222222-2222-4222-8222-222222222222\"))",
+            "      (sheetpath (tstamps \"/33333333-3333-4333-8333-333333333333/\"))\n      (tstamps \"44444444-4444-4444-8444-444444444444\")",
+            "      (sheetpath (tstamps \"/\"))\n      (tstamps \"22222222-2222-4222-8222-222222222222\")",
         )
     }
 
@@ -3648,6 +3754,26 @@ mod tests {
             "      (tstamps \"22222222-2222-4222-8222-222222222222\")\n",
             "",
         )
+    }
+
+    fn identity_rebind_source_with_d1_unconnected_pin(source: &str) -> String {
+        replace_once(
+            source,
+            "      (units (unit (name \"1\") (pins (pin (num \"1\")) (pin (num \"2\")))))",
+            "      (units (unit (name \"1\") (pins (pin (num \"1\")) (pin (num \"2\")) (pin (num \"3\")))))",
+        )
+    }
+
+    fn identity_rebind_source_without_units(source: &str) -> String {
+        source
+            .replace(
+                "\n      (units (unit (name \"1\") (pins (pin (num \"1\")) (pin (num \"2\")))))",
+                "",
+            )
+            .replace(
+                "\n      (units (unit (name \"1\") (pins (pin (num \"1\")) (pin (num \"2\")) (pin (num \"3\")))))",
+                "",
+            )
     }
 
     fn design_component_mut<'a>(
@@ -3703,6 +3829,56 @@ mod tests {
             "/22222222-2222-4222-8222-222222222222",
         );
         assert_eq!(plan.changes[0].preserve.layer, "F.Cu");
+    }
+
+    #[test]
+    fn identity_rebind_requires_exact_unconnected_pad_set_equivalence() {
+        let (source, _, board) = identity_rebind_fixture();
+        let source = identity_rebind_source_with_d1_unconnected_pin(&source);
+        let design = parse_identity_rebind_source(&source);
+        let mut matching_board = board.clone();
+        let matching_footprint = board_footprint_mut(&mut matching_board, "D1");
+        matching_footprint.pad_numbers = normalized_pad_numbers(["1", "2", "3"]);
+
+        let ready = plan_identity_rebind(&source, &design, &matching_board, &["D1".to_string()]);
+        assert_eq!(ready.status, PlanStatus::Ready);
+
+        let mut missing_unconnected = board.clone();
+        let missing =
+            plan_identity_rebind(&source, &design, &missing_unconnected, &["D1".to_string()]);
+        assert_eq!(missing.status, PlanStatus::Conflict);
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "pad_set_mismatch"));
+
+        let extra_footprint = board_footprint_mut(&mut missing_unconnected, "D1");
+        extra_footprint.pad_numbers = normalized_pad_numbers(["1", "2", "99"]);
+        extra_footprint
+            .pad_nets
+            .insert("99".to_string(), String::new());
+        let extra =
+            plan_identity_rebind(&source, &design, &missing_unconnected, &["D1".to_string()]);
+        assert_eq!(extra.status, PlanStatus::Conflict);
+        assert!(extra
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "pad_set_mismatch"));
+    }
+
+    #[test]
+    fn identity_rebind_rejects_unproven_schematic_pad_set() {
+        let (source, _, board) = identity_rebind_fixture();
+        let source = identity_rebind_source_without_units(&source);
+        let design = parse_identity_rebind_source(&source);
+
+        let plan = plan_identity_rebind(&source, &design, &board, &["D1".to_string()]);
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "pad_set_unverified"));
     }
 
     #[test]
@@ -3791,7 +3967,9 @@ mod tests {
                 name: "pad set drift",
                 mutate_source: None,
                 mutate_board: |board| {
-                    board_footprint_mut(board, "D1").pad_nets.remove("2");
+                    let footprint = board_footprint_mut(board, "D1");
+                    footprint.pad_numbers = normalized_pad_numbers(["1"]);
+                    footprint.pad_nets.remove("2");
                 },
                 mutate_requested: |requested| *requested = vec!["D1".to_string()],
                 code: "pad_set_mismatch",
@@ -4109,6 +4287,22 @@ mod tests {
         let mut board_only = board.clone();
         board_footprint_mut(&mut board_only, "D1").not_in_schematic = true;
         let changed = plan_identity_rebind(&source, &design, &board_only, &requested);
+
+        assert_ne!(base.plan_revision, changed.plan_revision);
+    }
+
+    #[test]
+    fn identity_rebind_plan_revision_changes_when_unconnected_pad_set_changes() {
+        let (source, _, board) = identity_rebind_fixture();
+        let source = identity_rebind_source_with_d1_unconnected_pin(&source);
+        let design = parse_identity_rebind_source(&source);
+        let mut matching_board = board.clone();
+        let matching_footprint = board_footprint_mut(&mut matching_board, "D1");
+        matching_footprint.pad_numbers = normalized_pad_numbers(["1", "2", "3"]);
+        let requested = vec!["D1".to_string()];
+
+        let base = plan_identity_rebind(&source, &design, &matching_board, &requested);
+        let changed = plan_identity_rebind(&source, &design, &board, &requested);
 
         assert_ne!(base.plan_revision, changed.plan_revision);
     }
@@ -4789,12 +4983,10 @@ mod tests {
             panic!("expected apply context");
         };
         assert_eq!(context.plan.plan_revision, expected_revision);
-        assert_eq!(context.requested_before_items.len(), 2);
+        assert_eq!(context.before_items.len(), 2);
         assert!(
-            context.requested_before_items.contains_key("d1-kiid")
-                || context
-                    .requested_before_items
-                    .contains_key("rebind-d1-kiid")
+            context.before_items.contains_key("d1-kiid")
+                || context.before_items.contains_key("rebind-d1-kiid")
         );
         assert_eq!(context.document, snapshot.document);
         assert_eq!(context.hierarchy_files, 5);
@@ -4966,7 +5158,7 @@ mod tests {
         let IdentityRebindLiveDecision::Apply(mut context) = apply_decision else {
             panic!("expected apply context");
         };
-        context.requested_before_items.remove("d1-kiid");
+        context.before_items.remove("d1-kiid");
 
         let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
         let error = apply_identity_rebind_context(&client, *context)
@@ -4974,8 +5166,7 @@ mod tests {
             .to_string();
 
         assert!(
-            error.contains("requested before item count")
-                || error.contains("missing requested before footprint")
+            error.contains("missing requested before footprint")
                 || error.contains("FootprintInstance"),
             "{error}"
         );
@@ -5019,7 +5210,7 @@ mod tests {
         let IdentityRebindLiveDecision::Apply(mut context) = apply_decision else {
             panic!("expected apply context");
         };
-        context.requested_before_items.remove("d1-kiid");
+        context.before_items.remove("d1-kiid");
         let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
 
         let error = apply_identity_rebind_context(&client, *context)
@@ -5027,8 +5218,7 @@ mod tests {
             .to_string();
 
         assert!(
-            error.contains("requested before item count")
-                || error.contains("missing requested before footprint")
+            error.contains("missing requested before footprint")
                 || error.contains("FootprintInstance"),
             "{error}"
         );
@@ -5132,9 +5322,9 @@ mod tests {
             .iter()
             .map(|change| {
                 let template = context
-                    .requested_before_items
+                    .before_items
                     .get(&change.kiid)
-                    .or_else(|| context.requested_before_items.values().next())
+                    .or_else(|| context.before_items.values().next())
                     .expect("template before item");
                 (
                     change.kiid.clone(),
@@ -5142,14 +5332,10 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        context.requested_before_items = requested_before_items;
+        context.before_items = requested_before_items;
 
         let current_items = Arc::new(Mutex::new(
-            context
-                .requested_before_items
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
+            context.before_items.values().cloned().collect::<Vec<_>>(),
         ));
         let captured_updates = Arc::new(Mutex::new(
             Vec::<kiapi::common::commands::UpdateItems>::new(),
@@ -5168,7 +5354,7 @@ mod tests {
             .iter()
             .map(|change| {
                 let before = context
-                    .requested_before_items
+                    .before_items
                     .get(&change.kiid)
                     .expect("before item for change");
                 rebind_footprint_item(before, change).expect("rebound item")
@@ -5369,6 +5555,7 @@ mod tests {
                     value: "1k".to_string(),
                     footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
                     symbol_path: Some("/sheet/existing".to_string()),
+                    pad_numbers: normalized_pad_numbers(["1", "2"]),
                     pad_nets: BTreeMap::from([
                         ("1".to_string(), "VCC".to_string()),
                         ("2".to_string(), "GND".to_string()),
@@ -5386,6 +5573,7 @@ mod tests {
                     value: "MountingHole".to_string(),
                     footprint_id: "MountingHole:MountingHole_3.2mm_M3".to_string(),
                     symbol_path: None,
+                    pad_numbers: normalized_pad_numbers(std::iter::empty::<&str>()),
                     pad_nets: BTreeMap::new(),
                     position: Point { x: 2.0, y: 2.0 },
                     rotation: 0.0,
@@ -6265,7 +6453,7 @@ mod tests {
         before_by_kiid.insert(change.kiid.clone(), before_item);
 
         let (unrelated_before, _, _) = identity_rebind_fixture_item_and_change();
-        let unrelated_after = mutate_rebound_footprint_item(&unrelated_before, |footprint| {
+        let unrelated_item = mutate_rebound_footprint_item(&unrelated_before, |footprint| {
             use konnect_ipc::gen::kiapi;
             set_field_text(&mut footprint.reference_field, "Reference", "U7");
             footprint.id = Some(kiapi::common::types::Kiid {
@@ -6278,10 +6466,11 @@ mod tests {
                 path_human_readable: String::new(),
             });
         });
+        before_by_kiid.insert("unrelated-u7-kiid".to_string(), unrelated_item.clone());
 
         verify_identity_rebind_readback(
             &before_by_kiid,
-            &[rebound_item, unrelated_after],
+            &[rebound_item, unrelated_item],
             &[change],
         )
         .unwrap();
@@ -6319,6 +6508,114 @@ mod tests {
         assert!(
             duplicate_error.contains("duplicate after KIID"),
             "{duplicate_error}"
+        );
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_removed_unrelated_kiid() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let unrelated_before =
+            mutate_rebound_footprint_item(&footprint_with_artwork("U7"), |footprint| {
+                use konnect_ipc::gen::kiapi;
+                footprint.id = Some(kiapi::common::types::Kiid {
+                    value: "unrelated-u7-kiid".to_string(),
+                });
+                footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                    path: vec![kiapi::common::types::Kiid {
+                        value: "77777777-7777-4777-8777-777777777777".to_string(),
+                    }],
+                    path_human_readable: String::new(),
+                });
+            });
+        before_by_kiid.insert("unrelated-u7-kiid".to_string(), unrelated_before);
+
+        let error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item],
+            std::slice::from_ref(&change),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("missing unrelated after footprint unrelated-u7-kiid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_added_unrelated_kiid() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let added = mutate_rebound_footprint_item(&footprint_with_artwork("U9"), |footprint| {
+            use konnect_ipc::gen::kiapi;
+            footprint.id = Some(kiapi::common::types::Kiid {
+                value: "added-u9-kiid".to_string(),
+            });
+            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                path: vec![kiapi::common::types::Kiid {
+                    value: "99999999-9999-4999-8999-999999999999".to_string(),
+                }],
+                path_human_readable: String::new(),
+            });
+        });
+
+        let error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item, added],
+            std::slice::from_ref(&change),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unexpected unrelated after footprint added-u9-kiid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rebind_collection_readback_rejects_mutated_unrelated_kiid() {
+        let (before_item, change, _) = identity_rebind_fixture_item_and_change();
+        let rebound_item = rebind_footprint_item(&before_item, &change).unwrap();
+        let mut before_by_kiid = BTreeMap::new();
+        before_by_kiid.insert(change.kiid.clone(), before_item);
+
+        let unrelated_before =
+            mutate_rebound_footprint_item(&footprint_with_artwork("U7"), |footprint| {
+                use konnect_ipc::gen::kiapi;
+                footprint.id = Some(kiapi::common::types::Kiid {
+                    value: "unrelated-u7-kiid".to_string(),
+                });
+                footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                    path: vec![kiapi::common::types::Kiid {
+                        value: "77777777-7777-4777-8777-777777777777".to_string(),
+                    }],
+                    path_human_readable: String::new(),
+                });
+            });
+        let unrelated_after = mutate_rebound_footprint_item(&unrelated_before, |footprint| {
+            footprint.locked = konnect_ipc::gen::kiapi::common::types::LockedState::LsLocked as i32;
+        });
+        before_by_kiid.insert("unrelated-u7-kiid".to_string(), unrelated_before);
+
+        let error = verify_identity_rebind_readback(
+            &before_by_kiid,
+            &[rebound_item, unrelated_after],
+            std::slice::from_ref(&change),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "unrelated footprint unrelated-u7-kiid changed during identity rebind readback"
+            ),
+            "{error}"
         );
     }
 
@@ -6416,6 +6713,16 @@ mod tests {
                 path_human_readable: String::new(),
             });
         });
+        let colliding_before = mutate_rebound_footprint_item(&colliding_after, |footprint| {
+            use konnect_ipc::gen::kiapi;
+            footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+                path: vec![kiapi::common::types::Kiid {
+                    value: "88888888-8888-4888-8888-888888888888".to_string(),
+                }],
+                path_human_readable: String::new(),
+            });
+        });
+        before_by_kiid.insert("unrelated-u8-kiid".to_string(), colliding_before);
 
         let error = verify_identity_rebind_readback(
             &before_by_kiid,
@@ -6754,6 +7061,8 @@ mod tests {
     fn removing_a_pad_from_a_routed_net_conflicts_the_whole_plan() {
         let design = ExportedDesign {
             components: vec![DesignComponent {
+                pad_numbers_complete: true,
+                pad_numbers: normalized_pad_numbers(["1", "2"]),
                 pad_nets: BTreeMap::new(),
                 ..resistor("R1", "/sheet/existing")
             }],
@@ -6766,6 +7075,7 @@ mod tests {
                 value: "10k".to_string(),
                 footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
                 symbol_path: Some("/sheet/existing".to_string()),
+                pad_numbers: normalized_pad_numbers(["1"]),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
                 position: Point { x: 1.0, y: 2.0 },
                 rotation: 0.0,
@@ -6835,6 +7145,32 @@ mod tests {
     }
 
     #[test]
+    fn normal_sync_retains_connected_pad_fallback_for_exports_without_units() {
+        let source = r#"
+(export
+  (components
+    (comp
+      (ref "R1")
+      (value "10k")
+      (footprint "Resistor_SMD:R_0603_1608Metric")
+      (sheetpath (tstamps "/sheet/"))
+      (tstamps "symbol")))
+  (nets
+    (net (code "1") (name "GND")
+      (node (ref "R1") (pin "1")))))
+"#;
+        let design = parse_exported_netlist(source).expect("connected-only netlist still parses");
+        let mut board = board_resistor("R1", Some("/sheet/symbol"));
+        board.pad_numbers = normalized_pad_numbers(["1"]);
+        board.pad_nets = BTreeMap::from([("1".to_string(), "VCC".to_string())]);
+
+        let plan = plan_sync(source, &design, &board_with(vec![board]));
+
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.pads_reassigned.planned, 1);
+    }
+
+    #[test]
     fn on_board_no_skips_absent_but_conflicts_when_present() {
         let design = ExportedDesign {
             components: Vec::new(),
@@ -6877,6 +7213,8 @@ mod tests {
                     footprint_id: String::new(),
                     symbol_path: "/root/sym-flg1".to_string(),
                     dnp: false,
+                    pad_numbers_complete: true,
+                    pad_numbers: normalized_pad_numbers(std::iter::empty::<&str>()),
                     pad_nets: BTreeMap::new(),
                 },
                 DesignComponent {
@@ -6885,6 +7223,8 @@ mod tests {
                     footprint_id: String::new(),
                     symbol_path: "/root/sym-flg2".to_string(),
                     dnp: false,
+                    pad_numbers_complete: true,
+                    pad_numbers: normalized_pad_numbers(std::iter::empty::<&str>()),
                     pad_nets: BTreeMap::new(),
                 },
                 DesignComponent {
@@ -6893,6 +7233,8 @@ mod tests {
                     footprint_id: String::new(),
                     symbol_path: "/root/sym-flg3".to_string(),
                     dnp: false,
+                    pad_numbers_complete: true,
+                    pad_numbers: normalized_pad_numbers(std::iter::empty::<&str>()),
                     pad_nets: BTreeMap::new(),
                 },
             ],
