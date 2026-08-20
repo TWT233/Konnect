@@ -411,6 +411,13 @@ struct PreparedBatchComponentUpdate {
     content: String,
     updated: Vec<serde_json::Value>,
     unchanged: Vec<serde_json::Value>,
+    flag_verifications: Vec<BatchComponentFlagVerification>,
+}
+
+#[derive(Debug)]
+struct BatchComponentFlagVerification {
+    reference: String,
+    requested: Vec<(InstanceFlagKind, bool, Vec<bool>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1060,6 +1067,7 @@ fn prepare_batch_component_update(
     let mut edits = Vec::new();
     let mut updated = Vec::with_capacity(requests.len());
     let mut unchanged = Vec::new();
+    let mut flag_verifications = Vec::new();
 
     for request in requests {
         let symbol_blocks = find_all_symbol_instance_blocks(content, &request.reference);
@@ -1067,41 +1075,29 @@ fn prepare_batch_component_update(
             return Err(format!("component '{}' not found", request.reference));
         }
 
-        let mut all_flag_states = HashMap::new();
-        for kind in [
-            InstanceFlagKind::InBom,
-            InstanceFlagKind::OnBoard,
-            InstanceFlagKind::Dnp,
+        for (kind, requested) in [
+            (InstanceFlagKind::InBom, request.in_bom),
+            (InstanceFlagKind::OnBoard, request.on_board),
+            (InstanceFlagKind::Dnp, request.dnp),
         ] {
-            let mut states = Vec::with_capacity(symbol_blocks.len());
-            for (symbol_start, symbol_end) in &symbol_blocks {
-                let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
-                    .map_err(|reason| format!("component '{}' {}", request.reference, reason))?;
-                states.push(state);
+            if requested.is_some() {
+                continue;
             }
-            all_flag_states.insert(kind, states);
-        }
-
-        for kind in [
-            InstanceFlagKind::InBom,
-            InstanceFlagKind::OnBoard,
-            InstanceFlagKind::Dnp,
-        ] {
-            let requested = match kind {
-                InstanceFlagKind::InBom => request.in_bom,
-                InstanceFlagKind::OnBoard => request.on_board,
-                InstanceFlagKind::Dnp => request.dnp,
-            };
-            let states = all_flag_states
-                .get(&kind)
-                .expect("every flag kind collected during preflight");
-            let first = states[0].value;
-            if requested.is_none() && states.iter().any(|state| state.value != first) {
-                return Err(format!(
-                    "component '{}' flag '{}' differs across units",
-                    request.reference,
-                    kind.key()
-                ));
+            let states: Result<Vec<_>, _> = symbol_blocks
+                .iter()
+                .map(|(symbol_start, symbol_end)| {
+                    flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
+                })
+                .collect();
+            if let Ok(states) = states {
+                let first = states[0].value;
+                if states.iter().any(|state| state.value != first) {
+                    return Err(format!(
+                        "component '{}' flag '{}' differs across units",
+                        request.reference,
+                        kind.key()
+                    ));
+                }
             }
         }
 
@@ -1155,20 +1151,21 @@ fn prepare_batch_component_update(
             .iter()
             .any(|(_, requested)| requested.is_some());
 
-        let mut final_flags = serde_json::Map::new();
-        let mut changed_flags = Vec::new();
+        let mut requested_flag_states = Vec::new();
         for (kind, requested) in requested_flags {
-            let states = all_flag_states
-                .get(&kind)
-                .expect("every flag kind collected during preflight");
-            let final_value = requested.unwrap_or(states[0].value);
-            final_flags.insert(kind.key().to_string(), json!(final_value));
             if let Some(target) = requested {
+                let mut states = Vec::with_capacity(symbol_blocks.len());
+                for (symbol_start, symbol_end) in &symbol_blocks {
+                    let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
+                        .map_err(|reason| {
+                            format!("component '{}' {}", request.reference, reason)
+                        })?;
+                    states.push(state);
+                }
                 let flag_changed = states.iter().any(|state| state.value != target);
                 if flag_changed {
                     changed = true;
-                    changed_flags.push(kind.key().to_string());
-                    for state in states {
+                    for state in &states {
                         edits.push(SexpEdit::replace(
                             state.token_start,
                             state.token_end,
@@ -1176,14 +1173,19 @@ fn prepare_batch_component_update(
                         ));
                     }
                 }
+                requested_flag_states.push((
+                    kind,
+                    target,
+                    states.iter().map(|state| state.value).collect(),
+                ));
             }
         }
 
         if any_requested_flags {
-            result.insert("flags".to_string(), serde_json::Value::Object(final_flags));
-            if !changed_flags.is_empty() {
-                result.insert("changed_flags".to_string(), json!(changed_flags));
-            }
+            flag_verifications.push(BatchComponentFlagVerification {
+                reference: request.reference.clone(),
+                requested: requested_flag_states,
+            });
         }
 
         let result = serde_json::Value::Object(result);
@@ -1198,7 +1200,103 @@ fn prepare_batch_component_update(
         content: apply_edits(content.to_string(), edits),
         updated,
         unchanged,
+        flag_verifications,
     })
+}
+
+fn build_verified_batch_component_response(
+    content: &str,
+    prepared: &PreparedBatchComponentUpdate,
+) -> Result<serde_json::Value, String> {
+    let mut updated = prepared.updated.clone();
+    let mut unchanged = prepared.unchanged.clone();
+
+    for verification in &prepared.flag_verifications {
+        let symbol_blocks = find_all_symbol_instance_blocks(content, &verification.reference);
+        if symbol_blocks.is_empty() {
+            return Err(format!(
+                "component '{}' disappeared after write; inspect/reload the schematic",
+                verification.reference
+            ));
+        }
+
+        let mut final_flags = serde_json::Map::new();
+        let mut changed_flags = Vec::new();
+        for (kind, target, before) in &verification.requested {
+            let mut final_states = Vec::with_capacity(symbol_blocks.len());
+            for (symbol_start, symbol_end) in &symbol_blocks {
+                let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, *kind)
+                    .map_err(|reason| {
+                        format!(
+                            "post-write validation for component '{}' failed: {}; inspect/reload the schematic",
+                            verification.reference, reason
+                        )
+                    })?;
+                final_states.push(state.value);
+            }
+            if final_states.iter().any(|value| *value != *target) {
+                return Err(format!(
+                    "post-write validation for component '{}' requested '{}'={} but reread {:?}; inspect/reload the schematic",
+                    verification.reference,
+                    kind.key(),
+                    target,
+                    final_states
+                ));
+            }
+            final_flags.insert(kind.key().to_string(), json!(target));
+            if before
+                .iter()
+                .zip(&final_states)
+                .any(|(old, new)| old != new)
+            {
+                changed_flags.push(kind.key().to_string());
+            }
+        }
+
+        for kind in [
+            InstanceFlagKind::InBom,
+            InstanceFlagKind::OnBoard,
+            InstanceFlagKind::Dnp,
+        ] {
+            if final_flags.contains_key(kind.key()) {
+                continue;
+            }
+            let mut values = Vec::with_capacity(symbol_blocks.len());
+            let mut available = true;
+            for (symbol_start, symbol_end) in &symbol_blocks {
+                match flag_state_in_symbol(content, *symbol_start, *symbol_end, kind) {
+                    Ok(state) => values.push(state.value),
+                    Err(_) => {
+                        available = false;
+                        break;
+                    }
+                }
+            }
+            if available && values.windows(2).all(|pair| pair[0] == pair[1]) {
+                final_flags.insert(kind.key().to_string(), json!(values[0]));
+            }
+        }
+
+        let entry = updated
+            .iter_mut()
+            .chain(unchanged.iter_mut())
+            .find(|entry| entry["reference"] == json!(verification.reference))
+            .expect("prepared component result exists");
+        let object = entry
+            .as_object_mut()
+            .expect("prepared component result is an object");
+        object.insert("flags".to_string(), serde_json::Value::Object(final_flags));
+        if !changed_flags.is_empty() {
+            object.insert("changed_flags".to_string(), json!(changed_flags));
+        }
+    }
+
+    Ok(json!({
+        "atomic": true,
+        "updated_count": updated.len(),
+        "updated": updated,
+        "unchanged": unchanged,
+    }))
 }
 
 fn persist_field_visibility_update(
@@ -1803,12 +1901,13 @@ async fn handle_batch_edit(
         }
     }
 
-    Ok(CallToolResult::json(&json!({
-        "atomic": true,
-        "updated_count": prepared.updated.len(),
-        "updated": prepared.updated,
-        "unchanged": prepared.unchanged,
-    })))
+    let final_content = read_consistent(&sch_path)?;
+    let response = match build_verified_batch_component_response(&final_content, &prepared) {
+        Ok(response) => response,
+        Err(reason) => return Ok(CallToolResult::error(reason)),
+    };
+
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_batch_delete_components(
@@ -3474,6 +3573,38 @@ mod batch_component_flag_tests {
         (dir, path)
     }
 
+    fn default_flag_atom(kind: InstanceFlagKind) -> &'static str {
+        match kind {
+            InstanceFlagKind::InBom => "(in_bom yes)\n",
+            InstanceFlagKind::OnBoard => "(on_board yes)\n",
+            InstanceFlagKind::Dnp => "(dnp no)\n",
+        }
+    }
+
+    fn remove_first_flag_node(content: &str, kind: InstanceFlagKind) -> String {
+        content.replacen(&format!("    {}", default_flag_atom(kind)), "", 1)
+    }
+
+    fn remove_flag_node_from_reference(
+        content: &str,
+        reference: &str,
+        kind: InstanceFlagKind,
+    ) -> String {
+        let (symbol_start, symbol_end) = find_all_symbol_instance_blocks(content, reference)
+            .into_iter()
+            .next()
+            .expect("fixture reference exists");
+        let symbol = &content[symbol_start..symbol_end];
+        let atom = format!("    {}", default_flag_atom(kind));
+        let flag_start = symbol.find(&atom).expect("fixture flag exists");
+        let mut out = content.to_string();
+        out.replace_range(
+            symbol_start + flag_start..symbol_start + flag_start + atom.len(),
+            "",
+        );
+        out
+    }
+
     const SCH_FLAGS: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 20 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg2\")\n    (property \"Reference\" \"#FLG02\" (at 20 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 20 12 0))\n    (property \"Footprint\" \"\" (at 20 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 30 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg3\")\n    (property \"Reference\" \"#FLG03\" (at 30 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 30 12 0))\n    (property \"Footprint\" \"\" (at 30 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 80 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\" (at 80 8 0))\n    (property \"Value\" \"10k\" (at 80 12 0))\n    (property \"Footprint\" \"\" (at 80 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
 
     const SCH_FLAGS_MISSING_ON_BOARD: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
@@ -3509,6 +3640,212 @@ mod batch_component_flag_tests {
         assert_eq!(
             schema["properties"]["edits"]["items"]["additionalProperties"],
             json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn field_only_legacy_edits_do_not_require_omitted_flag_nodes() {
+        for (name, content, edit, expected_fragment) in [
+            (
+                "field-only-missing-in-bom.kicad_sch",
+                remove_first_flag_node(SCH_FLAGS, InstanceFlagKind::InBom),
+                json!({"reference": "#FLG01", "value": "PWR_FLAG_LEGACY"}),
+                r#"(property "Value" "PWR_FLAG_LEGACY""#,
+            ),
+            (
+                "field-only-missing-on-board.kicad_sch",
+                remove_first_flag_node(SCH_FLAGS, InstanceFlagKind::OnBoard),
+                json!({"reference": "#FLG01", "footprint": "Test:Flag"}),
+                r#"(property "Footprint" "Test:Flag""#,
+            ),
+            (
+                "field-only-missing-dnp.kicad_sch",
+                remove_first_flag_node(
+                    &SCH_FLAGS.replace(
+                        r#"(property "Footprint" "" (at 10 14 0))"#,
+                        r#"(property "Footprint" "" (at 10 14 0))
+    (property "MPN" "OLD" (at 10 16 0))"#,
+                    ),
+                    InstanceFlagKind::Dnp,
+                ),
+                json!({"reference": "#FLG01", "fields": {"MPN": "NEW"}}),
+                r#"(property "MPN" "NEW""#,
+            ),
+        ] {
+            let (_dir, path) = write_fixture(name, &content);
+
+            let result = handle_batch_edit(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "edits": [edit]
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!result.is_error, "{name}: {result:?}");
+            let body = result_body(&result);
+            assert_eq!(body["updated_count"], json!(1), "{body}");
+            assert!(
+                body["updated"][0].get("flags").is_none(),
+                "field-only result must not be forced to include flags: {body}"
+            );
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains(expected_fragment), "{after}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_field_only_legacy_and_explicit_flag_edits_commit_together() {
+        let content = remove_flag_node_from_reference(SCH_FLAGS, "R1", InstanceFlagKind::OnBoard);
+        let (_dir, path) = write_fixture("mixed-legacy-field-and-flag.kicad_sch", &content);
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "R1", "value": "22k"},
+                    {"reference": "#FLG01", "on_board": false}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(2), "{body}");
+        assert!(
+            body["updated"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["reference"] == json!("R1") && entry.get("flags").is_none() }),
+            "field-only entry must remain flagless: {body}"
+        );
+        assert!(
+            body["updated"].as_array().unwrap().iter().any(|entry| {
+                entry["reference"] == json!("#FLG01")
+                    && entry["flags"] == json!({"in_bom": true, "on_board": false, "dnp": false})
+            }),
+            "flag entry must report reread final flags: {body}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(r#"(property "Value" "22k""#), "{after}");
+        assert_eq!(
+            find_all_symbol_instance_blocks(&after, "R1")
+                .into_iter()
+                .filter(|(start, end)| {
+                    flag_state_in_symbol(&after, *start, *end, InstanceFlagKind::OnBoard).is_ok()
+                })
+                .count(),
+            0,
+            "field-only edit must not invent the missing on_board node: {after}"
+        );
+        assert!(after.contains("(on_board no)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_rejects_when_explicit_flag_node_is_missing() {
+        let content =
+            remove_flag_node_from_reference(SCH_FLAGS, "#FLG01", InstanceFlagKind::OnBoard);
+        let (_dir, path) = write_fixture("mixed-explicit-missing-flag.kicad_sch", &content);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "R1", "value": "22k"},
+                    {"reference": "#FLG01", "on_board": false}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn verified_flag_response_uses_final_content_for_returned_flags() {
+        let requests = parse_batch_component_edit_requests(&[json!({
+            "reference": "#FLG01",
+            "on_board": false
+        })])
+        .expect("valid request");
+        let prepared =
+            prepare_batch_component_update(SCH_FLAGS, &requests).expect("request prevalidates");
+        let final_content = prepared.content.replacen("(dnp no)", "(dnp yes)", 1);
+
+        let response = build_verified_batch_component_response(&final_content, &prepared).unwrap();
+
+        assert_eq!(
+            response["updated"][0]["flags"],
+            json!({"in_bom": true, "on_board": false, "dnp": true})
+        );
+        assert_eq!(response["updated"][0]["changed_flags"], json!(["on_board"]));
+    }
+
+    #[test]
+    fn verified_flag_response_rejects_requested_state_mismatch_with_reload_guidance() {
+        let requests = parse_batch_component_edit_requests(&[json!({
+            "reference": "#FLG01",
+            "on_board": false
+        })])
+        .expect("valid request");
+        let prepared =
+            prepare_batch_component_update(SCH_FLAGS, &requests).expect("request prevalidates");
+        let tampered = prepared
+            .content
+            .replacen("(on_board no)", "(on_board yes)", 1);
+
+        let error = build_verified_batch_component_response(&tampered, &prepared)
+            .expect_err("requested flag mismatch must fail closed");
+
+        assert!(
+            error.contains("inspect/reload"),
+            "post-write validation errors must tell callers what to do: {error}"
+        );
+        assert!(
+            error.contains("requested 'on_board'"),
+            "error should identify the failed requested flag: {error}"
+        );
+    }
+
+    #[test]
+    fn verified_flag_response_rejects_malformed_reread_with_reload_guidance() {
+        let requests = parse_batch_component_edit_requests(&[json!({
+            "reference": "#FLG01",
+            "on_board": false
+        })])
+        .expect("valid request");
+        let prepared =
+            prepare_batch_component_update(SCH_FLAGS, &requests).expect("request prevalidates");
+        let malformed =
+            prepared
+                .content
+                .replacen("(on_board no)", "(on_board no)\n    (on_board yes)", 1);
+
+        let error = build_verified_batch_component_response(&malformed, &prepared)
+            .expect_err("malformed flag reread must fail closed");
+
+        assert!(
+            error.contains("inspect/reload"),
+            "post-write validation errors must tell callers what to do: {error}"
+        );
+        assert!(
+            error.contains("multiple direct 'on_board' nodes"),
+            "{error}"
         );
     }
 
