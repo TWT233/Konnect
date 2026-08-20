@@ -27,7 +27,7 @@ use konnect_sexp::{
     SexpError,
 };
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 // Re-use the crate-internal net-graph primitives from sch_analysis.
@@ -163,8 +163,8 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+            "Apply field updates (Value, Footprint, custom properties) and instance flags \
+             (in_bom, on_board, dnp) to multiple components in a single atomic file write.",
             json!({
                 "type": "object",
                 "properties": {
@@ -178,12 +178,16 @@ pub fn tools() -> Vec<ToolDef> {
                                 "reference": { "type": "string" },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
+                                "in_bom": { "type": "boolean" },
+                                "on_board": { "type": "boolean" },
+                                "dnp": { "type": "boolean" },
                                 "fields": {
                                     "type": "object",
                                     "description": "Additional property fields as key:value pairs"
                                 }
                             },
-                            "required": ["reference"]
+                            "required": ["reference"],
+                            "additionalProperties": false
                         }
                     }
                 },
@@ -390,6 +394,24 @@ struct PreparedFieldVisibilityUpdate {
     results: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+struct BatchComponentEditRequest {
+    reference: String,
+    value: Option<String>,
+    footprint: Option<String>,
+    fields: BTreeMap<String, String>,
+    in_bom: Option<bool>,
+    on_board: Option<bool>,
+    dnp: Option<bool>,
+}
+
+#[derive(Debug)]
+struct PreparedBatchComponentUpdate {
+    content: String,
+    updated: Vec<serde_json::Value>,
+    unchanged: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FieldVisibilityKind {
     Reference,
@@ -412,6 +434,30 @@ impl FieldVisibilityKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InstanceFlagKind {
+    InBom,
+    OnBoard,
+    Dnp,
+}
+
+impl InstanceFlagKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::InBom => "in_bom",
+            Self::OnBoard => "on_board",
+            Self::Dnp => "dnp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InstanceFlagState {
+    value: bool,
+    token_start: usize,
+    token_end: usize,
+}
+
 #[derive(Debug)]
 struct PropertyVisibilityState {
     visible: bool,
@@ -422,6 +468,17 @@ struct PropertyVisibilityState {
 }
 
 fn invalid_field_visibility_arg(reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: "edits".to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument 'edits' is invalid: {reason}"),
+    )
+}
+
+fn invalid_batch_edit_arg(reason: impl Into<String>) -> CallToolResult {
     let reason = reason.into();
     CallToolResult::error_kind(
         ToolErrorKind::InvalidArgument {
@@ -519,6 +576,190 @@ fn property_name_from_block(block: &str) -> Option<&str> {
     let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+fn flag_state_in_symbol(
+    content: &str,
+    symbol_start: usize,
+    symbol_end: usize,
+    kind: InstanceFlagKind,
+) -> Result<InstanceFlagState, String> {
+    let symbol = &content[symbol_start..symbol_end];
+    let mut matches = Vec::new();
+
+    for (child_start, child_end) in find_direct_child_blocks(symbol, "symbol") {
+        let child = &symbol[child_start..child_end];
+        if sexp_tag(child) == kind.key() {
+            matches.push((child_start, child_end, child));
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!("component is missing direct '{}' node", kind.key())),
+        1 => {
+            let (child_start, _child_end, child) = matches[0];
+            let prefix = format!("({} ", kind.key());
+            let Some(value_text) = child
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(')'))
+            else {
+                return Err(format!(
+                    "component has malformed direct '{}' node '{}'",
+                    kind.key(),
+                    child.trim()
+                ));
+            };
+            let value = match value_text {
+                "yes" => true,
+                "no" => false,
+                _ => {
+                    return Err(format!(
+                        "component has malformed direct '{}' node '{}'",
+                        kind.key(),
+                        child.trim()
+                    ))
+                }
+            };
+            let token_start = symbol_start + child_start + prefix.len();
+            let token_end = token_start + value_text.len();
+            Ok(InstanceFlagState {
+                value,
+                token_start,
+                token_end,
+            })
+        }
+        _ => Err(format!(
+            "component has multiple direct '{}' nodes",
+            kind.key()
+        )),
+    }
+}
+
+fn parse_batch_component_edit_requests(
+    edits: &[serde_json::Value],
+) -> Result<Vec<BatchComponentEditRequest>, CallToolResult> {
+    let mut requests = Vec::with_capacity(edits.len());
+    let mut seen = HashSet::new();
+
+    for edit in edits {
+        let Some(object) = edit.as_object() else {
+            return Err(invalid_batch_edit_arg(
+                "each edit must be an object with reference and optional field or flag keys",
+            ));
+        };
+
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "reference" | "value" | "footprint" | "fields" | "in_bom" | "on_board" | "dnp"
+            ) {
+                return Err(invalid_batch_edit_arg(format!(
+                    "unknown key '{}' in component edit",
+                    key
+                )));
+            }
+        }
+
+        let Some(reference) = object.get("reference").and_then(|value| value.as_str()) else {
+            return Err(invalid_batch_edit_arg(
+                "each edit must include non-empty string field 'reference'",
+            ));
+        };
+        if reference.is_empty() {
+            return Err(invalid_batch_edit_arg(
+                "each edit must include non-empty string field 'reference'",
+            ));
+        }
+        if !seen.insert(reference.to_string()) {
+            return Err(invalid_batch_edit_arg(format!(
+                "duplicate edit for reference '{}'",
+                reference
+            )));
+        }
+
+        let value = match object.get("value") {
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                invalid_batch_edit_arg("field 'value' must be string when present")
+            })?),
+            None => None,
+        }
+        .map(str::to_string);
+        let footprint = match object.get("footprint") {
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                invalid_batch_edit_arg("field 'footprint' must be string when present")
+            })?),
+            None => None,
+        }
+        .map(str::to_string);
+
+        let mut fields = BTreeMap::new();
+        if let Some(value) = object.get("fields") {
+            let Some(map) = value.as_object() else {
+                return Err(invalid_batch_edit_arg(
+                    "field 'fields' must be an object when present",
+                ));
+            };
+            for (name, value) in map {
+                if matches!(name.as_str(), "Reference" | "Value" | "Footprint") {
+                    return Err(invalid_batch_edit_arg(format!(
+                        "field '{}' must use its dedicated top-level key",
+                        name
+                    )));
+                }
+                let Some(value) = value.as_str() else {
+                    return Err(invalid_batch_edit_arg(format!(
+                        "custom field '{}' must have a string value",
+                        name
+                    )));
+                };
+                fields.insert(name.clone(), value.to_string());
+            }
+        }
+
+        let in_bom = match object.get("in_bom") {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                invalid_batch_edit_arg("field 'in_bom' must be boolean when present")
+            })?),
+            None => None,
+        };
+        let on_board = match object.get("on_board") {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                invalid_batch_edit_arg("field 'on_board' must be boolean when present")
+            })?),
+            None => None,
+        };
+        let dnp = match object.get("dnp") {
+            Some(value) => Some(value.as_bool().ok_or_else(|| {
+                invalid_batch_edit_arg("field 'dnp' must be boolean when present")
+            })?),
+            None => None,
+        };
+
+        if value.is_none()
+            && footprint.is_none()
+            && fields.is_empty()
+            && in_bom.is_none()
+            && on_board.is_none()
+            && dnp.is_none()
+        {
+            return Err(invalid_batch_edit_arg(format!(
+                "edit for '{}' must include at least one field or flag change",
+                reference
+            )));
+        }
+
+        requests.push(BatchComponentEditRequest {
+            reference: reference.to_string(),
+            value,
+            footprint,
+            fields,
+            in_bom,
+            on_board,
+            dnp,
+        });
+    }
+
+    Ok(requests)
 }
 
 fn line_indent(content: &str, start: usize) -> String {
@@ -750,6 +991,160 @@ fn prepare_field_visibility_update(
         updated_count,
         unchanged_count,
         results,
+    })
+}
+
+fn prepare_batch_component_update(
+    content: &str,
+    requests: &[BatchComponentEditRequest],
+) -> Result<PreparedBatchComponentUpdate, String> {
+    let mut edits = Vec::new();
+    let mut updated = Vec::with_capacity(requests.len());
+    let mut unchanged = Vec::new();
+
+    for request in requests {
+        let symbol_blocks = find_all_symbol_instance_blocks(content, &request.reference);
+        if symbol_blocks.is_empty() {
+            return Err(format!("component '{}' not found", request.reference));
+        }
+
+        let mut all_flag_states = HashMap::new();
+        for kind in [
+            InstanceFlagKind::InBom,
+            InstanceFlagKind::OnBoard,
+            InstanceFlagKind::Dnp,
+        ] {
+            let mut states = Vec::with_capacity(symbol_blocks.len());
+            for (symbol_start, symbol_end) in &symbol_blocks {
+                let state = flag_state_in_symbol(content, *symbol_start, *symbol_end, kind)
+                    .map_err(|reason| format!("component '{}' {}", request.reference, reason))?;
+                states.push(state);
+            }
+            all_flag_states.insert(kind, states);
+        }
+
+        for kind in [
+            InstanceFlagKind::InBom,
+            InstanceFlagKind::OnBoard,
+            InstanceFlagKind::Dnp,
+        ] {
+            let requested = match kind {
+                InstanceFlagKind::InBom => request.in_bom,
+                InstanceFlagKind::OnBoard => request.on_board,
+                InstanceFlagKind::Dnp => request.dnp,
+            };
+            let states = all_flag_states
+                .get(&kind)
+                .expect("every flag kind collected during preflight");
+            let first = states[0].value;
+            if requested.is_none() && states.iter().any(|state| state.value != first) {
+                return Err(format!(
+                    "component '{}' flag '{}' differs across units",
+                    request.reference,
+                    kind.key()
+                ));
+            }
+        }
+
+        let mut component_changes = Vec::new();
+        let mut changed = false;
+        let mut result = serde_json::Map::new();
+        result.insert("reference".to_string(), json!(request.reference));
+
+        let field_specs = [
+            ("Value", request.value.as_ref()),
+            ("Footprint", request.footprint.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| Some((field.to_string(), value?)))
+        .chain(
+            request
+                .fields
+                .iter()
+                .map(|(field, value)| (field.clone(), value)),
+        );
+
+        for (field, new_val) in field_specs {
+            let ranges = field_value_ranges(content, &request.reference, &field);
+            if ranges.is_empty() {
+                return Err(format!(
+                    "component '{}' field '{}' not found",
+                    request.reference, field
+                ));
+            }
+            let units = ranges.len();
+            let field_changed = ranges
+                .iter()
+                .any(|(start, end)| &content[*start..*end] != new_val.as_str());
+            if field_changed {
+                changed = true;
+                for (start, end) in ranges {
+                    edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+                }
+                component_changes.push(if units > 1 {
+                    format!("{} → {} ({} units)", field, new_val, units)
+                } else {
+                    format!("{} → {}", field, new_val)
+                });
+            }
+        }
+
+        if !component_changes.is_empty() {
+            result.insert("changes".to_string(), json!(component_changes));
+        }
+
+        let requested_flags = [
+            (InstanceFlagKind::InBom, request.in_bom),
+            (InstanceFlagKind::OnBoard, request.on_board),
+            (InstanceFlagKind::Dnp, request.dnp),
+        ];
+        let any_requested_flags = requested_flags
+            .iter()
+            .any(|(_, requested)| requested.is_some());
+
+        let mut final_flags = serde_json::Map::new();
+        let mut changed_flags = Vec::new();
+        for (kind, requested) in requested_flags {
+            let states = all_flag_states
+                .get(&kind)
+                .expect("every flag kind collected during preflight");
+            let final_value = requested.unwrap_or(states[0].value);
+            final_flags.insert(kind.key().to_string(), json!(final_value));
+            if let Some(target) = requested {
+                let flag_changed = states.iter().any(|state| state.value != target);
+                if flag_changed {
+                    changed = true;
+                    changed_flags.push(kind.key().to_string());
+                    for state in states {
+                        edits.push(SexpEdit::replace(
+                            state.token_start,
+                            state.token_end,
+                            if target { "yes" } else { "no" },
+                        ));
+                    }
+                }
+            }
+        }
+
+        if any_requested_flags {
+            result.insert("flags".to_string(), serde_json::Value::Object(final_flags));
+            if !changed_flags.is_empty() {
+                result.insert("changed_flags".to_string(), json!(changed_flags));
+            }
+        }
+
+        let result = serde_json::Value::Object(result);
+        if changed {
+            updated.push(result);
+        } else {
+            unchanged.push(result);
+        }
+    }
+
+    Ok(PreparedBatchComponentUpdate {
+        content: apply_edits(content.to_string(), edits),
+        updated,
+        unchanged,
     })
 }
 
@@ -1328,74 +1723,38 @@ async fn handle_batch_edit(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let edits_arr = match args["edits"].as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'edits' array")),
+    let edits = match require_array(args, "edits") {
+        Ok(edits) => edits,
+        Err(error) => return Ok(error),
+    };
+    let requests = match parse_batch_component_edit_requests(edits) {
+        Ok(requests) => requests,
+        Err(error) => return Ok(error),
+    };
+    let content = read_consistent(&sch_path)?;
+    let prepared = match prepare_batch_component_update(&content, &requests) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(invalid_batch_edit_arg(reason)),
     };
 
-    let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut file_edits: Vec<SexpEdit> = Vec::new();
-    let mut changed: Vec<serde_json::Value> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for edit_spec in &edits_arr {
-        let reference = match edit_spec["reference"].as_str() {
-            Some(r) => r,
-            None => {
-                errors.push("Missing 'reference' in edit spec".into());
-                continue;
+    if prepared.content != content {
+        match write_atomic_if_unchanged(&sch_path, &content, &prepared.content) {
+            Ok(()) => {}
+            Err(SexpError::Conflict { .. }) => return Ok(conflict_result(&sch_path)),
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "Failed to persist batch component update to '{}': {error}",
+                    sch_path.display()
+                )))
             }
-        };
-
-        let mut component_changes: Vec<String> = Vec::new();
-
-        // Standard fields, then arbitrary extra fields from the "fields" object.
-        // Each is rewritten in every unit's block, which is where a multi-unit
-        // part keeps its copies of the value.
-        let extra = edit_spec["fields"].as_object();
-        let specs = [("Value", "value"), ("Footprint", "footprint")]
-            .into_iter()
-            .filter_map(|(field, key)| Some((field.to_string(), edit_spec[key].as_str()?)))
-            .chain(
-                extra
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?))),
-            );
-
-        for (field, new_val) in specs {
-            let ranges = field_value_ranges(&content, reference, &field);
-            if ranges.is_empty() {
-                errors.push(format!("Field '{}' not found on '{}'", field, reference));
-                continue;
-            }
-            let units = ranges.len();
-            for (start, end) in ranges {
-                file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
-            }
-            component_changes.push(if units > 1 {
-                format!("{} → {} ({} units)", field, new_val, units)
-            } else {
-                format!("{} → {}", field, new_val)
-            });
-        }
-
-        if !component_changes.is_empty() {
-            changed.push(json!({
-                "reference": reference,
-                "changes": component_changes
-            }));
         }
     }
 
-    let new_content = apply_edits(content, file_edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
-
     Ok(CallToolResult::json(&json!({
-        "updated_count": changed.len(),
-        "updated": changed,
-        "errors": errors
+        "atomic": true,
+        "updated_count": prepared.updated.len(),
+        "updated": prepared.updated,
+        "unchanged": prepared.unchanged,
     })))
 }
 
@@ -3021,6 +3380,297 @@ mod field_visibility_tests {
         assert!(result.is_error, "{result:?}");
         assert_eq!(extract_error_kind(&result).as_deref(), Some("conflict"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), externally_changed);
+    }
+}
+
+#[cfg(test)]
+mod batch_component_flag_tests {
+    use super::*;
+    use crate::mcp::error::extract_error_kind;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn result_body(result: &CallToolResult) -> Value {
+        let Some(crate::mcp::protocol::ToolContent::Text { text }) = result.content.first() else {
+            panic!("expected text content: {result:?}");
+        };
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{error}: {text}"))
+    }
+
+    fn write_fixture(name: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    const SCH_FLAGS: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\")\n      (property \"Value\" \"R\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 20 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg2\")\n    (property \"Reference\" \"#FLG02\" (at 20 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 20 12 0))\n    (property \"Footprint\" \"\" (at 20 14 0))\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 30 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-flg3\")\n    (property \"Reference\" \"#FLG03\" (at 30 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 30 12 0))\n    (property \"Footprint\" \"\" (at 30 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (symbol\n    (lib_id \"Device:R\")\n    (at 80 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-r1\")\n    (property \"Reference\" \"R1\" (at 80 8 0))\n    (property \"Value\" \"10k\" (at 80 12 0))\n    (property \"Footprint\" \"\" (at 80 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_FLAGS_MISSING_ON_BOARD: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_FLAGS_DUPLICATE_DIRECT: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"power:PWR_FLAG\"\n      (property \"Reference\" \"#FLG\")\n      (property \"Value\" \"PWR_FLAG\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"power:PWR_FLAG\")\n    (at 10 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-flg1\")\n    (property \"Reference\" \"#FLG01\" (at 10 8 0))\n    (property \"Value\" \"PWR_FLAG\" (at 10 12 0))\n    (property \"Footprint\" \"\" (at 10 14 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    const SCH_FLAGS_MULTI_UNIT_INCONSISTENT: &str = "(kicad_sch\n  (version 20260306)\n  (generator \"konnect\")\n  (uuid \"root\")\n  (lib_symbols\n    (symbol \"74xx:74HC14\"\n      (property \"Reference\" \"U\")\n      (property \"Value\" \"74HC14\")\n      (property \"Footprint\" \"\")\n    )\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 10 0)\n    (unit 1)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"sym-u1-1\")\n    (property \"Reference\" \"U1\" (at 50 8 0))\n    (property \"Value\" \"74HC14\" (at 50 12 0))\n    (property \"Footprint\" \"\" (at 50 14 0))\n  )\n  (symbol\n    (lib_id \"74xx:74HC14\")\n    (at 50 25 0)\n    (unit 2)\n    (in_bom yes)\n    (on_board no)\n    (dnp no)\n    (uuid \"sym-u1-2\")\n    (property \"Reference\" \"U1\" (at 50 23 0))\n    (property \"Value\" \"74HC14\" (at 50 27 0))\n    (property \"Footprint\" \"\" (at 50 29 0))\n  )\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n";
+
+    #[test]
+    fn batch_edit_schematic_components_schema_exposes_instance_flags() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "batch_edit_schematic_components")
+            .expect("tool is registered");
+        let schema = tool.input_schema;
+        assert_eq!(schema["required"], json!(["schematic", "edits"]));
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["in_bom"]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["on_board"]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["properties"]["dnp"]["type"],
+            json!("boolean")
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_flag_references_change_only_on_board() {
+        let (_dir, path) = write_fixture("flags-only-on-board.kicad_sch", SCH_FLAGS);
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "#FLG01", "on_board": false},
+                    {"reference": "#FLG02", "on_board": false},
+                    {"reference": "#FLG03", "on_board": false}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["atomic"], json!(true));
+        assert_eq!(body["updated_count"], json!(3));
+        assert_eq!(body["unchanged"], json!([]));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(on_board no)").count(), 3, "{after}");
+        assert_eq!(after.matches("(in_bom yes)").count(), 6, "{after}");
+        assert_eq!(after.matches("(dnp no)").count(), 6, "{after}");
+    }
+
+    #[tokio::test]
+    async fn explicit_flags_round_trip() {
+        let (_dir, path) = write_fixture("flags-round-trip.kicad_sch", SCH_FLAGS);
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "#FLG01",
+                    "in_bom": false,
+                    "on_board": false,
+                    "dnp": true
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(1));
+        assert_eq!(
+            body["updated"][0]["flags"],
+            json!({"in_bom": false, "on_board": false, "dnp": true})
+        );
+        assert_eq!(
+            body["updated"][0]["changed_flags"],
+            json!(["in_bom", "on_board", "dnp"])
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("(in_bom no)"), "{after}");
+        assert!(after.contains("(on_board no)"), "{after}");
+        assert!(after.contains("(dnp yes)"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn multi_unit_flag_update_reaches_every_unit() {
+        let (_dir, path) = write_fixture("flags-multi-unit.kicad_sch", SCH_FLAGS);
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "U1",
+                    "on_board": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(1));
+        assert_eq!(body["updated"][0]["changed_flags"], json!(["on_board"]));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("(property \"Reference\" \"U1\"").count(), 2);
+        assert_eq!(after.matches("(on_board no)").count(), 2, "{after}");
+    }
+
+    #[tokio::test]
+    async fn exact_repeat_is_a_successful_byte_identical_no_op() {
+        let (_dir, path) = write_fixture("flags-noop.kicad_sch", SCH_FLAGS);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "#FLG01",
+                    "in_bom": true,
+                    "on_board": true,
+                    "dnp": false
+                }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        let body = result_body(&result);
+        assert_eq!(body["updated_count"], json!(0));
+        assert_eq!(body["updated"], json!([]));
+        assert_eq!(
+            body["unchanged"],
+            json!([{
+                "reference": "#FLG01",
+                "flags": {"in_bom": true, "on_board": true, "dnp": false}
+            }])
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn invalid_flag_batches_are_rejected_without_writing_any_bytes() {
+        for (name, content, args) in [
+            (
+                "flags-empty-reference.kicad_sch",
+                SCH_FLAGS,
+                json!({"edits": [{"reference": "", "on_board": false}]}),
+            ),
+            (
+                "flags-duplicate-reference.kicad_sch",
+                SCH_FLAGS,
+                json!({"edits": [
+                    {"reference": "#FLG01", "on_board": false},
+                    {"reference": "#FLG01", "dnp": true}
+                ]}),
+            ),
+            (
+                "flags-missing-reference.kicad_sch",
+                SCH_FLAGS,
+                json!({"edits": [{"on_board": false}]}),
+            ),
+            (
+                "flags-missing-target.kicad_sch",
+                SCH_FLAGS,
+                json!({"edits": [{"reference": "#FLG99", "on_board": false}]}),
+            ),
+            (
+                "flags-non-boolean.kicad_sch",
+                SCH_FLAGS,
+                json!({"edits": [{"reference": "#FLG01", "on_board": "no"}]}),
+            ),
+            (
+                "flags-missing-direct-token.kicad_sch",
+                SCH_FLAGS_MISSING_ON_BOARD,
+                json!({"edits": [{"reference": "#FLG01", "on_board": false}]}),
+            ),
+            (
+                "flags-duplicate-direct-token.kicad_sch",
+                SCH_FLAGS_DUPLICATE_DIRECT,
+                json!({"edits": [{"reference": "#FLG01", "on_board": false}]}),
+            ),
+            (
+                "flags-unrelated-inconsistency.kicad_sch",
+                SCH_FLAGS_MULTI_UNIT_INCONSISTENT,
+                json!({"edits": [{"reference": "U1", "dnp": true}]}),
+            ),
+        ] {
+            let (_dir, path) = write_fixture(name, content);
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut full_args = args;
+            full_args["schematic"] = json!(path.display().to_string());
+
+            let result = handle_batch_edit(&full_args, &test_ctx()).await.unwrap();
+
+            assert!(result.is_error, "{full_args}: {result:?}");
+            assert_eq!(
+                extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{full_args}: {result:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_field_and_flag_invalid_request_writes_nothing() {
+        let (_dir, path) = write_fixture("flags-mixed-invalid.kicad_sch", SCH_FLAGS);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [
+                    {"reference": "R1", "value": "22k"},
+                    {"reference": "#FLG99", "on_board": false}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            extract_error_kind(&result).as_deref(),
+            Some("invalid_argument")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 }
 
