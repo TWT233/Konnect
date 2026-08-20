@@ -171,6 +171,24 @@ Connect multiple pins to the same net in one call. Ideal for:
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.
 
+This tool supports a **mixed batch** of field edits and instance flags:
+
+- Standard edits: `value`, `footprint`, and custom `fields` (property key/value pairs)
+- Optional instance flags: `in_bom`, `on_board`, `dnp`
+
+Contract:
+
+- Omitted fields/flags **preserve** their current values — only provided keys are changed.
+- The entire batch is **prevalidated** up front and applied **all-or-nothing**.
+  One bad reference, wrong type, or malformed edit aborts the whole request and
+  leaves the schematic bytes unchanged.
+- Repeating the existing state is a successful **byte-identical no-op**.
+- If you need to confirm the result, re-read with `get_schematic_component` or
+  `list_schematic_components`.
+- When downstream PCB eligibility matters, follow with the normal PCB sync
+  workflow using a dry run (for example `update_pcb_from_schematic` with its
+  plan-only default) before applying any board writes.
+
 ### batch_set_schematic_field_visibility
 
 Use this batch tool to hide or show the placed `Reference` and `Value` fields on

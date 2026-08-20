@@ -152,7 +152,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. Single read → all labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
-| `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
+| `batch_edit_schematic_components` | Atomically update component fields (Value, Footprint, custom properties) and optional instance flags (`in_bom`, `on_board`, `dnp`) across multiple components. Omitted keys preserve current values; the whole batch is prevalidated and all-or-nothing. |
 | `batch_set_schematic_field_visibility` | Set Reference and/or Value field visibility for multiple placed components from one `schematic` path plus `edits[]` objects containing `reference` and optional `reference_visible` / `value_visible`. The request is prevalidated atomically, a bad reference aborts the whole batch, and an edit already at the target state succeeds as a byte-identical no-op. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
