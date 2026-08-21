@@ -20,6 +20,20 @@ use tracing::{debug, info, warn};
 /// Extended timeout for long operations (export, ERC, DRC).
 const LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
+fn cli_failure_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (true, true) => "no diagnostic output".to_string(),
+    }
+}
+
 // ─── Result Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,11 +163,10 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     }
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "kicad-cli exited with {}: {}",
+            "kicad-cli exited with {}:\n{}",
             output.status.code().unwrap_or(-1),
-            stderr.trim()
+            cli_failure_diagnostics(&output.stdout, &output.stderr)
         );
     }
 
@@ -599,26 +612,50 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     Ok(drill_files_in(output_dir).await)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
-pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "pdf", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
+fn single_file_pcb_export_args(
+    format: &str,
+    output: &str,
+    layers: &[&str],
+    pcb: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "pcb".to_string(),
+        "export".to_string(),
+        format.to_string(),
+        "--output".to_string(),
+        output.to_string(),
+        "--mode-single".to_string(),
+    ];
+    if !layers.is_empty() {
+        args.push("--layers".to_string());
+        args.push(layers.join(","));
     }
-    args.push(pcb.to_str().unwrap());
+    args.push(pcb.to_string());
+    args
+}
+
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>] <input>`
+pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
+    let args = single_file_pcb_export_args(
+        "pdf",
+        output.to_str().unwrap(),
+        layers,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> [--layers <layer>]... <input>`
+/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>] <input>`
 pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "svg", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
-    }
-    args.push(pcb.to_str().unwrap());
+    let args = single_file_pcb_export_args(
+        "svg",
+        output.to_str().unwrap(),
+        layers,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -692,9 +729,10 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
-/// Unlike `pdf`/`svg`, DXF's `--layers` takes a single comma-separated value
-/// rather than a repeatable flag, and one file per requested layer is written
-/// into `output_dir` (verified against KiCAD 10.0).
+/// `--layers` takes a single comma-separated value, the same as every PCB
+/// exporter (the pdf/svg wrappers used to repeat the flag per layer, which
+/// KiCAD 10 rejects — #250). DXF differs in output shape only: one file per
+/// requested layer is written into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
     let output_str = output_dir.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
@@ -812,6 +850,54 @@ pub async fn render_pcb_png(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pcb_plot_export_tests {
+    use super::*;
+
+    #[test]
+    fn layers_are_one_comma_separated_argument_for_kicad_10() {
+        let args = single_file_pcb_export_args(
+            "svg",
+            "/out/board.svg",
+            &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
+            "/tmp/board.kicad_pcb",
+        );
+
+        assert_eq!(args.iter().filter(|arg| *arg == "--layers").count(), 1);
+        let layers = args
+            .iter()
+            .position(|arg| arg == "--layers")
+            .map(|index| args[index + 1].as_str());
+        assert_eq!(layers, Some("F.Cu,F.Paste,F.SilkS,Edge.Cuts"));
+    }
+
+    #[test]
+    fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
+        let args =
+            single_file_pcb_export_args("pdf", "/out/board.pdf", &[], "/tmp/board.kicad_pcb");
+
+        assert!(args.iter().any(|arg| arg == "--mode-single"));
+        assert!(!args.iter().any(|arg| arg == "--layers"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
+    }
+
+    #[test]
+    fn cli_failures_include_stdout_and_stderr_diagnostics() {
+        assert_eq!(
+            cli_failure_diagnostics(b"Duplicate argument --layers\n", b""),
+            "stdout:\nDuplicate argument --layers"
+        );
+        assert_eq!(
+            cli_failure_diagnostics(b"usage text", b"fatal detail"),
+            "stdout:\nusage text\nstderr:\nfatal detail"
+        );
+        assert_eq!(cli_failure_diagnostics(b"", b""), "no diagnostic output");
+    }
 }
 
 #[cfg(test)]
