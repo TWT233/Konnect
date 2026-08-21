@@ -82,7 +82,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_export",
