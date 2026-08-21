@@ -195,6 +195,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "Symbol name" },
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
+                    "datasheet": { "type": "string", "description": "Datasheet URL or path (default empty). A '~' is written as an empty string — carrying it fails ERC's library-match check." },
                     "glyph": {
                         "type": "string",
                         "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
@@ -1037,7 +1038,7 @@ fn global_sym_lib_table() -> PathBuf {
 /// and then resolve every library against the wrong `KIPRJMOD`. A directory
 /// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
 /// libraries come from, and that is the more specific answer.
-fn project_root_for(file: &Path) -> Option<PathBuf> {
+pub(crate) fn project_root_for(file: &Path) -> Option<PathBuf> {
     let start = file.parent()?;
     if holds_lib_table(start) {
         return Some(start.to_path_buf());
@@ -3012,6 +3013,14 @@ async fn handle_create_symbol(
         Err(e) => return Ok(e),
     };
     let value_str = args["value"].as_str().unwrap_or(name);
+    // `~` is KiCAD's legacy "no datasheet" placeholder. Its library loader
+    // normalises it to the empty string and its schematic lib_symbols loader
+    // does not, so a symbol carrying `~` never matches its own library copy in
+    // ERC. Write the normalised form on both paths.
+    let datasheet = match args["datasheet"].as_str().unwrap_or("") {
+        "~" => "",
+        s => s,
+    };
     let show_names = args["show_pin_names"].as_bool().unwrap_or(true);
     let show_numbers = args["show_pin_numbers"].as_bool().unwrap_or(true);
 
@@ -3195,7 +3204,7 @@ async fn handle_create_symbol(
         visible_property("Reference", ref_prefix, ref_y),
         visible_property("Value", value_str, value_y),
         hidden_property("Footprint", ""),
-        hidden_property("Datasheet", ""),
+        hidden_property("Datasheet", datasheet),
         hidden_property("Description", ""),
         units_sexp
     );
@@ -5362,6 +5371,46 @@ mod tests {
         assert!(output.contains("(do_not_autoplace no)"), "{output}");
         assert!(output.contains("(hide yes)"), "{output}");
         assert!(output.contains("(embedded_fonts no)"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn create_symbol_writes_datasheet_and_normalizes_the_placeholder() {
+        // `~` must never reach the file: KiCad's library loader normalises it to
+        // "" and its lib_symbols loader does not, so a symbol carrying it fails
+        // ERC's library-match check for as long as it exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let pins = json!([{"number":"1","name":"IN","type":"input","x":-7.62,"y":0.0,"angle":0}]);
+
+        for (i, (given, written)) in [
+            (
+                json!("https://example.com/ds.pdf"),
+                "https://example.com/ds.pdf",
+            ),
+            (json!("~"), ""),
+            (serde_json::Value::Null, ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let lib = tmp.path().join(format!("ds{i}.kicad_sym"));
+            let mut args = json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "DS",
+                "reference_prefix": "U",
+                "pins": pins,
+            });
+            if !given.is_null() {
+                args["datasheet"] = given;
+            }
+
+            let res = handle_create_symbol(&args, &test_ctx()).await.unwrap();
+            assert!(!res.is_error);
+            let output = std::fs::read_to_string(&lib).unwrap();
+            assert!(
+                output.contains(&format!("(property \"Datasheet\" \"{written}\"")),
+                "{output}"
+            );
+        }
     }
 
     #[tokio::test]

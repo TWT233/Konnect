@@ -10,11 +10,19 @@ use std::path::Path;
 
 // ─── Schematic file I/O ───────────────────────────────────────────────────────
 
-/// Create a minimal standalone schematic with a fresh root UUID.
+/// Create a minimal standalone schematic with a fresh root UUID, on A4.
 #[must_use]
 pub fn format_blank_schematic() -> String {
+    format_blank_schematic_with_paper("A4", false)
+}
+
+/// Same, on the given KiCad paper size. The caller validates the name: an
+/// unknown one makes KiCad reject the file.
+#[must_use]
+pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
+    let orientation = if portrait { " portrait" } else { "" };
     format!(
-        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n)\n",
         crate::writer::new_uuid()
     )
 }
