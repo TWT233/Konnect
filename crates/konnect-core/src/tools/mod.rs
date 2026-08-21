@@ -17,7 +17,6 @@ pub(crate) mod pcb_sync;
 pub mod project;
 pub mod sch_analysis;
 pub mod sch_batch;
-pub mod sch_bridge;
 pub mod sch_bus;
 pub mod sch_components;
 pub mod sch_export;
@@ -168,7 +167,7 @@ impl Default for QueryCache {
 
 /// Subset of the server configuration relevant to tool execution.
 /// This is the config that flows from `konnect::Config` into the core crate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
     pub kicad_cli: String,
     pub kicad_binary: String,
@@ -385,6 +384,11 @@ pub fn project_name_for(sch_path: &std::path::Path) -> String {
 /// paths against it and silently forms no wire-only nets when it's missing.
 pub fn blank_schematic_template() -> String {
     konnect_sexp::schematic::format_blank_schematic()
+}
+
+/// Same, on a caller-chosen paper size — validate the name first.
+pub fn blank_schematic_template_with_paper(size: &str, portrait: bool) -> String {
+    konnect_sexp::schematic::format_blank_schematic_with_paper(size, portrait)
 }
 
 /// Root UUID of a loaded schematic, assigning a fresh one when the file

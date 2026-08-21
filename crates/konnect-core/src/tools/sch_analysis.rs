@@ -10,8 +10,8 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_junctions, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, read_schematic, Wire,
+        extract_all_net_labels, extract_junctions, extract_labels, extract_symbol_instances,
+        extract_wires, find_lib_symbol, read_schematic, Label, Wire,
     },
 };
 use serde_json::json;
@@ -269,9 +269,13 @@ impl NetGraph {
     }
 }
 
+/// Build the connectivity graph. `labels` must be
+/// [`extract_all_net_labels`] — power symbols name nets too, and a graph
+/// built from [`extract_labels`] alone reports every `power:` rail
+/// unconnected.
 pub(crate) fn build_net_graph(
     wires: &[Wire],
-    labels: &[konnect_sexp::schematic::Label],
+    labels: &[Label],
     junctions: &[(f64, f64)],
 ) -> NetGraph {
     let mut g = NetGraph::new();
@@ -320,13 +324,11 @@ async fn handle_list_nets(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let sch = cse::Schematic::load(&sch_path)?;
-    let mut nets: Vec<String> = sch
-        .labels
-        .iter()
-        .map(|l| l.text.clone())
-        .chain(sch.global_labels.iter().map(|l| l.text.clone()))
-        .chain(sch.hierarchical_labels.iter().map(|l| l.text.clone()))
+    let (_, tree) = read_schematic(&sch_path)?;
+    // Power symbols name nets too — the tool has always said so.
+    let mut nets: Vec<String> = extract_all_net_labels(&tree)
+        .into_iter()
+        .map(|l| l.net)
         .collect();
     nets.sort();
     nets.dedup();
@@ -365,15 +367,15 @@ async fn handle_get_net_connections(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let sch = cse::Schematic::load(&sch_path)?;
-    let wires = super::sch_bridge::all_wires_as_sexp(&sch);
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
     let matching: Vec<_> = labels
         .iter()
         .filter(|l| l.net == net)
         .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
         .collect();
-    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let pts = g.points_on_net(&net).len();
     Ok(CallToolResult::json(
         &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
@@ -389,10 +391,10 @@ async fn handle_get_net_connectivity(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let sch = cse::Schematic::load(&sch_path)?;
-    let wires = super::sch_bridge::all_wires_as_sexp(&sch);
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let net_wires: Vec<_> = wires
         .iter()
@@ -434,7 +436,7 @@ async fn handle_get_pin_connections(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let inst = instances
         .iter()
         .find(|i| i.reference == reference)
@@ -477,7 +479,7 @@ async fn handle_get_component_nets(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let inst = instances
         .iter()
         .find(|i| i.reference == reference)
@@ -514,7 +516,7 @@ async fn handle_get_net_components(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -563,10 +565,10 @@ async fn handle_trace_from_point(
         Err(e) => return Ok(e),
     };
     let tol = opt_f64(args, "tolerance").unwrap_or(0.05);
-    let sch = cse::Schematic::load(&sch_path)?;
-    let wires = super::sch_bridge::all_wires_as_sexp(&sch);
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let on_wire: Vec<_> = wires
         .iter()
         .filter(|w| {
@@ -825,10 +827,10 @@ async fn handle_find_shorted_nets(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let sch = cse::Schematic::load(&sch_path)?;
-    let wires = super::sch_bridge::all_wires_as_sexp(&sch);
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let mut g = build_net_graph(&wires, &labels, &super::sch_bridge::all_junctions(&sch));
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
     let mut root_nets: HashMap<(i64, i64), Vec<String>> = HashMap::new();
     for l in &labels {
         let root = g.find(pt_key(l.x, l.y));
@@ -856,8 +858,8 @@ async fn handle_find_single_pin_nets(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let sch = cse::Schematic::load(&sch_path)?;
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
+    let (_, tree) = read_schematic(&sch_path)?;
+    let labels = extract_all_net_labels(&tree);
     let mut counts: HashMap<String, usize> = HashMap::new();
     for l in &labels {
         *counts.entry(l.net.clone()).or_insert(0) += 1;
@@ -888,7 +890,7 @@ async fn handle_get_connected_items(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -1039,6 +1041,7 @@ async fn handle_check_overlaps(
     ))
 }
 
+#[cfg(test)]
 #[cfg(test)]
 mod orphan_item_tests {
     use super::*;
@@ -1240,5 +1243,93 @@ mod orphan_item_tests {
             let result = call_result(&schematic(""), json!({ "tolerance": tolerance })).await;
             assert!(result.is_error, "accepted tolerance {tolerance}");
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod power_symbol_net_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// R1 with pin 1 on a `SIG` label and pin 2 wired down to a `power:GND`
+    /// symbol. The rail is what a label-only net graph loses.
+    const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+
+    /// Run a tool by name against a temp file holding `sch`.
+    async fn call(sch: &str, tool: &str, mut args: serde_json::Value) -> serde_json::Value {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(sch.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        args["schematic"] = json!(f.path().to_str().unwrap());
+        let def = tools().into_iter().find(|t| t.name == tool).unwrap();
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = (def.handler)(&args, Arc::new(ctx)).await.unwrap();
+        assert!(!result.is_error, "{tool} failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// The S-expression path: a pin reached only through a power symbol used to
+    /// report no net at all.
+    #[tokio::test]
+    async fn a_pin_on_a_rail_reports_it() {
+        let s = call(
+            SCH,
+            "get_pin_connections",
+            json!({ "reference": "R1", "pin_number": "2" }),
+        )
+        .await;
+        assert_eq!(s["net"], "GND");
+    }
+
+    #[tokio::test]
+    async fn the_rail_lists_the_components_on_it() {
+        let s = call(SCH, "get_net_components", json!({ "net": "GND" })).await;
+        let refs: Vec<&str> = s["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["reference"].as_str().unwrap())
+            .collect();
+        assert!(refs.contains(&"R1"), "R1 is on GND, got {refs:?}");
+    }
+
+    #[tokio::test]
+    async fn tracing_a_point_on_the_rail_names_it() {
+        let s = call(SCH, "trace_from_point", json!({ "x": 100.0, "y": 103.81 })).await;
+        assert_eq!(s["net"], "GND");
+    }
+
+    #[tokio::test]
+    async fn the_rail_is_listed_among_the_nets() {
+        let s = call(SCH, "list_schematic_nets", json!({})).await;
+        let nets: Vec<&str> = s["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(nets, vec!["GND", "SIG"]);
+    }
+
+    /// A rail carried onto a wire that also carries a named label is a short,
+    /// and it was invisible while the graph knew only labels.
+    #[tokio::test]
+    async fn a_rail_shorted_to_a_named_net_is_reported() {
+        let shorted = SCH.replace(
+            "(label \"SIG\" (at 100 96.19 0)",
+            "(label \"SIG\" (at 100 106 0)",
+        );
+        let s = call(&shorted, "find_shorted_nets", json!({})).await;
+        assert_eq!(s["short_count"], 1, "SIG and GND share one wire: {s}");
     }
 }

@@ -15,8 +15,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
+        extract_all_net_labels, extract_labels, extract_lib_pins, extract_symbol_instances,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        pin_label_rotation, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -1256,7 +1257,7 @@ async fn handle_validate_component_connections(
     let (_, tree) = read_schematic(&sch_path)?;
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
@@ -2336,5 +2337,50 @@ mod bulk_move_field_tests {
     #[tokio::test]
     async fn field_text_follows_a_negative_move() {
         assert_fields_follow(-25.4, -12.7).await;
+    }
+}
+
+#[cfg(test)]
+mod power_symbol_connection_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// A `power:GND` symbol dropped straight onto R1's pin 2 — no wire between
+    /// them, which is how KiCad itself draws a decoupling ground. Pin 1 is
+    /// genuinely unconnected.
+    const SCH: &str = include_str!("../../tests/fixtures/power_symbol_on_pin.kicad_sch");
+
+    /// The regression: the graph knew only labels, so a pin whose entire
+    /// connection is a power symbol was reported unconnected.
+    #[tokio::test]
+    async fn a_pin_under_a_power_symbol_is_connected() {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_validate_component_connections(
+            &json!({ "schematic": f.path().to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let s: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        let unconnected: Vec<(&str, &str)> = s["unconnected_pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["reference"].as_str().unwrap(), p["pin"].as_str().unwrap()))
+            .collect();
+        assert_eq!(unconnected, vec![("R1", "1")], "only pin 1 floats: {s}");
     }
 }
