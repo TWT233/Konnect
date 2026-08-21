@@ -118,7 +118,28 @@ fn extract_schematic_lines(tree: &SexpNode, kind: &str) -> Vec<Wire> {
 
 /// Extract all junction dot positions from a parsed schematic tree.
 pub fn extract_junctions(tree: &SexpNode) -> Vec<(f64, f64)> {
-    tree.find_all("junction")
+    at_positions(tree.find_all("junction"))
+}
+
+/// Extract all no-connect flag positions from a parsed schematic tree.
+pub fn extract_no_connects(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(tree.find_all("no_connect"))
+}
+
+/// Extract every hierarchical sheet pin position. A wire terminating on one
+/// leaves the sheet rather than dangling.
+pub fn extract_sheet_pins(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(
+        tree.find_all("sheet")
+            .iter()
+            .flat_map(|sheet| sheet.find_all("pin"))
+            .collect(),
+    )
+}
+
+/// The `(at x y …)` position of each node that has one.
+fn at_positions(nodes: Vec<&SexpNode>) -> Vec<(f64, f64)> {
+    nodes
         .iter()
         .filter_map(|node| {
             let at = node.find("at")?;
