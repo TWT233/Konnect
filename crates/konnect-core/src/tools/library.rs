@@ -1038,7 +1038,7 @@ fn global_sym_lib_table() -> PathBuf {
 /// and then resolve every library against the wrong `KIPRJMOD`. A directory
 /// carrying its own `sym-lib-table` or `fp-lib-table` is stating where its
 /// libraries come from, and that is the more specific answer.
-fn project_root_for(file: &Path) -> Option<PathBuf> {
+pub(crate) fn project_root_for(file: &Path) -> Option<PathBuf> {
     let start = file.parent()?;
     if holds_lib_table(start) {
         return Some(start.to_path_buf());
