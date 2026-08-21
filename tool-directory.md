@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **204 registered tools** + **6 always-visible meta-tools** = **210 total**
+- **203 registered tools** + **6 always-visible meta-tools** = **209 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -312,8 +312,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Integration
 
-### `integration` · 9 tools
-**Purpose:** JLCPCB parts database, Freerouting autoroute, datasheet URLs.
+### `integration` · 8 tools
+**Purpose:** JLCPCB parts database, Freerouting installation discovery, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
 | Tool | Description |
@@ -325,8 +325,11 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
-| `autoroute` | Run Freerouting autorouter: export DSN → autoroute → import SES result. |
-| `check_freerouting` | Verify that the Freerouting JAR is available and return its version. |
+| `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available. |
+
+Migration from the former `autoroute` tool: use Freerouting's KiCad ActionPlugin for
+DSN/SES routing. Konnect no longer advertises `autoroute` because it had no editor
+bridge and every call failed; `check_freerouting` remains available for diagnostics.
 
 ---
 
