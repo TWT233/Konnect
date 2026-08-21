@@ -26,8 +26,22 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct ErcViolation {
     pub severity: String,
     pub description: String,
+    /// KiCad's rule key (`"pin_to_pin"`, `"pin_not_connected"`, …). Stable,
+    /// unlike the prose description beside it.
+    pub rule: String,
     pub sheet: Option<String>,
+    /// Every item the rule caught, in report order. A `pin_to_pin` violation
+    /// always names two pins and the second is regularly the actionable one,
+    /// so keeping only the first hid what explains the violation.
+    pub items: Vec<ErcItem>,
+}
+
+/// One item involved in an ERC violation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErcItem {
+    pub description: String,
     pub pos: Option<ErcPos>,
+    pub uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,35 +194,44 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             continue;
         };
         for v in violations {
-            let first_item = v
+            let items: Vec<ErcItem> = v
                 .get("items")
                 .and_then(|i| i.as_array())
-                .and_then(|i| i.first());
+                .map(|items| items.iter().map(parse_erc_item).collect())
+                .unwrap_or_default();
             let mut description = v["description"].as_str().unwrap_or("").to_string();
             // The per-item description names the offender ("Symbol R1 Pin 1…")
             // — without it "Pin not connected" is unactionable.
-            if let Some(detail) = first_item
-                .and_then(|item| item.get("description"))
-                .and_then(|d| d.as_str())
+            if let Some(detail) = items
+                .first()
+                .map(|item| item.description.as_str())
+                .filter(|detail| !detail.is_empty())
             {
-                if !detail.is_empty() {
-                    description = format!("{}: {}", description, detail);
-                }
+                description = format!("{}: {}", description, detail);
             }
             out.push(ErcViolation {
                 severity: v["severity"].as_str().unwrap_or("error").to_string(),
                 description,
+                rule: v["type"].as_str().unwrap_or("").to_string(),
                 sheet: sheet_path.clone(),
-                pos: first_item.and_then(|item| item.get("pos")).and_then(|p| {
-                    Some(ErcPos {
-                        x: p["x"].as_f64()?,
-                        y: p["y"].as_f64()?,
-                    })
-                }),
+                items,
             });
         }
     }
     out
+}
+
+fn parse_erc_item(item: &serde_json::Value) -> ErcItem {
+    ErcItem {
+        description: item["description"].as_str().unwrap_or("").to_string(),
+        pos: item.get("pos").and_then(|p| {
+            Some(ErcPos {
+                x: p["x"].as_f64()?,
+                y: p["y"].as_f64()?,
+            })
+        }),
+        uuid: item["uuid"].as_str().map(String::from),
+    }
 }
 
 // ─── DRC ─────────────────────────────────────────────────────────────────────
@@ -901,6 +924,23 @@ mod erc_parse_tests {
                             ],
                             "severity": "warning",
                             "type": "pin_not_connected"
+                        },
+                        {
+                            "description": "Pins of type Power output and Power output are connected",
+                            "items": [
+                                {
+                                    "description": "Symbol #PWR031 Pin 1 [Power output, Line]",
+                                    "pos": { "x": 1.4351, "y": 0.889 },
+                                    "uuid": "0f7ec4d9-8a03-4a2f-8f9c-3d8f3f4e1c22"
+                                },
+                                {
+                                    "description": "Symbol U2 Pin 5 [VOUT, Power output, Line]",
+                                    "pos": { "x": 1.6002, "y": 1.016 },
+                                    "uuid": "5b6a1f42-2c17-4f0b-9a6e-8c3f7d21e0a4"
+                                }
+                            ],
+                            "severity": "error",
+                            "type": "pin_to_pin"
                         }
                     ]
                 }
@@ -913,7 +953,7 @@ mod erc_parse_tests {
         let violations = parse_erc_json(&real_report());
         assert_eq!(
             violations.len(),
-            2,
+            3,
             "must flatten sheets[].violations — a top-level 'violations' key does not exist in ERC reports"
         );
         assert_eq!(violations[0].severity, "error");
@@ -923,9 +963,65 @@ mod erc_parse_tests {
             "description should name the offending item"
         );
         assert_eq!(violations[0].sheet.as_deref(), Some("/"));
-        let pos = violations[0].pos.as_ref().expect("position from items[0]");
+        let pos = violations[0].items[0].pos.as_ref().expect("item position");
         assert!((pos.x - 1.0033).abs() < 1e-9);
         assert_eq!(violations[1].severity, "warning");
+    }
+
+    /// A `pin_to_pin` violation names both conflicting pins, and the second is
+    /// regularly the one that explains the first — here the regulator output
+    /// that makes the `PWR_FLAG` redundant. Keeping only `items[0]` sent the
+    /// caller back to `kicad-cli` by hand.
+    #[test]
+    fn every_item_of_a_violation_survives() {
+        let conflict = &parse_erc_json(&real_report())[2];
+        assert_eq!(conflict.items.len(), 2);
+        assert!(conflict.items[0].description.contains("#PWR031"));
+        let explains = &conflict.items[1];
+        assert!(explains.description.contains("U2 Pin 5"));
+        assert!((explains.pos.as_ref().expect("item position").y - 1.016).abs() < 1e-9);
+        assert_eq!(
+            explains.uuid.as_deref(),
+            Some("5b6a1f42-2c17-4f0b-9a6e-8c3f7d21e0a4")
+        );
+    }
+
+    /// `type` is the addressable key; `description` beside it is prose.
+    #[test]
+    fn violations_carry_kicads_rule_key() {
+        let violations = parse_erc_json(&real_report());
+        assert_eq!(violations[0].rule, "pin_not_connected");
+        assert_eq!(violations[2].rule, "pin_to_pin");
+    }
+
+    /// The violation description predates `items` and callers read it, so a
+    /// second item must not change what it says.
+    #[test]
+    fn the_description_still_names_the_first_item_only() {
+        let conflict = &parse_erc_json(&real_report())[2];
+        assert!(conflict.description.contains("#PWR031"));
+        assert!(!conflict.description.contains("U2"));
+    }
+
+    /// KiCad omits `pos` and `uuid` on some item kinds; that must not drop the
+    /// item, whose description is still the only thing naming the offender.
+    #[test]
+    fn an_item_without_a_position_is_still_reported() {
+        let violations = parse_erc_json(&serde_json::json!({
+            "sheets": [{
+                "path": "/",
+                "violations": [{
+                    "description": "Label not connected",
+                    "items": [{ "description": "Label VIN" }],
+                    "severity": "warning",
+                    "type": "label_dangling"
+                }]
+            }]
+        }));
+        assert_eq!(violations[0].items.len(), 1);
+        assert!(violations[0].items[0].pos.is_none());
+        assert!(violations[0].items[0].uuid.is_none());
+        assert!(violations[0].description.contains("Label VIN"));
     }
 
     #[test]

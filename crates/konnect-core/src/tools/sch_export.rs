@@ -95,7 +95,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Optional path to write ERC report JSON" },
+                    "output":    { "type": "string", "description": "Optional path to write this tool's filtered violation list as JSON (not KiCad's own ERC report)" },
                     "severity":  {
                         "type": "string",
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
@@ -275,6 +275,14 @@ async fn handle_export_netlist_summary(
     })))
 }
 
+/// ERC positions ride on the entry itself as `x`/`y`, not as a nested object.
+fn flatten_pos(entry: &mut serde_json::Value, pos: Option<&cli::ErcPos>) {
+    if let Some(pos) = pos {
+        entry["x"] = json!(pos.x);
+        entry["y"] = json!(pos.y);
+    }
+}
+
 async fn handle_run_erc(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -295,17 +303,33 @@ async fn handle_run_erc(
         .iter()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .map(|v| {
+            let items: Vec<serde_json::Value> = v
+                .items
+                .iter()
+                .map(|item| {
+                    let mut entry = json!({ "description": item.description });
+                    flatten_pos(&mut entry, item.pos.as_ref());
+                    if let Some(uuid) = &item.uuid {
+                        entry["uuid"] = json!(uuid);
+                    }
+                    entry
+                })
+                .collect();
             let mut entry = json!({
                 "severity": v.severity,
                 "description": v.description,
+                // KiCad's stable key for the rule; `description` is prose.
+                "rule": v.rule,
+                // A pin conflict names two pins, and `description` above
+                // carries only the first.
+                "items": items,
             });
             if let Some(sheet) = &v.sheet {
                 entry["sheet"] = json!(sheet);
             }
-            if let Some(pos) = &v.pos {
-                entry["x"] = json!(pos.x);
-                entry["y"] = json!(pos.y);
-            }
+            // The violation's own x/y predate `items` and stay the first
+            // item's.
+            flatten_pos(&mut entry, v.items.first().and_then(|i| i.pos.as_ref()));
             entry
         })
         .collect();
