@@ -386,6 +386,11 @@ pub fn blank_schematic_template() -> String {
     konnect_sexp::schematic::format_blank_schematic()
 }
 
+/// Same, on a caller-chosen paper size — validate the name first.
+pub fn blank_schematic_template_with_paper(size: &str, portrait: bool) -> String {
+    konnect_sexp::schematic::format_blank_schematic_with_paper(size, portrait)
+}
+
 /// Root UUID of a loaded schematic, assigning a fresh one when the file
 /// predates Konnect writing root UUIDs — the file is repaired on its next
 /// overwrite. Instance paths are built as "/<root-uuid>[/<sheet-uuid>…]".

@@ -893,6 +893,7 @@ async fn handle_run_design_review(
                         "rule": violation.rule,
                         "message": violation.description,
                         "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                        "items": violation.items,
                     })
                 }));
                 audits.push(drc);
