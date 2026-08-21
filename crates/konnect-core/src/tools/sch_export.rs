@@ -293,7 +293,10 @@ async fn handle_run_erc(
     let min_severity = args["severity"].as_str().unwrap_or("warning");
 
     if let Some(root) = owning_project_root(&sch_path) {
-        return Ok(CallToolResult::error(format!(
+        // Structured, not free text: a caller can react to `invalid_argument`
+        // on `schematic` by retrying against the named root, which is exactly
+        // what the message says to do.
+        let reason = format!(
             "{} is a sheet inside the project rooted at {}, not a project root of its own. \
              kicad-cli treats the file it is handed as the root and looks for a .kicad_pro \
              beside it, so the project's sym-lib-table is never read and every symbol from a \
@@ -303,7 +306,14 @@ async fn handle_run_erc(
             sch_path.display(),
             root.display(),
             root.display()
-        )));
+        );
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "schematic".to_string(),
+                reason: reason.clone(),
+            },
+            reason,
+        ));
     }
 
     let violations = cli::run_erc(&ctx.config.kicad_cli, &sch_path).await?;
@@ -652,6 +662,49 @@ mod tests {
         let loose = blank(tmp.path(), "loose.kicad_sch");
 
         assert_eq!(owning_project_root(&loose), None);
+    }
+
+    /// The refusal is a structured `invalid_argument` naming `schematic`, so a
+    /// caller can react by retrying against the root the message names — the
+    /// convention `mcp/error.rs` asks for on anything an LLM might branch on.
+    #[tokio::test]
+    async fn the_sub_sheet_refusal_is_structured_and_names_the_field() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
+        let child = blank(tmp.path(), "child.kicad_sch");
+
+        let ctx = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_run_erc(
+            &serde_json::json!({ "schematic": child.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("a refusal is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "schematic");
+        assert!(output["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("proj.kicad_sch"));
     }
 
     /// Sitting beside a project is not the same as belonging to it — the file
