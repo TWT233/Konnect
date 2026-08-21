@@ -2911,9 +2911,11 @@ mod tests {
     /// "doesn't match copy in library".
     #[tokio::test]
     async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
+        // In the stub project dir, so its sym-lib-table shadows the global
+        // `Device` entry — off a developer's KiCad install, that entry resolves
+        // and the edit below then lands on a library nothing reads.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stale.kicad_sch");
+        let path = symdir.path().join("stale.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3006,9 +3008,9 @@ mod tests {
     /// (grafted from #177 by @JYPochez).
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_moved_pin_unless_allowed() {
+        // In the stub project dir — see the stale-copy test above.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("guarded.kicad_sch");
+        let path = symdir.path().join("guarded.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3201,9 +3203,9 @@ mod tests {
     /// dangles. Same guard, different message.
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_removed_pin() {
+        // In the stub project dir — see the stale-copy test above.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shrunk.kicad_sch");
+        let path = symdir.path().join("shrunk.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
