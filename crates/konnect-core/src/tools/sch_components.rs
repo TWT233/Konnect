@@ -32,11 +32,25 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "create_schematic",
-            "Create a new blank .kicad_sch schematic file.",
+            "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
+             size is given. Use set_schematic_page to change it later.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" }
+                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'USLetter' (default 'A4')",
+                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
+                                 "A", "B", "C", "D", "E",
+                                 "USLetter", "USLegal", "USLedger"],
+                        "default": "A4"
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
                 },
                 "required": ["path"]
             }),
@@ -378,16 +392,28 @@ async fn handle_create_schematic(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
+    let size = opt_str(args, "size").unwrap_or("A4").to_string();
+    let portrait = args["portrait"].as_bool().unwrap_or(false);
+    let (w, h) = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
+    };
+    let (width_mm, height_mm) = if portrait { (h, w) } else { (w, h) };
+
     // Build a minimal valid schematic and save via cse's atomic writer.
-    let template = crate::tools::blank_schematic_template();
+    let template = crate::tools::blank_schematic_template_with_paper(&size, portrait);
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
     write_new_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "created": path.display().to_string() }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "created": path.display().to_string(),
+        "size": size,
+        "portrait": portrait,
+        "width_mm": width_mm,
+        "height_mm": height_mm
+    })))
 }
 
 /// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
@@ -410,6 +436,28 @@ const PAPER_SIZES: &[(&str, f64, f64)] = &[
     ("USLedger", 431.8, 279.4),
 ];
 
+/// Landscape width and height of a named paper size, or the `invalid_argument`
+/// refusal naming every size that would have worked.
+fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
+    match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
+        Some(&(_, w, h)) => Ok((w, h)),
+        None => {
+            let valid = PAPER_SIZES
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "size".into(),
+                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
+                },
+                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
+            ))
+        }
+    }
+}
+
 async fn handle_set_page(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -421,22 +469,9 @@ async fn handle_set_page(
     };
     let portrait = args["portrait"].as_bool().unwrap_or(false);
 
-    let dims = match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
-        Some(&(_, w, h)) => (w, h),
-        None => {
-            let valid = PAPER_SIZES
-                .iter()
-                .map(|(n, _, _)| *n)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Ok(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::InvalidArgument {
-                    field: "size".into(),
-                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
-                },
-                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
-            ));
-        }
+    let dims = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
     };
     let (w, h) = if portrait { (dims.1, dims.0) } else { dims };
 
@@ -1949,6 +1984,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_schematic_defaults_to_a4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.kicad_sch");
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &test_ctx())
+            .await
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A4\")"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn create_schematic_honours_size_and_orientation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A3", "portrait": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        // The dimensions are reported swapped for portrait, matching
+        // set_schematic_page.
+        assert!(text.contains("\"width_mm\":297"), "got {text}");
+        assert!(text.contains("\"height_mm\":420"), "got {text}");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+        // The orientation token has to survive cse's normalising rewrite:
+        // KiCad rejects a `(paper …)` it cannot parse.
+        assert_eq!(
+            cse::Schematic::load(&path).unwrap().paper.as_deref(),
+            Some("A3")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_refuses_an_unknown_size_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A9" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(!path.exists(), "a rejected size must leave no file behind");
+    }
+
     /// #204: on a child sheet both halves of the instance key came from the
     /// child file — its own stem as the project name, its own uuid as the
     /// whole path. KiCad matches that against nothing, so every symbol placed
@@ -3441,8 +3529,8 @@ mod page_tests {
         assert_eq!(out.matches("(paper").count(), 1);
     }
 
-    /// A blank sheet from `create_schematic` has no paper node at all; the new
-    /// one has to land in the header, before any element.
+    /// A sheet written without a paper node — KiCad treats it as A4 — takes the
+    /// new one in the header, before any element.
     #[tokio::test]
     async fn inserts_when_absent_and_stays_in_the_header() {
         let out = set_page(NO_PAPER, "A3", false).await;
