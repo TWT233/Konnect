@@ -729,9 +729,10 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
-/// Unlike `pdf`/`svg`, DXF's `--layers` takes a single comma-separated value
-/// rather than a repeatable flag, and one file per requested layer is written
-/// into `output_dir` (verified against KiCAD 10.0).
+/// `--layers` takes a single comma-separated value, the same as every PCB
+/// exporter (the pdf/svg wrappers used to repeat the flag per layer, which
+/// KiCAD 10 rejects — #250). DXF differs in output shape only: one file per
+/// requested layer is written into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
     let output_str = output_dir.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
