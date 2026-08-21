@@ -17,7 +17,6 @@ pub(crate) mod pcb_sync;
 pub mod project;
 pub mod sch_analysis;
 pub mod sch_batch;
-pub mod sch_bridge;
 pub mod sch_bus;
 pub mod sch_components;
 pub mod sch_export;
@@ -168,7 +167,7 @@ impl Default for QueryCache {
 
 /// Subset of the server configuration relevant to tool execution.
 /// This is the config that flows from `konnect::Config` into the core crate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
     pub kicad_cli: String,
     pub kicad_binary: String,
