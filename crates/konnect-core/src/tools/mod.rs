@@ -262,7 +262,7 @@ macro_rules! tool {
 /// Build a structured `InvalidArgument` CallToolResult. Used by the
 /// `require_*` helpers so every handler that uses them emits structured
 /// errors the client / observer can match on — no per-handler change needed.
-fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
+pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::InvalidArgument {
             field: field.to_string(),
