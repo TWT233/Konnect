@@ -29,9 +29,18 @@ __pycache__/
 #                 snapshots, per-machine (Preferences > Common > Project Backup)
 #   *.lck         transient board lock; contains {hostname, username}
 #   *.kicad_prl   per-user local project settings, never shared
-#   *.kicad_pro   generated on open for a bare .kicad_pcb fixture; this repo
-#                 tracks no project files, only the boards themselves
+#   *.kicad_pro   generated on open for a bare .kicad_pcb fixture
+#
+# .kicad_pro is ignored in general but deliberately re-included under
+# tests/fixtures: the netclass tools (create_netclass, assign_net_to_class)
+# write to the sibling project file by design, so a fixture exercising them
+# needs a project file tracked on purpose — and a blanket ignore would make
+# `git add` skip it in silence, which is the same failure this block exists to
+# prevent, only inverted. A *generated* one appearing there should be deleted,
+# not committed. .history/, *.lck and *.kicad_prl stay ignored everywhere,
+# fixtures included: those must never be tracked even deliberately.
 .history/
 *.lck
 *.kicad_prl
 *.kicad_pro
+!crates/*/tests/fixtures/*.kicad_pro
