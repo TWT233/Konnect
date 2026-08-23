@@ -1,13 +1,69 @@
 //! Live KiCad GUI IPC regression tests.
 //!
-//! These tests are ignored by default. The CI live-GUI job launches pcbnew
-//! under Xvfb and supplies the socket and a disposable board path.
+//! These tests are ignored by default; run them with `-- --ignored`, and with
+//! `--test-threads=1`, since they all drive the one board KiCad has open.
+//!
+//! ## Point `KONNECT_LIVE_KICAD_BOARD` at a COPY
+//!
+//! These tests mutate the open board and call `save_board()` — the move test
+//! relocates and rotates a mounting hole. Opening the tracked fixture directly
+//! writes those mutations back into the repository, and KiCad also upgrades
+//! the file format and drops a `.kicad_pro`, a `.kicad_prl`, a lock file and a
+//! `.history/` beside it. That has already happened once: a live run left the
+//! fixture format-upgraded with `MH1` moved, and `git add -A` swept the lot
+//! into a commit. Copy it to a scratch directory and open the copy:
+//!
+//! ```sh
+//! cp crates/konnect-ipc/tests/fixtures/live_ipc.kicad_pcb /tmp/live/
+//! export KONNECT_LIVE_KICAD_BOARD=/tmp/live/live_ipc.kicad_pcb
+//! ```
+//!
+//! ## The fixture
+//!
 //! `fixtures/live_ipc.kicad_pcb` is KiCad's GPL-licensed built-in
-//! EuroCard160mmX100mm template, used here as a realistic footprint fixture.
+//! EuroCard160mmX100mm template — board outline (55, 45) to (215, 145), four
+//! locked mounting holes, and two keepout zones along the guide-rail edges —
+//! plus a `GND` and a `SIG1` net added for these tests. Those nets are
+//! load-bearing: the stock template declares only the unnamed net 0, so
+//! `get_nets` returns nothing usable and every net-attached test below fails
+//! its own precondition before reaching the code under test. The board is in
+//! the legacy (KiCad 9) format, where nets live in a top-level table and
+//! copper references them by id; KiCad 10 upgrades it on open.
+//!
+//! Coordinates in these tests are absolute board coordinates, so they must sit
+//! inside that outline — the template does not start at the origin, and a zone
+//! placed outside the outline is clipped to nothing.
+//!
+//! ## Finding the socket (`KICAD_API_SOCKET`)
+//!
+//! KiCad exposes **one socket per frame**, not one per process, and the
+//! well-known path is not usually the one you want. On macOS with KiCad 10 the
+//! *manager* owns `/tmp/kicad/api.sock` and answers `GetOpenDocuments` with
+//! `AS_UNHANDLED`, because it holds no board; a standalone pcbnew registers its
+//! own `/tmp/kicad/api-<pid>.sock`, and that is the one to target. The suffix
+//! changes every launch, so it cannot be hard-coded:
+//!
+//! ```sh
+//! ls -t /tmp/kicad/api-*.sock | head -1
+//! ```
+//!
+//! There is no CI job for this file. `e2e-kicad.yml` installs KiCad but runs
+//! only the kicad-cli and mock-server suites, and sets none of the variables
+//! these tests require — so nothing here has ever run automatically. Run it by
+//! hand before tagging a release.
 
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::{parse_sexp, SexpNode};
 use std::path::Path;
+
+/// Where `adding_a_via_actually_creates_it_on_the_board` puts its via, and the
+/// outline `adding_a_zone_creates_it_on_the_live_board` pours. Both are
+/// absolute board coordinates, and both are checked against the fixture's
+/// outline by `the_live_fixture_satisfies_what_the_live_tests_assume` — the
+/// via spot used to be (40, 40), which is off the board.
+const VIA_SPOT: (f64, f64) = (100.0, 120.0);
+const ZONE_OUTLINE: [(f64, f64); 4] =
+    [(150.0, 95.0), (190.0, 95.0), (190.0, 115.0), (150.0, 115.0)];
 
 fn footprint<'a>(tree: &'a SexpNode, reference: &str) -> &'a SexpNode {
     tree.find_all("footprint")
@@ -176,13 +232,16 @@ fn adding_a_via_actually_creates_it_on_the_board() {
         .expect("net list query failed")
         .into_iter()
         .find(|net| !net.name.is_empty())
-        .expect("board has no named net to attach a via to");
+        .expect(
+            "board has no named net to attach a via to — on the bundled fixture \
+             this means its GND/SIG1 track segments have been lost",
+        );
 
     client.save_board().expect("initial board save failed");
     let vias_before = load_board(Path::new(&board)).find_all("via").len();
 
-    // Somewhere clear of the EuroCard template's own content.
-    let (x, y) = (40.0, 40.0);
+    // Inside the EuroCard outline and clear of its mounting holes and tracks.
+    let (x, y) = VIA_SPOT;
     client
         .add_via(&net.name, x, y, 0.4, 0.8)
         .expect("add_via reported an error");
@@ -237,17 +296,26 @@ fn adding_a_zone_creates_it_on_the_live_board() {
     let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
     let client = KiCadIpcClient::new(socket);
 
-    let net = client
-        .get_nets()
-        .expect("net list query failed")
-        .into_iter()
-        .find(|net| !net.name.is_empty())
-        .expect("board has no named net to attach a zone to");
+    // GND by preference, not merely the first named net: the fill assertion
+    // below needs the pour to reach copper already on its own net, and on the
+    // bundled fixture that copper is the GND segment at y = 105.
+    let nets = client.get_nets().expect("net list query failed");
+    let net = nets
+        .iter()
+        .find(|net| net.name == "GND")
+        .or_else(|| nets.iter().find(|net| !net.name.is_empty()))
+        .expect(
+            "board has no named net to attach a zone to — on the bundled fixture \
+             this means its GND/SIG1 track segments have been lost",
+        )
+        .clone();
 
     // Distinctive so the read-back cannot pick up a zone the board already had.
     let name = "konnect live add_zone";
-    // Clear of the EuroCard template's own content, as the via test's spot is.
-    let points = [(40.0, 60.0), (60.0, 60.0), (60.0, 75.0), (40.0, 75.0)];
+    // Inside the EuroCard outline (55, 45)-(215, 145), clear of its mounting
+    // holes, and straddling the fixture's GND track so the fill has something
+    // on its own net to connect to.
+    let points = ZONE_OUTLINE;
 
     let zone_id = client
         .add_zone(&konnect_ipc::builders::ZoneSpec {
@@ -313,10 +381,16 @@ fn adding_a_zone_creates_it_on_the_live_board() {
             .zone_connection,
         ZoneConnectionStyle::ZcsFull as i32
     );
+    assert!(zone.filled, "add_zone refills before returning");
     assert!(
-        zone.filled && !zone.filled_polygons.is_empty(),
-        "add_zone refills before returning, so KiCad should hold computed fill \
-         polygons — an outline with no copper is what the user would see"
+        !zone.filled_polygons.is_empty(),
+        "the zone has an outline but no computed copper, which is exactly what \
+         the user would be left looking at. Most likely cause on a board other \
+         than the bundled fixture: add_zone sets island removal to IRM_ALWAYS \
+         (KiCad's default), so a pour that reaches nothing else on its own net \
+         has its whole fill discarded as islands — check that {} has copper \
+         inside the test region",
+        net.name
     );
 
     // Leave the disposable board as we found it.
@@ -327,5 +401,117 @@ fn adding_a_zone_creates_it_on_the_live_board() {
     assert!(
         read_back().is_empty(),
         "the test zone survived its own cleanup"
+    );
+}
+
+/// The bundled fixture's own preconditions, checked without KiCad — and
+/// deliberately **not** `#[ignore]`d, so CI runs it.
+///
+/// Every net-attached test in this file used to die on its `expect` line
+/// before reaching the code under test: the EuroCard template ships with no
+/// nets at all, so `get_nets` came back empty. The via test could therefore
+/// never have passed against this fixture in any environment, which is its own
+/// evidence that the live suite has never actually run. Since no CI job runs
+/// it even now, this guard is the only automatic check that the fixture still
+/// satisfies what the live tests assume.
+#[test]
+fn the_live_fixture_satisfies_what_the_live_tests_assume() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live_ipc.kicad_pcb");
+    let tree = load_board(&fixture);
+
+    let nets = konnect_sexp::net::collect_net_keys(&tree);
+    assert!(
+        nets.contains("GND"),
+        "the fixture lost its GND net; the zone test's fill assertion needs \
+         copper on GND inside its outline. Nets found: {nets:?}"
+    );
+    assert!(
+        nets.iter().any(|net| net != "GND" && !net.is_empty()),
+        "the fixture needs a second named net, so that a test picking 'the \
+         first named net' is picking from more than one. Nets found: {nets:?}"
+    );
+    // This board carries a top-level net table and copper references nets by
+    // id. A fixture re-saved by KiCad 10 would come back in the name-only
+    // shape instead — which still works, but means the tracked file has been
+    // overwritten by a live run rather than copied first.
+    assert_eq!(
+        konnect_sexp::net::net_ref_for_write(&tree, "GND"),
+        Some(konnect_sexp::net::NetRef::ById {
+            id: "1".into(),
+            name: "GND".into()
+        }),
+        "the fixture is no longer in the legacy net-table shape — it looks like \
+         a live run saved over the tracked file instead of a copy"
+    );
+
+    // The template is not at the origin, and coordinates in the live tests are
+    // absolute. A zone outside the outline is clipped to nothing, and a via
+    // outside it is not the regression the via test means to catch.
+    let outline = tree
+        .find_all("gr_rect")
+        .into_iter()
+        .find(|rect| {
+            rect.find("layer")
+                .and_then(|layer| layer.get(1))
+                .and_then(SexpNode::as_str)
+                == Some("Edge.Cuts")
+        })
+        .expect("fixture has no Edge.Cuts rectangle");
+    let start = outline.find("start").expect("outline start");
+    let end = outline.find("end").expect("outline end");
+    let (x1, y1) = (start.get_f64(1).unwrap(), start.get_f64(2).unwrap());
+    let (x2, y2) = (end.get_f64(1).unwrap(), end.get_f64(2).unwrap());
+    let (left, right) = (x1.min(x2), x1.max(x2));
+    let (top, bottom) = (y1.min(y2), y1.max(y2));
+
+    // A margin, so a point is not merely on the edge where fill is clipped.
+    let inside =
+        |(x, y): (f64, f64)| x > left + 2.0 && x < right - 2.0 && y > top + 2.0 && y < bottom - 2.0;
+    assert!(
+        inside(VIA_SPOT),
+        "VIA_SPOT {VIA_SPOT:?} is not inside the fixture outline \
+         ({left}, {top})-({right}, {bottom})"
+    );
+    for point in ZONE_OUTLINE {
+        assert!(
+            inside(point),
+            "ZONE_OUTLINE vertex {point:?} is not inside the fixture outline \
+             ({left}, {top})-({right}, {bottom})"
+        );
+    }
+
+    // The zone test asserts KiCad computed fill polygons. add_zone sets island
+    // removal to IRM_ALWAYS, so a pour reaching nothing else on its own net
+    // has its entire fill discarded — the outline must cross GND copper.
+    let zone_left = ZONE_OUTLINE.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let zone_right = ZONE_OUTLINE.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+    let zone_top = ZONE_OUTLINE.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    let zone_bottom = ZONE_OUTLINE.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+    // How copper spells "GND" depends on the board format: an id on this
+    // legacy fixture, the name itself once KiCad 10 has rewritten it.
+    let gnd = match konnect_sexp::net::net_ref_for_write(&tree, "GND") {
+        Some(konnect_sexp::net::NetRef::ById { id, .. }) => id,
+        Some(konnect_sexp::net::NetRef::ByName(name)) => name,
+        None => unreachable!("GND was asserted present above"),
+    };
+    let crosses_zone = tree.find_all("segment").into_iter().any(|segment| {
+        let on_gnd = segment
+            .find("net")
+            .and_then(|net| net.get(1))
+            .and_then(SexpNode::as_str)
+            == Some(gnd.as_str());
+        let touches = |node: Option<&SexpNode>| {
+            node.and_then(|n| Some((n.get_f64(1)?, n.get_f64(2)?)))
+                .is_some_and(|(x, y)| {
+                    y > zone_top && y < zone_bottom && x > zone_left - 20.0 && x < zone_right + 20.0
+                })
+        };
+        on_gnd && (touches(segment.find("start")) || touches(segment.find("end")))
+    });
+    assert!(
+        crosses_zone,
+        "no GND segment runs through the zone test's region \
+         ({zone_left}, {zone_top})-({zone_right}, {zone_bottom}); its fill \
+         would be removed as unconnected islands"
     );
 }

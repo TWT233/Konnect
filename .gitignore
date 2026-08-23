@@ -18,3 +18,20 @@ dist/
 # .pyc files had been committed.
 __pycache__/
 *.py[cod]
+
+# Files KiCad writes beside any board it opens. Running the live IPC suite
+# means opening a board in KiCad, so every reviewer who does grows a set of
+# these, and `git add -A` will otherwise sweep them in — a `.history/` gitlink
+# and a lock file naming the developer's host and username both reached a
+# commit that way.
+#
+#   .history/     KiCad 10 Local History: an embedded git repo of automatic
+#                 snapshots, per-machine (Preferences > Common > Project Backup)
+#   *.lck         transient board lock; contains {hostname, username}
+#   *.kicad_prl   per-user local project settings, never shared
+#   *.kicad_pro   generated on open for a bare .kicad_pcb fixture; this repo
+#                 tracks no project files, only the boards themselves
+.history/
+*.lck
+*.kicad_prl
+*.kicad_pro
