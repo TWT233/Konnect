@@ -209,6 +209,112 @@ pub fn build_via(
     }
 }
 
+/// KiCad's default thermal-relief geometry. Kept as a constant because the
+/// S-expression fallback in `add_zone` writes the same numbers as
+/// `(thermal_gap …)` / `(thermal_bridge_width …)` — the two paths must produce
+/// the same zone or a board grown half over IPC and half over the file would
+/// fill differently.
+pub const ZONE_THERMAL_RELIEF_MM: f64 = 0.5;
+
+/// `(hatch edge 0.508)` — the border hatch pcbnew gives a freshly drawn zone.
+pub const ZONE_BORDER_PITCH_MM: f64 = 0.508;
+
+/// Everything a caller may choose about a copper pour. The net *code* is not
+/// in here: it is resolved from `net_name` against the live board by
+/// [`crate::client::KiCadIpcClient::add_zone`], which keeps this a pure
+/// builder that unit tests can drive without a socket.
+pub struct ZoneSpec<'a> {
+    /// Copper layer name, e.g. `"F.Cu"`.
+    pub layer: &'a str,
+    /// Net the pour is bound to.
+    pub net_name: &'a str,
+    /// Outline vertices in mm. The loop is closed for you.
+    pub points: &'a [(f64, f64)],
+    pub clearance_mm: f64,
+    pub min_thickness_mm: f64,
+    /// Zone name as shown in pcbnew's zone properties; empty leaves it unnamed.
+    pub name: &'a str,
+    /// Higher priority wins where two zones overlap. KiCad's default is 0.
+    pub priority: u32,
+    /// How the pour attaches to pads on its net.
+    pub connection: kiapi::board::types::ZoneConnectionStyle,
+}
+
+/// Build a copper `Zone` protobuf message for `create_items`.
+///
+/// The zone is deliberately sent **unfilled** (`filled: false`, no
+/// `filled_polygons`): the fill polygons are KiCad's to compute from the
+/// outline and the design rules, so [`crate::client::KiCadIpcClient::add_zone`]
+/// follows the create with a `RefillZones`. Sending our own polygons would
+/// hand KiCad a fill that ignores every clearance it knows about.
+pub fn build_zone(spec: &ZoneSpec<'_>, net_code: i32) -> kiapi::board::types::Zone {
+    use kiapi::board::types::{
+        CopperZoneSettings, IslandRemovalMode, TeardropSettings, TeardropType,
+        ThermalSpokeSettings, ZoneBorderSettings, ZoneBorderStyle, ZoneConnectionSettings,
+        ZoneFillMode, ZoneType,
+    };
+
+    let outline = kiapi::common::types::PolySet {
+        polygons: vec![kiapi::common::types::PolygonWithHoles {
+            outline: Some(kiapi::common::types::PolyLine {
+                nodes: spec
+                    .points
+                    .iter()
+                    .map(|&(x, y)| kiapi::common::types::PolyLineNode {
+                        geometry: Some(kiapi::common::types::poly_line_node::Geometry::Point(
+                            vec2(x, y),
+                        )),
+                    })
+                    .collect(),
+                closed: true,
+            }),
+            holes: vec![],
+        }],
+    };
+
+    let copper = CopperZoneSettings {
+        connection: Some(ZoneConnectionSettings {
+            zone_connection: spec.connection as i32,
+            thermal_spokes: Some(ThermalSpokeSettings {
+                width: Some(distance(ZONE_THERMAL_RELIEF_MM)),
+                gap: Some(distance(ZONE_THERMAL_RELIEF_MM)),
+                angle: Some(kiapi::common::types::Angle {
+                    value_degrees: 45.0,
+                }),
+            }),
+        }),
+        clearance: Some(distance(spec.clearance_mm)),
+        min_thickness: Some(distance(spec.min_thickness_mm)),
+        island_mode: IslandRemovalMode::IrmAlways as i32,
+        min_island_area: 0,
+        fill_mode: ZoneFillMode::ZfmSolid as i32,
+        // Only read when fill_mode is ZFM_HATCHED.
+        hatch_settings: None,
+        net: Some(net(spec.net_name, net_code)),
+        teardrop: Some(TeardropSettings {
+            r#type: TeardropType::TdtNone as i32,
+        }),
+    };
+
+    kiapi::board::types::Zone {
+        id: None, // KiCAD assigns the ID
+        r#type: ZoneType::ZtCopper as i32,
+        layers: vec![layer_from_name(spec.layer) as i32],
+        outline: Some(outline),
+        name: spec.name.to_string(),
+        priority: spec.priority,
+        filled: false,
+        filled_polygons: vec![],
+        border: Some(ZoneBorderSettings {
+            style: ZoneBorderStyle::ZbsDiagonalEdge as i32,
+            pitch: Some(distance(ZONE_BORDER_PITCH_MM)),
+        }),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        layer_properties: vec![],
+        settings: Some(kiapi::board::types::zone::Settings::CopperSettings(copper)),
+    }
+}
+
 /// Pack a protobuf message into a prost_types::Any.
 pub fn pack_any<M: prost::Message>(msg: &M, type_name: &str) -> prost_types::Any {
     let mut buf = Vec::new();
@@ -473,6 +579,132 @@ pub fn board_text(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    /// The builder is the only thing standing between an `add_zone` request
+    /// and the board, so every user-visible choice is asserted here: the mock
+    /// server echoes requests back rather than running KiCad's parser, so no
+    /// transport test can check a zone's contents for us.
+    #[test]
+    fn build_zone_carries_layer_net_outline_and_the_caller_s_choices() {
+        use kiapi::board::types::{IslandRemovalMode, ZoneConnectionStyle, ZoneFillMode, ZoneType};
+
+        let points = [(1.0, 2.0), (11.0, 2.0), (11.0, 7.5)];
+        let zone = build_zone(
+            &ZoneSpec {
+                layer: "In1.Cu",
+                net_name: "GND",
+                points: &points,
+                clearance_mm: 0.3,
+                min_thickness_mm: 0.25,
+                name: "ground pour",
+                priority: 2,
+                connection: ZoneConnectionStyle::ZcsFull,
+            },
+            7,
+        );
+
+        assert_eq!(zone.r#type, ZoneType::ZtCopper as i32);
+        assert_eq!(
+            zone.layers,
+            vec![kiapi::board::types::BoardLayer::BlIn1Cu as i32]
+        );
+        assert_eq!(zone.name, "ground pour");
+        assert_eq!(zone.priority, 2);
+        assert!(zone.id.is_none(), "KiCAD assigns the id");
+
+        // mm → nm, and the loop is closed for the caller.
+        let outline = zone.outline.expect("outline");
+        assert_eq!(outline.polygons.len(), 1);
+        let line = outline.polygons[0].outline.clone().expect("polyline");
+        assert!(line.closed);
+        let coords: Vec<(i64, i64)> = line
+            .nodes
+            .iter()
+            .map(
+                |node| match node.geometry.as_ref().expect("node geometry") {
+                    kiapi::common::types::poly_line_node::Geometry::Point(p) => (p.x_nm, p.y_nm),
+                    other => panic!("expected a point node, got {other:?}"),
+                },
+            )
+            .collect();
+        assert_eq!(
+            coords,
+            vec![
+                (1_000_000, 2_000_000),
+                (11_000_000, 2_000_000),
+                (11_000_000, 7_500_000)
+            ]
+        );
+
+        let settings = match zone.settings.expect("settings") {
+            kiapi::board::types::zone::Settings::CopperSettings(s) => s,
+            other => panic!("a copper zone must carry CopperZoneSettings, got {other:?}"),
+        };
+        let net = settings.net.expect("net");
+        assert_eq!(net.name, "GND");
+        assert_eq!(net.code.expect("net code").value, 7);
+        assert_eq!(settings.clearance.expect("clearance").value_nm, 300_000);
+        assert_eq!(
+            settings.min_thickness.expect("min thickness").value_nm,
+            250_000
+        );
+        assert_eq!(
+            settings.connection.expect("connection").zone_connection,
+            ZoneConnectionStyle::ZcsFull as i32
+        );
+        assert_eq!(settings.fill_mode, ZoneFillMode::ZfmSolid as i32);
+        assert_eq!(settings.island_mode, IslandRemovalMode::IrmAlways as i32);
+    }
+
+    /// A zone must go over the wire unfilled: the fill polygons are KiCad's to
+    /// compute against the design rules, which is why `add_zone` follows the
+    /// create with a RefillZones. Sending our own would be a fill that honours
+    /// no clearance KiCad knows about.
+    #[test]
+    fn build_zone_leaves_the_fill_for_kicad() {
+        let zone = build_zone(
+            &ZoneSpec {
+                layer: "F.Cu",
+                net_name: "GND",
+                points: &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                clearance_mm: 0.2,
+                min_thickness_mm: 0.2,
+                name: "",
+                priority: 0,
+                connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+            },
+            1,
+        );
+        assert!(!zone.filled);
+        assert!(zone.filled_polygons.is_empty());
+    }
+
+    /// `BL_UNDEFINED` is not something KiCad rejects, it is something it
+    /// crashes on (see `try_layer_from_name`), and a zone names its layer in a
+    /// repeated field where a bad value is easy to miss.
+    #[test]
+    fn build_zone_resolves_every_copper_layer_name_it_is_given() {
+        for layer in ["F.Cu", "In1.Cu", "In14.Cu", "B.Cu"] {
+            let zone = build_zone(
+                &ZoneSpec {
+                    layer,
+                    net_name: "GND",
+                    points: &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+                    clearance_mm: 0.2,
+                    min_thickness_mm: 0.2,
+                    name: "",
+                    priority: 0,
+                    connection: kiapi::board::types::ZoneConnectionStyle::ZcsThermal,
+                },
+                1,
+            );
+            assert_eq!(
+                zone.layers,
+                vec![try_layer_from_name(layer).expect("known layer") as i32],
+                "{layer}"
+            );
+        }
+    }
 
     /// `any_is` compares the whole message name, not a suffix of the URL.
     ///

@@ -214,3 +214,118 @@ fn adding_a_via_actually_creates_it_on_the_board() {
         "via is missing its size/drill: {placed:?}"
     );
 }
+
+/// `add_zone` over IPC, end to end: create, read the zone back out of KiCad,
+/// and delete it again.
+///
+/// This is the gate for the same class of defect `add_via` hit in v0.2.1 and
+/// for the one `add_zone` itself shipped: a zone written only into the
+/// `.kicad_pcb` file is invisible to an open pcbnew and is discarded by its
+/// next save, so "the tool returned Ok" proves nothing. Only a live KiCad can
+/// say whether the `Zone` message it was handed deserialises at all — the
+/// mocks accept any schema-valid protobuf, which is exactly why a malformed
+/// padstack got through offline testing before.
+///
+/// Reads the zone back over IPC rather than from the saved file so the
+/// assertion is against KiCad's own model, including the fill it computed.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn adding_a_zone_creates_it_on_the_live_board() {
+    use konnect_ipc::gen::kiapi::board::types::{BoardLayer, Zone, ZoneConnectionStyle, ZoneType};
+    use prost::Message;
+
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+
+    let net = client
+        .get_nets()
+        .expect("net list query failed")
+        .into_iter()
+        .find(|net| !net.name.is_empty())
+        .expect("board has no named net to attach a zone to");
+
+    // Distinctive so the read-back cannot pick up a zone the board already had.
+    let name = "konnect live add_zone";
+    // Clear of the EuroCard template's own content, as the via test's spot is.
+    let points = [(40.0, 60.0), (60.0, 60.0), (60.0, 75.0), (40.0, 75.0)];
+
+    let zone_id = client
+        .add_zone(&konnect_ipc::builders::ZoneSpec {
+            layer: "B.Cu",
+            net_name: &net.name,
+            points: &points,
+            clearance_mm: 0.3,
+            min_thickness_mm: 0.25,
+            name,
+            priority: 2,
+            connection: ZoneConnectionStyle::ZcsFull,
+        })
+        .expect("add_zone reported an error");
+
+    let read_back = || -> Vec<Zone> {
+        client
+            .get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbZone)
+            .expect("zone query failed")
+            .iter()
+            .filter_map(|item| Zone::decode(item.value.as_slice()).ok())
+            .filter(|zone| zone.name == name)
+            .collect()
+    };
+
+    let found = read_back();
+    assert_eq!(
+        found.len(),
+        1,
+        "add_zone returned Ok but KiCad holds {} zones named {name:?} — a silent \
+         success with nothing created is the v0.2.1 failure mode",
+        found.len()
+    );
+    let zone = &found[0];
+
+    assert_eq!(zone.r#type, ZoneType::ZtCopper as i32);
+    assert_eq!(zone.layers, vec![BoardLayer::BlBCu as i32]);
+    assert_eq!(zone.priority, 2);
+
+    let outline = zone.outline.as_ref().expect("zone has no outline");
+    assert_eq!(outline.polygons.len(), 1);
+    let nodes = outline.polygons[0]
+        .outline
+        .as_ref()
+        .expect("outline polyline")
+        .nodes
+        .len();
+    assert_eq!(nodes, points.len(), "KiCad kept a different vertex count");
+
+    let settings = match zone.settings.as_ref().expect("zone settings") {
+        konnect_ipc::gen::kiapi::board::types::zone::Settings::CopperSettings(s) => s,
+        other => panic!("expected copper zone settings, got {other:?}"),
+    };
+    assert_eq!(
+        settings.net.as_ref().expect("zone net").name,
+        net.name,
+        "the zone landed on the wrong net"
+    );
+    assert_eq!(
+        settings
+            .connection
+            .as_ref()
+            .expect("connection settings")
+            .zone_connection,
+        ZoneConnectionStyle::ZcsFull as i32
+    );
+    assert!(
+        zone.filled && !zone.filled_polygons.is_empty(),
+        "add_zone refills before returning, so KiCad should hold computed fill \
+         polygons — an outline with no copper is what the user would see"
+    );
+
+    // Leave the disposable board as we found it.
+    let id = zone_id
+        .or_else(|| zone.id.as_ref().map(|id| id.value.clone()))
+        .expect("no KIID to delete the zone by");
+    client.delete_items(vec![id]).expect("zone cleanup failed");
+    assert!(
+        read_back().is_empty(),
+        "the test zone survived its own cleanup"
+    );
+}

@@ -658,14 +658,34 @@ impl KiCadIpcClient {
         self.create_items_in(self.get_board_document()?, items)
     }
 
+    /// As [`Self::create_items`], handing back the items KiCad actually
+    /// created. Their `id` is the only place a caller can learn the KIID KiCad
+    /// assigned, since the request carries none.
+    pub fn create_items_returning(
+        &self,
+        items: Vec<prost_types::Any>,
+    ) -> Result<Vec<prost_types::Any>> {
+        self.create_items_in_returning(self.get_board_document()?, items)
+    }
+
     /// As [`Self::create_items`], targeting a specific open document.
     pub fn create_items_in(
         &self,
         document: kiapi::common::types::DocumentSpecifier,
         items: Vec<prost_types::Any>,
     ) -> Result<()> {
+        self.create_items_in_returning(document, items).map(|_| ())
+    }
+
+    /// The shared body of [`Self::create_items_in`], returning the created
+    /// items rather than discarding them.
+    pub fn create_items_in_returning(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        items: Vec<prost_types::Any>,
+    ) -> Result<Vec<prost_types::Any>> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let expected_count = items.len();
         let header = header_for(document);
@@ -688,6 +708,7 @@ impl KiCadIpcClient {
             );
         }
         let mut created = 0usize;
+        let mut created_items = Vec::new();
         let mut rejections = Vec::new();
         for (index, result) in response.created_items.iter().enumerate() {
             use kiapi::common::commands::ItemStatusCode;
@@ -705,6 +726,12 @@ impl KiCadIpcClient {
             };
             if is_created {
                 created += 1;
+                // KiCad echoes the created item back with the KIID it
+                // assigned. It is allowed to omit it (an IscOk with no item),
+                // so this is best-effort and never gates success.
+                if let Some(item) = result.item.clone() {
+                    created_items.push(item);
+                }
             } else {
                 let message = result
                     .status
@@ -722,7 +749,7 @@ impl KiCadIpcClient {
                 rejections.join("; ")
             );
         }
-        Ok(())
+        Ok(created_items)
     }
 
     /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;
@@ -1027,6 +1054,30 @@ impl KiCadIpcClient {
         let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
         self.create_items(vec![any])?;
         Ok(())
+    }
+
+    /// Add a copper zone to the live board and refill it, returning the KIID
+    /// KiCad assigned if it reported one.
+    ///
+    /// The refill is part of the operation rather than the caller's problem: a
+    /// zone created over IPC arrives unfilled, so without it the user sees an
+    /// outline and no copper and reasonably concludes the tool did nothing.
+    pub fn add_zone(&self, spec: &crate::builders::ZoneSpec<'_>) -> Result<Option<String>> {
+        let net_code = self.resolve_net_code(spec.net_name)?;
+        let zone = crate::builders::build_zone(spec, net_code);
+        let any = crate::builders::pack_any(&zone, "kiapi.board.types.Zone");
+        let created = self.create_items_returning(vec![any])?;
+        self.refill_zones()?;
+        // Discriminate on the declared type, never on whether a decode happens
+        // to succeed — see `builders::any_is` for why that distinction cost
+        // every synced footprint its graphics (#244).
+        Ok(created
+            .iter()
+            .find(|item| crate::builders::any_is(item, "kiapi.board.types.Zone"))
+            .and_then(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).ok())
+            .and_then(|zone| zone.id)
+            .map(|id| id.value)
+            .filter(|id| !id.is_empty()))
     }
 
     /// Delete a track by UUID.
