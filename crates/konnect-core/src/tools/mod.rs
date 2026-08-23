@@ -272,6 +272,22 @@ fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     )
 }
 
+/// The reason string for a footprint file whose root is not `(footprint ...)`.
+///
+/// A pre-6.0 library file has a `(module ...)` root instead, and those are
+/// still everywhere — vendor downloads and older personal libraries. The
+/// generic "file root must be a footprint" reads like a dead end there, when
+/// one shipped command migrates the file (#304). Name the situation and the
+/// way out; keep the generic message for everything else.
+pub(crate) fn footprint_root_reason(head: Option<&str>) -> String {
+    match head {
+        Some("module") => "file root is a pre-6.0 `(module ...)` footprint — \
+             convert it with `kicad-cli fp upgrade <dir-or-file>`, then retry"
+            .to_string(),
+        _ => "file root must be a footprint".to_string(),
+    }
+}
+
 /// Extract a required string argument, returning a structured
 /// `InvalidArgument` error result if missing or not a string.
 pub fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, CallToolResult> {
