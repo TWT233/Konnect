@@ -1,17 +1,18 @@
 //! `sch_analysis` toolset — net connectivity, pin queries, trace paths, overlap/orphan detection.
 //!
-//! All operations are read-only S-expression analysis.
-//! Net graph uses union-find (O(W+L+P)), matching net_analysis.py.
+//! All operations are read-only S-expression analysis. Connectivity — the net
+//! graph and what counts as attached at a point — lives in `sch_connectivity`.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::sch_connectivity::{net_graph_for, pt_key, ConnectivityIndex};
 use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_junctions, extract_labels, extract_symbol_instances,
-        extract_wires, find_lib_symbol, read_schematic, Label, Wire,
+        extract_all_net_labels, extract_symbol_instances, extract_wires, find_lib_symbol,
+        read_schematic, LabelKind, Wire,
     },
 };
 use serde_json::json;
@@ -183,126 +184,6 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
-// ─── Union-Find net graph ─────────────────────────────────────────────────────
-
-pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
-    ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64)
-}
-
-pub(crate) struct NetGraph {
-    pub(crate) point_nets: HashMap<(i64, i64), String>,
-    pub(crate) parent: HashMap<(i64, i64), (i64, i64)>,
-}
-
-impl NetGraph {
-    pub(crate) fn new() -> Self {
-        NetGraph {
-            point_nets: HashMap::new(),
-            parent: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn ensure(&mut self, k: (i64, i64)) {
-        self.parent.entry(k).or_insert(k);
-    }
-
-    pub(crate) fn find(&mut self, k: (i64, i64)) -> (i64, i64) {
-        self.ensure(k);
-        let p = self.parent[&k];
-        if p == k {
-            return k;
-        }
-        let root = self.find(p);
-        self.parent.insert(k, root);
-        root
-    }
-
-    pub(crate) fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra != rb {
-            self.parent.insert(rb, ra);
-        }
-    }
-
-    pub(crate) fn add_wire(&mut self, w: &Wire) {
-        let a = pt_key(w.x1, w.y1);
-        let b = pt_key(w.x2, w.y2);
-        self.ensure(a);
-        self.ensure(b);
-        self.union(a, b);
-    }
-
-    pub(crate) fn add_label(&mut self, x: f64, y: f64, net: &str) {
-        let k = pt_key(x, y);
-        self.ensure(k);
-        self.point_nets.insert(k, net.to_string());
-    }
-
-    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
-        let k = pt_key(x, y);
-        self.ensure(k);
-        let root = self.find(k);
-        let labels: Vec<_> = self.point_nets.clone().into_iter().collect();
-        for (lk, net) in labels {
-            if self.find(lk) == root {
-                return Some(net);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn points_on_net(&mut self, net: &str) -> Vec<(i64, i64)> {
-        // Collect keys first to avoid simultaneous borrow of point_nets and self.find()
-        let net_keys: Vec<(i64, i64)> = self
-            .point_nets
-            .iter()
-            .filter(|(_, n)| n.as_str() == net)
-            .map(|(k, _)| *k)
-            .collect();
-        let net_roots: HashSet<(i64, i64)> = net_keys.iter().map(|k| self.find(*k)).collect();
-        let all_keys: Vec<(i64, i64)> = self.parent.keys().cloned().collect();
-        all_keys
-            .into_iter()
-            .filter(|k| net_roots.contains(&self.find(*k)))
-            .collect()
-    }
-}
-
-/// Build the connectivity graph. `labels` must be
-/// [`extract_all_net_labels`] — power symbols name nets too, and a graph
-/// built from [`extract_labels`] alone reports every `power:` rail
-/// unconnected.
-pub(crate) fn build_net_graph(
-    wires: &[Wire],
-    labels: &[Label],
-    junctions: &[(f64, f64)],
-) -> NetGraph {
-    let mut g = NetGraph::new();
-    for w in wires {
-        g.add_wire(w);
-    }
-    // Labels and junction dots connect anywhere along a wire, not only at
-    // endpoints — union each such point with the segment it sits on.
-    // ponytail: O(P×W) scan; fine at schematic scale, index wires if it hurts.
-    let attach = |g: &mut NetGraph, x: f64, y: f64| {
-        for w in wires {
-            if point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, 0.01) {
-                g.union(pt_key(x, y), pt_key(w.x1, w.y1));
-            }
-        }
-    };
-    for l in labels {
-        g.add_label(l.x, l.y, &l.net);
-        attach(&mut g, l.x, l.y);
-    }
-    for &(jx, jy) in junctions {
-        g.ensure(pt_key(jx, jy));
-        attach(&mut g, jx, jy);
-    }
-    g
-}
-
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_list_wires(
@@ -375,7 +256,7 @@ async fn handle_get_net_connections(
         .filter(|l| l.net == net)
         .map(|l| json!({ "type": format!("{:?}", l.kind), "x": l.x, "y": l.y }))
         .collect();
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let pts = g.points_on_net(&net).len();
     Ok(CallToolResult::json(
         &json!({ "net": net, "label_count": matching.len(), "labels": matching, "connected_points": pts }),
@@ -394,7 +275,7 @@ async fn handle_get_net_connectivity(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let net_wires: Vec<_> = wires
         .iter()
@@ -461,7 +342,7 @@ async fn handle_get_pin_connections(
             )))
         }
     };
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
     ))
@@ -489,7 +370,7 @@ async fn handle_get_component_nets(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let lib_sym = find_lib_symbol(&lib_syms, inst);
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let t = inst.pin_transform();
         konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
@@ -521,7 +402,7 @@ async fn handle_get_net_components(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let result: Vec<serde_json::Value> = instances
         .iter()
@@ -568,7 +449,7 @@ async fn handle_trace_from_point(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let on_wire: Vec<_> = wires
         .iter()
         .filter(|w| {
@@ -588,120 +469,6 @@ async fn handle_trace_from_point(
     ))
 }
 
-/// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
-/// instead of scanning every point. `points_coincident` compares an L∞ box of
-/// side `tol`, which the 3×3 neighbourhood covers exactly.
-struct PointIndex {
-    tol: f64,
-    buckets: HashMap<(i64, i64), Vec<(f64, f64)>>,
-}
-
-impl PointIndex {
-    fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
-        let mut index = PointIndex {
-            tol,
-            buckets: HashMap::new(),
-        };
-        for (x, y) in points {
-            let key = index.cell(x, y);
-            index.buckets.entry(key).or_default().push((x, y));
-        }
-        index
-    }
-
-    fn cell(&self, x: f64, y: f64) -> (i64, i64) {
-        ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
-    }
-
-    /// How many indexed points coincide with `(x, y)`.
-    fn count_at(&self, x: f64, y: f64) -> usize {
-        let (cx, cy) = self.cell(x, y);
-        let mut found = 0;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) else {
-                    continue;
-                };
-                found += bucket
-                    .iter()
-                    .filter(|(px, py)| points_coincident(x, y, *px, *py, self.tol))
-                    .count();
-            }
-        }
-        found
-    }
-
-    fn contains(&self, x: f64, y: f64) -> bool {
-        self.count_at(x, y) > 0
-    }
-}
-
-/// Wires bucketed by the coordinate they hold constant: a horizontal wire can
-/// only be met in its own row, a vertical one in its own column. Mirrors
-/// `point_on_segment`, which answers `false` for anything diagonal.
-struct WireIndex<'a> {
-    tol: f64,
-    rows: HashMap<i64, Vec<&'a Wire>>,
-    columns: HashMap<i64, Vec<&'a Wire>>,
-}
-
-impl<'a> WireIndex<'a> {
-    fn build(wires: &'a [Wire], tol: f64) -> Self {
-        let mut index = WireIndex {
-            tol,
-            rows: HashMap::new(),
-            columns: HashMap::new(),
-        };
-        for wire in wires {
-            if (wire.x1 - wire.x2).abs() < tol {
-                index
-                    .columns
-                    .entry(bucket(wire.x1, tol))
-                    .or_default()
-                    .push(wire);
-            } else if (wire.y1 - wire.y2).abs() < tol {
-                index
-                    .rows
-                    .entry(bucket(wire.y1, tol))
-                    .or_default()
-                    .push(wire);
-            }
-        }
-        index
-    }
-
-    /// Every wire that could pass through `(x, y)`.
-    fn candidates(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
-        let cell_x = bucket(x, self.tol);
-        let cell_y = bucket(y, self.tol);
-        (-1..=1).flat_map(move |delta| {
-            let column = self.columns.get(&(cell_x + delta)).into_iter().flatten();
-            let row = self.rows.get(&(cell_y + delta)).into_iter().flatten();
-            column.chain(row)
-        })
-    }
-
-    /// Lies anywhere on a wire, endpoints included.
-    fn covers(&self, x: f64, y: f64) -> bool {
-        self.candidates(x, y)
-            .any(|wire| point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol))
-    }
-
-    /// Lies on the interior of a wire — a T-junction, which KiCAD connects
-    /// without splitting the crossed wire.
-    fn covers_interior(&self, x: f64, y: f64) -> bool {
-        self.candidates(x, y).any(|wire| {
-            point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol)
-                && !points_coincident(x, y, wire.x1, wire.y1, self.tol)
-                && !points_coincident(x, y, wire.x2, wire.y2, self.tol)
-        })
-    }
-}
-
-fn bucket(value: f64, tolerance: f64) -> i64 {
-    (value / tolerance).floor() as i64
-}
-
 async fn handle_find_orphan_items(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -716,72 +483,35 @@ async fn handle_find_orphan_items(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
-
-    // Unit-aware, so a multi-unit symbol does not contribute another unit's
-    // pins as phantom connection points (#35).
-    let placed = crate::tools::placed_pins_by_reference(&tree);
-    let pins: Vec<(&str, &konnect_sexp::schematic::LibPin, (f64, f64))> = placed
-        .iter()
-        .flat_map(|(reference, pins)| {
-            pins.iter().map(move |(pin, transform)| {
-                (
-                    reference.as_str(),
-                    pin,
-                    konnect_sexp::schematic::pin_endpoint(pin, *transform),
-                )
-            })
-        })
-        .collect();
-
-    let on_wire = WireIndex::build(&wires, tolerance);
-    let wire_ends = PointIndex::build(
-        wires
-            .iter()
-            .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)]),
-        tolerance,
-    );
-    let label_points = PointIndex::build(labels.iter().map(|label| (label.x, label.y)), tolerance);
-    let pin_points = PointIndex::build(pins.iter().map(|(_, _, at)| *at), tolerance);
-    let junctions = PointIndex::build(extract_junctions(&tree), tolerance);
-    let no_connects = PointIndex::build(
-        konnect_sexp::schematic::extract_no_connects(&tree),
-        tolerance,
-    );
-    let sheet_pins = PointIndex::build(
-        konnect_sexp::schematic::extract_sheet_pins(&tree),
-        tolerance,
-    );
+    // Every net name, so the index is the same one every other tool builds. A
+    // power symbol's pseudo-label sits on the pin already indexed, so feeding
+    // them changes no coincidence answer below.
+    let labels = extract_all_net_labels(&tree);
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, tolerance);
 
     let mut all: Vec<serde_json::Value> = Vec::new();
 
     // A wire end is dangling only when nothing terminates it. Ending on a
     // component or hierarchical sheet pin is the normal case.
-    for wire in &wires {
-        for (x, y) in [(wire.x1, wire.y1), (wire.x2, wire.y2)] {
-            let connected = pin_points.contains(x, y)
-                || label_points.contains(x, y)
-                || sheet_pins.contains(x, y)
-                || junctions.contains(x, y)
-                || no_connects.contains(x, y)
-                // This end is itself indexed; a second hit is another wire.
-                || wire_ends.count_at(x, y) >= 2
-                || on_wire.covers_interior(x, y);
-            if !connected {
-                all.push(json!({
-                    "type": "dangling_wire_end",
-                    "x": x,
-                    "y": y,
-                    "wire_uuid": wire.uuid
-                }));
-            }
-        }
+    for (x, y, wire_uuid) in index.floating_wire_ends() {
+        all.push(json!({
+            "type": "dangling_wire_end",
+            "x": x,
+            "y": y,
+            "wire_uuid": wire_uuid
+        }));
     }
 
     // Labels connect anywhere along a wire, not only at its endpoint, or
-    // directly on a bare symbol pin.
-    for label in &labels {
-        if !on_wire.covers(label.x, label.y) && !pin_points.contains(label.x, label.y) {
+    // directly on a bare symbol pin. Only real labels are reported: a power
+    // symbol that connects to nothing is an unconnected pin, below, and
+    // reporting it twice would be a second answer to one question.
+    for label in index
+        .labels()
+        .iter()
+        .filter(|label| label.kind != LabelKind::PowerSymbol)
+    {
+        if !index.on_wire(label.x, label.y) && !index.has_pin(label.x, label.y) {
             all.push(json!({
                 "type": "floating_label",
                 "net": label.net,
@@ -793,22 +523,17 @@ async fn handle_find_orphan_items(
 
     // Report the unconnected pins promised by the tool description. A pin
     // sitting mid-wire connects only through a junction dot (#104).
-    for (reference, pin, (x, y)) in &pins {
-        let (x, y) = (*x, *y);
-        if pin.electrical_type == "no_connect" || no_connects.contains(x, y) {
+    for placed in index.placed_pins() {
+        let (x, y) = placed.at;
+        if placed.pin.electrical_type == "no_connect" || index.has_no_connect(x, y) {
             continue;
         }
-        let connected = wire_ends.contains(x, y)
-            || label_points.contains(x, y)
-            // This pin is itself indexed; a second hit is a stacked pin.
-            || pin_points.count_at(x, y) >= 2
-            || (junctions.contains(x, y) && on_wire.covers(x, y));
-        if !connected {
+        if !index.attaches_pin(x, y) {
             all.push(json!({
                 "type": "unconnected_pin",
-                "reference": reference,
-                "pin": pin.number,
-                "pin_name": pin.name,
+                "reference": placed.reference,
+                "pin": placed.pin.number,
+                "pin_name": placed.pin.name,
                 "x": x,
                 "y": y
             }));
@@ -830,7 +555,7 @@ async fn handle_find_shorted_nets(
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
     let mut root_nets: HashMap<(i64, i64), Vec<String>> = HashMap::new();
     for l in &labels {
         let root = g.find(pt_key(l.x, l.y));
@@ -907,7 +632,7 @@ async fn handle_get_connected_items(
     };
 
     let lib_sym = find_lib_symbol(&lib_syms, inst);
-    let mut g = build_net_graph(&wires, &labels, &extract_junctions(&tree));
+    let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Get nets for each pin
     let mut connected_nets: HashSet<String> = HashSet::new();
