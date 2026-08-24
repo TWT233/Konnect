@@ -206,7 +206,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `set_board_size` | Set the PCB board outline to a rectangle on the Edge.Cuts layer. |
-| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size, `layer_count`, `copper_layer_count`, and `net_count` (counted from the tree, so KiCad 10 boards report real numbers instead of 0). |
+| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (counted from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board: `id`, `name`, `type`, plus the optional `user_name` label and a `copper` flag. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
