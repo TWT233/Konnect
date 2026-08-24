@@ -2552,6 +2552,25 @@ fn merge_clean_footprint_children(
     ))
 }
 
+fn merge_corrupted_footprint_candidate(
+    reference: &str,
+    current: &prost_types::Any,
+    clean: &prost_types::Any,
+    diagnostics: &mut Vec<serde_json::Value>,
+) -> Option<prost_types::Any> {
+    match merge_clean_footprint_children(current, clean) {
+        Ok(repaired) => Some(repaired),
+        Err(error) => {
+            diagnostics.push(json!({
+                "reference": reference,
+                "code": "repair_merge_failed",
+                "message": format!("{error:#}")
+            }));
+            None
+        }
+    }
+}
+
 struct CorruptedFootprintRepair {
     reference: String,
     footprint: String,
@@ -2750,7 +2769,14 @@ async fn handle_repair_corrupted_footprints(
                     summary.rotation,
                     &summary.layer,
                 )?;
-                let repaired_item = merge_clean_footprint_children(&item, &clean)?;
+                let Some(repaired_item) = merge_corrupted_footprint_candidate(
+                    &reference,
+                    &item,
+                    &clean,
+                    &mut diagnostics,
+                ) else {
+                    continue;
+                };
                 source_digests.push((reference.clone(), source.into_bytes()));
                 repairs.push(CorruptedFootprintRepair {
                     reference,
@@ -3530,6 +3556,40 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(texts, ["custom-board-text"]);
+    }
+
+    #[test]
+    fn repair_merge_failure_is_scoped_to_one_footprint() {
+        use konnect_ipc::gen::kiapi;
+
+        let valid = kiapi::board::types::FootprintInstance {
+            definition: Some(kiapi::board::types::Footprint::default()),
+            ..Default::default()
+        };
+        let valid = konnect_ipc::builders::pack_any(&valid, "kiapi.board.types.FootprintInstance");
+        let invalid = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.FootprintInstance".to_string(),
+            value: vec![0xff],
+        };
+        let mut diagnostics = Vec::new();
+        let mut repaired = Vec::new();
+
+        for (reference, clean) in [("R_BAD", &invalid), ("R_GOOD", &valid)] {
+            if merge_corrupted_footprint_candidate(reference, &valid, clean, &mut diagnostics)
+                .is_some()
+            {
+                repaired.push(reference);
+            }
+        }
+
+        assert_eq!(repaired, ["R_GOOD"]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["reference"], "R_BAD");
+        assert_eq!(diagnostics[0]["code"], "repair_merge_failed");
+        assert!(diagnostics[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid clean footprint"));
     }
 
     #[test]
