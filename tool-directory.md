@@ -217,7 +217,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
-| `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
+| `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
 ### `pcb_components` · 17 tools
@@ -254,7 +254,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
-| `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. Same net and board-open refusals as `add_zone`. |
+| `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |

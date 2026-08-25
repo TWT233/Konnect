@@ -280,6 +280,101 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
     }
 }
 
+// ─── Zone construction, shared by `add_zone` and its `add_copper_pour` alias ──
+
+/// KiCad's own defaults for a freshly drawn zone. Shared by both tools so the
+/// two cannot hand out different copper for the same request — they used to
+/// disagree on `min_width` (0.2 vs 0.25).
+pub(crate) const DEFAULT_ZONE_CLEARANCE_MM: f64 = 0.2;
+pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
+
+/// What the caller gets back when no live KiCAD could be reached and the zone
+/// went into the file instead.
+pub(crate) const ZONE_FILE_FALLBACK_WARNING: &str =
+    "KiCAD was not reachable over IPC, so the zone was written straight into the board \
+     file. If KiCAD in fact has this board open (with the IPC API switched off, say), use \
+     File → Revert there before saving, or the zone will be discarded by KiCAD's next save.";
+
+/// The `pad_connection` argument in both the representations it needs: the IPC
+/// enum and the token KiCad's `(connect_pads …)` takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PadConnection {
+    Solid,
+    Thermal,
+    None,
+}
+
+impl PadConnection {
+    /// `thermal` is KiCad's default for a new zone, so it is ours.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("thermal") {
+            "solid" => Ok(Self::Solid),
+            "thermal" => Ok(Self::Thermal),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "Unknown pad_connection '{other}'. Expected 'solid', 'thermal' or 'none'."
+            )),
+        }
+    }
+
+    fn as_ipc(self) -> konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle {
+        use konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle;
+        match self {
+            Self::Solid => ZoneConnectionStyle::ZcsFull,
+            Self::Thermal => ZoneConnectionStyle::ZcsThermal,
+            Self::None => ZoneConnectionStyle::ZcsNone,
+        }
+    }
+
+    /// The token between `connect_pads` and its `(clearance …)`. Thermal is
+    /// spelled by writing nothing at all — that is how the file format says
+    /// "the default".
+    fn sexp_token(self) -> &'static str {
+        match self {
+            Self::Solid => " yes",
+            Self::Thermal => "",
+            Self::None => " no",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Solid => "solid",
+            Self::Thermal => "thermal",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The JSON schema both zone tools advertise. One definition so `add_zone` and
+/// `add_copper_pour` cannot drift apart again.
+pub(crate) fn zone_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board":      { "type": "string", "description": "Path to the .kicad_pcb file" },
+            "net_name":   { "type": "string", "description": "Net name (e.g. 'GND')" },
+            "layer":      { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
+            "points": {
+                "type": "array",
+                "description": "Polygon vertices as [{x, y}], in mm",
+                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
+            },
+            "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM },
+            "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM },
+            "name":       { "type": "string", "description": "Optional zone name, as shown in pcbnew's zone properties" },
+            "priority":   { "type": "integer", "description": "Higher priority wins where zones overlap", "default": 0, "minimum": 0 },
+            "pad_connection": {
+                "type": "string",
+                "description": "How the pour attaches to pads on its net",
+                "enum": ["solid", "thermal", "none"],
+                "default": "thermal"
+            }
+        },
+        "required": ["board", "net_name", "layer", "points"]
+    })
+}
+
 // ─── S-expression format helpers ──────────────────────────────────────────────
 
 fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
@@ -392,22 +487,47 @@ fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> Strin
 /// `(net_name …)` pair and singular `(layer …)`. The net reference comes from
 /// [`konnect_sexp::net::net_ref_for_write`] — resolved structurally, never by
 /// string offset, which is how zones used to land on net 0 (#192).
+///
+/// Only the fallback path writes this; the live-KiCad path goes through
+/// [`konnect_ipc::builders::build_zone`], and the two are kept in step by
+/// sharing the thermal-relief and hatch-pitch constants.
+#[allow(clippy::too_many_arguments)]
 fn format_zone_polygon(
     net: &konnect_sexp::net::NetRef,
     layer: &str,
     clearance: f64,
     min_width: f64,
     points: &[(f64, f64)],
+    name: &str,
+    priority: u32,
+    connection: PadConnection,
 ) -> String {
     let uuid = new_uuid();
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
+    // KiCad omits both of these at their defaults, and so do we: an explicit
+    // `(priority 0)` is legal but is not what pcbnew writes.
+    let name_node = if name.is_empty() {
+        String::new()
+    } else {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\n    (name \"{escaped}\")")
+    };
+    let priority_node = if priority == 0 {
+        String::new()
+    } else {
+        format!("\n    (priority {priority})")
+    };
+    let connect = connection.sexp_token();
+    let thermal = konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
+    let hatch_pitch = konnect_ipc::builders::ZONE_BORDER_PITCH_MM;
     format!(
-        "\n  (zone {net_nodes} {layer_node} (uuid \"{uuid}\")\n    \
-         (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
-         (min_thickness {min_width})\n    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n    \
+        "\n  (zone {net_nodes} {layer_node}{name_node} (uuid \"{uuid}\"){priority_node}\n    \
+         (hatch edge {hatch_pitch})\n    (connect_pads{connect} (clearance {clearance}))\n    \
+         (min_thickness {min_width})\n    \
+         (fill yes (thermal_gap {thermal}) (thermal_bridge_width {thermal}))\n    \
          (polygon (pts{pts}\n    ))\n  )",
         net_nodes = net.zone_net_nodes(),
         layer_node = net.zone_layer_node(layer),
@@ -613,23 +733,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_zone",
-            "Add a copper fill zone polygon on a specified layer and net.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board":      { "type": "string" },
-                    "net_name":   { "type": "string", "description": "Net name (e.g. 'GND')" },
-                    "layer":      { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
-                    "points": {
-                        "type": "array",
-                        "description": "Polygon vertices as [{x, y}]",
-                        "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
-                    },
-                    "clearance":  { "type": "number", "default": 0.2 },
-                    "min_width":  { "type": "number", "default": 0.2 }
-                },
-                "required": ["board", "net_name", "layer", "points"]
-            }),
+            "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
+             first — with KiCAD live on this board the zone is created through the API and \
+             refilled, so it shows up at once and is undoable there. Only when no live KiCAD \
+             answers does it fall back to inserting the (zone …) S-expression into the file, \
+             and that result carries a warning, because a file-only edit is invisible to an \
+             open pcbnew and is lost on its next save. Refuses a net the board does not \
+             declare rather than binding copper to net 0.",
+            zone_schema(),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
         ),
         tool!(
@@ -1346,9 +1457,17 @@ async fn handle_add_board_text(
     })))
 }
 
-async fn handle_add_zone(
+/// Shared implementation of `add_zone` and its `add_copper_pour` alias.
+///
+/// IPC first: with KiCAD live on the board, the zone is created through the
+/// API and refilled, so it appears immediately and is part of the user's undo
+/// stack. Only when no live KiCAD answers does this fall back to inserting the
+/// `(zone …)` S-expression, which is reported with an explicit warning — a
+/// file-only edit is invisible to an open pcbnew and is discarded by its next
+/// save (#192), and that is exactly what `add_zone` used to do unconditionally.
+pub(crate) async fn add_zone_impl(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
@@ -1359,8 +1478,18 @@ async fn handle_add_zone(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let clearance = args["clearance"].as_f64().unwrap_or(0.2);
-    let min_width = args["min_width"].as_f64().unwrap_or(0.2);
+    let clearance = args["clearance"]
+        .as_f64()
+        .unwrap_or(DEFAULT_ZONE_CLEARANCE_MM);
+    let min_width = args["min_width"]
+        .as_f64()
+        .unwrap_or(DEFAULT_ZONE_MIN_WIDTH_MM);
+    let zone_name = args["name"].as_str().unwrap_or("").to_string();
+    let priority = args["priority"].as_u64().unwrap_or(0) as u32;
+    let connection = match PadConnection::parse(args["pad_connection"].as_str()) {
+        Ok(v) => v,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
     let pts_arr = match args["points"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'points' array")),
@@ -1375,10 +1504,52 @@ async fn handle_add_zone(
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
 
-    if let Some(refusal) =
-        refuse_if_board_open_in_kicad(_ctx.config.ipc_address.clone(), &board_path, "zone").await?
-    {
-        return Ok(refusal);
+    let describe = || {
+        json!({
+            "net": net_name,
+            "layer": layer,
+            "point_count": points.len(),
+            "name": zone_name,
+            "priority": priority,
+            "pad_connection": connection.as_str(),
+        })
+    };
+
+    let net_ipc = net_name.clone();
+    let layer_ipc = layer.clone();
+    let name_ipc = zone_name.clone();
+    let points_ipc = points.clone();
+    let ipc_attempt = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "zone",
+        move |c| {
+            c.add_zone(&konnect_ipc::builders::ZoneSpec {
+                layer: &layer_ipc,
+                net_name: &net_ipc,
+                points: &points_ipc,
+                clearance_mm: clearance,
+                min_thickness_mm: min_width,
+                name: &name_ipc,
+                priority,
+                connection: connection.as_ipc(),
+            })
+        },
+    )
+    .await?;
+
+    match ipc_attempt {
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::Ipc(zone_id) => {
+            let mut body = describe();
+            body["source"] = json!("ipc");
+            body["zone_id"] = match zone_id {
+                Some(id) => json!(id),
+                None => serde_json::Value::Null,
+            };
+            return Ok(CallToolResult::json(&body));
+        }
+        BoardWrite::File => {}
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -1392,16 +1563,25 @@ async fn handle_add_zone(
             board_path.display()
         )));
     };
-    let zone_sexp = format_zone_polygon(&net, &layer, clearance, min_width, &points);
+    let zone_sexp = format_zone_polygon(
+        &net, &layer, clearance, min_width, &points, &zone_name, priority, connection,
+    );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
     write_atomic(&board_path, &new_content)?;
 
-    Ok(CallToolResult::json(&json!({
-        "net": net_name, "layer": layer,
-        "point_count": points.len()
-    })))
+    let mut body = describe();
+    body["source"] = json!("file");
+    body["warning"] = json!(ZONE_FILE_FALLBACK_WARNING);
+    Ok(CallToolResult::json(&body))
+}
+
+async fn handle_add_zone(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    add_zone_impl(args, ctx).await
 }
 
 async fn handle_import_svg_logo(
@@ -2186,6 +2366,125 @@ mod zone_net_format_tests {
         let (result, after) = zone(LEGACY, "PWR").await;
         assert!(result.is_error, "{}", text_of(&result));
         assert_eq!(after, LEGACY);
+    }
+
+    fn body_of(r: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&text_of(r)).expect("tool results are JSON")
+    }
+
+    async fn zone_with(board: &str, extra: serde_json::Value) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let mut args = json!({
+            "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+            "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ]
+        });
+        for (key, value) in extra.as_object().expect("object").clone() {
+            args[key] = value;
+        }
+        let result = handle_add_zone(&args, &test_ctx()).await.unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    /// The defect this replaced: with no IPC attempt at all, `add_zone` wrote
+    /// the file and reported plain success, so a zone added while KiCad held
+    /// the board open was invisible and was dropped by KiCad's next save
+    /// (#192). The file path is still there — it is the right thing to do when
+    /// nothing is holding the board — but it now says so.
+    #[tokio::test]
+    async fn the_file_fallback_names_itself_and_warns() {
+        let (result, _) = zone_with(KICAD_10, json!({})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(body["source"], json!("file"));
+        let warning = body["warning"].as_str().expect("a fallback must warn");
+        assert!(warning.contains("File → Revert"), "{warning}");
+        assert!(warning.contains("next save"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn the_new_fields_reach_the_s_expression() {
+        let (result, after) = zone_with(
+            KICAD_10,
+            json!({ "name": "ground pour", "priority": 3, "pad_connection": "solid" }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(name \"ground pour\")"), "{z}");
+        assert!(z.contains("(priority 3)"), "{z}");
+        assert!(z.contains("(connect_pads yes (clearance"), "{z}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "still parses");
+
+        let body = body_of(&result);
+        assert_eq!(body["name"], json!("ground pour"));
+        assert_eq!(body["priority"], json!(3));
+        assert_eq!(body["pad_connection"], json!("solid"));
+    }
+
+    /// KiCad spells "thermal" and "priority 0" by writing nothing at all, so
+    /// the defaults must not start emitting nodes pcbnew never writes.
+    #[tokio::test]
+    async fn the_defaults_write_what_pcbnew_writes() {
+        let (result, after) = zone_with(KICAD_10, json!({})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(connect_pads (clearance 0.2))"), "{z}");
+        assert!(z.contains("(min_thickness 0.2)"), "{z}");
+        assert!(!z.contains("(priority"), "priority 0 is implicit: {z}");
+        assert!(
+            !z.contains("(name"),
+            "an unnamed zone gets no name node: {z}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pad_connection_none_writes_the_no_token() {
+        let (_, after) = zone_with(KICAD_10, json!({ "pad_connection": "none" })).await;
+        let z = &after[after.find("(zone").unwrap()..];
+        assert!(z.contains("(connect_pads no (clearance"), "{z}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pad_connection_is_refused_before_anything_is_written() {
+        let (result, after) =
+            zone_with(KICAD_10, json!({ "pad_connection": "thermal_relief" })).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(text_of(&result).contains("'solid', 'thermal' or 'none'"));
+        assert_eq!(after, KICAD_10, "file must be untouched");
+    }
+
+    /// A KiCad that answers — even to say no — may be holding this board, so
+    /// the file must not be edited behind it. This is `attempt_ipc_write`'s
+    /// fail-closed rule; before this change `add_zone` reached the same
+    /// outcome through `refuse_if_board_open_in_kicad`, which had no IPC path
+    /// to offer instead.
+    #[tokio::test]
+    async fn a_rejecting_kicad_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, KICAD_10).unwrap();
+        let ctx = super::mounting_hole_tests::ctx_with_ipc(
+            super::mounting_hole_tests::spawn_rejecting_kicad(),
+        );
+        let result = handle_add_zone(
+            &json!({
+                "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+                "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("board file was not modified"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD_10);
     }
 }
 
