@@ -13,11 +13,10 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident, snap_point},
+    geometry::{points_coincident, snap_point},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_lib_pins, extract_lib_pins_for_unit,
-        extract_symbol_instances, extract_wires, find_lib_symbol, format_net_label, format_wire,
-        pin_endpoint, pin_label_rotation, read_schematic,
+        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
+        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -27,8 +26,7 @@ use konnect_sexp::{
 use serde_json::json;
 use std::collections::HashSet;
 
-// Re-use the crate-internal net-graph primitives from sch_analysis.
-use super::sch_analysis::build_net_graph;
+use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::place_one_component;
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
@@ -1230,78 +1228,14 @@ async fn handle_validate_wire_connections(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let labels = extract_all_net_labels(&tree);
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
 
-    // Collect all valid pin endpoints
-    let mut pin_points: Vec<(f64, f64)> = Vec::new();
-    for inst in &instances {
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
-                pin_points.push(pin_endpoint(&pin, t));
-            }
-        }
-    }
-
-    let label_points: Vec<(f64, f64)> = labels.iter().map(|l| (l.x, l.y)).collect();
-    // All wire endpoints as a flat list (for quick counting)
-    let all_wire_eps: Vec<(f64, f64)> = wires
-        .iter()
-        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
+    let floating: Vec<serde_json::Value> = index
+        .floating_wire_ends()
+        .into_iter()
+        .map(|(x, y, wire_uuid)| json!({ "x": x, "y": y, "wire_uuid": wire_uuid }))
         .collect();
-
-    let is_connected = |px: f64, py: f64| -> bool {
-        // Another wire endpoint at the same position (count >= 2 because px/py itself is in the list)
-        let same_ep_count = all_wire_eps
-            .iter()
-            .filter(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
-            .count();
-        if same_ep_count >= 2 {
-            return true;
-        }
-
-        // T-junction: lies on the INTERIOR of another wire
-        if wires.iter().any(|w| {
-            point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol)
-                && !points_coincident(px, py, w.x1, w.y1, tol)
-                && !points_coincident(px, py, w.x2, w.y2, tol)
-        }) {
-            return true;
-        }
-
-        // Label at this point
-        if label_points
-            .iter()
-            .any(|(lx, ly)| points_coincident(px, py, *lx, *ly, tol))
-        {
-            return true;
-        }
-
-        // Pin endpoint at this point
-        if pin_points
-            .iter()
-            .any(|(ppx, ppy)| points_coincident(px, py, *ppx, *ppy, tol))
-        {
-            return true;
-        }
-
-        false
-    };
-
-    let mut floating: Vec<serde_json::Value> = Vec::new();
-    for w in &wires {
-        for (px, py) in [(w.x1, w.y1), (w.x2, w.y2)] {
-            if !is_connected(px, py) {
-                floating.push(json!({ "x": px, "y": py, "wire_uuid": w.uuid }));
-            }
-        }
-    }
 
     Ok(CallToolResult::json(&json!({
         "valid": floating.is_empty(),
@@ -1315,7 +1249,7 @@ async fn handle_validate_component_connections(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let filter_refs: Vec<String> = args["references"]
+    let filter_refs: HashSet<String> = args["references"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -1324,100 +1258,48 @@ async fn handle_validate_component_connections(
         })
         .unwrap_or_default();
     let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
-    let tol = 0.01_f64;
-
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-
-    // No-connect positions (pins with intentional no-connect markers are exempt)
-    let no_connect_pts = konnect_sexp::schematic::extract_no_connects(&tree);
-
-    // Build net graph so we can check connectivity. Junctions matter: a pin
-    // sitting mid-wire is connected only through a junction dot, so without
-    // them this validator reports false "not connected" (#104).
-    let junction_pts = konnect_sexp::schematic::extract_junctions(&tree);
-    let mut g = build_net_graph(&wires, &labels, &junction_pts);
-    // Also build flat wire-endpoint list for direct presence checks
-    let all_wire_eps: Vec<(f64, f64)> = wires
-        .iter()
-        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
-        .collect();
-
-    // `g.net_at` requires &mut self, so we need a `mut` closure.
-    let mut has_connection = |px: f64, py: f64| -> bool {
-        // Connected to a wire endpoint
-        if all_wire_eps
-            .iter()
-            .any(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
-        {
-            return true;
-        }
-        // A pin landing mid-wire connects only through a junction dot — KiCad's
-        // netlister registers the unsplit wire at a junction point, so a dot
-        // alone is enough and no wire split is required (#104).
-        if junction_pts
-            .iter()
-            .any(|(jx, jy)| points_coincident(px, py, *jx, *jy, tol))
-            && wires
-                .iter()
-                .any(|w| point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol))
-        {
-            return true;
-        }
-        // Or has a named net (label at or reachable from pin via wires)
-        g.net_at(px, py).is_some()
-    };
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
 
-    for inst in &instances {
-        if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
+    for placed in index.placed_pins() {
+        if !filter_refs.is_empty() && !filter_refs.contains(&placed.reference) {
             continue;
         }
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
-                // A library-declared no-connect pin is intentional by
-                // definition and does not need a placed X marker. This is
-                // distinct from an ordinary pin carrying a schematic
-                // `(no_connect ...)` marker, which is handled below.
-                if pin.electrical_type == "no_connect" {
-                    continue;
-                }
-                if ignore_power_pins
-                    && matches!(pin.electrical_type.as_str(), "power_in" | "power_out")
-                {
-                    continue;
-                }
-                let (px, py) = pin_endpoint(&pin, t);
+        let (px, py) = placed.at;
 
-                // Skip intentional no-connects
-                if no_connect_pts
-                    .iter()
-                    .any(|(nx, ny)| points_coincident(px, py, *nx, *ny, tol))
-                {
-                    continue;
-                }
+        // A library-declared no-connect pin is intentional by definition and
+        // does not need a placed X marker (#267).
+        if placed.pin.electrical_type == "no_connect" {
+            continue;
+        }
+        if ignore_power_pins
+            && matches!(
+                placed.pin.electrical_type.as_str(),
+                "power_in" | "power_out"
+            )
+        {
+            continue;
+        }
 
-                if !has_connection(px, py) {
-                    unconnected.push(json!({
-                        "reference": inst.reference,
-                        "value": inst.value,
-                        "pin": pin.number,
-                        "pin_name": pin.name,
-                        "pin_type": pin.electrical_type,
-                        "x": px,
-                        "y": py
-                    }));
-                }
-            }
+        // Skip intentional no-connects.
+        if index.has_no_connect(px, py) {
+            continue;
+        }
+
+        if !index.attaches_pin(px, py) {
+            unconnected.push(json!({
+                "reference": placed.reference,
+                "value": placed.value,
+                "pin": placed.pin.number,
+                "pin_name": placed.pin.name,
+                "pin_type": placed.pin.electrical_type,
+                "x": px,
+                "y": py
+            }));
         }
     }
 

@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_analysis::build_net_graph;
+use super::sch_connectivity::net_graph_for;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -236,11 +236,7 @@ async fn handle_export_netlist_summary(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
-    let mut g = build_net_graph(
-        &wires,
-        &labels,
-        &konnect_sexp::schematic::extract_junctions(&tree),
-    );
+    let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Collect distinct net names
     let mut net_names: Vec<String> = labels.iter().map(|l| l.net.clone()).collect();

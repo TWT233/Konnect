@@ -19,6 +19,7 @@ pub mod sch_analysis;
 pub mod sch_batch;
 pub mod sch_bus;
 pub mod sch_components;
+pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;
@@ -437,12 +438,16 @@ pub(crate) fn placed_pins(
         .collect()
 }
 
-/// [`placed_pins`], grouped under the reference designator that owns each
-/// placed unit, for callers that report pins by name rather than position.
+/// [`placed_pins`], grouped under the instance that placed each unit, for
+/// callers that report pins by name rather than position. The whole instance
+/// is returned because a caller reporting a pin usually wants its reference
+/// *and* something else about the component — value, uuid, unit — and a
+/// reference alone collapses on a pre-annotation sheet where every part is
+/// `R?`.
 pub(crate) fn placed_pins_by_reference(
     tree: &konnect_sexp::SexpNode,
 ) -> Vec<(
-    String,
+    konnect_sexp::schematic::SymbolInstance,
     Vec<(
         konnect_sexp::schematic::LibPin,
         konnect_sexp::geometry::PinTransform,
@@ -468,7 +473,7 @@ pub(crate) fn placed_pins_by_reference(
             .into_iter()
             .map(|p| (p, t))
             .collect();
-        by_reference.push((inst.reference, pins));
+        by_reference.push((inst, pins));
     }
     by_reference
 }
