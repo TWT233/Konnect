@@ -1201,7 +1201,13 @@ async fn handle_rotate_schematic_component(
         .iter_mut()
         .filter(|symbol| symbol.reference() == Some(reference.as_str()))
     {
-        let new_rotation = symbol.at.rotation.unwrap_or(0.0) + rotation_delta;
+        // The delta lands each unit at its own angle, so a unit already at
+        // 270° asked to follow a +90° turn computes 360° — normalize into
+        // [0, 360) before writing; eeschema only ever stores 0/90/180/270
+        // and re-saves anything else, so an unnormalized angle survives only
+        // until KiCad touches the file and then silently diverges from what
+        // this response reported.
+        let new_rotation = (symbol.at.rotation.unwrap_or(0.0) + rotation_delta).rem_euclid(360.0);
         symbol.set_rotation(new_rotation);
         placements.push(json!({ "unit": symbol.unit, "rotation": new_rotation }));
     }
@@ -3927,6 +3933,81 @@ mod multi_unit_component_tests {
         (directory, path)
     }
 
+    /// A real eeschema save (KiCad's ecc83 demo): tabs, CRLF, and U1 placed
+    /// as units 2 and 3 of the embedded `ecc83-pp:ECC83` dual triode. The
+    /// hand-written `SCHEMATIC` above shares this module's own serialization
+    /// habits, so only this file exercises the indentation- and
+    /// dialect-matching branches against what KiCad actually writes.
+    fn eeschema_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ecc83.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[tokio::test]
+    async fn a_real_eeschema_multi_unit_component_is_seen_whole() {
+        let (_directory, path) = eeschema_fixture();
+        let result = body(
+            handle_get_schematic_component(
+                &json!({ "schematic": path, "reference": "U1" }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            result["unit_count"], 3,
+            "U1 is placed as both triodes plus the heater unit"
+        );
+        let mut units: Vec<i64> = result["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| unit["unit"].as_i64().unwrap())
+            .collect();
+        units.sort_unstable();
+        assert_eq!(units, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn annotating_a_real_eeschema_file_reaches_every_unit_in_its_own_dialect() {
+        let (_directory, path) = eeschema_fixture();
+        let result = body(
+            handle_add_component_annotation(
+                &json!({
+                    "schematic": path,
+                    "reference": "U1",
+                    "key": "MPN",
+                    "value": "ECC83-JJ"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(result["added_units"], 3, "{result}");
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            source.matches("(property \"MPN\" \"ECC83-JJ\"").count(),
+            3,
+            "the property lands in every unit block"
+        );
+        // The inserted lines must follow the file's own indentation (tabs) —
+        // a 2-space insert in a tab-indented eeschema file is exactly the
+        // drift the KiCad-authored fixture exists to catch.
+        for line in source.lines().filter(|line| line.contains("\"MPN\"")) {
+            assert!(
+                line.starts_with('\t'),
+                "inserted property must be tab-indented like its file: {line:?}"
+            );
+        }
+    }
+
     fn body(result: CallToolResult) -> serde_json::Value {
         assert!(!result.is_error, "mutation unexpectedly failed");
         let ToolContent::Text { text } = &result.content[0] else {
@@ -4001,6 +4082,42 @@ mod multi_unit_component_tests {
         placed.sort_by_key(|instance| instance.unit);
         assert_eq!(placed[0].rotation, 90.0);
         assert_eq!(placed[1].rotation, 270.0);
+    }
+
+    /// The delta arithmetic can push a trailing unit past 360° — a unit at
+    /// 270° following a +90° turn computes 360°, which eeschema never writes
+    /// (it stores 0/90/180/270 and re-saves anything else). The stored and
+    /// reported angle must be the normalized one, or the response diverges
+    /// from the file the moment KiCad touches it.
+    #[tokio::test]
+    async fn rotation_past_a_full_turn_normalizes_instead_of_writing_360() {
+        let (_directory, path) = fixture();
+        for target in [90.0, 180.0] {
+            body(
+                handle_rotate_schematic_component(
+                    &json!({
+                        "schematic": path,
+                        "reference": "U1",
+                        "rotation": target
+                    }),
+                    &context(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut placed = instances(&path);
+        placed.sort_by_key(|instance| instance.unit);
+        assert_eq!(placed[0].rotation, 180.0);
+        assert_eq!(
+            placed[1].rotation, 0.0,
+            "270° + 90° must store 0°, not 360°"
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !source.contains("(at 40 20 360)") && !source.contains(" 360)"),
+            "no unnormalized angle may reach the file"
+        );
     }
 
     #[tokio::test]
