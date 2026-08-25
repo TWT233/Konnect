@@ -241,7 +241,10 @@ async fn handle_add_bus_entry(
     // segments and only fall back to the convention when geometry cannot
     // decide.
     let round6 = |value: f64| (value * 1e6).round() / 1e6;
-    let far = (round6(x + direction.size().0), round6(y + direction.size().1));
+    let far = (
+        round6(x + direction.size().0),
+        round6(y + direction.size().1),
+    );
     let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
         Ok(tree) => {
             let buses = bus_segments(&tree);
@@ -513,7 +516,10 @@ mod tests {
         assert_eq!(response["bus_side"]["y"], 100.33);
         assert_eq!(response["wire_side"]["x"], 123.19);
         assert_eq!(response["wire_side"]["y"], 102.87);
-        assert!(response.get("note").is_none(), "geometry decided: {response}");
+        assert!(
+            response.get("note").is_none(),
+            "geometry decided: {response}"
+        );
     }
 
     /// The documented usage — x/y at the wire end, the tick running to the
