@@ -232,11 +232,87 @@ async fn handle_add_bus_entry(
         crate::tools::sch_wiring::insert_before_close(&content, &format_bus_entry(x, y, direction));
     write_atomic(&sch_path, &new_content)?;
 
-    Ok(CallToolResult::json(&json!({
+    // Which end is the bus side is a fact about the sheet, not about the
+    // request: the entry's `at` corner is wherever the caller put it. The
+    // documented convention (x/y = wire side) only holds when the caller
+    // follows it, and the response used to assert it unchecked — labelling
+    // the on-bus corner `wire_side` for anyone who gave the bus point
+    // instead (#329). Judge both corners against the sheet's actual bus
+    // segments and only fall back to the convention when geometry cannot
+    // decide.
+    let far = (x + direction.size().0, y + direction.size().1);
+    let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
+        Ok(tree) => {
+            let buses = bus_segments(&tree);
+            (
+                buses.iter().any(|s| point_on_segment((x, y), *s)),
+                buses.iter().any(|s| point_on_segment(far, *s)),
+            )
+        }
+        Err(_) => (false, false),
+    };
+    let (bus_side, wire_side, note) = match (at_on_bus, far_on_bus) {
+        (true, false) => ((x, y), far, None),
+        (false, true) => (far, (x, y), None),
+        (true, true) => (
+            far,
+            (x, y),
+            Some("both ends of this entry touch a bus; sides are reported from the documented convention (x/y = wire side)"),
+        ),
+        (false, false) => (
+            far,
+            (x, y),
+            Some("no bus touches this entry; sides are reported from the documented convention (x/y = wire side)"),
+        ),
+    };
+    let mut response = json!({
         "added": "bus_entry",
-        "wire_side": { "x": x, "y": y },
-        "bus_side": { "x": x + direction.size().0, "y": y + direction.size().1 }
-    })))
+        "wire_side": { "x": wire_side.0, "y": wire_side.1 },
+        "bus_side": { "x": bus_side.0, "y": bus_side.1 }
+    });
+    if let Some(note) = note {
+        response["note"] = json!(note);
+    }
+    Ok(CallToolResult::json(&response))
+}
+
+/// Every bus segment on the sheet, as endpoint pairs.
+fn bus_segments(tree: &konnect_sexp::SexpNode) -> Vec<((f64, f64), (f64, f64))> {
+    let mut segments = Vec::new();
+    for bus in tree.find_all("bus") {
+        let Some(pts) = bus.find("pts") else {
+            continue;
+        };
+        let points: Vec<(f64, f64)> = pts
+            .find_all("xy")
+            .iter()
+            .filter_map(|xy| {
+                Some((
+                    xy.get(1)?.as_str()?.parse().ok()?,
+                    xy.get(2)?.as_str()?.parse().ok()?,
+                ))
+            })
+            .collect();
+        for pair in points.windows(2) {
+            segments.push((pair[0], pair[1]));
+        }
+    }
+    segments
+}
+
+/// Whether `p` lies on the segment `(a, b)` — collinear and within its span.
+fn point_on_segment(p: (f64, f64), (a, b): ((f64, f64), (f64, f64))) -> bool {
+    const EPS: f64 = 0.01;
+    let cross = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let length = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    if length < EPS {
+        return (p.0 - a.0).abs() < EPS && (p.1 - a.1).abs() < EPS;
+    }
+    if (cross / length).abs() > EPS {
+        return false;
+    }
+    let dot = (p.0 - a.0) * (b.0 - a.0) + (p.1 - a.1) * (b.1 - a.1);
+    (-EPS * length..=length * length + EPS * length).contains(&dot)
 }
 
 async fn handle_connect_pins_to_bus(
@@ -391,6 +467,88 @@ fn read_xy_pair(v: &serde_json::Value) -> Result<(f64, f64, f64, f64), CallToolR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sheet_with_bus() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bus.kicad_sch");
+        let mut content = String::from(
+            "(kicad_sch\n  (version 20260306)\n  (uuid \"11111111-1111-4111-8111-111111111111\")\n",
+        );
+        content.push_str(&format_bus(100.33, 100.33, 150.11, 100.33));
+        content.push_str("\n)\n");
+        std::fs::write(&path, content).unwrap();
+        (directory, path)
+    }
+
+    async fn entry_response(path: &std::path::Path, x: f64, y: f64) -> serde_json::Value {
+        let result = handle_add_bus_entry(
+            &json!({ "schematic": path, "x": x, "y": y, "direction": "down_right" }),
+            &crate::tools::ToolContext::new(
+                crate::tools::ServerConfig::default(),
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "add_bus_entry failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// #329: which end touches the bus is a fact about the sheet. The caller
+    /// here places the entry's `at` ON the bus (contrary to the documented
+    /// x/y-is-the-wire-side convention, but exactly how people use it), and
+    /// the response must label the corners from the geometry, not the
+    /// convention — the old response called the on-bus corner `wire_side`,
+    /// and a caller following it attached the wire to the bus itself, where
+    /// it connects nothing.
+    #[tokio::test]
+    async fn bus_side_is_the_corner_that_actually_touches_the_bus() {
+        let (_directory, path) = sheet_with_bus();
+        let response = entry_response(&path, 120.65, 100.33).await;
+        assert_eq!(response["bus_side"]["x"], 120.65, "{response}");
+        assert_eq!(response["bus_side"]["y"], 100.33);
+        assert_eq!(response["wire_side"]["x"], 123.19);
+        assert_eq!(response["wire_side"]["y"], 102.87);
+        assert!(response.get("note").is_none(), "geometry decided: {response}");
+    }
+
+    /// The documented usage — x/y at the wire end, the tick running to the
+    /// bus — keeps its labels, now confirmed by geometry rather than assumed.
+    #[tokio::test]
+    async fn the_documented_wire_side_placement_keeps_its_labels() {
+        let (_directory, path) = sheet_with_bus();
+        let response = entry_response(&path, 120.65, 97.79).await;
+        assert_eq!(response["wire_side"]["x"], 120.65, "{response}");
+        assert_eq!(response["wire_side"]["y"], 97.79);
+        assert_eq!(response["bus_side"]["x"], 123.19);
+        assert_eq!(response["bus_side"]["y"], 100.33);
+        assert!(response.get("note").is_none(), "{response}");
+    }
+
+    /// With no bus near the entry, geometry cannot decide — the response
+    /// falls back to the documented convention and says so instead of
+    /// silently asserting.
+    #[tokio::test]
+    async fn a_floating_entry_reports_the_convention_and_says_so() {
+        let (_directory, path) = sheet_with_bus();
+        let response = entry_response(&path, 30.0, 30.0).await;
+        assert_eq!(response["wire_side"]["x"], 30.0, "{response}");
+        assert_eq!(response["bus_side"]["x"], 32.54);
+        let note = response["note"].as_str().expect("note present");
+        assert!(note.contains("no bus touches"), "{note}");
+    }
+
+    #[test]
+    fn point_on_segment_handles_span_and_offset() {
+        let seg = ((100.33, 100.33), (150.11, 100.33));
+        assert!(point_on_segment((120.65, 100.33), seg));
+        assert!(point_on_segment((100.33, 100.33), seg), "endpoint counts");
+        assert!(!point_on_segment((120.65, 102.87), seg), "off the line");
+        assert!(!point_on_segment((160.0, 100.33), seg), "past the span");
+    }
 
     #[test]
     fn bus_sexp_is_a_bus_node_not_a_wire() {
