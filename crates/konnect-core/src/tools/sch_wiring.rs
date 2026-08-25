@@ -878,9 +878,12 @@ pub(crate) fn reconcile_junctions_at(
         }
     }
 
-    let pruned = ranges.len();
+    // Two coincident pin endpoints vacating one spot produce the same
+    // candidate twice — dedup BEFORE counting, or the counts overstate what
+    // happened and the add branch writes the same dot twice.
     ranges.sort_unstable();
     ranges.dedup();
+    let pruned = ranges.len();
     let mut out = apply_edits(
         content,
         ranges
@@ -888,12 +891,18 @@ pub(crate) fn reconcile_junctions_at(
             .map(|(s, e)| SexpEdit::delete(s, e))
             .collect(),
     );
-    let added = to_add.len();
-    for (x, y) in to_add {
+    let mut to_add: Vec<(f64, f64)> = to_add
+        .into_iter()
         // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002)
         // and `format_junction` interpolates the f64 verbatim, so round to the
         // 6 decimals KiCAD writes rather than leaking float noise into the file.
-        out = insert_before_close(&out, &format_junction(round6(x), round6(y)));
+        .map(|(x, y)| (round6(x), round6(y)))
+        .collect();
+    to_add.sort_by(|a, b| a.partial_cmp(b).expect("rounded coordinates are finite"));
+    to_add.dedup();
+    let added = to_add.len();
+    for (x, y) in to_add {
+        out = insert_before_close(&out, &format_junction(x, y));
     }
     (out, added, pruned)
 }
@@ -2438,6 +2447,70 @@ mod unit_aware_wiring_tests {
             reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(190.5, 200.66)]);
         assert_eq!((added, pruned), (0, 0), "a no-connect forbids the dot");
         assert!(!has_dot(&out, "190.5", "200.66"));
+    }
+
+    /// The fixture with R1's justified dot removed — the sheet as it would
+    /// look after that dot was lost, so the ADD branch has real work.
+    fn fixture_missing_r1s_dot() -> String {
+        let src = RECONCILE_SCH;
+        let at = src
+            .find("(at 120.65 139.7)")
+            .expect("fixture carries R1's dot");
+        let start = src[..at].rfind("(junction").expect("inside a junction");
+        let mut depth = 0usize;
+        let mut end = start;
+        for (offset, byte) in src[start..].bytes().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let stripped = format!("{}{}", &src[..start], &src[end..]);
+        assert!(!has_dot(&stripped, "120.65", "139.7"), "dot removed");
+        stripped
+    }
+
+    /// The positive half of the reconcile: a pin sitting mid-span on exactly
+    /// one wire with no dot gets one, and float noise in the candidate
+    /// coordinate never reaches the file.
+    #[test]
+    fn a_pin_left_mid_wire_gets_its_dot_back() {
+        let (out, added, pruned) =
+            reconcile_junctions_at(fixture_missing_r1s_dot(), &[(120.65, 139.70000000000002)]);
+        assert_eq!((added, pruned), (1, 0), "the missing dot comes back");
+        assert!(
+            has_dot(&out, "120.65", "139.7"),
+            "rounded, not 139.70000000000002"
+        );
+        assert!(
+            !out.contains("139.70000000000002"),
+            "no float noise in the file"
+        );
+    }
+
+    /// Two coincident pin endpoints vacating or landing on one spot hand the
+    /// reconciler the same candidate twice. The counts must describe what
+    /// happened to the sheet, not how many times we asked — and the sheet
+    /// must not gain two identical dots.
+    #[test]
+    fn duplicate_candidates_produce_one_dot_and_honest_counts() {
+        let (out, added, _pruned) = reconcile_junctions_at(
+            fixture_missing_r1s_dot(),
+            &[(120.65, 139.7), (120.65, 139.7)],
+        );
+        assert_eq!(added, 1, "one dot added, however many times we were asked");
+        let dots_there = dots(&out)
+            .iter()
+            .filter(|(x, y)| x == "120.65" && y == "139.7")
+            .count();
+        assert_eq!(dots_there, 1, "exactly one junction block written");
     }
 
     /// A dot on a bus tee is a BUS junction — it joins bus segments, which no

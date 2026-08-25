@@ -571,7 +571,7 @@ async fn handle_add_schematic_component(
     // path can do one junction pass for the whole batch instead of one per part.
     let mut result = result;
     let junctions = crate::tools::add_pin_midwire_junctions(&sch_path, ref_str)?;
-    result["junctions_added_count"] = json!(junctions
+    result["junctions_added"] = json!(junctions
         .iter()
         .map(|(x, y)| json!({ "x": x, "y": y }))
         .collect::<Vec<_>>());

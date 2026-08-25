@@ -247,11 +247,21 @@ async fn handle_add_bus_entry(
     );
     let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
         Ok(tree) => {
-            let buses = bus_segments(&tree);
-            (
-                buses.iter().any(|s| point_on_segment((x, y), *s)),
-                buses.iter().any(|s| point_on_segment(far, *s)),
-            )
+            let buses = konnect_sexp::schematic::extract_buses(&tree);
+            let on_bus = |p: (f64, f64)| {
+                buses.iter().any(|bus| {
+                    konnect_sexp::geometry::point_on_segment(
+                        p.0,
+                        p.1,
+                        bus.x1,
+                        bus.y1,
+                        bus.x2,
+                        bus.y2,
+                        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+                    )
+                })
+            };
+            (on_bus((x, y)), on_bus(far))
         }
         Err(_) => (false, false),
     };
@@ -278,45 +288,6 @@ async fn handle_add_bus_entry(
         response["note"] = json!(note);
     }
     Ok(CallToolResult::json(&response))
-}
-
-/// Every bus segment on the sheet, as endpoint pairs.
-fn bus_segments(tree: &konnect_sexp::SexpNode) -> Vec<((f64, f64), (f64, f64))> {
-    let mut segments = Vec::new();
-    for bus in tree.find_all("bus") {
-        let Some(pts) = bus.find("pts") else {
-            continue;
-        };
-        let points: Vec<(f64, f64)> = pts
-            .find_all("xy")
-            .iter()
-            .filter_map(|xy| {
-                Some((
-                    xy.get(1)?.as_str()?.parse().ok()?,
-                    xy.get(2)?.as_str()?.parse().ok()?,
-                ))
-            })
-            .collect();
-        for pair in points.windows(2) {
-            segments.push((pair[0], pair[1]));
-        }
-    }
-    segments
-}
-
-/// Whether `p` lies on the segment `(a, b)` — collinear and within its span.
-fn point_on_segment(p: (f64, f64), (a, b): ((f64, f64), (f64, f64))) -> bool {
-    const EPS: f64 = 0.01;
-    let cross = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
-    let length = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-    if length < EPS {
-        return (p.0 - a.0).abs() < EPS && (p.1 - a.1).abs() < EPS;
-    }
-    if (cross / length).abs() > EPS {
-        return false;
-    }
-    let dot = (p.0 - a.0) * (b.0 - a.0) + (p.1 - a.1) * (b.1 - a.1);
-    (-EPS * length..=length * length + EPS * length).contains(&dot)
 }
 
 async fn handle_connect_pins_to_bus(
@@ -546,15 +517,6 @@ mod tests {
         assert_eq!(response["bus_side"]["x"], 32.54);
         let note = response["note"].as_str().expect("note present");
         assert!(note.contains("no bus touches"), "{note}");
-    }
-
-    #[test]
-    fn point_on_segment_handles_span_and_offset() {
-        let seg = ((100.33, 100.33), (150.11, 100.33));
-        assert!(point_on_segment((120.65, 100.33), seg));
-        assert!(point_on_segment((100.33, 100.33), seg), "endpoint counts");
-        assert!(!point_on_segment((120.65, 102.87), seg), "off the line");
-        assert!(!point_on_segment((160.0, 100.33), seg), "past the span");
     }
 
     #[test]
