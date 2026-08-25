@@ -299,3 +299,147 @@ fn full_design_loop_with_real_kicad() {
 
     eprintln!("E2E OK: project created, wired, ERC'd, {produced} gerber files, DRC'd");
 }
+
+/// #326 in plotted form: wire groups drawn with no stroke, and the junction
+/// dot's radius, which collapses from 0.4572 mm to 0.0001 mm when the Default
+/// has no `wire_width`. Neither shows up in ERC, so plotting is the only
+/// headless way to see it.
+fn plotted_wires_and_junction(kicad_cli: &str, sch: &std::path::Path) -> (usize, f64) {
+    let out = sch.parent().unwrap().join("svg");
+    let _ = std::fs::remove_dir_all(&out);
+    let status = Command::new(kicad_cli)
+        .args([
+            "sch",
+            "export",
+            "svg",
+            "--exclude-drawing-sheet",
+            "--output",
+        ])
+        .arg(&out)
+        .arg(sch)
+        .status()
+        .expect("kicad-cli sch export svg failed to run");
+    assert!(status.success(), "kicad-cli sch export svg exited {status}");
+
+    let svg_path = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "svg"))
+        .expect("kicad-cli wrote no SVG");
+    let svg = std::fs::read_to_string(svg_path).unwrap();
+
+    // Groups containing wires only. A healthy junction dot is filled rather
+    // than stroked, so it carries `stroke:none` too.
+    let mut strokeless = 0;
+    let chunks: Vec<&str> = svg.split("style=\"").collect();
+    for chunk in chunks.iter().skip(1) {
+        let Some((style, body)) = chunk.split_once('"') else {
+            continue;
+        };
+        if body.contains("<path d=") && style.contains("stroke:none") {
+            strokeless += 1;
+        }
+    }
+
+    // With two bare wires the only circle is the junction dot.
+    let radius = svg
+        .split("<circle")
+        .skip(1)
+        .filter_map(|c| c.split_once("r=\""))
+        .filter_map(|(_, rest)| rest.split_once('"'))
+        .filter_map(|(r, _)| r.parse::<f64>().ok())
+        .fold(0.0_f64, f64::max);
+
+    (strokeless, radius)
+}
+
+/// #326: a Default written with only the four PCB fields left eeschema unable
+/// to place a junction anywhere in the project. The failure is in how KiCad
+/// resolves the class rather than in the JSON, so only real eeschema can
+/// confirm the fix.
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn a_written_default_netclass_still_plots_wires() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("nc");
+    let sch = proj.join("nc.kicad_sch");
+    let pcb = proj.join("nc.kicad_pcb");
+    let mut p = Mcp::spawn(&kicad_cli);
+
+    p.tool(
+        "create_project",
+        json!({"name": "nc", "path": proj.to_string_lossy()}),
+    );
+    p.load("sch_wiring");
+    // A T at (120, 100), where the junction dot belongs.
+    p.tool(
+        "batch_add_wire",
+        json!({
+            "schematic": sch.to_string_lossy(),
+            "wires": [
+                { "x1": 100.0, "y1": 100.0, "x2": 140.0, "y2": 100.0 },
+                { "x1": 120.0, "y1": 100.0, "x2": 120.0, "y2": 120.0 }
+            ]
+        }),
+    );
+    // Baseline: no net_settings, so KiCad's seeded Default applies. The
+    // radius comes from the wire width, which is what the assertions below
+    // compare against.
+    let (strokeless, radius) = plotted_wires_and_junction(&kicad_cli, &sch);
+    assert_eq!(
+        strokeless, 0,
+        "a project with no net_settings must plot normally — the fixture is wrong, not the fix"
+    );
+    assert!(
+        radius > 0.1,
+        "no junction dot on the baseline plot (r={radius}) — the fixture is wrong, not the fix"
+    );
+
+    // The reported repro, exactly: name the Default and change nothing else.
+    p.load("pcb_routing");
+    p.tool(
+        "create_netclass",
+        json!({"board": pcb.to_string_lossy(), "name": "Default"}),
+    );
+    let (strokeless, after) = plotted_wires_and_junction(&kicad_cli, &sch);
+    assert_eq!(
+        strokeless, 0,
+        "a Default written by create_netclass left eeschema with no wire width (#326)"
+    );
+    // Before the fix this collapsed to 0.0001 mm. Compared against the
+    // baseline rather than a literal in case KiCad changes the ratio.
+    assert!(
+        (after - radius).abs() < 1e-6,
+        "junction dot changed size after writing the Default: {radius} -> {after} (#326)"
+    );
+
+    // KiCad picks the default by name, not position, so a sparse named class
+    // must not disturb it. Guards against "fixing" #326 by completing
+    // whichever class comes first.
+    p.tool(
+        "create_netclass",
+        json!({"board": pcb.to_string_lossy(), "name": "HV", "clearance": 0.5}),
+    );
+    let classes: Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join("nc.kicad_pro")).unwrap()).unwrap();
+    let names: Vec<&str> = classes["net_settings"]["classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names, vec!["Default", "HV"], "unexpected class order");
+    let (strokeless, after) = plotted_wires_and_junction(&kicad_cli, &sch);
+    assert_eq!(
+        strokeless, 0,
+        "a sparse named class must not disturb the Default"
+    );
+    assert!(
+        (after - radius).abs() < 1e-6,
+        "a sparse named class changed the junction dot: {radius} -> {after}"
+    );
+}

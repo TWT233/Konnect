@@ -194,7 +194,11 @@ pub fn tools() -> Vec<ToolDef> {
              class holds, call get_netclasses rather than this tool: naming a class \
              that does not exist here creates it with the defaults, so a call meant \
              as a look writes one instead — and its result is nearly \
-             indistinguishable from a read of an existing class.",
+             indistinguishable from a read of an existing class. The class \
+             named 'Default' is special: it is written complete, because KiCad \
+             replaces its own default with it and backfills every other class \
+             from it. Calling this on an existing, incomplete 'Default' \
+             repairs it in place without touching values already set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -655,6 +659,40 @@ fn save_project_settings(
     Ok(())
 }
 
+/// The class every other class inherits from. `SetName` marks it on an exact
+/// match (`netclass.h:96`), so casing matters.
+const DEFAULT_CLASS_NAME: &str = "Default";
+
+/// KiCad's own Default, field for field (`netclass.cpp:36-50`). Schematic
+/// fields are mils, PCB fields mm.
+///
+/// A written Default replaces the one KiCad seeds rather than merging with it,
+/// and nothing backfills it, so every key omitted here resolves from nothing.
+/// Without `wire_width` that means no junction dots anywhere in the project,
+/// silently (#326). See `docs/KICAD_NETCLASS_DEFAULTS.md`.
+fn kicad_default_class() -> serde_json::Value {
+    json!({
+        // Ranks the Default last. A C++ int (`net_settings.cpp:69`), so not
+        // widened past i32.
+        "priority": i32::MAX,
+        "schematic_color": "rgba(0, 0, 0, 0.000)",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "tuning_profile": "",
+        "wire_width": 6,
+        "bus_width": 12,
+        "line_style": 0,
+        "clearance": 0.2,
+        "track_width": 0.25,
+        "via_diameter": 0.8,
+        "via_drill": 0.4,
+        "microvia_diameter": 0.3,
+        "microvia_drill": 0.1,
+        "diff_pair_width": 0.2,
+        "diff_pair_gap": 0.25,
+        "diff_pair_via_gap": 0.25
+    })
+}
+
 async fn handle_create_netclass(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -674,6 +712,8 @@ async fn handle_create_netclass(
         ("via_drill", "via_drill", 0.4),
         ("via_diameter", "via_diameter", 0.8),
     ];
+    // Only the Default must be complete. Every other class may stay sparse.
+    let is_default = name == DEFAULT_CLASS_NAME;
 
     let (pro, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,
@@ -699,6 +739,7 @@ async fn handle_create_netclass(
     // KiCad keys classes by name; a second entry with the same name is
     // undefined in its dialog, so an existing class is updated in place.
     let mut changed = true;
+    let mut backfilled: Vec<String> = Vec::new();
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
         let before = class.clone();
         for (key, arg, _) in FIELDS {
@@ -706,9 +747,41 @@ async fn handle_create_netclass(
                 class[key] = json!(value);
             }
         }
+        // KiCad backfills from the Default, never into it, so a Default left
+        // incomplete by an older Konnect can only be repaired here. Absent
+        // keys only: overwriting one already set is #220.
+        if is_default {
+            let complete = kicad_default_class();
+            let seeded = complete
+                .as_object()
+                .expect("kicad_default_class builds an object");
+            let class = class.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("{}: netclass '{name}' is not an object", pro.display())
+            })?;
+            for (key, value) in seeded {
+                if class.get(key).is_none_or(|v| v.is_null()) {
+                    class.insert(key.clone(), value.clone());
+                    backfilled.push(key.clone());
+                }
+            }
+        }
         changed = *class != before;
         true
+    } else if is_default {
+        // A partial write here erases KiCad's values rather than falling back
+        // to them, so start from the full set.
+        let mut class = kicad_default_class();
+        class["name"] = json!(name);
+        for (key, arg, _) in FIELDS {
+            if let Some(value) = opt_f64(args, arg) {
+                class[key] = json!(value);
+            }
+        }
+        classes.push(class);
+        false
     } else {
+        // Sparse on purpose: a key omitted here resolves from the Default, so
+        // writing the full set would sever that inheritance.
         let mut class = json!({ "name": name, "priority": 0 });
         for (key, arg, default) in FIELDS {
             class[key] = json!(opt_f64(args, arg).unwrap_or(default));
@@ -731,14 +804,26 @@ async fn handle_create_netclass(
         save_project_settings(&pro, &settings)?;
     }
 
+    let note = if backfilled.is_empty() {
+        "Netclasses live in the project file; assign nets with assign_net_to_class. \
+         KiCad reads the change on next project open."
+            .to_string()
+    } else {
+        format!(
+            "Repaired an incomplete Default netclass by adding {}. A Default missing \
+             wire_width stops Eeschema placing junctions anywhere in the project; \
+             reopen the project in KiCad to pick the change up. Netclasses live in the \
+             project file; assign nets with assign_net_to_class.",
+            backfilled.join(", ")
+        )
+    };
     Ok(CallToolResult::json(&json!({
         "created_netclass": name,
         "updated_existing": updated,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
         "file": pro.display().to_string(),
-        "note": "Netclasses live in the project file; assign nets with assign_net_to_class. \
-                 KiCad reads the change on next project open."
+        "note": note
     })))
 }
 
@@ -1269,6 +1354,128 @@ mod netclass_tests {
         assert_eq!(pro["meta"]["filename"], json!("demo.kicad_pro"));
     }
 
+    /// #326: a Default written with only the four PCB fields leaves KiCad's
+    /// schematic side resolved from nothing — Eeschema silently refuses to
+    /// place a junction anywhere in the project. KiCad replaces its own seeded
+    /// default with whatever the file holds and backfills nothing into it, so
+    /// the file must carry the whole class.
+    #[tokio::test]
+    async fn create_netclass_writes_the_default_class_complete() {
+        let (_dir, board) = fixture(true);
+        let result = create(&board, json!({ "name": "Default" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let pro = project_json(&board);
+        let default = pro["net_settings"]["classes"][0].clone();
+        assert_eq!(default["wire_width"], json!(6), "{default}");
+        assert_eq!(default["bus_width"], json!(12), "{default}");
+        assert_eq!(default["line_style"], json!(0), "{default}");
+        assert_eq!(default["priority"], json!(i32::MAX), "{default}");
+        for key in ["schematic_color", "pcb_color", "tuning_profile"] {
+            assert!(default.get(key).is_some(), "{key} missing from {default}");
+        }
+    }
+
+    /// The caller still wins over KiCad's values on the Default.
+    #[tokio::test]
+    async fn create_netclass_lets_the_caller_override_the_default_class() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "Default", "trace_width": 0.35 })).await;
+
+        let default = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(default["track_width"], json!(0.35), "{default}");
+        assert_eq!(default["wire_width"], json!(6), "{default}");
+    }
+
+    /// The repair path. A project written by an older Konnect already holds a
+    /// four-field Default, and KiCad cannot recover it: `addMissingDefaults`
+    /// fills other classes *from* the Default, never the Default itself. So
+    /// the update path fills what is absent — and nothing else, or this
+    /// reintroduces #220.
+    #[tokio::test]
+    async fn create_netclass_backfills_an_incomplete_default_without_touching_set_values() {
+        let (_dir, board) = fixture(true);
+        let pro_path = board.with_extension("kicad_pro");
+        let mut pro = project_json(&board);
+        pro["net_settings"] = json!({
+            "classes": [{
+                "name": "Default", "priority": 0,
+                "clearance": 1.5, "track_width": 0.25,
+                "via_drill": 0.4, "via_diameter": 0.8
+            }],
+            "meta": { "version": 5 },
+            "netclass_patterns": []
+        });
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&pro).unwrap()).unwrap();
+
+        let result = create(&board, json!({ "name": "Default" })).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let default = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert_eq!(default["wire_width"], json!(6), "{default}");
+        assert_eq!(default["bus_width"], json!(12), "{default}");
+        // Everything the file already stated survives, priority included:
+        // absent is repaired, present is left alone.
+        assert_eq!(default["clearance"], json!(1.5), "{default}");
+        assert_eq!(default["track_width"], json!(0.25), "{default}");
+        assert_eq!(default["priority"], json!(0), "{default}");
+
+        let echoed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let note = echoed["note"].as_str().unwrap_or_default();
+        assert!(note.contains("wire_width"), "{note}");
+        assert!(!note.contains("clearance"), "{note}");
+    }
+
+    /// Only the Default carries the completeness requirement. A named class
+    /// that omits a field inherits it, so writing the full set here would
+    /// sever that inheritance and freeze the class against later edits to the
+    /// Default.
+    #[tokio::test]
+    async fn create_netclass_leaves_a_named_class_sparse() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV", "clearance": 0.5 })).await;
+
+        let hv = project_json(&board)["net_settings"]["classes"][0].clone();
+        assert!(hv.get("wire_width").is_none(), "{hv}");
+        assert!(hv.get("diff_pair_gap").is_none(), "{hv}");
+    }
+
+    /// A project with no Default in its file keeps the one KiCad seeds at
+    /// construction, which is complete. Inventing a Default alongside a named
+    /// class would replace that healthy class with this tool's idea of it —
+    /// the same failure as #326, wearing a different hat.
+    #[tokio::test]
+    async fn create_netclass_does_not_invent_a_default_alongside_a_named_class() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+
+        let classes = project_json(&board)["net_settings"]["classes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(classes.len(), 1, "{classes:?}");
+        assert_eq!(classes[0]["name"], json!("HV"), "{classes:?}");
+    }
+
+    /// The name is what makes a class the default, not its place in the array:
+    /// `SetName` sets `m_isDefault` on an exact match and the loader branches
+    /// on that alone. A sparse class sitting at index 0 is ordinary.
+    #[tokio::test]
+    async fn create_netclass_treats_the_default_by_name_not_by_position() {
+        let (_dir, board) = fixture(true);
+        create(&board, json!({ "name": "HV" })).await;
+        create(&board, json!({ "name": "Default" })).await;
+
+        let classes = project_json(&board)["net_settings"]["classes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(classes[0]["name"], json!("HV"), "{classes:?}");
+        assert!(classes[0].get("wire_width").is_none(), "{classes:?}");
+        assert_eq!(classes[1]["name"], json!("Default"), "{classes:?}");
+        assert_eq!(classes[1]["wire_width"], json!(6), "{classes:?}");
+    }
+
     /// No project file means nowhere KiCad would ever read the class from;
     /// inventing one risks orphan settings, so the tool refuses instead.
     #[tokio::test]
@@ -1633,14 +1840,14 @@ mod netclass_tests {
             serde_json::from_str(&std::fs::read_to_string(&pro).unwrap()).unwrap();
         settings["net_settings"] = json!({
             "classes": [{ "name": "Default", "clearance": 0.2, "track_width": 0.25,
-                          "priority": 2147483647i64 }],
+                          "priority": i32::MAX }],
             "netclass_patterns": []
         });
         std::fs::write(&pro, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
 
         let body = get_classes(&board).await;
         assert_eq!(body["netclasses"][0]["is_default"], json!(true));
-        assert_eq!(body["netclasses"][0]["priority"], json!(2147483647i64));
+        assert_eq!(body["netclasses"][0]["priority"], json!(i32::MAX));
     }
 
     /// Reading must not write. The project file is byte-identical afterwards —
