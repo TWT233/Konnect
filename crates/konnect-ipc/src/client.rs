@@ -1477,9 +1477,16 @@ impl KiCadIpcClient {
     /// every child must receive the same rigid transform as its parent. Doing
     /// that from one board snapshot also avoids the transient state and the
     /// two IPC round trips produced by a separate move followed by a rotate.
-    pub fn set_footprint_placements(&self, placements: &[IpcFootprintPlacement]) -> Result<()> {
+    /// Returns the placements as the board holds them after the commit —
+    /// read back from KiCad, never echoed from the request (the #294/#232
+    /// standard). KiCad may normalize what it stores (angles in particular),
+    /// so the response has to come from the result.
+    pub fn set_footprint_placements(
+        &self,
+        placements: &[IpcFootprintPlacement],
+    ) -> Result<Vec<IpcFootprintPlacement>> {
         if placements.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut requested = std::collections::HashSet::new();
@@ -1574,7 +1581,49 @@ impl KiCadIpcClient {
             }
 
             client.update_items(updates)
-        })
+        })?;
+
+        // Post-commit read-back: report what the board holds, in request order.
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut held = std::collections::HashMap::new();
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.clone())
+                .unwrap_or_default();
+            let position = footprint.position.unwrap_or_default();
+            held.insert(
+                reference.clone(),
+                IpcFootprintPlacement {
+                    reference,
+                    x: nm_to_mm(position.x_nm),
+                    y: nm_to_mm(position.y_nm),
+                    rotation: footprint
+                        .orientation
+                        .as_ref()
+                        .map(|angle| angle.value_degrees)
+                        .unwrap_or(0.0),
+                },
+            );
+        }
+        placements
+            .iter()
+            .map(|placement| {
+                held.remove(&placement.reference).with_context(|| {
+                    format!(
+                        "footprint '{}' was updated but is missing from the post-commit read-back",
+                        placement.reference
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Update the visible value field of an existing footprint.

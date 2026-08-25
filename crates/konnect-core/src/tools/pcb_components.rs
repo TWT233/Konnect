@@ -1010,7 +1010,7 @@ fn update_closed_board_footprint(
 fn update_closed_board_footprints(
     board_path: &Path,
     placements: &[konnect_ipc::types::IpcFootprintPlacement],
-) -> Result<(), ClosedBoardError> {
+) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
     let content =
         read_consistent(board_path).map_err(|error| ClosedBoardError::Io(error.into()))?;
     let mut updated = content.clone();
@@ -1027,7 +1027,34 @@ fn update_closed_board_footprints(
     }
     persist_board_replacement(board_path, &content, &updated)
         .map_err(|error| ClosedBoardError::Io(error.into()))?;
-    Ok(())
+    // Report what was written, not what was asked: the file path normalizes
+    // the root angle to KiCad's (-180, 180] (a requested 270 is stored as
+    // -90), and the response has to say the number the file now holds.
+    let mut applied = Vec::with_capacity(placements.len());
+    for placement in placements {
+        let root_at = find_direct_child_blocks(&updated, "kicad_pcb")
+            .into_iter()
+            .filter_map(|(start, end)| konnect_sexp::parse_sexp(&updated[start..end]).ok())
+            .filter(|node| node.head() == Some("footprint"))
+            .find(|node| footprint_reference(node).as_deref() == Some(&placement.reference))
+            .and_then(|node| {
+                let at = node.find("at")?;
+                Some((at.get_f64(1)?, at.get_f64(2)?, at.get_f64(3).unwrap_or(0.0)))
+            })
+            .ok_or_else(|| {
+                ClosedBoardError::Unusable(format!(
+                    "footprint '{}' was updated but cannot be read back from the written board",
+                    placement.reference
+                ))
+            })?;
+        applied.push(konnect_ipc::types::IpcFootprintPlacement {
+            reference: placement.reference.clone(),
+            x: root_at.0,
+            y: root_at.1,
+            rotation: root_at.2,
+        });
+    }
+    Ok(applied)
 }
 
 fn prepare_closed_board_footprint_update(
@@ -2414,17 +2441,17 @@ async fn handle_set_component_placements(
     )
     .await?
     {
-        BoardWrite::Ipc(()) => Ok(CallToolResult::json(&json!({
-            "count": placements.len(),
-            "placements": placements,
+        BoardWrite::Ipc(applied) => Ok(CallToolResult::json(&json!({
+            "count": applied.len(),
+            "placements": applied,
             "source": "ipc",
             "undo": "One KiCad undo step reverses the whole placement batch."
         }))),
         BoardWrite::Refused(result) => Ok(result),
         BoardWrite::File => match update_closed_board_footprints(&board, &placements) {
-            Ok(()) => Ok(CallToolResult::json(&json!({
-                "count": placements.len(),
-                "placements": placements,
+            Ok(applied) => Ok(CallToolResult::json(&json!({
+                "count": applied.len(),
+                "placements": applied,
                 "source": "file",
                 "warning": "KiCad IPC was not reachable, so the closed board file was edited once with a revision check."
             }))),
@@ -4627,6 +4654,16 @@ mod tests {
         assert!(written.contains("(at 40 50 -90)"), "{written}");
         assert!(written.contains("(at 60 70 45)"), "{written}");
         assert!(konnect_sexp::parse_sexp(&written).is_ok());
+
+        // The response reports what the file now holds, not what was asked:
+        // the requested 270 is stored (and therefore reported) as -90. An
+        // echoed 270 here and a -90 in the file would be two different
+        // answers for one final state.
+        assert_eq!(response["placements"][0]["reference"], "R1");
+        assert_eq!(response["placements"][0]["rotation"], -90.0, "{response}");
+        assert_eq!(response["placements"][1]["rotation"], 45.0);
+        assert_eq!(response["placements"][0]["x"], 40.0);
+        assert_eq!(response["placements"][1]["y"], 70.0);
     }
 
     #[tokio::test]
