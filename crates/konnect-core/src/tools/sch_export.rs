@@ -10,17 +10,19 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        pin_endpoint, read_schematic,
+        extract_all_net_labels, extract_labels, extract_lib_pins, extract_symbol_instances,
+        extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
     },
 };
 use serde_json::json;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_analysis::build_net_graph;
+use super::sch_connectivity::net_graph_for;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -28,14 +30,14 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_schematic_svg",
-            "Export a schematic sheet to an SVG file using kicad-cli.",
+            "Export a schematic sheet to an SVG file using kicad-cli. The result doubles as a              machine-readable geometry source: kicad-cli writes every string twice — visibly as              stroke paths, and again as an invisible <text opacity=\"0\"> element carrying x, y,              textLength, font-size and text-anchor — so text content, position and width are              checkable without rendering a pixel.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "theme": { "type": "string", "description": "KiCAD colour theme name (optional)" }
+                    "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -50,7 +52,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "output":    { "type": "string", "description": "Output PDF file path" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
-                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets", "default": true }
+                    "all_sheets": { "type": "boolean", "description": "Include all hierarchical sheets; false exports page 1 only", "default": true }
                 },
                 "required": ["schematic", "output"]
             }),
@@ -77,7 +79,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "export_netlist_summary",
             "Return a human-readable JSON summary of the schematic netlist: all \
-             components, their nets, pin counts. Does not require kicad-cli.",
+             components, their nets, pin counts. Nets come from labels and from \
+             power symbols. Does not require kicad-cli.",
             json!({
                 "type": "object",
                 "properties": {
@@ -95,7 +98,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Optional path to write ERC report JSON" },
+                    "output":    { "type": "string", "description": "Optional path to write this tool's filtered violation list as JSON (not KiCad's own ERC report)" },
                     "severity":  {
                         "type": "string",
                         "description": "Minimum severity to report: 'error', 'warning', 'info'",
@@ -152,6 +155,10 @@ async fn handle_export_svg(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicSvgOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        theme: args["theme"].as_str(),
+    };
 
     // kicad-cli writes to an output directory and names the file <stem>.svg
     let output_dir = output_path
@@ -160,10 +167,13 @@ async fn handle_export_svg(
         .to_path_buf();
     std::fs::create_dir_all(&output_dir)?;
 
-    let svg_path = cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir).await?;
+    let svg_path =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string()
+        "exported": svg_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "theme": options.theme
     })))
 }
 
@@ -173,15 +183,21 @@ async fn handle_export_pdf(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let output_path = get_path(args, "output")?;
+    let options = cli::SchematicPdfOptions {
+        black_and_white: args["black_and_white"].as_bool().unwrap_or(false),
+        all_sheets: args["all_sheets"].as_bool().unwrap_or(true),
+    };
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path).await?;
+    cli::export_schematic_pdf(&ctx.config.kicad_cli, &sch_path, &output_path, &options).await?;
 
     Ok(CallToolResult::json(&json!({
-        "exported": output_path.display().to_string()
+        "exported": output_path.display().to_string(),
+        "black_and_white": options.black_and_white,
+        "all_sheets": options.all_sheets
     })))
 }
 
@@ -214,17 +230,13 @@ async fn handle_export_netlist_summary(
 
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
+    let labels = extract_all_net_labels(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
-    let mut g = build_net_graph(
-        &wires,
-        &labels,
-        &konnect_sexp::schematic::extract_junctions(&tree),
-    );
+    let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Collect distinct net names
     let mut net_names: Vec<String> = labels.iter().map(|l| l.net.clone()).collect();
@@ -275,12 +287,44 @@ async fn handle_export_netlist_summary(
     })))
 }
 
+/// ERC positions ride on the entry itself as `x`/`y`, not as a nested object.
+fn flatten_pos(entry: &mut serde_json::Value, pos: Option<&cli::ReportPos>) {
+    if let Some(pos) = pos {
+        entry["x"] = json!(pos.x);
+        entry["y"] = json!(pos.y);
+    }
+}
+
 async fn handle_run_erc(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let min_severity = args["severity"].as_str().unwrap_or("warning");
+
+    if let Some(root) = owning_project_root(&sch_path) {
+        // Structured, not free text: a caller can react to `invalid_argument`
+        // on `schematic` by retrying against the named root, which is exactly
+        // what the message says to do.
+        let reason = format!(
+            "{} is a sheet inside the project rooted at {}, not a project root of its own. \
+             kicad-cli treats the file it is handed as the root and looks for a .kicad_pro \
+             beside it, so the project's sym-lib-table is never read and every symbol from a \
+             project library is reported as an unknown library — violations that describe the \
+             invocation, not the design. ERC covers the whole hierarchy in any case: run it on \
+             {}.",
+            sch_path.display(),
+            root.display(),
+            root.display()
+        );
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::InvalidArgument {
+                field: "schematic".to_string(),
+                reason: reason.clone(),
+            },
+            reason,
+        ));
+    }
 
     let violations = cli::run_erc(&ctx.config.kicad_cli, &sch_path).await?;
 
@@ -295,17 +339,33 @@ async fn handle_run_erc(
         .iter()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .map(|v| {
+            let items: Vec<serde_json::Value> = v
+                .items
+                .iter()
+                .map(|item| {
+                    let mut entry = json!({ "description": item.description });
+                    flatten_pos(&mut entry, item.pos.as_ref());
+                    if let Some(uuid) = &item.uuid {
+                        entry["uuid"] = json!(uuid);
+                    }
+                    entry
+                })
+                .collect();
             let mut entry = json!({
                 "severity": v.severity,
                 "description": v.description,
+                // KiCad's stable key for the rule; `description` is prose.
+                "rule": v.rule,
+                // A pin conflict names two pins, and `description` above
+                // carries only the first.
+                "items": items,
             });
             if let Some(sheet) = &v.sheet {
                 entry["sheet"] = json!(sheet);
             }
-            if let Some(pos) = &v.pos {
-                entry["x"] = json!(pos.x);
-                entry["y"] = json!(pos.y);
-            }
+            // The violation's own x/y predate `items` and stay the first
+            // item's.
+            flatten_pos(&mut entry, v.items.first().and_then(|i| i.pos.as_ref()));
             entry
         })
         .collect();
@@ -453,4 +513,322 @@ async fn handle_fix_connectivity(
         "dry_run": dry_run,
         "fixes": fixes
     })))
+}
+
+#[cfg(test)]
+mod netlist_summary_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// R1 with pin 2 wired to a `power:GND` symbol, and pin 1 on a plain label.
+    /// The rail is the case that used to disappear.
+    const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+
+    async fn summary(content: &str) -> serde_json::Value {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let ctx = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_export_netlist_summary(
+            &json!({ "schematic": f.path().to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn net_of(summary: &serde_json::Value, reference: &str, pin: &str) -> String {
+        summary["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["reference"] == reference)
+            .expect("component present")["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["number"] == pin)
+            .expect("pin present")["net"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The regression: nets came from labels alone, so a pin reached only
+    /// through a power symbol reported `"~"` and the rail was absent from
+    /// `nets` — the summary showed every power connection as unconnected.
+    #[tokio::test]
+    async fn a_rail_reached_through_a_power_symbol_is_named() {
+        let s = summary(SCH).await;
+        assert_eq!(net_of(&s, "R1", "2"), "GND");
+        assert_eq!(net_of(&s, "R1", "1"), "SIG");
+
+        let nets: Vec<&str> = s["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(nets, vec!["GND", "SIG"]);
+        assert_eq!(s["net_count"], 2);
+    }
+
+    /// The power symbol's own pin resolves too, so `#PWR01` is not reported as
+    /// a floating part.
+    #[tokio::test]
+    async fn the_power_symbol_pin_resolves_to_its_own_rail() {
+        let s = summary(SCH).await;
+        assert_eq!(net_of(&s, "#PWR01", "1"), "GND");
+    }
+
+    /// A rail with no wire on it is still a net: the symbol declares it.
+    #[tokio::test]
+    async fn an_unwired_power_symbol_still_declares_its_net() {
+        let sch = SCH.replace(
+            "(wire (pts (xy 100 103.81) (xy 100 110)) (uuid \"w1\"))",
+            "",
+        );
+        let s = summary(&sch).await;
+        assert_eq!(net_of(&s, "R1", "2"), "~");
+        assert!(s["nets"].as_array().unwrap().iter().any(|n| n == "GND"));
+    }
+}
+
+// ─── Project-root detection for ERC ───────────────────────────────────────────
+
+/// The root schematic of the project that owns `file` as a sub-sheet, if any.
+///
+/// `kicad-cli` treats whatever file it is handed as the root of the hierarchy
+/// and looks for a `.kicad_pro` named after it. A sub-sheet has no such file,
+/// so the project's `sym-lib-table` is never read and every symbol from a
+/// project library comes back as an unknown library. Those violations describe
+/// the invocation rather than the design, and the obvious remedy — registering
+/// the library again — is the wrong one, so the case is worth naming.
+///
+/// Returns `None` for a schematic that is a root in its own right, one that
+/// belongs to no project, and one that sits beside a project without appearing
+/// in its sheet tree.
+fn owning_project_root(file: &Path) -> Option<PathBuf> {
+    if file.with_extension("kicad_pro").is_file() {
+        return None;
+    }
+    let root = project_root_schematic(&crate::tools::library::project_root_for(file)?)?;
+    if same_file(&root, file) {
+        return None;
+    }
+    let mut visited = HashSet::new();
+    sheet_tree_contains(&root, file, 0, &mut visited).then_some(root)
+}
+
+/// The `<stem>.kicad_sch` beside the single `.kicad_pro` in `dir`. A directory
+/// holding more than one project says nothing definite about which root a loose
+/// sheet belongs to, so it yields nothing rather than a guess.
+fn project_root_schematic(dir: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "kicad_pro") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    let sch = found?.with_extension("kicad_sch");
+    sch.is_file().then_some(sch)
+}
+
+/// Whether `target` is reachable as a sheet from `root`. Depth and visited set
+/// guard the same way [`crate::tools::sch_hierarchy::build_hierarchy_node`]
+/// does: a sheet may reference a file that references it back.
+fn sheet_tree_contains(
+    root: &Path,
+    target: &Path,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> bool {
+    if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH {
+        return false;
+    }
+    let canon = canonical(root);
+    if !visited.insert(canon) {
+        return false;
+    }
+    let Ok(sch) = konnect_schematic_editor::Schematic::load(root) else {
+        return false;
+    };
+    let dir = root.parent().unwrap_or_else(|| Path::new("."));
+    sch.sheets.iter().any(|sheet| {
+        let child = dir.join(sheet.file());
+        same_file(&child, target) || sheet_tree_contains(&child, target, depth + 1, visited)
+    })
+}
+
+/// Path equality that survives `.\foo` versus `foo` and case-insensitive
+/// filesystems. Falls back to a literal comparison for paths that do not exist.
+fn same_file(a: &Path, b: &Path) -> bool {
+    canonical(a) == canonical(b)
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A root sheet holding one sub-sheet reference. The `(sheet …)` block is
+    /// shaped the way KiCad 10 writes one — trimmed to the fields the loader
+    /// reads.
+    fn root_with_child(dir: &Path, root: &str, child_file: &str) -> PathBuf {
+        let path = dir.join(root);
+        std::fs::write(
+            &path,
+            format!(
+                r#"(kicad_sch
+	(version 20250610)
+	(generator "konnect")
+	(generator_version "10.0")
+	(uuid "00000000-0000-4000-8000-000000000001")
+	(paper "A4")
+	(sheet
+		(at 40 50)
+		(size 80 25)
+		(uuid "00000000-0000-4000-8000-000000000002")
+		(property "Sheetname" "Child"
+			(at 40 49.365 0)
+		)
+		(property "Sheetfile" "{child_file}"
+			(at 40 75.635 0)
+		)
+	)
+	(sheet_instances
+		(path "/" (page "1"))
+	)
+)
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn blank(dir: &Path, name: &str) -> PathBuf {
+        write(dir, name, &crate::tools::blank_schematic_template())
+    }
+
+    #[test]
+    fn child_sheet_resolves_to_its_project_root() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
+        let child = blank(tmp.path(), "child.kicad_sch");
+
+        assert_eq!(owning_project_root(&child), Some(root));
+    }
+
+    #[test]
+    fn a_root_of_its_own_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        let root = root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
+        blank(tmp.path(), "child.kicad_sch");
+
+        assert_eq!(owning_project_root(&root), None);
+    }
+
+    #[test]
+    fn a_sheet_belonging_to_no_project_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let loose = blank(tmp.path(), "loose.kicad_sch");
+
+        assert_eq!(owning_project_root(&loose), None);
+    }
+
+    /// The refusal is a structured `invalid_argument` naming `schematic`, so a
+    /// caller can react by retrying against the root the message names — the
+    /// convention `mcp/error.rs` asks for on anything an LLM might branch on.
+    #[tokio::test]
+    async fn the_sub_sheet_refusal_is_structured_and_names_the_field() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
+        let child = blank(tmp.path(), "child.kicad_sch");
+
+        let ctx = crate::tools::ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = handle_run_erc(
+            &serde_json::json!({ "schematic": child.display().to_string() }),
+            &ctx,
+        )
+        .await
+        .expect("a refusal is a tool error, not a transport error");
+
+        assert!(result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(output["error"]["kind"], "invalid_argument");
+        assert_eq!(output["error"]["field"], "schematic");
+        assert!(output["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("proj.kicad_sch"));
+    }
+
+    /// Sitting beside a project is not the same as belonging to it — the file
+    /// has to appear in the sheet tree.
+    #[test]
+    fn unrelated_neighbour_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        root_with_child(tmp.path(), "proj.kicad_sch", "child.kicad_sch");
+        blank(tmp.path(), "child.kicad_sch");
+        let stranger = blank(tmp.path(), "stranger.kicad_sch");
+
+        assert_eq!(owning_project_root(&stranger), None);
+    }
+
+    /// A sheet cycle must not hang the walk.
+    #[test]
+    fn a_reference_cycle_terminates() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "proj.kicad_pro", "{}");
+        root_with_child(tmp.path(), "proj.kicad_sch", "a.kicad_sch");
+        root_with_child(tmp.path(), "a.kicad_sch", "proj.kicad_sch");
+        let stranger = blank(tmp.path(), "stranger.kicad_sch");
+
+        assert_eq!(owning_project_root(&stranger), None);
+    }
 }

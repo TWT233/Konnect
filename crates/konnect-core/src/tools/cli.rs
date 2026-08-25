@@ -20,18 +20,50 @@ use tracing::{debug, info, warn};
 /// Extended timeout for long operations (export, ERC, DRC).
 const LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
+fn cli_failure_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (true, true) => "no diagnostic output".to_string(),
+    }
+}
+
 // ─── Result Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErcViolation {
     pub severity: String,
     pub description: String,
+    /// KiCad's rule key (`"pin_to_pin"`, `"pin_not_connected"`, …). Stable,
+    /// unlike the prose description beside it.
+    pub rule: String,
     pub sheet: Option<String>,
-    pub pos: Option<ErcPos>,
+    /// Every item the rule caught, in report order. A `pin_to_pin` violation
+    /// always names two pins and the second is regularly the actionable one,
+    /// so keeping only the first hid what explains the violation.
+    pub items: Vec<ReportItem>,
 }
 
+/// One item involved in an ERC or DRC violation. Both reports use the same
+/// item shape, so both parsers decode it the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErcPos {
+pub struct ReportItem {
+    pub description: String,
+    pub pos: Option<ReportPos>,
+    /// Absent rather than null when KiCad names no item id, which is the
+    /// shape both the ERC and DRC responses have always had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ReportPos {
     pub x: f64,
     pub y: f64,
 }
@@ -40,7 +72,65 @@ pub struct ErcPos {
 pub struct DrcViolation {
     pub severity: String,
     pub description: String,
-    pub pos: Option<ErcPos>,
+    /// KiCad's rule key (`"silk_edge_clearance"`, `"clearance"`, …). This is
+    /// what a caller needs to fix or waive the rule; the prose description
+    /// alone is not addressable.
+    pub rule: String,
+    /// Where to look. KiCad reports one position per *involved item*, not one
+    /// per violation, so this is the first item's — which is what the report
+    /// used to try to read from a top-level `pos` field that does not exist,
+    /// making every position `null`.
+    pub pos: Option<ReportPos>,
+    /// Every item the rule caught, in report order. The prose description of
+    /// an `unconnected_items` violation is a constant, so the pads and the net
+    /// its items name are the only record of what is unrouted — and two
+    /// violations sharing a rule, a description and a first position differ
+    /// nowhere else.
+    pub items: Vec<ReportItem>,
+}
+
+/// Everything `kicad-cli pcb drc` reports, not just the part Konnect used to
+/// read.
+///
+/// The JSON carries three sibling arrays. Konnect took `violations` and
+/// dropped the other two, so a board with an unrouted net — which is what
+/// `unconnected_items` is for — came back clean from every tool that gates on
+/// DRC (#245).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrcReport {
+    pub violations: Vec<DrcViolation>,
+    /// `None` means this kicad-cli did not report the category at all, which
+    /// is not the same as "there are none" and must not be rendered as zero.
+    pub unconnected_items: Option<Vec<DrcViolation>>,
+    pub schematic_parity: Option<Vec<DrcViolation>>,
+}
+
+impl DrcReport {
+    /// Findings across every category, for a caller that just wants to know
+    /// whether the board is clean.
+    pub fn all(&self) -> impl Iterator<Item = &DrcViolation> {
+        self.violations
+            .iter()
+            .chain(self.unconnected_items.iter().flatten())
+            .chain(self.schematic_parity.iter().flatten())
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.all().filter(|v| v.severity == "error").count()
+    }
+
+    /// Categories this kicad-cli did not report, by name. A gate that wants to
+    /// fail closed needs to know its evidence was incomplete.
+    pub fn missing_categories(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.unconnected_items.is_none() {
+            missing.push("unconnected_items");
+        }
+        if self.schematic_parity.is_none() {
+            missing.push("schematic_parity");
+        }
+        missing
+    }
 }
 
 // ─── KiCAD CLI Runner ─────────────────────────────────────────────────────────
@@ -73,11 +163,10 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     }
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "kicad-cli exited with {}: {}",
+            "kicad-cli exited with {}:\n{}",
             output.status.code().unwrap_or(-1),
-            stderr.trim()
+            cli_failure_diagnostics(&output.stdout, &output.stderr)
         );
     }
 
@@ -128,42 +217,56 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
             continue;
         };
         for v in violations {
-            let first_item = v
+            let items: Vec<ReportItem> = v
                 .get("items")
                 .and_then(|i| i.as_array())
-                .and_then(|i| i.first());
+                .map(|items| items.iter().map(parse_report_item).collect())
+                .unwrap_or_default();
             let mut description = v["description"].as_str().unwrap_or("").to_string();
             // The per-item description names the offender ("Symbol R1 Pin 1…")
             // — without it "Pin not connected" is unactionable.
-            if let Some(detail) = first_item
-                .and_then(|item| item.get("description"))
-                .and_then(|d| d.as_str())
+            if let Some(detail) = items
+                .first()
+                .map(|item| item.description.as_str())
+                .filter(|detail| !detail.is_empty())
             {
-                if !detail.is_empty() {
-                    description = format!("{}: {}", description, detail);
-                }
+                description = format!("{}: {}", description, detail);
             }
             out.push(ErcViolation {
                 severity: v["severity"].as_str().unwrap_or("error").to_string(),
                 description,
+                rule: v["type"].as_str().unwrap_or("").to_string(),
                 sheet: sheet_path.clone(),
-                pos: first_item.and_then(|item| item.get("pos")).and_then(|p| {
-                    Some(ErcPos {
-                        x: p["x"].as_f64()?,
-                        y: p["y"].as_f64()?,
-                    })
-                }),
+                items,
             });
         }
     }
     out
 }
 
+/// Decode one item of an ERC or DRC violation — the two reports spell it the
+/// same way.
+fn parse_report_item(item: &serde_json::Value) -> ReportItem {
+    ReportItem {
+        description: item["description"].as_str().unwrap_or("").to_string(),
+        pos: parse_item_pos(item),
+        uuid: item["uuid"].as_str().map(String::from),
+    }
+}
+
+fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
+    let pos = item.get("pos")?;
+    Some(ReportPos {
+        x: pos["x"].as_f64()?,
+        y: pos["y"].as_f64()?,
+    })
+}
+
 // ─── DRC ─────────────────────────────────────────────────────────────────────
 
 /// Run DRC on a PCB and return parsed violations.
 /// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
-pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<DrcViolation>> {
+pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
     let out_path = pcb.with_extension("drc.json");
     let mut args = vec![
         "pcb",
@@ -185,22 +288,45 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
     let _ = tokio::fs::remove_file(&out_path).await;
 
-    Ok(raw
-        .get("violations")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|v| DrcViolation {
-            severity: v["severity"].as_str().unwrap_or("error").to_string(),
-            description: v["description"].as_str().unwrap_or("").to_string(),
-            pos: v.get("pos").and_then(|p| {
-                Some(ErcPos {
-                    x: p["x"].as_f64()?,
-                    y: p["y"].as_f64()?,
+    parse_drc_report(&raw)
+}
+
+/// Split out so it can be tested against a real `kicad-cli` report without
+/// running kicad-cli.
+fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
+    fn category(raw: &serde_json::Value, key: &str) -> Option<Vec<DrcViolation>> {
+        Some(
+            raw.get(key)?
+                .as_array()?
+                .iter()
+                .map(|v| {
+                    let items: Vec<ReportItem> = v["items"]
+                        .as_array()
+                        .map(|items| items.iter().map(parse_report_item).collect())
+                        .unwrap_or_default();
+                    DrcViolation {
+                        severity: v["severity"].as_str().unwrap_or("error").to_string(),
+                        description: v["description"].as_str().unwrap_or("").to_string(),
+                        rule: v["type"].as_str().unwrap_or("").to_string(),
+                        // The position lives on each involved item; a violation
+                        // has no `pos` of its own.
+                        pos: items.iter().find_map(|item| item.pos),
+                        items,
+                    }
                 })
-            }),
-        })
-        .collect())
+                .collect(),
+        )
+    }
+
+    Ok(DrcReport {
+        // A report without this key is not a DRC report. Defaulting it to an
+        // empty list would render as a clean board, which is the failure mode
+        // this whole change exists to remove.
+        violations: category(raw, "violations")
+            .context("DRC report has no 'violations' array; kicad-cli did not produce a report")?,
+        unconnected_items: category(raw, "unconnected_items"),
+        schematic_parity: category(raw, "schematic_parity"),
+    })
 }
 
 // ─── Annotation ───────────────────────────────────────────────────────────────
@@ -275,35 +401,91 @@ pub async fn annotate_schematic(_cli: &str, schematic: &Path) -> Result<()> {
 
 // ─── Schematic Export ────────────────────────────────────────────────────────
 
-/// KiCAD 10: `sch export svg --output <dir> <input>`
+#[derive(Debug, Default, Clone)]
+pub struct SchematicSvgOptions<'a> {
+    pub black_and_white: bool,
+    pub theme: Option<&'a str>,
+}
+
+fn schematic_svg_args<'a>(
+    output_dir: &'a str,
+    schematic: &'a str,
+    options: &'a SchematicSvgOptions<'a>,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "svg", "--output", output_dir];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if let Some(theme) = options.theme {
+        args.push("--theme");
+        args.push(theme);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export svg --output <dir> [--black-and-white]
+/// [--theme <name>] <input>`
 pub async fn export_schematic_svg(
     cli: &str,
     schematic: &Path,
     output_dir: &Path,
+    options: &SchematicSvgOptions<'_>,
 ) -> Result<PathBuf> {
-    let args = [
-        "sch",
-        "export",
-        "svg",
-        "--output",
+    let args = schematic_svg_args(
         output_dir.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
     Ok(output_dir.join(format!("{}.svg", stem)))
 }
 
-/// KiCAD 10: `sch export pdf --output <path> <input>`
-pub async fn export_schematic_pdf(cli: &str, schematic: &Path, output: &Path) -> Result<()> {
-    let args = [
-        "sch",
-        "export",
-        "pdf",
-        "--output",
+#[derive(Debug, Clone)]
+pub struct SchematicPdfOptions {
+    pub black_and_white: bool,
+    pub all_sheets: bool,
+}
+
+impl Default for SchematicPdfOptions {
+    fn default() -> Self {
+        Self {
+            black_and_white: false,
+            all_sheets: true,
+        }
+    }
+}
+
+fn schematic_pdf_args<'a>(
+    output: &'a str,
+    schematic: &'a str,
+    options: &SchematicPdfOptions,
+) -> Vec<&'a str> {
+    let mut args = vec!["sch", "export", "pdf", "--output", output];
+    if options.black_and_white {
+        args.push("--black-and-white");
+    }
+    if !options.all_sheets {
+        args.extend(["--pages", "1"]);
+    }
+    args.push(schematic);
+    args
+}
+
+/// KiCAD 10: `sch export pdf --output <path> [--black-and-white]
+/// [--pages 1] <input>`
+pub async fn export_schematic_pdf(
+    cli: &str,
+    schematic: &Path,
+    output: &Path,
+    options: &SchematicPdfOptions,
+) -> Result<()> {
+    let args = schematic_pdf_args(
         output.to_str().unwrap(),
         schematic.to_str().unwrap(),
-    ];
+        options,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -410,16 +592,32 @@ pub async fn export_netlist(
 
 // ─── PCB Export ──────────────────────────────────────────────────────────────
 
-/// KiCAD 10: `pcb export gerbers --output <dir> <input>` (PLURAL!)
-pub async fn export_gerber(cli: &str, pcb: &Path, output_dir: &Path) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "gerbers",
-        "--output",
-        output_dir.to_str().unwrap(),
-        pcb.to_str().unwrap(),
-    ];
+/// Argument vector for Gerber export. KiCad's plural `gerbers` subcommand
+/// accepts the complete selection as one comma-separated `--layers` value.
+fn gerber_args<'a>(output_dir: &'a str, pcb: &'a str, layers_csv: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["pcb", "export", "gerbers", "--output", output_dir];
+    if !layers_csv.is_empty() {
+        args.push("--layers");
+        args.push(layers_csv);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export gerbers --output <dir> [--layers <csv>] <input>`
+/// (PLURAL!)
+pub async fn export_gerber(
+    cli: &str,
+    pcb: &Path,
+    output_dir: &Path,
+    layers: &[&str],
+) -> Result<()> {
+    let layers_csv = layers.join(",");
+    let args = gerber_args(
+        output_dir.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
+        &layers_csv,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -486,33 +684,82 @@ pub async fn export_drill(cli: &str, pcb: &Path, output_dir: &Path) -> Result<Ve
     Ok(drill_files_in(output_dir).await)
 }
 
-/// KiCAD 10: `pcb export pdf --output <path> [--layers <layer>]... <input>`
-pub async fn export_pdf(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "pdf", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
+fn single_file_pcb_export_args(
+    format: &str,
+    output: &str,
+    layers: &[&str],
+    black_and_white: bool,
+    pcb: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "pcb".to_string(),
+        "export".to_string(),
+        format.to_string(),
+        "--output".to_string(),
+        output.to_string(),
+        "--mode-single".to_string(),
+    ];
+    if !layers.is_empty() {
+        args.push("--layers".to_string());
+        args.push(layers.join(","));
     }
-    args.push(pcb.to_str().unwrap());
+    if black_and_white {
+        args.push("--black-and-white".to_string());
+    }
+    args.push(pcb.to_string());
+    args
+}
+
+/// KiCAD 10: `pcb export pdf --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_pdf(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    let args = single_file_pcb_export_args(
+        "pdf",
+        output.to_str().unwrap(),
+        layers,
+        black_and_white,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export svg --output <path> [--layers <layer>]... <input>`
-pub async fn export_svg_pcb(cli: &str, pcb: &Path, output: &Path, layers: &[&str]) -> Result<()> {
-    let mut args = vec!["pcb", "export", "svg", "--output", output.to_str().unwrap()];
-    for layer in layers {
-        args.push("--layers");
-        args.push(layer);
-    }
-    args.push(pcb.to_str().unwrap());
+/// KiCAD 10: `pcb export svg --output <path> --mode-single [--layers <a,b>]
+/// [--black-and-white] <input>`
+pub async fn export_svg_pcb(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    layers: &[&str],
+    black_and_white: bool,
+) -> Result<()> {
+    let args = single_file_pcb_export_args(
+        "svg",
+        output.to_str().unwrap(),
+        layers,
+        black_and_white,
+        pcb.to_str().unwrap(),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export <format> --output <path> <input>`
+/// KiCAD 10: `pcb export <format> --output <path> [--no-unspecified] <input>`
 /// Supported 3D formats: step, vrml, glb, brep, stl, ply, stpz, u3d, xao, 3dpdf
-pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Result<()> {
+fn export_3d_args<'a>(
+    pcb: &'a str,
+    output: &'a str,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<Vec<&'a str>> {
     let subcommand = match format.to_lowercase().as_str() {
         "step" | "stp" => "step",
         "vrml" | "wrl" => "vrml",
@@ -529,36 +776,74 @@ pub async fn export_3d(cli: &str, pcb: &Path, output: &Path, format: &str) -> Re
             other
         ),
     };
-    let args = vec![
-        "pcb",
-        "export",
-        subcommand,
-        "--output",
-        output.to_str().unwrap(),
+    let mut args = vec!["pcb", "export", subcommand, "--output", output];
+    if !include_unspecified {
+        args.push("--no-unspecified");
+    }
+    args.push(pcb);
+    Ok(args)
+}
+
+pub async fn export_3d(
+    cli: &str,
+    pcb: &Path,
+    output: &Path,
+    format: &str,
+    include_unspecified: bool,
+) -> Result<()> {
+    let args = export_3d_args(
         pcb.to_str().unwrap(),
-    ];
+        output.to_str().unwrap(),
+        format,
+        include_unspecified,
+    )?;
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
 
-/// KiCAD 10: `pcb export pos --output <path> --format <fmt> <input>`
-/// Formats: ascii (default), csv, gerber
+/// Argument vector for position export, factored out so the public options can
+/// be regression-tested without a kicad-cli installation.
+fn position_args<'a>(
+    output: &'a str,
+    pcb: &'a str,
+    format: &'a str,
+    units: &'a str,
+    side: &'a str,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "pcb", "export", "pos", "--output", output, "--format", format, "--side", side,
+    ];
+    // Gerber coordinates have format-defined units; KiCad only accepts this
+    // option for its ASCII and CSV position formats.
+    if format != "gerber" {
+        args.push("--units");
+        args.push(units);
+    }
+    args.push(pcb);
+    args
+}
+
+/// KiCad 10: `pcb export pos --output <path> --format <fmt> --side <side>
+/// [--units <units>] <input>`
+///
+/// KiCad itself omits footprints carrying `exclude_from_pos_files`; Konnect
+/// deliberately leaves that source-of-truth filtering to the exporter rather
+/// than trying to post-process CSV and Gerber output differently.
 pub async fn export_position_file(
     cli: &str,
     pcb: &Path,
     output: &Path,
     format: &str,
+    units: &str,
+    side: &str,
 ) -> Result<()> {
-    let args = [
-        "pcb",
-        "export",
-        "pos",
-        "--output",
-        output.to_str().unwrap(),
-        "--format",
+    let args = position_args(
+        output.to_str().unwrap_or(""),
+        pcb.to_str().unwrap_or(""),
         format,
-        pcb.to_str().unwrap(),
-    ];
+        units,
+        side,
+    );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
@@ -579,9 +864,10 @@ pub async fn export_ipcd356(cli: &str, pcb: &Path, output: &Path) -> Result<()> 
 
 /// KiCAD 10: `pcb export dxf --output <dir> [--layers <csv>] --mode-multi <input>`
 ///
-/// Unlike `pdf`/`svg`, DXF's `--layers` takes a single comma-separated value
-/// rather than a repeatable flag, and one file per requested layer is written
-/// into `output_dir` (verified against KiCAD 10.0).
+/// `--layers` takes a single comma-separated value, the same as every PCB
+/// exporter (the pdf/svg wrappers used to repeat the flag per layer, which
+/// KiCAD 10 rejects — #250). DXF differs in output shape only: one file per
+/// requested layer is written into `output_dir` (verified against KiCAD 10.0).
 pub async fn export_dxf(cli: &str, pcb: &Path, output_dir: &Path, layers: &[&str]) -> Result<()> {
     let output_str = output_dir.to_str().unwrap();
     let pcb_str = pcb.to_str().unwrap();
@@ -667,7 +953,7 @@ pub async fn export_odb(
 /// KiCAD 10: `sch export svg --output <dir> <input>`
 pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) -> Result<PathBuf> {
     let output_dir = output.parent().unwrap_or(Path::new("."));
-    export_schematic_svg(cli, schematic, output_dir).await
+    export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
 }
 
 /// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
@@ -699,6 +985,275 @@ pub async fn render_pcb_png(
     ];
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod schematic_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn svg_theme_and_monochrome_flags_reach_kicad() {
+        let options = SchematicSvgOptions {
+            black_and_white: true,
+            theme: Some("Solarized Dark"),
+        };
+        let args = schematic_svg_args("/out", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let theme = args
+            .iter()
+            .position(|argument| *argument == "--theme")
+            .map(|index| args[index + 1]);
+        assert_eq!(theme, Some("Solarized Dark"));
+        assert_eq!(args.last().copied(), Some("/tmp/design.kicad_sch"));
+    }
+
+    #[test]
+    fn pdf_can_limit_the_export_to_the_root_sheet() {
+        let options = SchematicPdfOptions {
+            black_and_white: true,
+            all_sheets: false,
+        };
+        let args = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &options);
+
+        assert!(args.contains(&"--black-and-white"));
+        let pages = args
+            .iter()
+            .position(|argument| *argument == "--pages")
+            .map(|index| args[index + 1]);
+        assert_eq!(pages, Some("1"));
+    }
+
+    #[test]
+    fn schematic_defaults_leave_kicad_theme_and_page_selection_alone() {
+        let svg_options = SchematicSvgOptions::default();
+        let svg = schematic_svg_args("/out", "/tmp/design.kicad_sch", &svg_options);
+        assert!(!svg.contains(&"--black-and-white"));
+        assert!(!svg.contains(&"--theme"));
+
+        let pdf_options = SchematicPdfOptions::default();
+        let pdf = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &pdf_options);
+        assert!(!pdf.contains(&"--black-and-white"));
+        assert!(!pdf.contains(&"--pages"));
+    }
+}
+
+#[cfg(test)]
+mod three_d_export_option_tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_models_are_excluded_by_default() {
+        let args =
+            export_3d_args("/tmp/board.kicad_pcb", "/out/board.step", "step", false).unwrap();
+        assert!(args.contains(&"--no-unspecified"));
+    }
+
+    #[test]
+    fn including_unspecified_models_omits_the_exclusion_flag() {
+        let args = export_3d_args("/tmp/board.kicad_pcb", "/out/board.wrl", "vrml", true).unwrap();
+        assert!(!args.contains(&"--no-unspecified"));
+    }
+}
+
+#[cfg(test)]
+mod pcb_plot_export_tests {
+    use super::*;
+
+    #[test]
+    fn layers_are_one_comma_separated_argument_for_kicad_10() {
+        let args = single_file_pcb_export_args(
+            "svg",
+            "/out/board.svg",
+            &["F.Cu", "F.Paste", "F.SilkS", "Edge.Cuts"],
+            false,
+            "/tmp/board.kicad_pcb",
+        );
+
+        assert_eq!(args.iter().filter(|arg| *arg == "--layers").count(), 1);
+        let layers = args
+            .iter()
+            .position(|arg| arg == "--layers")
+            .map(|index| args[index + 1].as_str());
+        assert_eq!(layers, Some("F.Cu,F.Paste,F.SilkS,Edge.Cuts"));
+    }
+
+    #[test]
+    fn file_output_uses_single_mode_and_empty_layers_are_omitted() {
+        let args = single_file_pcb_export_args(
+            "pdf",
+            "/out/board.pdf",
+            &[],
+            false,
+            "/tmp/board.kicad_pcb",
+        );
+
+        assert!(args.iter().any(|arg| arg == "--mode-single"));
+        assert!(!args.iter().any(|arg| arg == "--layers"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
+    }
+
+    #[test]
+    fn black_and_white_reaches_both_single_file_plotters() {
+        for format in ["pdf", "svg"] {
+            let args = single_file_pcb_export_args(
+                format,
+                "/out/board.plot",
+                &["F.Cu"],
+                true,
+                "/tmp/board.kicad_pcb",
+            );
+            assert!(args.iter().any(|argument| argument == "--black-and-white"));
+        }
+    }
+
+    #[test]
+    fn cli_failures_include_stdout_and_stderr_diagnostics() {
+        assert_eq!(
+            cli_failure_diagnostics(b"Duplicate argument --layers\n", b""),
+            "stdout:\nDuplicate argument --layers"
+        );
+        assert_eq!(
+            cli_failure_diagnostics(b"usage text", b"fatal detail"),
+            "stdout:\nusage text\nstderr:\nfatal detail"
+        );
+        assert_eq!(cli_failure_diagnostics(b"", b""), "no diagnostic output");
+    }
+}
+
+#[cfg(test)]
+mod drc_parse_tests {
+    use super::*;
+
+    /// Real `kicad-cli pcb drc --format json` output (KiCAD 10.0.0, schema
+    /// https://schemas.kicad.org/drc.v1.json), captured from the bundled
+    /// `ecc83-pp` demo with its track segments removed so KiCad would actually
+    /// report unconnected items. Trimmed to two entries per category; nothing
+    /// is reshaped.
+    fn real_report() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/drc_report_kicad10.json")).unwrap()
+    }
+
+    /// The whole point of #245: `unconnected_items` is where an unrouted net
+    /// is reported, it carries severity `error`, and Konnect read only
+    /// `violations` — so this board came back with zero errors.
+    #[test]
+    fn unconnected_items_are_part_of_the_result() {
+        let report = parse_drc_report(&real_report()).unwrap();
+
+        assert_eq!(report.violations.len(), 2);
+        assert_eq!(report.unconnected_items.as_ref().unwrap().len(), 2);
+        assert_eq!(report.schematic_parity.as_ref().unwrap().len(), 0);
+        assert_eq!(report.all().count(), 4);
+
+        // Reading `violations` alone would have said zero.
+        assert_eq!(report.error_count(), 2);
+        assert!(report
+            .unconnected_items
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.severity == "error"));
+    }
+
+    /// KiCad reports a position per *involved item*, not one per violation.
+    /// Reading a top-level `pos` — which the schema has never had — made every
+    /// position `null`, and the rule key was dropped entirely, leaving the
+    /// caller with prose they cannot act on.
+    #[test]
+    fn a_violation_carries_its_rule_key_and_a_real_position() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let first = &report.violations[0];
+
+        assert!(
+            !first.rule.is_empty(),
+            "the rule key is what you fix or waive"
+        );
+        let pos = first
+            .pos
+            .as_ref()
+            .expect("position comes from items[0].pos");
+        assert!(pos.x != 0.0 || pos.y != 0.0);
+
+        let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
+        assert_eq!(unconnected.rule, "unconnected_items");
+        assert!(unconnected.pos.is_some());
+    }
+
+    /// `unconnected_items` says "Missing connection between items" and nothing
+    /// else; the pads and the net live in the items, so dropping them left the
+    /// caller with "something, somewhere, is unrouted".
+    #[test]
+    fn a_violation_keeps_every_item_it_names() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
+
+        assert_eq!(unconnected.description, "Missing connection between items");
+        assert_eq!(unconnected.items.len(), 2);
+        assert_eq!(
+            unconnected.items[0].description,
+            "PTH pad 1 [Net-(P3-P1)] of C1"
+        );
+        assert_eq!(
+            unconnected.items[1].description,
+            "PTH pad 1 [Net-(P3-P1)] of P3"
+        );
+        assert!(unconnected.items.iter().all(|item| item.uuid.is_some()));
+        assert!(unconnected.items.iter().all(|item| item.pos.is_some()));
+
+        // The violation's own position stays the first item's.
+        let pos = unconnected.pos.as_ref().unwrap();
+        let first = unconnected.items[0].pos.as_ref().unwrap();
+        assert_eq!((pos.x, pos.y), (first.x, first.y));
+    }
+
+    /// The two `silk_edge_clearance` violations share a severity, a rule, a
+    /// description and a first-item position. Without the items they serialise
+    /// identically, and a caller cannot tell there are two problems.
+    #[test]
+    fn two_violations_alike_but_for_their_items_stay_distinguishable() {
+        let report = parse_drc_report(&real_report()).unwrap();
+        let (first, second) = (&report.violations[0], &report.violations[1]);
+
+        assert_eq!(first.rule, second.rule);
+        assert_eq!(first.description, second.description);
+        assert_eq!(
+            serde_json::to_value(&first.items[0]).unwrap(),
+            serde_json::to_value(&second.items[0]).unwrap()
+        );
+        assert_ne!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(second).unwrap(),
+            "two different problems must not serialise byte-identically"
+        );
+    }
+
+    /// A report missing `violations` is not a DRC report. Defaulting it to an
+    /// empty list renders as a clean board, which is the failure this change
+    /// exists to remove.
+    #[test]
+    fn a_report_without_violations_is_an_error_not_a_clean_board() {
+        let error = parse_drc_report(&serde_json::json!({ "source": "x.kicad_pcb" }))
+            .expect_err("a report with no violations array is not a result");
+        assert!(format!("{error:#}").contains("violations"));
+    }
+
+    /// A kicad-cli that does not report a category must read as `None`, never
+    /// as zero: "none found" and "never asked" are different answers, and only
+    /// one of them justifies calling a board clean.
+    #[test]
+    fn an_unreported_category_is_absent_not_zero() {
+        let report = parse_drc_report(&serde_json::json!({ "violations": [] })).unwrap();
+        assert!(report.unconnected_items.is_none());
+        assert!(report.schematic_parity.is_none());
+        assert_eq!(
+            report.missing_categories(),
+            vec!["unconnected_items", "schematic_parity"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +1296,23 @@ mod erc_parse_tests {
                             ],
                             "severity": "warning",
                             "type": "pin_not_connected"
+                        },
+                        {
+                            "description": "Pins of type Power output and Power output are connected",
+                            "items": [
+                                {
+                                    "description": "Symbol #PWR031 Pin 1 [Power output, Line]",
+                                    "pos": { "x": 1.4351, "y": 0.889 },
+                                    "uuid": "0f7ec4d9-8a03-4a2f-8f9c-3d8f3f4e1c22"
+                                },
+                                {
+                                    "description": "Symbol U2 Pin 5 [VOUT, Power output, Line]",
+                                    "pos": { "x": 1.6002, "y": 1.016 },
+                                    "uuid": "5b6a1f42-2c17-4f0b-9a6e-8c3f7d21e0a4"
+                                }
+                            ],
+                            "severity": "error",
+                            "type": "pin_to_pin"
                         }
                     ]
                 }
@@ -753,7 +1325,7 @@ mod erc_parse_tests {
         let violations = parse_erc_json(&real_report());
         assert_eq!(
             violations.len(),
-            2,
+            3,
             "must flatten sheets[].violations — a top-level 'violations' key does not exist in ERC reports"
         );
         assert_eq!(violations[0].severity, "error");
@@ -763,9 +1335,65 @@ mod erc_parse_tests {
             "description should name the offending item"
         );
         assert_eq!(violations[0].sheet.as_deref(), Some("/"));
-        let pos = violations[0].pos.as_ref().expect("position from items[0]");
+        let pos = violations[0].items[0].pos.as_ref().expect("item position");
         assert!((pos.x - 1.0033).abs() < 1e-9);
         assert_eq!(violations[1].severity, "warning");
+    }
+
+    /// A `pin_to_pin` violation names both conflicting pins, and the second is
+    /// regularly the one that explains the first — here the regulator output
+    /// that makes the `PWR_FLAG` redundant. Keeping only `items[0]` sent the
+    /// caller back to `kicad-cli` by hand.
+    #[test]
+    fn every_item_of_a_violation_survives() {
+        let conflict = &parse_erc_json(&real_report())[2];
+        assert_eq!(conflict.items.len(), 2);
+        assert!(conflict.items[0].description.contains("#PWR031"));
+        let explains = &conflict.items[1];
+        assert!(explains.description.contains("U2 Pin 5"));
+        assert!((explains.pos.as_ref().expect("item position").y - 1.016).abs() < 1e-9);
+        assert_eq!(
+            explains.uuid.as_deref(),
+            Some("5b6a1f42-2c17-4f0b-9a6e-8c3f7d21e0a4")
+        );
+    }
+
+    /// `type` is the addressable key; `description` beside it is prose.
+    #[test]
+    fn violations_carry_kicads_rule_key() {
+        let violations = parse_erc_json(&real_report());
+        assert_eq!(violations[0].rule, "pin_not_connected");
+        assert_eq!(violations[2].rule, "pin_to_pin");
+    }
+
+    /// The violation description predates `items` and callers read it, so a
+    /// second item must not change what it says.
+    #[test]
+    fn the_description_still_names_the_first_item_only() {
+        let conflict = &parse_erc_json(&real_report())[2];
+        assert!(conflict.description.contains("#PWR031"));
+        assert!(!conflict.description.contains("U2"));
+    }
+
+    /// KiCad omits `pos` and `uuid` on some item kinds; that must not drop the
+    /// item, whose description is still the only thing naming the offender.
+    #[test]
+    fn an_item_without_a_position_is_still_reported() {
+        let violations = parse_erc_json(&serde_json::json!({
+            "sheets": [{
+                "path": "/",
+                "violations": [{
+                    "description": "Label not connected",
+                    "items": [{ "description": "Label VIN" }],
+                    "severity": "warning",
+                    "type": "label_dangling"
+                }]
+            }]
+        }));
+        assert_eq!(violations[0].items.len(), 1);
+        assert!(violations[0].items[0].pos.is_none());
+        assert!(violations[0].items[0].uuid.is_none());
+        assert!(violations[0].description.contains("Label VIN"));
     }
 
     #[test]
@@ -777,6 +1405,72 @@ mod erc_parse_tests {
             parse_erc_json(&serde_json::json!({ "violations": [{ "severity": "error" }] }))
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod gerber_export_tests {
+    use super::*;
+
+    #[test]
+    fn requested_layers_reach_kicad_as_one_csv_argument() {
+        let args = gerber_args(
+            "/out/gerbers",
+            "/tmp/board.kicad_pcb",
+            "F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts",
+        );
+        let layers = args
+            .iter()
+            .position(|argument| *argument == "--layers")
+            .map(|index| args[index + 1]);
+        assert_eq!(layers, Some("F.Cu,In1.Cu,B.Cu,F.Mask,B.Mask,Edge.Cuts"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn empty_layer_selection_keeps_the_flag_absent() {
+        let args = gerber_args("/out", "/tmp/board.kicad_pcb", "");
+        assert!(!args.contains(&"--layers"));
+    }
+}
+
+#[cfg(test)]
+mod position_export_tests {
+    use super::*;
+
+    fn flag<'a>(args: &'a [&str], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|argument| *argument == name)
+            .map(|index| args[index + 1])
+    }
+
+    #[test]
+    fn csv_units_and_side_reach_kicad_cli() {
+        let args = position_args(
+            "/out/positions.csv",
+            "/tmp/board.kicad_pcb",
+            "csv",
+            "mm",
+            "back",
+        );
+        assert_eq!(flag(&args, "--format"), Some("csv"));
+        assert_eq!(flag(&args, "--units"), Some("mm"));
+        assert_eq!(flag(&args, "--side"), Some("back"));
+        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+    }
+
+    #[test]
+    fn gerber_position_export_does_not_claim_a_units_flag() {
+        let args = position_args(
+            "/out/positions.gbr",
+            "/tmp/board.kicad_pcb",
+            "gerber",
+            "mm",
+            "front",
+        );
+        assert_eq!(flag(&args, "--format"), Some("gerber"));
+        assert_eq!(flag(&args, "--side"), Some("front"));
+        assert_eq!(flag(&args, "--units"), None);
     }
 }
 

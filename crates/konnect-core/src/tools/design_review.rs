@@ -5,6 +5,7 @@
 //!
 //! These tools work on the S-expression files directly — no KiCAD running required.
 
+use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
@@ -27,18 +28,13 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "audit_decoupling",
-            "Check that all ICs have appropriate decoupling capacitors. Finds power pins \
-             without nearby capacitors and flags wrong values. The #1 most common PCB design mistake.",
+            "Audit schematic connectivity between IC power nets and decoupling capacitors. \
+             This does not inspect PCB placement distance; use PCB clearance/placement tools \
+             for a physical review.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file (optional, for distance check)" },
-                    "max_distance_mm": {
-                        "type": "number",
-                        "description": "Max allowed distance from power pin to decoupling cap on PCB (mm)",
-                        "default": 5.0
-                    }
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" }
                 },
                 "required": ["schematic"]
             }),
@@ -91,9 +87,12 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "run_design_review",
             "Run all available audit checks and produce a consolidated design review report. \
-             Audits every reachable schematic sheet and reports status, coverage, and diagnostics. \
-             Returns an INCOMPLETE verdict instead of approval when coverage is partial or failed. \
-             This is the tool to call when the user asks 'is my board ready?' or 'review my design'.",
+             Audits every reachable schematic sheet, and when a board is supplied also runs \
+             KiCAD's DRC, folding its errors, unconnected items and schematic-parity findings \
+             into the verdict. Reports status, coverage, and diagnostics. Returns an INCOMPLETE \
+             verdict instead of approval when coverage is partial, when an audit failed, or \
+             when DRC could not run. This is the tool to call when the user asks 'is my board \
+             ready?' or 'review my design'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -228,6 +227,8 @@ async fn handle_audit_decoupling(
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "audit": "decoupling",
+            "scope": "schematic_connectivity",
+            "pcb_distance_checked": false,
             "findings": findings,
             "pass_count": pass_count,
             "total_power_pins": total_power_pins,
@@ -732,8 +733,10 @@ fn inspect_board_coverage(path: &Path) -> anyhow::Result<BoardReviewCoverage> {
     let content = std::fs::read_to_string(path)?;
     let tree = parse_sexp(&content)?;
     Ok(BoardReviewCoverage {
-        footprints: tree.find_all("footprint").len(),
-        pads: tree.find_all("pad").len(),
+        footprints: konnect_sexp::board::footprints(&tree).len(),
+        // Pads are nested inside each footprint, so asking the root for them
+        // returned 0 for every board this review has ever run on (#246).
+        pads: konnect_sexp::board::count_pads(&tree),
         named_nets: konnect_sexp::net::count_distinct_nets(&tree),
     })
 }
@@ -813,6 +816,7 @@ async fn handle_run_design_review(
     }
 
     let mut board_coverage = None;
+    let mut drc_summary = None;
     if let Some(board) = args["board"].as_str() {
         let board_path = PathBuf::from(board);
         match inspect_board_coverage(&board_path) {
@@ -822,6 +826,22 @@ async fn handle_run_design_review(
                         "code": "zero_footprints",
                         "source": board_path.display().to_string(),
                         "message": "the supplied board contains no footprints"
+                    }));
+                } else if coverage.pads == 0 {
+                    // A board with footprints and no pads is not a design, it
+                    // is a failed read. #185 added the zero-footprint and
+                    // zero-net diagnostics and missed this one, so an
+                    // impossible pad count was absorbed into a "complete"
+                    // review that then said LOOKS GOOD (#246).
+                    diagnostics.push(json!({
+                        "code": "zero_pads",
+                        "source": board_path.display().to_string(),
+                        "message": format!(
+                            "the supplied board has {} footprints but no pads; \
+                             the board was not read correctly, so this review \
+                             cannot speak for it",
+                            coverage.footprints
+                        )
                     }));
                 }
                 board_coverage = Some(coverage);
@@ -837,6 +857,53 @@ async fn handle_run_design_review(
         let result = handle_audit_manufacturing(args, ctx).await;
         manufacturing.record(&board_path, result, &mut diagnostics);
         audits.push(manufacturing);
+
+        // KiCad's own DRC is the authority on whether a board is clean, and
+        // this review never asked it. It ran four schematic audits plus a DFM
+        // check, found nothing, and said LOOKS GOOD about a board carrying 25
+        // DRC errors and an unrouted net (#247). A review that has not
+        // consulted DRC has not reviewed the board.
+        match cli::run_drc(&ctx.config.kicad_cli, &board_path, false).await {
+            Ok(report) => {
+                for missing in report.missing_categories() {
+                    diagnostics.push(json!({
+                        "code": "drc_category_not_reported",
+                        "source": board_path.display().to_string(),
+                        "message": format!(
+                            "kicad-cli did not report '{missing}', so this review \
+                             cannot speak to that class of problem"
+                        )
+                    }));
+                }
+                drc_summary = Some(json!({
+                    "errors": report.error_count(),
+                    "design_rule_violations": report.violations.len(),
+                    "unconnected_items": report.unconnected_items.as_ref().map(Vec::len),
+                    "schematic_parity": report.schematic_parity.as_ref().map(Vec::len),
+                }));
+                let mut drc = AuditAggregate::new("drc");
+                drc.completed += 1;
+                drc.findings.extend(report.all().map(|violation| {
+                    json!({
+                        "severity": violation.severity,
+                        "category": "drc",
+                        "rule": violation.rule,
+                        "message": violation.description,
+                        "location": violation.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                        "items": violation.items,
+                    })
+                }));
+                audits.push(drc);
+            }
+            Err(error) => diagnostics.push(json!({
+                "code": "drc_unavailable",
+                "source": board_path.display().to_string(),
+                "message": format!(
+                    "DRC could not run, so no verdict here accounts for design \
+                     rule violations or unrouted nets: {error:#}"
+                )
+            })),
+        }
     }
 
     let audit_summaries = audits
@@ -930,6 +997,11 @@ async fn handle_run_design_review(
                         "named_nets": coverage.named_nets
                     }))
                 },
+                // Null when no board was supplied, or when DRC could not run
+                // — in the latter case `diagnostics` says so and the verdict
+                // is INCOMPLETE. Never zero: this review must not be able to
+                // imply a clean board it did not check.
+                "drc": drc_summary,
                 "diagnostics": diagnostics
             }
         }))
@@ -1686,5 +1758,148 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|item| item["code"] == "zero_footprints"));
+    }
+
+    /// A board KiCad wrote, in KiCad's own tab-indented layout, with pads
+    /// where pads actually live: nested inside each `(footprint …)`.
+    fn board_with_two_pads() -> &'static str {
+        "(kicad_pcb\n\
+         \t(version 20260206)\n\
+         \t(generator \"pcbnew\")\n\
+         \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+         \t(footprint \"Resistor_SMD:R_0603_1608Metric\"\n\
+         \t\t(layer \"F.Cu\")\n\
+         \t\t(at 10 10)\n\
+         \t\t(pad \"1\" smd roundrect\n\t\t\t(at -0.8 0)\n\t\t\t(size 0.9 0.95)\n\t\t)\n\
+         \t\t(pad \"2\" smd roundrect\n\t\t\t(at 0.8 0)\n\t\t\t(size 0.9 0.95)\n\t\t)\n\
+         \t)\n\
+         )"
+    }
+
+    /// #247: this review never consulted DRC. It ran four schematic audits
+    /// plus a DFM check, found nothing, and said `LOOKS GOOD` about a board
+    /// carrying 25 DRC errors and an unrouted net.
+    ///
+    /// The test context has no kicad-cli, so DRC cannot run — which is the
+    /// case that matters: missing evidence must produce `INCOMPLETE`, not a
+    /// verdict that quietly means "clean except for everything I didn't
+    /// check".
+    #[tokio::test]
+    async fn a_board_review_without_drc_evidence_cannot_look_good() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("two_pads.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(&board, board_with_two_pads()).unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+
+        assert_eq!(report["status"], "partial");
+        assert_eq!(
+            report["verdict"],
+            "INCOMPLETE — review could not evaluate the full design"
+        );
+        assert!(report["drc"].is_null(), "no DRC ran, so no DRC summary");
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "drc_unavailable"));
+    }
+
+    /// A schematic-only review is unaffected: DRC is required when a board is
+    /// in scope, not always. Otherwise this change would make every
+    /// schematic review permanently INCOMPLETE.
+    #[tokio::test]
+    async fn a_schematic_only_review_does_not_need_drc() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+
+        let result = review(&root, None).await;
+        let report = &result["design_review"];
+        assert_eq!(report["status"], "complete");
+        assert!(!report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "drc_unavailable"));
+    }
+
+    /// #246: `find_all` is direct-children-only and pads are nested, so the
+    /// old `tree.find_all("pad")` on the board root reported 0 for every board
+    /// ever reviewed — including this one, which plainly has two.
+    #[tokio::test]
+    async fn board_coverage_counts_pads_inside_footprints() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("two_pads.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(&board, board_with_two_pads()).unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["board"]["footprints"], 1);
+        assert_eq!(report["coverage"]["board"]["pads"], 2);
+        assert!(
+            !report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["code"] == "zero_pads"),
+            "a board with pads must not be flagged as unread: {report}"
+        );
+    }
+
+    /// Footprints but no pads is not a design, it is a failed read — and #185's
+    /// coverage guard checked footprints and nets but never pads, so the
+    /// impossible count passed straight through to a `LOOKS GOOD` verdict.
+    #[tokio::test]
+    async fn a_board_whose_footprints_have_no_pads_cannot_be_reviewed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("clean.kicad_sch");
+        let board = tmp.path().join("padless.kicad_pcb");
+        std::fs::write(
+            &root,
+            single_unit_schematic("Resistor_SMD:R_0603_1608Metric"),
+        )
+        .unwrap();
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(version 20260206)\n\
+             \t(generator \"pcbnew\")\n\
+             \t(footprint \"Resistor_SMD:R_0603_1608Metric\"\n\
+             \t\t(layer \"F.Cu\")\n\
+             \t\t(at 10 10)\n\
+             \t)\n\
+             )",
+        )
+        .unwrap();
+
+        let result = review(&root, Some(&board)).await;
+        let report = &result["design_review"];
+        assert_eq!(report["coverage"]["board"]["footprints"], 1);
+        assert_eq!(report["coverage"]["board"]["pads"], 0);
+        assert_eq!(report["status"], "partial");
+        assert_ne!(report["verdict"], "LOOKS GOOD — no critical issues found");
+        assert!(report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "zero_pads"));
     }
 }

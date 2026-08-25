@@ -211,14 +211,21 @@ Zone tools live in the `pcb_board` toolset.
 Creates a copper pour area (polygon fill).
 
 ```
-add_zone(board, net_name, layer, points, clearance?, min_width?)
+add_zone(board, net_name, layer, points, clearance?, min_width?,
+         name?, priority?, pad_connection?)
 ```
 
 - Almost always GND net on both F.Cu and B.Cu
 - `points` is the outline polygon; define it slightly inside the board edge
   (0.5mm inset)
-- There is no priority argument, and no `(priority …)` is written, so every
-  zone takes KiCad's default. Set priority in KiCad if two pours overlap
+- `priority` defaults to 0; the higher priority wins where two pours overlap
+- `pad_connection` is `solid` | `thermal` | `none`, defaulting to `thermal`
+  as KiCad does
+- With KiCad running on this board the zone is created over IPC and refilled
+  for you, so it appears at once and is in KiCad's undo stack. Without a live
+  KiCad it goes into the file instead, and the result says so (`source: file`)
+  and carries a `warning` — a file-only edit is invisible to an open pcbnew
+  and is lost on its next save
 
 ### refill_zones
 

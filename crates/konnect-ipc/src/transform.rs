@@ -279,19 +279,22 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
     };
 
     for item in def.items.iter_mut() {
-        let url = item.type_url.as_str();
-        if url.ends_with("kiapi.board.types.Pad") {
+        // Discriminate on the declared type, never on whether a decode
+        // happens to succeed — see `builders::any_is` for why that distinction
+        // cost every synced footprint its graphics (#244).
+        let url = crate::builders::any_type_name(item);
+        if url == "kiapi.board.types.Pad" {
             let mut pad = board::Pad::decode(item.value.as_slice())?;
             xform_vec2(&mut pad.position, xf);
             if let Some(ps) = pad.pad_stack.as_mut() {
                 xform_angle(&mut ps.angle, xf);
             }
             item.value = pad.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.BoardText") {
+        } else if url == "kiapi.board.types.BoardText" {
             let mut text = board::BoardText::decode(item.value.as_slice())?;
             xform_board_text(&mut text, xf);
             item.value = text.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.BoardTextBox") {
+        } else if url == "kiapi.board.types.BoardTextBox" {
             if !xf.is_cardinal() {
                 anyhow::bail!(
                     "cannot rotate a footprint containing a textbox by a \
@@ -307,27 +310,25 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
                 }
             }
             item.value = tb.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.Field") {
+        } else if url == "kiapi.board.types.Field" {
             let mut field = board::Field::decode(item.value.as_slice())?;
             if let Some(text) = field.text.as_mut() {
                 xform_board_text(text, xf);
             }
             item.value = field.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.BoardGraphicShape") {
+        } else if url == "kiapi.board.types.BoardGraphicShape" {
             let mut shape = board::BoardGraphicShape::decode(item.value.as_slice())?;
             xform_graphic_shape(&mut shape, xf)?;
             item.value = shape.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.Zone") {
+        } else if url == "kiapi.board.types.Zone" {
             let mut zone = board::Zone::decode(item.value.as_slice())?;
             xform_zone(&mut zone, xf);
             item.value = zone.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.Dimension") {
+        } else if url == "kiapi.board.types.Dimension" {
             let mut dim = board::Dimension::decode(item.value.as_slice())?;
             xform_dimension(&mut dim, xf);
             item.value = dim.encode_to_vec();
-        } else if url.ends_with("kiapi.board.types.Footprint3DModel")
-            || url.ends_with("kiapi.board.types.Group")
-        {
+        } else if url == "kiapi.board.types.Footprint3DModel" || url == "kiapi.board.types.Group" {
             // No board-space geometry of their own — nothing to shift.
         } else {
             // KiCAD would re-create this item wherever the stale message

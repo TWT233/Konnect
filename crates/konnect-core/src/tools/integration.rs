@@ -1,7 +1,8 @@
-//! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting autorouter.
+//! `integration` toolset — JLCPCB parts database, datasheet enrichment, and Freerouting discovery.
 //!
 //! JLCPCB tools query a local SQLite cache of the JLCPCB parts database.
-//! Freerouting wraps the Freerouting JAR via subprocess.
+//! Freerouting discovery locates the JAR and verifies the Java runtime. Konnect
+//! does not advertise an autorouter until it has a real PCB-editor bridge.
 //! Datasheet enrichment uses the LCSC HTTP API.
 //!
 //! The three network calls (JLCPCB database download, LCSC datasheet lookups)
@@ -128,23 +129,8 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_get_datasheet_url(args, ctx).await }
         ),
         tool!(
-            "autoroute",
-            "Run Freerouting autorouter on the PCB: export DSN → autoroute → import SES result.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
-                    "passes": { "type": "integer", "description": "Number of autorouter passes", "default": 3 },
-                    "timeout_seconds": { "type": "integer", "description": "Maximum autorouter runtime in seconds", "default": 120 },
-                    "jar_path": { "type": "string", "description": "Path to freerouting.jar (optional, uses config default)" }
-                },
-                "required": ["board"]
-            }),
-            |args, ctx| async move { handle_autoroute(args, ctx).await }
-        ),
-        tool!(
             "check_freerouting",
-            "Verify that the Freerouting JAR is available and return its version.",
+            "Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available.",
             json!({
                 "type": "object",
                 "properties": {
@@ -589,7 +575,7 @@ async fn handle_search_jlcpcb_parts(
         // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
         // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
         let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE (Description LIKE ?1 OR MFR_Part LIKE ?1)"
         );
         if basic_only {
@@ -633,6 +619,13 @@ async fn handle_search_jlcpcb_parts(
 }
 
 fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    // The exact LCSC PDF URL for most parts. Omitted here once made a caller
+    // unable to get a datasheet the table already held (#255); an empty cell
+    // reads as null rather than "" so callers can test presence directly.
+    let datasheet_url = match row.get::<_, String>(6).unwrap_or_default() {
+        url if url.is_empty() => serde_json::Value::Null,
+        url => json!(url),
+    };
     Ok(json!({
         "lcsc": row.get::<_, String>(0).unwrap_or_default(),
         "mpn": row.get::<_, String>(1).unwrap_or_default(),
@@ -640,8 +633,9 @@ fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         "manufacturer": row.get::<_, String>(3).unwrap_or_default(),
         "library_type": row.get::<_, String>(4).unwrap_or_default(),
         "description": row.get::<_, String>(5).unwrap_or_default(),
-        "price": row.get::<_, f64>(6).unwrap_or(0.0),
-        "stock": row.get::<_, i64>(7).unwrap_or(0)
+        "datasheet_url": datasheet_url,
+        "price": row.get::<_, f64>(7).unwrap_or(0.0),
+        "stock": row.get::<_, i64>(8).unwrap_or(0)
     }))
 }
 
@@ -671,7 +665,7 @@ async fn handle_get_jlcpcb_part(
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
             let conn = rusqlite::Connection::open(&db_path)?;
             let mut stmt = conn.prepare(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE LCSC = ?1 LIMIT 1"
         )?;
             let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
@@ -748,7 +742,7 @@ async fn handle_suggest_alternatives(
         let like_pkg = format!("%{}%", package_hint);
 
         let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
         );
         if let Some(max_p) = max_price {
@@ -923,15 +917,70 @@ async fn handle_enrich_datasheets(
     ))
 }
 
+/// The datasheet URL from the local JLCPCB catalog, keyed by LCSC ID or MPN.
+/// The database Konnect already downloads carries the exact LCSC PDF URL in
+/// its `Datasheet` column for most parts, so a hit here answers without a
+/// network round trip. `Ok(None)` is an ordinary miss; `Err` means the
+/// database could not be read at all.
+async fn datasheet_from_catalog(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    lcsc_id: Option<&str>,
+    mpn: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let db_path = resolve_db_path(args, ctx);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let lcsc_id = lcsc_id.map(String::from);
+    let mpn = mpn.map(String::from);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let (sql, param): (&str, String) = match (&lcsc_id, &mpn) {
+            // An LCSC ID is the primary key shape, so it wins when both are
+            // given — same precedence the web path used.
+            (Some(id), _) => (
+                "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
+                id.clone(),
+            ),
+            (None, Some(mpn)) => (
+                "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
+                mpn.clone(),
+            ),
+            // Unreachable: the caller rejects both-absent before calling.
+            (None, None) => return Ok(None),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query_map(rusqlite::params![param], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?.filter(|url| !url.is_empty()))
+    })
+    .await?
+}
+
 async fn handle_get_datasheet_url(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let mpn = args["mpn"].as_str();
     let lcsc_id = args["lcsc_id"].as_str();
 
     if mpn.is_none() && lcsc_id.is_none() {
         return Ok(CallToolResult::error("Provide either 'mpn' or 'lcsc_id'"));
+    }
+
+    // The local catalog first: it already holds exact URLs, so a hit saves a
+    // network round trip and works offline. Only a miss falls through to the
+    // live LCSC API.
+    if let Ok(Some(url)) = datasheet_from_catalog(args, ctx, lcsc_id, mpn).await {
+        return Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "mpn": mpn,
+                "lcsc_id": lcsc_id,
+                "datasheet_url": url,
+                "source": "local_catalog"
+            }))
+            .unwrap(),
+        ));
     }
 
     let client = reqwest::Client::builder()
@@ -954,7 +1003,8 @@ async fn handle_get_datasheet_url(
                         return Ok(CallToolResult::text(
                             serde_json::to_string(&json!({
                                 "lcsc_id": id,
-                                "datasheet_url": ds_url
+                                "datasheet_url": ds_url,
+                                "source": "lcsc_api"
                             }))
                             .unwrap(),
                         ));
@@ -964,12 +1014,23 @@ async fn handle_get_datasheet_url(
         }
     }
 
+    // Both sources missed — say which were tried, not just that the answer
+    // is null (#255).
+    let mut tried = vec![];
+    if resolve_db_path(&serde_json::Value::Null, ctx).exists() {
+        tried.push("local catalog");
+    } else {
+        tried.push("local catalog (database not downloaded)");
+    }
+    if lcsc_id.is_some() {
+        tried.push("LCSC API");
+    }
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "mpn": mpn,
             "lcsc_id": lcsc_id,
             "datasheet_url": null,
-            "note": "Datasheet not found via LCSC API"
+            "note": format!("Datasheet not found via {}", tried.join(" or "))
         }))
         .unwrap(),
     ))
@@ -977,37 +1038,133 @@ async fn handle_get_datasheet_url(
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────
 
-fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
-    if let Some(p) = args["jar_path"].as_str() {
-        return Some(PathBuf::from(p));
-    }
-    // Common locations
-    let candidates = [
-        "freerouting.jar",
-        "/usr/local/lib/freerouting/freerouting.jar",
-        "/opt/freerouting/freerouting.jar",
-    ];
-    for c in &candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+fn is_freerouting_jar(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("freerouting"))
 }
 
-async fn handle_autoroute(
-    _args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    // ponytail: Freerouting workflow requires Specctra DSN export + SES import,
-    // both of which were removed from kicad-cli in KiCAD 10. The tool stays in the
-    // registry so callers get a clear error; remove entirely once IPC round-trip lands.
-    Ok(CallToolResult::error(
-        "Autoroute via Freerouting is not available: kicad-cli in KiCAD 10 no longer \
-         supports Specctra DSN export or SES import. Use KiCAD's PCB editor \
-         (File > Export > Specctra DSN, then File > Import > Specctra Session) manually.",
-    ))
+fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<PathBuf> {
+    if is_freerouting_jar(root) {
+        return Some(root.to_path_buf());
+    }
+    if remaining_depth == 0 || !root.is_dir() {
+        return None;
+    }
+
+    let mut entries = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    entries
+        .iter()
+        .find(|path| is_freerouting_jar(path))
+        .cloned()
+        .or_else(|| {
+            entries.into_iter().find_map(|path| {
+                let file_type = std::fs::symlink_metadata(&path).ok()?.file_type();
+                file_type
+                    .is_dir()
+                    .then(|| find_freerouting_jar_below(&path, remaining_depth - 1))
+                    .flatten()
+            })
+        })
+}
+
+fn freerouting_search_roots() -> Vec<(PathBuf, usize)> {
+    let mut roots = Vec::new();
+
+    for variable in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"] {
+        if let Some(path) = std::env::var_os(variable) {
+            roots.push((PathBuf::from(path), 5));
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for version in ["10.0", "9.0", "8.0"] {
+            roots.push((
+                home.join("Documents")
+                    .join("KiCad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+            roots.push((
+                home.join(".local")
+                    .join("share")
+                    .join("kicad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        for version in ["10.0", "9.0", "8.0"] {
+            roots.push((
+                profile
+                    .join("Documents")
+                    .join("KiCad")
+                    .join(version)
+                    .join("3rdparty")
+                    .join("plugins"),
+                5,
+            ));
+        }
+    }
+
+    roots.extend([
+        (PathBuf::from("freerouting.jar"), 0),
+        (PathBuf::from("/usr/local/lib/freerouting"), 3),
+        (PathBuf::from("/opt/freerouting"), 3),
+    ]);
+    if let Some(path) = std::env::var_os("PATH") {
+        roots.extend(std::env::split_paths(&path).map(|directory| (directory, 1)));
+    }
+    roots
+}
+
+fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
+    if let Some(path) = args["jar_path"].as_str() {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+
+    freerouting_search_roots()
+        .into_iter()
+        .find_map(|(root, depth)| find_freerouting_jar_below(&root, depth))
+}
+
+fn command_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn run_java_command(
+    command: &mut tokio::process::Command,
+) -> Result<std::process::Output, String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("Java command timed out after 10 seconds".to_string()),
+    }
 }
 
 async fn handle_check_freerouting(
@@ -1025,30 +1182,76 @@ async fn handle_check_freerouting(
             .unwrap(),
         )),
         Some(jar_path) => {
-            // Try to get version from java -jar freerouting.jar --version
-            let output = tokio::process::Command::new("java")
-                .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
-                .output()
-                .await;
-
-            let version = match output {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    format!("{}{}", stdout.trim(), stderr.trim())
+            let mut java_command = tokio::process::Command::new("java");
+            java_command.arg("-version");
+            let java = match run_java_command(&mut java_command).await {
+                Ok(output) => output,
+                Err(error) => {
+                    return Ok(CallToolResult::json(&json!({
+                        "available": false,
+                        "jar_path": jar_path,
+                        "java_available": false,
+                        "note": error
+                    })));
                 }
-                Err(e) => format!("java not available: {e}"),
+            };
+            if !java.status.success() {
+                return Ok(CallToolResult::json(&json!({
+                    "available": false,
+                    "jar_path": jar_path,
+                    "java_available": false,
+                    "java_output": command_output(&java),
+                    "note": "Freerouting was found, but Java did not start successfully"
+                })));
+            }
+
+            let mut freerouting_command = tokio::process::Command::new("java");
+            freerouting_command.args(["-jar", jar_path.to_str().unwrap_or(""), "--version"]);
+            let freerouting = run_java_command(&mut freerouting_command).await;
+            let (version_checked, version_output) = match freerouting {
+                Ok(output) => (output.status.success(), command_output(&output)),
+                Err(error) => (false, error),
             };
 
-            Ok(CallToolResult::text(
-                serde_json::to_string(&json!({
-                    "available": true,
-                    "jar_path": jar_path.to_str().unwrap_or(""),
-                    "version_output": version
-                }))
-                .unwrap(),
-            ))
+            Ok(CallToolResult::json(&json!({
+                "available": true,
+                "jar_path": jar_path,
+                "java_available": true,
+                "java_output": command_output(&java),
+                "version_checked": version_checked,
+                "version_output": version_output
+            })))
         }
+    }
+}
+
+#[cfg(test)]
+mod freerouting_tests {
+    use super::*;
+
+    #[test]
+    fn finds_versioned_jar_inside_pcm_plugin_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("app_freerouting_kicad-plugin").join("lib");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let jar = plugin.join("freerouting-2.3.0.jar");
+        std::fs::write(&jar, b"fixture").unwrap();
+
+        assert_eq!(find_freerouting_jar_below(temp.path(), 5), Some(jar));
+    }
+
+    #[test]
+    fn explicit_missing_jar_does_not_claim_availability() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.jar");
+        assert_eq!(find_freerouting_jar(&json!({ "jar_path": missing })), None);
+    }
+
+    #[test]
+    fn ignores_unrelated_jars() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("other.jar"), b"fixture").unwrap();
+        assert_eq!(find_freerouting_jar_below(temp.path(), 5), None);
     }
 }
 
@@ -1329,14 +1532,14 @@ mod jlcpcb_cache_tests {
         conn.execute(
             "CREATE TABLE components (
                 LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT,
-                Library_Type TEXT, Description TEXT, Price REAL, Stock INTEGER,
-                Category TEXT
+                Library_Type TEXT, Description TEXT, Datasheet TEXT,
+                Price REAL, Stock INTEGER, Category TEXT
             )",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 "C14663",
                 "RC0402FR-0710KL",
@@ -1344,6 +1547,7 @@ mod jlcpcb_cache_tests {
                 "YAGEO",
                 "Basic",
                 "10k resistor 0402",
+                "https://www.lcsc.com/datasheet/C14663.pdf",
                 0.01,
                 5000,
                 "Resistors / Chip Resistor - Surface Mount"
@@ -1426,5 +1630,84 @@ mod jlcpcb_cache_tests {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             _ => panic!("expected text content"),
         }
+    }
+
+    /// The defect in #255: the local catalog holds exact datasheet URLs, but
+    /// get_datasheet_url only ever asked the live LCSC API and returned null.
+    /// A catalog hit must answer directly — no network involved.
+    #[tokio::test]
+    async fn get_datasheet_url_answers_from_the_local_catalog() {
+        let (_dir, db_path) = seed_test_db();
+        let ctx = test_ctx();
+
+        let by_lcsc = handle_get_datasheet_url(
+            &json!({ "lcsc_id": "C14663", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body = response_json(&by_lcsc);
+        assert_eq!(
+            body["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+        assert_eq!(body["source"], json!("local_catalog"));
+
+        let by_mpn = handle_get_datasheet_url(
+            &json!({ "mpn": "RC0402FR-0710KL", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&by_mpn)["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+    }
+
+    /// The catalog projections hid the column too — a caller could not get a
+    /// URL from part lookup either.
+    #[tokio::test]
+    async fn catalog_lookups_carry_the_datasheet_url() {
+        let (_dir, db_path) = seed_test_db();
+        let ctx = test_ctx();
+
+        let part = handle_get_jlcpcb_part(
+            &json!({ "lcsc_id": "C14663", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&part)["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+
+        let search = handle_search_jlcpcb_parts(
+            &json!({ "query": "10k", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&search)["results"][0]["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+    }
+
+    /// With no database at all the tool degrades to its old behaviour — web
+    // lookup (unreachable in tests), then null with a note naming what was
+    // tried rather than blaming only the API (#255).
+    #[tokio::test]
+    async fn a_catalog_miss_falls_through_and_the_note_names_the_sources() {
+        let ctx = test_ctx(); // jlcpcb_db_path: None → default path absent
+
+        let result = handle_get_datasheet_url(&json!({ "lcsc_id": "C99999999" }), &ctx)
+            .await
+            .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["datasheet_url"], serde_json::Value::Null);
+        let note = body["note"].as_str().unwrap();
+        assert!(note.contains("local catalog"), "{note}");
     }
 }

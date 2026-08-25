@@ -2,6 +2,10 @@
 
 Internal reference for developing and maintaining the Rust port.
 
+New to the codebase? Start with the map in
+[docs/DEVELOPER_OVERVIEW.md](docs/DEVELOPER_OVERVIEW.md), then return here for
+the detailed implementation reference and current statistics.
+
 Repository-wide naming, public API, branch, and pull-request rules live in
 [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md).
 
@@ -88,7 +92,7 @@ Konnect/
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 17 tools (IPC real-time + safe headless single-placement fallback)
+│   │           ├── pcb_components.rs # 18 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
@@ -96,7 +100,7 @@ Konnect/
 │   │           ├── footprint_graphics.rs # footprint primitive validation, inspection, and atomic edits
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
-│   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting, datasheets)
+│   │           ├── integration.rs    # 8 tools (JLCPCB SQLite, Freerouting discovery, datasheets)
 │   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
@@ -299,7 +303,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 204 tools (210 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 205 tools (211 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -374,9 +378,11 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **19 toolsets, 204 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **19 toolsets, 205 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 210 tools (204 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 211 tools (205 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
-- **3 CLI commands removed in KiCAD v10** (specctra DSN/SES, pcb sync — return clear errors)
+- **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect
+  therefore does not advertise autorouting until it has a real editor bridge; the
+  `check_freerouting` diagnostic still discovers PCM installations and Java.

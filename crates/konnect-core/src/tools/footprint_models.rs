@@ -258,7 +258,10 @@ fn prepare_mutation(source: &str, request: &ModelRequest) -> Result<PreparedMuta
     let root = konnect_sexp::parse_sexp(source)
         .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
     if root.head() != Some("footprint") {
-        return Err(invalid("footprint_path", "file root must be a footprint"));
+        return Err(invalid(
+            "footprint_path",
+            crate::tools::footprint_root_reason(root.head()),
+        ));
     }
 
     let mut selected = Vec::new();
@@ -464,6 +467,31 @@ mod tests {
     (rotate (xyz 0 0 90)))
 )
 "#;
+
+    /// Regression for #304: a pre-6.0 `(module ...)` root was refused with the
+    /// generic message, which reads like a dead end when `kicad-cli fp upgrade`
+    /// migrates the file in one command. The refusal stays; the message names
+    /// the way out.
+    #[test]
+    fn module_root_refusal_names_the_migration() {
+        let legacy = "(module TRIM_PART (layer F.Cu) (tedit 62174BF4)\n  (pad 1 smd rect (at 0 0) (size 1 1) (layers F.Cu)))\n";
+        let request = ModelRequest {
+            mode: ModelMode::Delete,
+            models: Vec::new(),
+        };
+        let err = prepare_mutation(legacy, &request).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("pre-6.0"),
+            "must name the legacy format: {msg}"
+        );
+        assert!(msg.contains("fp upgrade"), "must name the migration: {msg}");
+        // Anything else that is not a footprint keeps the generic message.
+        let err = prepare_mutation("(kicad_pcb)", &request).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("must be a footprint"), "{msg}");
+        assert!(!msg.contains("fp upgrade"), "{msg}");
+    }
 
     fn test_ctx() -> ToolContext {
         ToolContext::new(

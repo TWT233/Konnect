@@ -10,11 +10,19 @@ use std::path::Path;
 
 // ─── Schematic file I/O ───────────────────────────────────────────────────────
 
-/// Create a minimal standalone schematic with a fresh root UUID.
+/// Create a minimal standalone schematic with a fresh root UUID, on A4.
 #[must_use]
 pub fn format_blank_schematic() -> String {
+    format_blank_schematic_with_paper("A4", false)
+}
+
+/// Same, on the given KiCad paper size. The caller validates the name: an
+/// unknown one makes KiCad reject the file.
+#[must_use]
+pub fn format_blank_schematic_with_paper(size: &str, portrait: bool) -> String {
+    let orientation = if portrait { " portrait" } else { "" };
     format!(
-        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"A4\")\n\t(lib_symbols\n\t)\n)\n",
+        "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(generator_version \"10.0\")\n\t(uuid \"{}\")\n\t(paper \"{size}\"{orientation})\n\t(lib_symbols\n\t)\n)\n",
         crate::writer::new_uuid()
     )
 }
@@ -110,7 +118,28 @@ fn extract_schematic_lines(tree: &SexpNode, kind: &str) -> Vec<Wire> {
 
 /// Extract all junction dot positions from a parsed schematic tree.
 pub fn extract_junctions(tree: &SexpNode) -> Vec<(f64, f64)> {
-    tree.find_all("junction")
+    at_positions(tree.find_all("junction"))
+}
+
+/// Extract all no-connect flag positions from a parsed schematic tree.
+pub fn extract_no_connects(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(tree.find_all("no_connect"))
+}
+
+/// Extract every hierarchical sheet pin position. A wire terminating on one
+/// leaves the sheet rather than dangling.
+pub fn extract_sheet_pins(tree: &SexpNode) -> Vec<(f64, f64)> {
+    at_positions(
+        tree.find_all("sheet")
+            .iter()
+            .flat_map(|sheet| sheet.find_all("pin"))
+            .collect(),
+    )
+}
+
+/// The `(at x y …)` position of each node that has one.
+fn at_positions(nodes: Vec<&SexpNode>) -> Vec<(f64, f64)> {
+    nodes
         .iter()
         .filter_map(|node| {
             let at = node.find("at")?;
@@ -319,12 +348,72 @@ pub fn find_lib_symbol<'a>(
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(want))
 }
 
+/// Every net-naming item on the sheet: [`extract_labels`] plus
+/// [`extract_power_symbol_labels`]. This is what a net graph wants.
+pub fn extract_all_net_labels(tree: &SexpNode) -> Vec<Label> {
+    let mut labels = extract_labels(tree);
+    labels.extend(extract_power_symbol_labels(tree));
+    labels
+}
+
+/// Every power symbol on the sheet, as the [`Label`] it electrically is.
+///
+/// A `power:GND` symbol names the net it touches exactly as a label does —
+/// KiCAD takes the name from the placed symbol's `Value`, which is why editing
+/// that field re-rails the connection. Feed these to the net graph alongside
+/// [`extract_labels`] or the rails come back unnamed.
+///
+/// Only `power_in` pins name a net, which is eeschema's own rule and what keeps
+/// `PWR_FLAG` — a power symbol whose pin is `power_out` — from renaming the rail
+/// it flags. Symbols whose definition is not embedded in `lib_symbols` are
+/// skipped: without it there is no pin to place the label on.
+pub fn extract_power_symbol_labels(tree: &SexpNode) -> Vec<Label> {
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+
+    let mut labels = Vec::new();
+    for inst in extract_symbol_instances(tree) {
+        if inst.value.is_empty() {
+            continue;
+        }
+        let Some(sym) = find_lib_symbol(&lib_syms, &inst) else {
+            continue;
+        };
+        // KiCAD marks a power symbol with `(power)` — `(power global)` or
+        // `(power local)` since KiCAD 9.
+        if sym.find("power").is_none() {
+            continue;
+        }
+        let t = inst.pin_transform();
+        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+            if pin.electrical_type != "power_in" {
+                continue;
+            }
+            let (x, y) = pin_endpoint(&pin, t);
+            labels.push(Label {
+                kind: LabelKind::PowerSymbol,
+                net: inst.value.clone(),
+                x,
+                y,
+                rotation: inst.rotation,
+                uuid: inst.uuid.clone(),
+            });
+        }
+    }
+    labels
+}
+
 // ─── Pin in library symbol ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct LibPin {
     pub number: String,
     pub name: String,
+    /// KiCAD's electrical type — `power_in`, `passive`, `no_connect`, … — read
+    /// from `(pin <type> <style> …)`. Empty when the pin declares none.
+    pub electrical_type: String,
     /// Position in symbol-local Y-up space (mm).
     pub local_x: f64,
     pub local_y: f64,
@@ -415,9 +504,15 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
+    let electrical_type = node
+        .get(1)
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
     Some(LibPin {
         number,
         name,
+        electrical_type,
         local_x: x,
         local_y: y,
         rotation,
@@ -706,6 +801,74 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
 }
 
 #[cfg(test)]
+mod power_symbol_tests {
+    use super::*;
+
+    /// A sheet holding a `power:GND`, a `PWR_FLAG` (power symbol too, but with
+    /// a `power_out` pin) and a plain `Device:R` that must be ignored for not
+    /// being a power symbol at all. Library bodies are shaped like KiCAD 10's
+    /// own — `(power global)`, pin in a `_1_1` sub-symbol at the anchor.
+    fn sheet() -> SexpNode {
+        let power_lib = |name: &str, pin_type: &str| {
+            format!(
+                "(symbol \"power:{name}\"\n  (power global)\n  (symbol \"{name}_1_1\"\n    (pin {pin_type} line (at 0 0 270) (length 0)\n      (name \"\") (number \"1\")\n    )\n  )\n)"
+            )
+        };
+        let placed = |lib_id: &str, reference: &str, value: &str, x: f64| {
+            format!(
+                "(symbol\n  (lib_id \"{lib_id}\")\n  (at {x} 60 0)\n  (unit 1)\n  (uuid \"{reference}\")\n  (property \"Reference\" \"{reference}\" (at {x} 60 0))\n  (property \"Value\" \"{value}\" (at {x} 60 0))\n)"
+            )
+        };
+        let sch = format!(
+            "(kicad_sch\n  (lib_symbols\n    {}\n    {}\n    (symbol \"Device:R\"\n      (symbol \"R_1_1\"\n        (pin passive line (at 0 3.81 270) (length 1.27)\n          (name \"~\") (number \"1\")\n        )\n      )\n    )\n  )\n  {}\n  {}\n  {}\n)",
+            power_lib("GND", "power_in"),
+            power_lib("PWR_FLAG", "power_out"),
+            placed("power:GND", "#PWR01", "GND", 50.0),
+            placed("power:PWR_FLAG", "#FLG01", "PWR_FLAG", 70.0),
+            placed("Device:R", "R1", "10k", 90.0),
+        );
+        parse_sexp(&sch).unwrap()
+    }
+
+    #[test]
+    fn power_symbols_become_labels_at_their_pin() {
+        let labels = extract_power_symbol_labels(&sheet());
+        assert_eq!(labels.len(), 1, "only the GND symbol names a net");
+        let l = &labels[0];
+        assert_eq!(l.net, "GND");
+        assert_eq!(l.kind, LabelKind::PowerSymbol);
+        // The pin sits at the symbol anchor, so the label lands on the point a
+        // wire connects to.
+        assert_eq!((l.x, l.y), (50.0, 60.0));
+    }
+
+    #[test]
+    fn pwr_flag_never_names_the_rail_it_flags() {
+        // It is a power symbol, and its Value is "PWR_FLAG" — taking that as a
+        // net name would rename whatever rail it is attached to. Its pin is
+        // power_out, which is exactly how eeschema tells the two apart.
+        let labels = extract_power_symbol_labels(&sheet());
+        assert!(labels.iter().all(|l| l.net != "PWR_FLAG"));
+    }
+
+    #[test]
+    fn rotation_carries_the_pin_around_the_anchor() {
+        // GND rotated 90° with the pin 2.54 mm off the anchor: the label must
+        // follow the pin, not the placement point.
+        let sch = "(kicad_sch\n  (lib_symbols\n    (symbol \"power:GND\"\n      (power global)\n      (symbol \"GND_1_1\"\n        (pin power_in line (at 0 2.54 270) (length 0) (name \"\") (number \"1\"))\n      )\n    )\n  )\n  (symbol\n    (lib_id \"power:GND\")\n    (at 50 60 90)\n    (unit 1)\n    (uuid \"p1\")\n    (property \"Reference\" \"#PWR01\" (at 50 60 0))\n    (property \"Value\" \"GND\" (at 50 60 0))\n  )\n)";
+        let labels = extract_power_symbol_labels(&parse_sexp(sch).unwrap());
+        assert_eq!(labels.len(), 1);
+        assert_eq!((labels[0].x, labels[0].y), (47.46, 60.0));
+    }
+
+    #[test]
+    fn a_symbol_without_its_library_body_is_skipped() {
+        let sch = "(kicad_sch\n  (lib_symbols)\n  (symbol\n    (lib_id \"power:GND\")\n    (at 50 60 0)\n    (unit 1)\n    (uuid \"p1\")\n    (property \"Reference\" \"#PWR01\" (at 50 60 0))\n    (property \"Value\" \"GND\" (at 50 60 0))\n  )\n)";
+        assert!(extract_power_symbol_labels(&parse_sexp(sch).unwrap()).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod unit_pin_tests {
     use super::*;
 
@@ -774,6 +937,24 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_preserves_the_electrical_pin_type() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin no_connect line (at 0 0 0) (length 0)
+      (name "NC" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27)))))))"#,
+        )
+        .unwrap();
+        let pin = extract_lib_pins(root.find("symbol").unwrap())
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(pin.electrical_type, "no_connect");
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));
@@ -796,6 +977,7 @@ mod pin_endpoint_tests {
         LibPin {
             number: number.to_string(),
             name: "~".to_string(),
+            electrical_type: "passive".to_string(),
             local_x: 0.0,
             local_y,
             rotation,
@@ -1030,6 +1212,7 @@ mod pin_label_rotation_tests {
         LibPin {
             number: "1".into(),
             name: "PIN".into(),
+            electrical_type: "passive".into(),
             // Tip sits 10 mm out from the origin, opposite the way it points.
             local_x: -10.0 * rad.cos(),
             local_y: -10.0 * rad.sin(),

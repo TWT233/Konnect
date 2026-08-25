@@ -7,10 +7,13 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 - Meta-tool definitions: `crates/konnect-core/src/router/meta_tools.rs` (`meta_tool_descriptions()`)
 - Per-tool names + descriptions: `crates/konnect-core/src/tools/<toolset>.rs` (each `tool!(…)` in the `tools()` vec)
 
+Compatibility notes for removed or narrowed arguments are recorded in
+[`docs/API_MIGRATIONS.md`](docs/API_MIGRATIONS.md).
+
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **204 registered tools** + **6 always-visible meta-tools** = **210 total**
+- **205 registered tools** + **6 always-visible meta-tools** = **211 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -45,7 +48,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `create_project` | Create a new KiCAD project at the given path. Creates the directory, a blank `.kicad_pro`, empty `.kicad_sch`, and blank `.kicad_pcb`; refuses to replace any existing project file. |
-| `open_project` | Check whether a KiCAD project is currently open in the running KiCAD UI. Returns the active project path and whether KiCAD IPC is available. |
+| `open_project` | List PCB documents open in the running KiCad UI and optionally check a specific `.kicad_pro` or `.kicad_pcb` path over IPC. |
 | `save_project` | Save the currently open PCB board file via KiCAD IPC. Requires KiCAD to be running with IPC enabled. |
 | `get_project_info` | Read project metadata from a `.kicad_pro` file. Returns name, schematic/PCB paths, last-modified times. |
 | `rename_project` | Rename the `.kicad_pro`/`.kicad_sch`/`.kicad_pcb`/`.kicad_prl` files *and* the internal references that carry the old name. Renaming the files alone makes KiCad treat the design as unannotated, losing every reference designator, because each symbol instance stores `(project "name")`. Supports `dry_run`. |
@@ -62,7 +65,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `create_schematic` | Create a new blank `.kicad_sch` schematic file. |
+| `create_schematic` | Create a new blank `.kicad_sch` schematic file, on A4 unless another paper size is given. Use `set_schematic_page` to change it later. |
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
@@ -81,7 +84,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `replace_component` | Replace a component's `lib_id` with a new library symbol (swap the component type). |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
-| `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
+| `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
 
 ### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
@@ -137,7 +140,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_component_nets` | Get all nets connected to every pin of a component. |
 | `get_net_components` | Get all components (and their pins) connected to a named net. |
 | `trace_from_point` | Trace connectivity from any (X,Y) point — returns what is at that point and the net it belongs to. |
-| `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints (0.05mm tolerance). |
+| `find_orphan_items` | Find dangling wire ends, floating labels, and unconnected pin endpoints. Pins, sheet pins, junctions, and no-connect flags all count as connections. |
 | `find_shorted_nets` | Detect accidentally merged nets — pairs of distinct net names sharing a wire path. |
 | `find_single_pin_nets` | Find nets with only one label/connection — often indicates a missing counterpart. |
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
@@ -155,7 +158,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
-| `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. |
+| `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. |
 | `get_schematic_layout` | Return a compact spatial summary of the schematic: component positions, bounding box, optionally wires and labels. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
@@ -168,10 +171,10 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `export_schematic_svg` | Export a schematic sheet to an SVG file using kicad-cli. |
-| `export_schematic_pdf` | Export a schematic sheet to a PDF file using kicad-cli. |
+| `export_schematic_svg` | Export a schematic sheet to SVG using kicad-cli, with optional monochrome rendering and colour theme. |
+| `export_schematic_pdf` | Export a schematic to PDF using kicad-cli, optionally monochrome or limited to the root sheet. |
 | `generate_netlist` | Generate a KiCAD netlist file from the schematic using kicad-cli. |
-| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
+| `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Nets come from labels and power symbols. Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |
@@ -206,19 +209,19 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `set_board_size` | Set the PCB board outline to a rectangle on the Edge.Cuts layer. |
-| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size, `layer_count`, `copper_layer_count`, and `net_count` (counted from the tree, so KiCad 10 boards report real numbers instead of 0). |
+| `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board: `id`, `name`, `type`, plus the optional `user_name` label and a `copper` flag. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. Rejects a non-canonical layer name — KiCad refuses to open a board containing one. Use the canonical name and pass your own label as its user name. |
 | `set_active_layer` | Set the active layer recorded in the board file's setup section. |
-| `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
+| `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
-| `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
+| `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 17 tools
-**Purpose:** Place, refresh, move, rotate, flip, align and duplicate PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
+### `pcb_components` · 18 tools
+**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -229,11 +232,12 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu on a closed board with KiCAD-equivalent geometry mirroring and revision checks; refuses live-editor races and unsupported geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
+| `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placed-instance state and pad nets while refreshing supported library-owned content. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
-| `get_component_pads` | Return pad positions and net assignments for a footprint. A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
+| `get_component_pads` | Return pad positions and net assignments for a footprint (IPC, falls back to file parse). A pad whose net node is present but unreadable reports `null` rather than an empty string, so "no net" stays distinguishable from "could not read it". |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
@@ -241,7 +245,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 12 tools
+### `pcb_routing` · 13 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -251,12 +255,13 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
-| `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. Same net and board-open refusals as `add_zone`. |
+| `add_copper_pour` | Alias of `add_zone`, kept for compatibility: same arguments, same defaults, same IPC-first behaviour. (Its `min_width` default was 0.25 and is now 0.2, matching `add_zone` and KiCad.) |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
-| `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. |
+| `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. |
+| `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Reads the `.kicad_pro` and the board file, so KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
@@ -267,17 +272,17 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `export_gerber` | Export Gerber production files for all copper/mask layers using kicad-cli. |
-| `export_pdf` | Export the PCB layout to a PDF file using kicad-cli. |
-| `export_svg` | Export the PCB layout to an SVG file using kicad-cli. |
-| `export_3d` | Export the PCB as a 3D model (STEP or VRML) using kicad-cli. |
-| `export_bom` | Generate a Bill of Materials (BOM) CSV from the schematic's component data. |
+| `export_pdf` | Export selected PCB layers to one PDF file using kicad-cli, optionally in black and white. |
+| `export_svg` | Export selected PCB layers to one SVG file using kicad-cli, optionally in black and white. |
+| `export_3d` | Export the PCB as a 3D model using kicad-cli, with explicit control over unspecified footprint models. |
+| `export_bom` | Generate KiCad 10's CSV Bill of Materials from schematic fields. |
 | `export_netlist` | Export the PCB netlist in KiCAD or IPC-D-356 format. |
 | `export_position_file` | Generate a component placement (pick-and-place) position file for SMT assembly. |
 | `export_dxf` | Export the PCB to DXF, one file per requested layer, using kicad-cli. `layers` is required — there is no all-layers default. For mechanical CAD interchange. |
 | `export_gencad` | Export the PCB in GenCAD format using kicad-cli. |
 | `export_ipc2581` | Export the PCB in IPC-2581 format using kicad-cli — a unified fab/assembly/test data format. |
 | `export_odb` | Export the PCB in ODB++ format using kicad-cli — a unified fabrication data format. |
-| `refill_zones` | Refill all copper pour zones over KiCAD IPC. Requires a running KiCAD with the board open — there is no kicad-cli fallback. |
+| `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
 | `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
 
 ---
@@ -291,7 +296,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
-| `edit_footprint_pad` | Edit or renumber the first or every matching pad in an existing `.kicad_mod`. |
+| `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions and independent dimensions. |
 | `set_footprint_graphics` | Atomically append, replace, or delete line, arc, rectangle, circle, and polygon primitives on one footprint layer. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
@@ -312,8 +317,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Integration
 
-### `integration` · 9 tools
-**Purpose:** JLCPCB parts database, Freerouting autoroute, datasheet URLs.
+### `integration` · 8 tools
+**Purpose:** JLCPCB parts database, Freerouting installation discovery, datasheet URLs.
 **Source:** [`crates/konnect-core/src/tools/integration.rs`](crates/konnect-core/src/tools/integration.rs)
 
 | Tool | Description |
@@ -324,9 +329,12 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked alternatives for a given component value and footprint. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
-| `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
-| `autoroute` | Run Freerouting autorouter: export DSN → autoroute → import SES result. |
-| `check_freerouting` | Verify that the Freerouting JAR is available and return its version. |
+| `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
+| `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available. |
+
+Migration from the former `autoroute` tool: use Freerouting's KiCad ActionPlugin for
+DSN/SES routing. Konnect no longer advertises `autoroute` because it had no editor
+bridge and every call failed; `check_freerouting` remains available for diagnostics.
 
 ---
 
@@ -338,10 +346,10 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `run_drc` | Run the Design Rule Check on the PCB and return structured violation results. |
+| `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
 | `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
-| `check_kicad_ui` | Check whether the KiCAD GUI application is running and responsive. |
+| `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
@@ -375,7 +383,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Description |
 |------|-------------|
-| `audit_decoupling` | Check that all ICs have appropriate decoupling caps. Finds power pins without nearby caps and flags wrong values. |
+| `audit_decoupling` | Audit schematic connectivity between IC power nets and decoupling capacitors; does not measure PCB placement distance. |
 | `audit_connections` | Check for common connection mistakes: missing pull-ups on I2C/reset, missing series resistors on LEDs, floating inputs, shorted outputs. |
 | `audit_power_rails` | Check power rail integrity: missing bulk capacitance, no test points, missing regulator output caps. |
 | `audit_manufacturing` | DFM checks for the configured fab house: component spacing, silkscreen overlap, via-in-pad, acid traps, board-outline issues. |
@@ -411,8 +419,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | Tool | Description |
 |------|-------------|
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, pick-and-place. Targets JLCPCB, PCBWay, etc. |
-| `validate_for_manufacturing` | Pre-flight check before ordering: verifies the design is ready for the target fab house (board outline, design rules, BOM completeness, assembly constraints). |
-| `estimate_cost` | Estimate total manufacturing cost (PCB + components + assembly) with itemized breakdown. |
+| `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
+| `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
 
 ---
 

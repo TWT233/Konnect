@@ -74,15 +74,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, refresh, move, rotate, flip, align and duplicate PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
+        description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 17,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_export",
@@ -98,9 +98,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, Freerouting autoroute, datasheet URLs",
+        description: "JLCPCB parts database, Freerouting installation discovery, datasheet URLs",
         category: "integration",
-        tool_count: 9,
+        tool_count: 8,
     },
     ToolsetMeta {
         name: "verification",

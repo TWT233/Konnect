@@ -20,10 +20,7 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{
-        apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
-        SexpEdit,
-    },
+    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
     ItemId, SchematicCommand,
 };
 use serde_json::json;
@@ -32,11 +29,25 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "create_schematic",
-            "Create a new blank .kicad_sch schematic file.",
+            "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
+             size is given. Use set_schematic_page to change it later.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" }
+                    "path": { "type": "string", "description": "Full path for the new .kicad_sch file" },
+                    "size": {
+                        "type": "string",
+                        "description": "Paper size, e.g. 'A4', 'A3', 'USLetter' (default 'A4')",
+                        "enum": ["A0", "A1", "A2", "A3", "A4", "A5",
+                                 "A", "B", "C", "D", "E",
+                                 "USLetter", "USLegal", "USLedger"],
+                        "default": "A4"
+                    },
+                    "portrait": {
+                        "type": "boolean",
+                        "description": "Portrait instead of the default landscape",
+                        "default": false
+                    }
                 },
                 "required": ["path"]
             }),
@@ -179,16 +190,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "Move a symbol and stretch/shrink connected wire stubs to preserve connections.",
+            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
+            // No parameters: the handler refuses unconditionally, and the
+            // schema-parameter guard (rightly) refuses a schema that advertises
+            // arguments nothing reads. The old parameters are documented in
+            // docs/API_MIGRATIONS.md alongside #285's removals.
             json!({
                 "type": "object",
-                "properties": {
-                    "schematic": { "type": "string" },
-                    "reference": { "type": "string" },
-                    "x": { "type": "number" },
-                    "y": { "type": "number" }
-                },
-                "required": ["schematic", "reference", "x", "y"]
+                "properties": {},
+                "required": []
             }),
             |args, ctx| async move { handle_move_connected(args, ctx).await }
         ),
@@ -358,7 +368,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_view",
-            "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
+            "Render a schematic sheet with kicad-cli and return the path to the SVG it wrote.              There is no PNG: KiCad ships no schematic rasteriser — `sch export` offers no bitmap              format and there is no `sch render` — so this is a vector file, not an image that can              be shown inline. It lands in a temporary directory and is overwritten by the next view              of the same sheet; use export_schematic_svg (toolset sch_export) to choose where it              goes. The SVG doubles as a geometry source: kicad-cli writes every string a second              time as an invisible <text opacity=\"0\"> element carrying x, y, textLength, font-size              and text-anchor, so text content, position and width can be checked without rendering              a pixel.",
             json!({
                 "type": "object",
                 "properties": {
@@ -378,16 +388,28 @@ async fn handle_create_schematic(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let path = get_path(args, "path")?;
+    let size = opt_str(args, "size").unwrap_or("A4").to_string();
+    let portrait = args["portrait"].as_bool().unwrap_or(false);
+    let (w, h) = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
+    };
+    let (width_mm, height_mm) = if portrait { (h, w) } else { (w, h) };
+
     // Build a minimal valid schematic and save via cse's atomic writer.
-    let template = crate::tools::blank_schematic_template();
+    let template = crate::tools::blank_schematic_template_with_paper(&size, portrait);
     // Write the template then immediately load/save through cse so the file
     // is normalised to cse's writer output format.
     write_new_atomic(&path, &template)?;
     let sch = cse::Schematic::load(&path)?;
     sch.overwrite()?;
-    Ok(CallToolResult::json(
-        &json!({ "created": path.display().to_string() }),
-    ))
+    Ok(CallToolResult::json(&json!({
+        "created": path.display().to_string(),
+        "size": size,
+        "portrait": portrait,
+        "width_mm": width_mm,
+        "height_mm": height_mm
+    })))
 }
 
 /// Paper sizes KiCad accepts in a `(paper …)` node, with their landscape
@@ -410,6 +432,28 @@ const PAPER_SIZES: &[(&str, f64, f64)] = &[
     ("USLedger", 431.8, 279.4),
 ];
 
+/// Landscape width and height of a named paper size, or the `invalid_argument`
+/// refusal naming every size that would have worked.
+fn paper_dimensions(size: &str) -> Result<(f64, f64), CallToolResult> {
+    match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
+        Some(&(_, w, h)) => Ok((w, h)),
+        None => {
+            let valid = PAPER_SIZES
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: "size".into(),
+                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
+                },
+                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
+            ))
+        }
+    }
+}
+
 async fn handle_set_page(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -421,22 +465,9 @@ async fn handle_set_page(
     };
     let portrait = args["portrait"].as_bool().unwrap_or(false);
 
-    let dims = match PAPER_SIZES.iter().find(|(n, _, _)| *n == size) {
-        Some(&(_, w, h)) => (w, h),
-        None => {
-            let valid = PAPER_SIZES
-                .iter()
-                .map(|(n, _, _)| *n)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Ok(CallToolResult::error_kind(
-                crate::mcp::error::ToolErrorKind::InvalidArgument {
-                    field: "size".into(),
-                    reason: format!("unknown paper size '{size}'; valid: {valid}"),
-                },
-                format!("Argument 'size' is invalid: unknown paper size '{size}'; valid: {valid}"),
-            ));
-        }
+    let dims = match paper_dimensions(&size) {
+        Ok(dims) => dims,
+        Err(e) => return Ok(e),
     };
     let (w, h) = if portrait { (dims.1, dims.0) } else { dims };
 
@@ -1080,11 +1111,17 @@ async fn handle_rotate_schematic_component(
 }
 
 async fn handle_move_connected(
-    args: &serde_json::Value,
-    ctx: &ToolContext,
+    _args: &serde_json::Value,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // For now: delegate to simple move. Wire adjustment is a Phase 2 enhancement.
-    handle_move_schematic_component(args, ctx).await
+    // Since the first release this silently delegated to the plain move and
+    // reported success — the symbol moved, every wire stayed put, and the
+    // caller was told the connections were preserved (#315). A tool must not
+    // claim work it does not do: refuse until the wire-carrying move exists
+    // (it needs #120's connectivity model to know which wires to stretch).
+    Ok(CallToolResult::error(
+        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
+    ))
 }
 
 async fn handle_move_region(
@@ -1327,29 +1364,46 @@ async fn handle_batch_get_pin_locations(
     Ok(CallToolResult::json(&json!({ "components": results })))
 }
 
+/// A stable per-schematic directory under the system temp dir.
+///
+/// The old handler made a fresh `konnect_<uuid>` directory for every call and
+/// deleted it again, so nothing survived to be returned. Keeping a uuid per call
+/// would instead leak a directory per call, so the slot is derived from the
+/// schematic's path: repeated views of the same sheet overwrite one file, and
+/// two sheets that merely share a stem do not collide.
+fn schematic_view_dir(schematic: &std::path::Path) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    schematic.hash(&mut hasher);
+    std::env::temp_dir()
+        .join("konnect-schematic-views")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
 async fn handle_get_schematic_view(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let tmp_dir = std::env::temp_dir().join(format!("konnect_{}", new_uuid()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
+    let out_dir = schematic_view_dir(&sch_path);
+    tokio::fs::create_dir_all(&out_dir).await?;
 
-    // KiCAD 10 CLI only supports SVG export for schematics (no bitmap)
+    // KiCad has no schematic rasteriser: `sch export` offers no bitmap format
+    // and there is no `sch render` at all. SVG is what there is.
     let svg_path =
-        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &tmp_dir).await?;
+        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &out_dir).await?;
 
-    let svg_content = tokio::fs::read_to_string(&svg_path).await?;
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    // Deliberately not deleted. The previous handler rendered the file, read its
+    // length, removed it, and then reported "The SVG file has been generated" —
+    // the caller got neither the image nor a path to it.
+    let bytes = tokio::fs::metadata(&svg_path).await?.len();
 
-    // Return as text content (SVG is XML text, not a raster image)
-    Ok(crate::mcp::protocol::CallToolResult {
-        content: vec![crate::mcp::protocol::ToolContent::Text {
-            text: format!("SVG schematic rendered. {} bytes.\n\nNote: KiCAD 10 CLI exports schematics as SVG only (no bitmap). \
-                          The SVG file has been generated. Use export_schematic_pdf for a PDF version.", svg_content.len()),
-        }],
-        is_error: false,
-    })
+    Ok(CallToolResult::json(&json!({
+        "schematic": sch_path.display().to_string(),
+        "svg": svg_path.display().to_string(),
+        "bytes": bytes,
+        "format": "svg"
+    })))
 }
 
 async fn handle_add_component_annotation(
@@ -1947,6 +2001,59 @@ mod tests {
             sch.uuid.is_some(),
             "root (uuid ...) is required for KiCAD's netlister to resolve instance paths"
         );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_defaults_to_a4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.kicad_sch");
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &test_ctx())
+            .await
+            .unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A4\")"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn create_schematic_honours_size_and_orientation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A3", "portrait": true }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text")
+        };
+        // The dimensions are reported swapped for portrait, matching
+        // set_schematic_page.
+        assert!(text.contains("\"width_mm\":297"), "got {text}");
+        assert!(text.contains("\"height_mm\":420"), "got {text}");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("(paper \"A3\" portrait)"), "got {out}");
+        // The orientation token has to survive cse's normalising rewrite:
+        // KiCad rejects a `(paper …)` it cannot parse.
+        assert_eq!(
+            cse::Schematic::load(&path).unwrap().paper.as_deref(),
+            Some("A3")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_schematic_refuses_an_unknown_size_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.kicad_sch");
+        let result = handle_create_schematic(
+            &json!({ "path": path.display().to_string(), "size": "A9" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(!path.exists(), "a rejected size must leave no file behind");
     }
 
     /// #204: on a child sheet both halves of the instance key came from the
@@ -2911,9 +3018,11 @@ mod tests {
     /// "doesn't match copy in library".
     #[tokio::test]
     async fn update_symbols_from_library_refreshes_a_stale_embedded_copy() {
+        // In the stub project dir, so its sym-lib-table shadows the global
+        // `Device` entry — off a developer's KiCad install, that entry resolves
+        // and the edit below then lands on a library nothing reads.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stale.kicad_sch");
+        let path = symdir.path().join("stale.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3006,9 +3115,9 @@ mod tests {
     /// (grafted from #177 by @JYPochez).
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_moved_pin_unless_allowed() {
+        // In the stub project dir — see the stale-copy test above.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("guarded.kicad_sch");
+        let path = symdir.path().join("guarded.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3201,9 +3310,9 @@ mod tests {
     /// dangles. Same guard, different message.
     #[tokio::test]
     async fn update_symbols_from_library_refuses_a_removed_pin() {
+        // In the stub project dir — see the stale-copy test above.
         let (symdir, _env) = stub_symbol_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shrunk.kicad_sch");
+        let path = symdir.path().join("shrunk.kicad_sch");
         let ctx = test_ctx();
         handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
             .await
@@ -3439,8 +3548,8 @@ mod page_tests {
         assert_eq!(out.matches("(paper").count(), 1);
     }
 
-    /// A blank sheet from `create_schematic` has no paper node at all; the new
-    /// one has to land in the header, before any element.
+    /// A sheet written without a paper node — KiCad treats it as A4 — takes the
+    /// new one in the header, before any element.
     #[tokio::test]
     async fn inserts_when_absent_and_stays_in_the_header() {
         let out = set_page(NO_PAPER, "A3", false).await;
@@ -3473,5 +3582,143 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+#[cfg(test)]
+mod schematic_view_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_view_slot_is_stable_for_one_schematic() {
+        let sheet = Path::new("/projects/alpha/power.kicad_sch");
+        assert_eq!(schematic_view_dir(sheet), schematic_view_dir(sheet));
+    }
+
+    /// The old handler used a fresh uuid per call, which is why nothing could
+    /// be returned without leaking a directory per call. Deriving the slot from
+    /// the path bounds it to one per schematic — but it must be the whole path,
+    /// or two projects with a `power.kicad_sch` would overwrite each other.
+    #[test]
+    fn two_sheets_sharing_a_stem_get_different_slots() {
+        let alpha = schematic_view_dir(Path::new("/projects/alpha/power.kicad_sch"));
+        let beta = schematic_view_dir(Path::new("/projects/beta/power.kicad_sch"));
+        assert_ne!(alpha, beta);
+    }
+
+    #[test]
+    fn the_view_slot_lives_under_the_system_temp_dir() {
+        let dir = schematic_view_dir(Path::new("/projects/alpha/power.kicad_sch"));
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "views must not be written next to the caller's project: {}",
+            dir.display()
+        );
+    }
+
+    /// The reported defect, end to end: the tool used to render the SVG, read
+    /// its length, delete it, and report "The SVG file has been generated".
+    /// Needs a real kicad-cli, so it is ignored like the other live tests.
+    #[tokio::test]
+    #[ignore = "needs a real kicad-cli on PATH"]
+    async fn the_rendered_svg_survives_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sheet = tmp.path().join("view.kicad_sch");
+        std::fs::write(
+            &sheet,
+            "(kicad_sch\n\t(version 20260101)\n\t(generator \"eeschema\")\n\t(uuid \"view-0001\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string()),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let ctx = ToolContext::new(cfg, std::sync::Arc::new(crate::router::ToolRouter::new()));
+        let args = json!({ "schematic": sheet.display().to_string() });
+
+        let first = handle_get_schematic_view(&args, &ctx).await.unwrap();
+        assert!(!first.is_error, "{:?}", first.content);
+        let body: serde_json::Value = match &first.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str(text).expect("the result is JSON, not prose")
+            }
+            _ => panic!("expected text content"),
+        };
+
+        let svg = PathBuf::from(body["svg"].as_str().expect("a path to the SVG"));
+        assert!(
+            svg.exists(),
+            "the file the tool names must still be there: {}",
+            svg.display()
+        );
+        assert_eq!(
+            std::fs::metadata(&svg).unwrap().len(),
+            body["bytes"].as_u64().unwrap(),
+            "the reported size is the file's size"
+        );
+        assert_eq!(body["format"], "svg");
+
+        // The invisible text layer this SVG is also useful for.
+        let content = std::fs::read_to_string(&svg).unwrap();
+        assert!(
+            content.contains("opacity=\"0\""),
+            "kicad-cli writes a machine-readable text layer"
+        );
+
+        // A second view reuses the slot instead of leaving a directory behind.
+        let second = handle_get_schematic_view(&args, &ctx).await.unwrap();
+        let body2: serde_json::Value = match &second.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(body2["svg"], body["svg"]);
+    }
+}
+
+#[cfg(test)]
+mod move_connected_tests {
+    use super::*;
+
+    /// #315: this tool silently delegated to the plain move since the first
+    /// release — symbol moved, wires stayed, success reported. Until the
+    /// wire-carrying move exists it must refuse, naming the alternative.
+    #[tokio::test]
+    async fn move_connected_refuses_instead_of_faking_success() {
+        let result = handle_move_connected(
+            &serde_json::json!({
+                "schematic": "unused.kicad_sch",
+                "reference": "R1", "x": 10.0, "y": 10.0
+            }),
+            &crate::tools::ToolContext::new(
+                crate::tools::ServerConfig {
+                    kicad_cli: String::new(),
+                    kicad_binary: String::new(),
+                    ipc_address: String::new(),
+                    project_dir: None,
+                    jlcpcb_db_path: None,
+                    auto_load_toolsets: false,
+                    eager_toolsets: false,
+                },
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("move_schematic_component"),
+            "must name the working alternative: {text}"
+        );
     }
 }

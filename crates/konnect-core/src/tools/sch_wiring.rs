@@ -618,6 +618,22 @@ async fn handle_batch_add_wire(
         Err(e) => return Ok(e),
     };
 
+    // v0.6.0 made top-level required arguments refuse instead of defaulting,
+    // but array items took the same silent path one level down (#234): an
+    // element missing `x2` became a real wire to x=0 across the sheet,
+    // reported as success. Validate every element before touching anything,
+    // so a malformed batch changes nothing.
+    for (i, w) in wires.iter().enumerate() {
+        for key in ["x1", "y1", "x2", "y2"] {
+            if w[key].as_f64().is_none() {
+                return Ok(crate::tools::invalid_arg(
+                    &format!("wires[{i}].{key}"),
+                    "missing or not a number",
+                ));
+            }
+        }
+    }
+
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
 
@@ -2190,6 +2206,38 @@ mod unit_aware_wiring_tests {
         for (x, y) in tees {
             assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
         }
+    }
+
+    /// Regression for #234: a malformed element used to default its missing
+    /// coordinate to 0 and land a real wire across the sheet, while the
+    /// single-wire tool refused the same omission.
+    #[tokio::test]
+    async fn batch_add_wire_refuses_a_malformed_element_and_writes_nothing() {
+        let (_d, path) = bare_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_batch_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "wires": [
+                    { "x1": 150.0, "y1": 150.0, "x2": 160.0, "y2": 150.0 },
+                    { "x1": 170.0, "y1": 170.0, "y2": 170.0 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        let msg = format!("{:?}", result.content);
+        assert!(
+            msg.contains("wires[1].x2"),
+            "must name the element and field: {msg}"
+        );
+        // The valid first element must not have been written either — the
+        // batch fails atomically.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     // ─── connect_to_net stub orientation ───────────────────────────────────
