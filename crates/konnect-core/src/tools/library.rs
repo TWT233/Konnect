@@ -861,10 +861,10 @@ async fn handle_edit_footprint_pad(
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
         Ok(root) if root.head() == Some("footprint") => {}
-        Ok(_) => {
+        Ok(root) => {
             return Ok(invalid_library_argument(
                 "footprint_path",
-                "file root must be a footprint",
+                crate::tools::footprint_root_reason(root.head()),
             ))
         }
         Err(error) => {
