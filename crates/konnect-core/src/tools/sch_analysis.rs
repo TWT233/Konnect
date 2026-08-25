@@ -12,8 +12,7 @@ use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, read_schematic, symbol_bounds_for_instance, LabelKind, SymbolBounds,
-        Wire,
+        find_lib_symbol, read_schematic, symbol_bounds_for_instance, LabelKind, SymbolBounds, Wire,
     },
 };
 use serde_json::json;

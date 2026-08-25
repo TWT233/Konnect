@@ -16,8 +16,8 @@ use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     schematic::{
         extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
-        symbol_bounds_for_instance, SymbolBounds,
+        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_label_rotation,
+        read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -2757,6 +2757,57 @@ mod layout_bounds_tests {
         assert_ne!(
             result["bounding_box"]["x_min"], 100.0,
             "an origin-only box reproduces the old false result"
+        );
+    }
+
+    /// A real eeschema save (KiCad's ecc83 demo): U1 is placed as three units
+    /// of the embedded dual triode — two identical triode units and one
+    /// heater unit with different library geometry. Every placement must get
+    /// its own resolved bounds from its OWN unit's drawing, or a multi-unit
+    /// component reports one unit's box three times.
+    #[tokio::test]
+    async fn every_placed_unit_gets_bounds_from_its_own_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ecc83.kicad_sch");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch"),
+        )
+        .unwrap();
+
+        let result =
+            handle_get_layout(&json!({ "schematic": path.to_string_lossy() }), &test_ctx())
+                .await
+                .unwrap();
+        let result = response_json(&result);
+
+        assert_eq!(result["bounds_unresolved"], json!([]), "{result}");
+        let u1_boxes: Vec<(f64, f64)> = result["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|component| component["reference"] == "U1")
+            .map(|component| {
+                let bounds = &component["bounds"];
+                assert!(
+                    !bounds.is_null(),
+                    "every U1 placement resolves bounds: {component}"
+                );
+                (
+                    bounds["width"].as_f64().unwrap(),
+                    bounds["height"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(u1_boxes.len(), 3, "three placed units of U1");
+        let distinct: std::collections::BTreeSet<String> = u1_boxes
+            .iter()
+            .map(|(w, h)| format!("{w:.3}x{h:.3}"))
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "the heater unit's geometry differs from the triodes', so one \
+             shared box means unit selection is broken: {u1_boxes:?}"
         );
     }
 
