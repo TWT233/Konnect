@@ -44,8 +44,14 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
                 "enum": ["line", "inverted", "clock", "inverted_clock", "input_low", "clock_low", "output_low", "edge_clock_high", "non_logic"],
                 "description": "Pin graphic style (default 'line'). 'inverted' = active-low bubble, 'clock' = clock input, etc. Works with any body shape."
             },
-            "x": { "type": "number" },
-            "y": { "type": "number" },
+            "x": {
+                "type": "number",
+                "description": "Starting position, not a fixed one. For a rectangle body the box is sized to fit the pin names and every pin whose angle names an edge is then aligned to that edge, so a pin can end up further out than requested. A `glyph` body ignores x/y entirely. The response reports where each pin actually ended up under `units[].pins`, with `requested` alongside whenever it differs."
+            },
+            "y": {
+                "type": "number",
+                "description": "Starting position, not a fixed one — see `x`."
+            },
             "angle": { "type": "number", "default": 0 },
             "length": { "type": "number", "default": 2.54 }
         },
@@ -155,7 +161,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
                         "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
@@ -207,7 +213,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "pins": {
                         "type": "array",
-                        "description": "Pin definitions. x/y position the rectangle body and are ignored when a `glyph` is set.",
+                        "description": "Pin definitions. x/y size and position the rectangle body rather than fixing the pins: see the per-pin `x`. They are ignored entirely when a `glyph` is set.",
                         "items": pin_item_schema("Pin electrical type — exactly one of KiCAD's 12 values. Note: NC pins are 'no_connect' (not 'not_connected').", false)
                     },
                     "show_pin_names": { "type": "boolean", "description": "Show pin names on the symbol (default true).", "default": true },
@@ -283,7 +289,7 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Scope: 'global' or 'project'",
                         "default": "project"
                     },
-                    "project": { "type": "string", "description": "Path to .kicad_pro file (required for project scope)" },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" },
                     "replace_existing": {
                         "type": "boolean",
                         "description": "Replace the URI of an existing nickname instead of leaving it unchanged",
@@ -881,10 +887,10 @@ async fn handle_edit_footprint_pad(
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
         Ok(root) if root.head() == Some("footprint") => {}
-        Ok(_) => {
+        Ok(root) => {
             return Ok(invalid_library_argument(
                 "footprint_path",
-                "file root must be a footprint",
+                crate::tools::footprint_root_reason(root.head()),
             ))
         }
         Err(error) => {
@@ -1857,6 +1863,40 @@ fn lexical_relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
 ///
 /// Shared by the symbol and footprint registrars so the two cannot drift: both
 /// need the same `${KIPRJMOD}` portability and the same empty-parent guard.
+/// Resolve the caller's `project` argument to the directory whose library table
+/// KiCad actually reads.
+///
+/// The schema documents a `.kicad_pro` path, but every other tool on this
+/// surface takes a project directory and callers pass one. Taking `parent()`
+/// unconditionally then lands one level *above* the project — a directory that
+/// holds no `.kicad_pro` and that KiCad never consults. The write succeeds
+/// there and reports `inserted`, so two projects sharing a parent end up
+/// sharing one stray table that neither of them reads.
+///
+/// A path that is neither an existing directory nor recognisable as a file is
+/// refused rather than guessed at, because guessing is what produced the stray
+/// table.
+fn project_table_dir(project: &str) -> Result<PathBuf, CallToolResult> {
+    let path = PathBuf::from(project);
+    if path.is_dir() {
+        return Ok(path);
+    }
+    let looks_like_a_file =
+        path.is_file() || path.extension().is_some_and(|ext| ext == "kicad_pro");
+    if looks_like_a_file {
+        // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path,
+        // not None — so the `.` default needs an explicit emptiness check.
+        return Ok(path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf());
+    }
+    Err(CallToolResult::error(format!(
+        "'project' must be a .kicad_pro file or an existing project directory, got '{project}'"
+    )))
+}
+
 fn lib_table_target(
     scope: &str,
     project: Option<&str>,
@@ -1872,13 +1912,7 @@ fn lib_table_target(
             "For project scope, provide 'project' path to .kicad_pro file",
         ));
     };
-    // `Path::new("board.kicad_pro").parent()` is Some("") — an empty path, not
-    // None — so the `.` default needs an explicit emptiness check.
-    let table_dir = PathBuf::from(proj)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let table_dir = project_table_dir(proj)?;
     let uri = project_relative_uri(lib_path, &table_dir);
     let uri = if uri.starts_with("${KIPRJMOD}") {
         uri
@@ -2925,7 +2959,7 @@ fn glyph_geom(g: Glyph) -> GlyphGeom {
 fn build_glyph_unit(
     pins_val: &[serde_json::Value],
     g: Glyph,
-) -> Result<(String, SymbolRect), String> {
+) -> Result<(String, SymbolRect, Vec<ResolvedPin>), String> {
     let mut inputs: Vec<&serde_json::Value> = Vec::new();
     let mut outputs: Vec<&serde_json::Value> = Vec::new();
     let mut powers: Vec<&serde_json::Value> = Vec::new();
@@ -2964,9 +2998,11 @@ fn build_glyph_unit(
 
     let geom = glyph_geom(g);
     let mut sexp = geom.body.clone();
+    let mut resolved = Vec::with_capacity(pins_val.len());
 
     // Inputs map onto the glyph anchors in the caller's order (top-to-bottom).
     for (p, &(x, y, angle, length)) in inputs.iter().zip(geom.inputs.iter()) {
+        resolved.push(ResolvedPin::new(p, x, y));
         let number = p["number"].as_str().unwrap_or("1");
         let name = p["name"].as_str().unwrap_or("~");
         let style = pin_style_token(p["style"].as_str());
@@ -2995,6 +3031,7 @@ fn build_glyph_unit(
         None => "line",
     };
     let (ox, oy, oa, ol) = geom.output;
+    resolved.push(ResolvedPin::new(out, ox, oy));
     sexp.push_str(&emit_pin(
         out_type,
         out_style,
@@ -3022,6 +3059,7 @@ fn build_glyph_unit(
             let (ax, ay) = geom.power_bottom;
             (ax, ay - length, 90.0) // bulb below, root on the bottom edge
         };
+        resolved.push(ResolvedPin::new(p, x, y));
         sexp.push_str(&emit_pin(
             ptype,
             style,
@@ -3035,7 +3073,7 @@ fn build_glyph_unit(
         ));
     }
 
-    Ok((sexp, Some(geom.rect)))
+    Ok((sexp, Some(geom.rect), resolved))
 }
 
 /// Build one unit's inner S-expression — an optional body (a rectangle, or a
@@ -3052,26 +3090,49 @@ fn build_symbol_unit(
     pins_val: &[serde_json::Value],
     glyph: Option<Glyph>,
     show_names: bool,
-) -> anyhow::Result<(String, SymbolRect, Option<String>)> {
+) -> anyhow::Result<BuiltUnit> {
     validate_pin_types(pins_val)?;
     if let Some(g) = glyph {
         if g != Glyph::Rectangle {
             match build_glyph_unit(pins_val, g) {
-                Ok((sexp, rect)) => return Ok((sexp, rect, None)),
+                Ok((sexp, rect, pins)) => {
+                    return Ok(BuiltUnit {
+                        sexp,
+                        rect,
+                        warning: None,
+                        body: g.name(),
+                        pins,
+                    })
+                }
                 Err(reason) => {
-                    let (sexp, rect) = build_rect_unit(pins_val, show_names);
-                    return Ok((sexp, rect, Some(reason)));
+                    let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+                    return Ok(BuiltUnit {
+                        sexp,
+                        rect,
+                        warning: Some(reason),
+                        body: "rectangle",
+                        pins,
+                    });
                 }
             }
         }
     }
-    let (sexp, rect) = build_rect_unit(pins_val, show_names);
-    Ok((sexp, rect, None))
+    let (sexp, rect, pins) = build_rect_unit(pins_val, show_names);
+    Ok(BuiltUnit {
+        sexp,
+        rect,
+        warning: None,
+        body: "rectangle",
+        pins,
+    })
 }
 
 /// The default rectangle body + caller-positioned pins. Pin types are assumed
 /// already validated by `build_symbol_unit`.
-fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String, SymbolRect) {
+fn build_rect_unit(
+    pins_val: &[serde_json::Value],
+    show_names: bool,
+) -> (String, SymbolRect, Vec<ResolvedPin>) {
     let mut pin_geoms: Vec<PinGeom> = Vec::new();
     for pin in pins_val {
         pin_geoms.push(PinGeom {
@@ -3098,7 +3159,9 @@ fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String,
     }
 
     let mut pins_sexp = String::new();
+    let mut resolved = Vec::with_capacity(pins_val.len());
     for (pin, g) in pins_val.iter().zip(&pin_geoms) {
+        resolved.push(ResolvedPin::new(pin, g.x, g.y));
         pins_sexp.push_str(&emit_pin(
             pin["type"].as_str().unwrap_or("passive"),
             pin_style_token(pin["style"].as_str()),
@@ -3118,10 +3181,110 @@ fn build_rect_unit(pins_val: &[serde_json::Value], show_names: bool) -> (String,
         ),
         None => String::new(),
     };
-    (format!("{}{}", body_sexp, pins_sexp), body)
+    (format!("{}{}", body_sexp, pins_sexp), body, resolved)
 }
 
 type SymbolRect = Option<(f64, f64, f64, f64)>;
+
+/// Where a pin ended up, next to where the caller asked for it.
+///
+/// `create_symbol` treats a pin's `x`/`y` as a starting point, not a fixed
+/// position: the body is sized to fit the pin names and every pin on an edge is
+/// then aligned to that edge. Callers cannot plan wiring from the coordinates
+/// they sent, so the resolved ones are reported back.
+struct ResolvedPin {
+    number: String,
+    name: String,
+    requested: Option<(f64, f64)>,
+    x: f64,
+    y: f64,
+}
+
+impl ResolvedPin {
+    fn new(pin: &serde_json::Value, x: f64, y: f64) -> Self {
+        let requested = match (pin["x"].as_f64(), pin["y"].as_f64()) {
+            (Some(rx), Some(ry)) => Some((rx, ry)),
+            _ => None,
+        };
+        ResolvedPin {
+            number: pin["number"].as_str().unwrap_or("1").to_string(),
+            name: pin["name"].as_str().unwrap_or("~").to_string(),
+            requested,
+            x,
+            y,
+        }
+    }
+
+    /// How far the pin was moved, or `None` when the caller named no position.
+    fn displacement(&self) -> Option<f64> {
+        let (rx, ry) = self.requested?;
+        let moved = ((self.x - rx).powi(2) + (self.y - ry).powi(2)).sqrt();
+        (moved > POSITION_EPSILON).then_some(moved)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut out = json!({
+            "number": self.number,
+            "name": self.name,
+            "x": self.x,
+            "y": self.y
+        });
+        // Only when it differs, so the common case stays compact and a moved
+        // pin stands out.
+        if let (Some((rx, ry)), Some(_)) = (self.requested, self.displacement()) {
+            out["requested"] = json!({ "x": rx, "y": ry });
+        }
+        out
+    }
+}
+
+/// Below this a difference is float noise from the body arithmetic, not a move.
+const POSITION_EPSILON: f64 = 1e-6;
+
+/// One unit's rendered body, and what became of the pins the caller placed.
+struct BuiltUnit {
+    sexp: String,
+    rect: SymbolRect,
+    /// A glyph that did not fit its pins and fell back to a rectangle.
+    warning: Option<String>,
+    /// `"rectangle"` or the glyph's name — a glyph places pins by type, so a
+    /// moved pin there is intended rather than a surprise.
+    body: &'static str,
+    pins: Vec<ResolvedPin>,
+}
+
+impl BuiltUnit {
+    /// A per-unit summary of the auto-size override, or `None` when nothing
+    /// moved. Per pin would be a dozen lines of noise on a normal symbol, and a
+    /// glyph unit moves every pin by design.
+    fn displacement_warning(&self, unit_label: &str) -> Option<String> {
+        if self.body != "rectangle" {
+            return None;
+        }
+        let moved: Vec<f64> = self
+            .pins
+            .iter()
+            .filter_map(ResolvedPin::displacement)
+            .collect();
+        let furthest = moved.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (!moved.is_empty()).then(|| {
+            format!(
+                "{unit_label}: the body was sized to fit the pin names, moving {} of {} pins by up to {:.2} mm; the resolved positions are in `units`",
+                moved.len(),
+                self.pins.len(),
+                furthest
+            )
+        })
+    }
+
+    fn to_json(&self, unit: usize) -> serde_json::Value {
+        json!({
+            "unit": unit,
+            "body": self.body,
+            "pins": self.pins.iter().map(ResolvedPin::to_json).collect::<Vec<_>>()
+        })
+    }
+}
 
 async fn handle_create_symbol(
     args: &serde_json::Value,
@@ -3154,6 +3317,10 @@ async fn handle_create_symbol(
     // Optional conventional body shape. `glyph` may be set at the symbol level
     // (a default for every unit) and/or per unit (overriding the default).
     let mut warnings: Vec<String> = Vec::new();
+    // Where each unit's pins actually ended up. The caller's x/y are a starting
+    // point, so this is the only way to plan wiring without re-measuring the
+    // finished symbol with batch_get_schematic_pin_locations.
+    let mut units_report: Vec<serde_json::Value> = Vec::new();
     let sym_glyph = match args["glyph"].as_str() {
         None => None,
         Some(s) => match Glyph::parse(s) {
@@ -3194,35 +3361,38 @@ async fn handle_create_symbol(
                 .cloned()
                 .collect();
             // Unit 1: the triangle with its signal pins.
-            let (inner1, body1, warn1) = match build_symbol_unit(&signal, sym_glyph, show_names) {
+            let unit1 = match build_symbol_unit(&signal, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn1 {
-                warnings.push(w);
-            }
+            warnings.extend(unit1.warning.clone());
+            warnings.extend(unit1.displacement_warning("unit 1"));
+            units_report.push(unit1.to_json(1));
+            let (inner1, body1) = (unit1.sexp, unit1.rect);
             units_sexp.push_str(&format!("\n    (symbol \"{}_1_1\"{}\n    )", name, inner1));
             // Unit 2: a rectangular power unit.
             let power_laid = layout_power_unit(&power);
-            let (inner2, _, warn2) = match build_symbol_unit(&power_laid, None, show_names) {
+            let unit2 = match build_symbol_unit(&power_laid, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn2 {
-                warnings.push(w);
-            }
+            warnings.extend(unit2.warning.clone());
+            warnings.extend(unit2.displacement_warning("unit 2"));
+            units_report.push(unit2.to_json(2));
+            let inner2 = unit2.sexp;
             units_sexp.push_str(&format!("\n    (symbol \"{}_2_1\"{}\n    )", name, inner2));
             unit_count = 2;
             ref_body = body1;
         } else {
             // Single unit: body + all pins live in NAME_0_1 (unchanged behavior).
-            let (inner, body, warn) = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
+            let unit = match build_symbol_unit(&pins_val, sym_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn {
-                warnings.push(w);
-            }
+            warnings.extend(unit.warning.clone());
+            warnings.extend(unit.displacement_warning("unit 1"));
+            units_report.push(unit.to_json(1));
+            let (inner, body) = (unit.sexp, unit.rect);
             units_sexp.push_str(&format!("\n    (symbol \"{}_0_1\"{}\n    )", name, inner));
             unit_count = 1;
             ref_body = body;
@@ -3252,13 +3422,16 @@ async fn handle_create_symbol(
                     }
                 },
             };
-            let (inner, body, warn) = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
+            let unit = match build_symbol_unit(&unit_pins, unit_glyph, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
-            if let Some(w) = warn {
+            if let Some(w) = unit.warning.clone() {
                 warnings.push(format!("unit {}: {}", i + 1, w));
             }
+            warnings.extend(unit.displacement_warning(&format!("unit {}", i + 1)));
+            units_report.push(unit.to_json(i + 1));
+            let (inner, body) = (unit.sexp, unit.rect);
             if i == 0 {
                 first_body = body;
             }
@@ -3272,11 +3445,14 @@ async fn handle_create_symbol(
         let mut total = unit_objs.len();
         if !power_pins.is_empty() {
             // The power unit is always a rectangle.
-            let (inner, _, _) = match build_symbol_unit(&power_pins, None, show_names) {
+            let unit = match build_symbol_unit(&power_pins, None, show_names) {
                 Ok(v) => v,
                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
             };
             total += 1;
+            warnings.extend(unit.displacement_warning(&format!("unit {total}")));
+            units_report.push(unit.to_json(total));
+            let inner = unit.sexp;
             units_sexp.push_str(&format!(
                 "\n    (symbol \"{}_{}_1\"{}\n    )",
                 name, total, inner
@@ -3371,6 +3547,7 @@ async fn handle_create_symbol(
         "unit_count": unit_count,
         "power_pin_count": power_pins.len()
     });
+    result["units"] = json!(units_report);
     if !warnings.is_empty() {
         result["warnings"] = json!(warnings);
     }
@@ -4671,6 +4848,86 @@ mod tests {
             .contains("(name \"Other\") (type \"KiCad\") (uri \"${KIPRJMOD}/other.pretty\")"));
         assert!(updated.contains("(name \"Parts\") (type \"KiCad\") (uri \"${KIPRJMOD}/../lib/Parts.pretty\") (options \"keep=1\") (descr \"keep me\")"));
         assert!(!updated.contains("C:/stale"));
+    }
+
+    /// The whole reported failure, end to end: two projects side by side under
+    /// one parent, the same nickname registered in each. Before, both resolved
+    /// to a stray table in the parent, so the second call reported `unchanged`
+    /// against the first project's entry and neither project ever saw one.
+    #[tokio::test]
+    async fn registering_by_project_directory_keeps_two_projects_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        let library = tmp.path().join("shared.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let register = |project: std::path::PathBuf| {
+            let library = library.clone();
+            async move {
+                handle_register_symbol_library(
+                    &json!({
+                        "library_path": library,
+                        "nickname": "Shared",
+                        "project": project
+                    }),
+                    &test_ctx(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let first = register(alpha.clone()).await;
+        let second = register(beta.clone()).await;
+
+        assert!(!first.is_error, "{:?}", first.content);
+        assert!(!second.is_error, "{:?}", second.content);
+        let first: serde_json::Value = serde_json::from_str(&result_text(&first)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&result_text(&second)).unwrap();
+        assert_eq!(first["state"], "inserted");
+        assert_eq!(
+            second["state"], "inserted",
+            "the second project must get its own entry, not `unchanged`"
+        );
+
+        assert!(
+            alpha.join("sym-lib-table").exists(),
+            "alpha must carry its own table"
+        );
+        assert!(
+            beta.join("sym-lib-table").exists(),
+            "beta must carry its own table"
+        );
+        assert!(
+            !tmp.path().join("sym-lib-table").exists(),
+            "nothing may be written above the projects"
+        );
+    }
+
+    /// A project argument that names nothing is refused instead of resolving to
+    /// its parent and reporting success there.
+    #[tokio::test]
+    async fn registering_against_a_missing_project_refuses_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("parts.kicad_sym");
+        std::fs::write(&library, "(kicad_symbol_lib)\n").unwrap();
+
+        let result = handle_register_symbol_library(
+            &json!({
+                "library_path": library,
+                "nickname": "Parts",
+                "project": tmp.path().join("no-such-project")
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{:?}", result.content);
+        assert!(!tmp.path().join("sym-lib-table").exists());
     }
 
     #[tokio::test]
@@ -6118,6 +6375,196 @@ mod tests {
         );
     }
 
+    /// A 14-pin module with pins declared on two facing columns, as the report
+    /// describes it. `names` decides how wide the body has to be.
+    async fn module_response(names: &[&str], x: f64) -> serde_json::Value {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("mod.kicad_sym");
+        let pins: Vec<serde_json::Value> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                // Facing columns: each row carries a left and a right pin, which
+                // is what makes two long names run into each other across the
+                // body and forces it wider.
+                let left = i % 2 == 0;
+                json!({
+                    "number": (i + 1).to_string(),
+                    "name": name,
+                    "type": "bidirectional",
+                    "x": if left { -x } else { x },
+                    "y": (i / 2) as f64 * 2.54,
+                    "angle": if left { 0 } else { 180 },
+                    "length": 2.54
+                })
+            })
+            .collect();
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "MODULE",
+                "reference_prefix": "U",
+                "pins": pins
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        serde_json::from_str(&result_text(&res)).unwrap()
+    }
+
+    fn pin_x(report: &serde_json::Value, number: &str) -> f64 {
+        report["units"][0]["pins"]
+            .as_array()
+            .expect("units[0].pins is an array")
+            .iter()
+            .find(|p| p["number"] == number)
+            .expect("pin present")["x"]
+            .as_f64()
+            .expect("x is a number")
+    }
+
+    /// The reported case: long pin names widen the body, the pins slide out to
+    /// meet it, and the response now says where they went.
+    #[tokio::test]
+    async fn long_pin_names_move_the_pins_and_the_response_reports_it() {
+        let long = ["D4/A4/SDA/P0.04"; 14];
+        let report = module_response(&long, 19.05).await;
+
+        let first = &report["units"][0]["pins"][0];
+        assert_eq!(report["units"][0]["body"], "rectangle");
+        assert!(
+            first["requested"].is_object(),
+            "a moved pin carries the position that was asked for: {first}"
+        );
+        assert_eq!(first["requested"]["x"], json!(-19.05));
+        assert!(
+            pin_x(&report, "1") < -19.05,
+            "the pin must sit further out than requested, got {}",
+            pin_x(&report, "1")
+        );
+
+        let warnings = report["warnings"]
+            .as_array()
+            .expect("a move is worth a warning");
+        assert_eq!(warnings.len(), 1, "one summary per unit, not one per pin");
+        let text = warnings[0].as_str().unwrap();
+        assert!(text.contains("14 of 14 pins"), "{text}");
+        assert!(text.contains("unit 1"), "{text}");
+    }
+
+    /// The other row of the report's table: short names need no extra width, so
+    /// the pins stay where they were put and nothing is warned about.
+    #[tokio::test]
+    async fn short_pin_names_leave_the_pins_alone() {
+        let short = ["D4/SDA"; 14];
+        let report = module_response(&short, 19.05).await;
+
+        assert_eq!(pin_x(&report, "1"), -19.05);
+        assert!(
+            report["units"][0]["pins"][0]["requested"].is_null(),
+            "an unmoved pin needs no `requested`: {}",
+            report["units"][0]["pins"][0]
+        );
+        assert!(
+            report["warnings"].is_null(),
+            "nothing moved, so nothing to warn about: {}",
+            report["warnings"]
+        );
+    }
+
+    /// Two symbols with identical pin coordinates but different name lengths
+    /// come out with different connection points. That is the surprise the
+    /// report is about, and the response is what makes it visible.
+    #[tokio::test]
+    async fn identical_coordinates_can_still_resolve_differently() {
+        let long = module_response(&["D4/A4/SDA/P0.04"; 14], 19.05).await;
+        let short = module_response(&["D4/SDA"; 14], 19.05).await;
+
+        assert_ne!(
+            pin_x(&long, "1"),
+            pin_x(&short, "1"),
+            "same request, different result — the caller has to be told"
+        );
+    }
+
+    /// Every pin on an edge is aligned to it, names or no names. A ragged
+    /// column is squared up even with `show_pin_names` off, so the response has
+    /// to report that too.
+    #[tokio::test]
+    async fn pins_are_aligned_to_the_body_edge_even_without_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("ragged.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "RAGGED",
+                "reference_prefix": "U",
+                "show_pin_names": false,
+                "pins": [
+                    {"number":"1","name":"A","type":"input","x":-7.62,"y":0.0,"angle":0,"length":2.54},
+                    {"number":"2","name":"B","type":"input","x":-12.7,"y":2.54,"angle":0,"length":2.54}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(
+            pin_x(&report, "1"),
+            pin_x(&report, "2"),
+            "both pins end up on the same edge"
+        );
+        let moved = report["units"][0]["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["requested"].is_object())
+            .count();
+        assert_eq!(moved, 1, "the pin that was pulled out is marked: {report}");
+    }
+
+    /// A glyph places its pins by type — documented, intended, and reported
+    /// without a warning, or every correct call would carry one.
+    #[tokio::test]
+    async fn a_glyph_unit_reports_its_placement_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("gate.kicad_sym");
+        let res = handle_create_symbol(
+            &json!({
+                "library_path": lib.to_string_lossy(),
+                "name": "GATE",
+                "reference_prefix": "U",
+                "glyph": "inverter",
+                "pins": [
+                    {"number":"1","name":"A","type":"input","x":100.0,"y":100.0},
+                    {"number":"2","name":"Y","type":"output","x":200.0,"y":200.0}
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        let report: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+
+        assert_eq!(report["units"][0]["body"], "inverter");
+        assert_ne!(
+            pin_x(&report, "1"),
+            100.0,
+            "a glyph ignores the requested position"
+        );
+        assert!(
+            report["warnings"].is_null(),
+            "a glyph move is intended, not a surprise: {}",
+            report["warnings"]
+        );
+    }
+
     #[tokio::test]
     async fn create_symbol_accepts_all_12_kicad_pin_types() {
         // One pin per valid electrical type; the generated library must carry
@@ -6939,6 +7386,175 @@ mod symbol_source_tests {
 
     /// Both registrars share one target helper, so footprints get the same
     /// portable URI and the same empty-parent guard as symbols.
+    /// The report: passing the project *directory* resolved one level above it,
+    /// so the table landed where KiCad never looks and the call still said
+    /// `inserted`.
+    #[test]
+    fn a_project_directory_resolves_to_its_own_table() {
+        let parent = tempfile::tempdir().unwrap();
+        let proj = parent.path().join("board");
+        std::fs::create_dir_all(proj.join("lib")).unwrap();
+        let sym = proj.join("lib/parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table, uri) = lib_table_target(
+            "project",
+            proj.to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("a project directory is a usable project argument");
+
+        assert_eq!(table, proj.join("sym-lib-table"));
+        assert_ne!(
+            table,
+            parent.path().join("sym-lib-table"),
+            "the table must not land above the project"
+        );
+        assert_eq!(uri, "${KIPRJMOD}/lib/parts.kicad_sym");
+    }
+
+    /// Both spellings of the same project must name the same table, or a caller
+    /// gets a different answer depending on which one it happened to pass.
+    #[test]
+    fn a_project_file_and_its_directory_agree() {
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join("lib")).unwrap();
+        let sym = proj.path().join("lib/parts.kicad_sym");
+        std::fs::write(&sym, "(kicad_symbol_lib)\n").unwrap();
+        let proj_file = proj.path().join("board.kicad_pro");
+        std::fs::write(&proj_file, "{}\n").unwrap();
+
+        let from_file = lib_table_target(
+            "project",
+            proj_file.to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("project file");
+        let from_dir = lib_table_target(
+            "project",
+            proj.path().to_str(),
+            &sym,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("project directory");
+
+        assert_eq!(from_file, from_dir);
+    }
+
+    /// The follow-on failure in the report: with both projects resolving to the
+    /// same stray table, registering a nickname for the second one came back
+    /// `unchanged` because the handler was reading the first one's entry.
+    #[test]
+    fn two_projects_under_one_parent_get_separate_tables() {
+        let parent = tempfile::tempdir().unwrap();
+        let one = parent.path().join("alpha");
+        let two = parent.path().join("beta");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let lib = parent.path().join("shared.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+
+        let (table_one, _) = lib_table_target(
+            "project",
+            one.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("first project");
+        let (table_two, _) = lib_table_target(
+            "project",
+            two.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("second project");
+
+        assert_ne!(
+            table_one, table_two,
+            "two projects must not share one table"
+        );
+        assert_eq!(table_one, one.join("sym-lib-table"));
+        assert_eq!(table_two, two.join("sym-lib-table"));
+    }
+
+    /// A path that is neither a directory nor recognisable as a file is refused
+    /// rather than resolved to its parent — guessing is what produced the stray
+    /// table in the first place.
+    #[test]
+    fn an_unusable_project_argument_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("no-such-project");
+        let lib = parent.path().join("parts.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+
+        let result = lib_table_target(
+            "project",
+            missing.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        );
+
+        assert!(
+            result.is_err(),
+            "a path that names nothing must not resolve"
+        );
+        assert!(
+            !parent.path().join("sym-lib-table").exists(),
+            "nothing may be written above the project"
+        );
+    }
+
+    /// A `.kicad_pro` that does not exist yet still resolves — the project file
+    /// is often written by the very next call.
+    #[test]
+    fn a_project_file_not_yet_on_disk_still_resolves() {
+        let proj = tempfile::tempdir().unwrap();
+        let lib = proj.path().join("parts.kicad_sym");
+        std::fs::write(&lib, "(kicad_symbol_lib)\n").unwrap();
+        let not_yet = proj.path().join("board.kicad_pro");
+
+        let (table, _) = lib_table_target(
+            "project",
+            not_yet.to_str(),
+            &lib,
+            global_sym_lib_table(),
+            "sym-lib-table",
+        )
+        .expect("a .kicad_pro path resolves whether or not it exists yet");
+
+        assert_eq!(table, proj.path().join("sym-lib-table"));
+    }
+
+    /// The footprint registrar shares `lib_table_target`, so the directory form
+    /// has to reach it too.
+    #[test]
+    fn the_footprint_registrar_takes_a_project_directory_as_well() {
+        let parent = tempfile::tempdir().unwrap();
+        let proj = parent.path().join("board");
+        std::fs::create_dir_all(proj.join("lib/parts.pretty")).unwrap();
+        let fp = proj.join("lib/parts.pretty");
+
+        let (table, uri) = lib_table_target(
+            "project",
+            proj.to_str(),
+            &fp,
+            global_fp_lib_table(),
+            "fp-lib-table",
+        )
+        .expect("footprint target");
+
+        assert_eq!(table, proj.join("fp-lib-table"));
+        assert_eq!(uri, "${KIPRJMOD}/lib/parts.pretty");
+    }
+
     #[test]
     fn both_registrars_agree_on_the_project_table_target() {
         let proj = tempfile::tempdir().unwrap();

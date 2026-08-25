@@ -210,7 +210,10 @@ fn prepare_mutation(
     let root = konnect_sexp::parse_sexp(source)
         .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
     if root.head() != Some("footprint") {
-        return Err(invalid("footprint_path", "file root must be a footprint"));
+        return Err(invalid(
+            "footprint_path",
+            crate::tools::footprint_root_reason(root.head()),
+        ));
     }
 
     let mut description = None;
