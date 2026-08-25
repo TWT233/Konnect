@@ -142,9 +142,15 @@ type CapturedUpdate = Arc<Mutex<Option<kiapi::common::commands::UpdateItems>>>;
 /// Mock KiCAD serving `fp` for GetItems and recording the UpdateItems it
 /// receives.
 fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKicad, CapturedUpdate) {
+    spawn_footprints_mock(vec![fp])
+}
+
+fn spawn_footprints_mock(
+    footprints: Vec<kiapi::board::types::FootprintInstance>,
+) -> (MockKicad, CapturedUpdate) {
     let captured: CapturedUpdate = Arc::new(Mutex::new(None));
     let captured_in_mock = captured.clone();
-    let current = Arc::new(Mutex::new(fp));
+    let current = Arc::new(Mutex::new(footprints));
     let current_in_mock = current.clone();
 
     let mock = spawn_mock(move |req| {
@@ -169,14 +175,32 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
             let resp = kiapi::common::commands::GetItemsResponse {
                 header: None,
                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                items: vec![builders::pack_any(
-                    &*current_in_mock.lock().unwrap(),
-                    "kiapi.board.types.FootprintInstance",
-                )],
+                items: current_in_mock
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|footprint| {
+                        builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+                    })
+                    .collect(),
             };
             Some(reply_with(builders::pack_any(
                 &resp,
                 "kiapi.common.commands.GetItemsResponse",
+            )))
+        } else if msg.type_url.ends_with("BeginCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "placement-commit".to_string(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )))
+        } else if msg.type_url.ends_with("EndCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
             )))
         } else if msg.type_url.ends_with("UpdateItems") {
             let update =
@@ -193,9 +217,23 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
                     item: Some(item),
                 })
                 .collect();
-            if let Some(item) = update.items.first() {
-                *current_in_mock.lock().unwrap() =
-                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            {
+                // Keep the mock stateful: a later GetItems must observe what
+                // UpdateItems wrote (the pad-readback test relies on it), and
+                // a batch update replaces every matching footprint.
+                let mut held = current_in_mock.lock().unwrap();
+                for item in &update.items {
+                    let incoming =
+                        kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                            .unwrap();
+                    let reference = mock_reference(&incoming);
+                    if let Some(slot) = held
+                        .iter_mut()
+                        .find(|existing| mock_reference(existing) == reference)
+                    {
+                        *slot = incoming;
+                    }
+                }
             }
             *captured_in_mock.lock().unwrap() = Some(update);
             Some(reply_with(builders::pack_any(
@@ -212,6 +250,15 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
     });
 
     (mock, captured)
+}
+
+fn mock_reference(fp: &kiapi::board::types::FootprintInstance) -> String {
+    fp.reference_field
+        .as_ref()
+        .and_then(|field| field.text.as_ref())
+        .and_then(|board_text| board_text.text.as_ref())
+        .map(|text| text.text.clone())
+        .unwrap_or_default()
 }
 
 fn pad_positions_mm(fp: &kiapi::board::types::FootprintInstance) -> Vec<(f64, f64)> {
@@ -325,4 +372,73 @@ fn footprint_pad_readback_observes_the_updated_live_state_after_a_move() {
         pads.iter().map(|pad| (pad.x, pad.y)).collect::<Vec<_>>(),
         vec![(49.0, 50.0), (51.0, 50.0)]
     );
+}
+
+#[test]
+fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
+    let r1 = mk_footprint_r1();
+    let mut r2 = mk_footprint_r1();
+    konnect_ipc::transform::transform_footprint_children(
+        &mut r2,
+        &konnect_ipc::transform::Xform::Translate {
+            dx_nm: 100_000_000,
+            dy_nm: 0,
+        },
+    )
+    .unwrap();
+    r2.position = Some(builders::vec2(200.0, 100.0));
+    r2.reference_field
+        .as_mut()
+        .unwrap()
+        .text
+        .as_mut()
+        .unwrap()
+        .text
+        .as_mut()
+        .unwrap()
+        .text = "R2".to_string();
+
+    let (mock, captured) = spawn_footprints_mock(vec![r1, r2]);
+    let client = KiCadIpcClient::new(&mock.url);
+    client
+        .set_footprint_placements(&[
+            konnect_ipc::types::IpcFootprintPlacement {
+                reference: "R1".to_string(),
+                x: 50.0,
+                y: 50.0,
+                rotation: 90.0,
+            },
+            konnect_ipc::types::IpcFootprintPlacement {
+                reference: "R2".to_string(),
+                x: 250.0,
+                y: 150.0,
+                rotation: 180.0,
+            },
+        ])
+        .unwrap();
+
+    let update = captured.lock().unwrap().take().expect("UpdateItems sent");
+    assert_eq!(
+        update.items.len(),
+        2,
+        "one request must carry both footprints"
+    );
+    let sent: Vec<_> = update
+        .items
+        .iter()
+        .map(|item| kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap())
+        .collect();
+    let placements: Vec<_> = sent
+        .iter()
+        .map(|footprint| {
+            let position = footprint.position.unwrap();
+            (
+                builders::nm_to_mm(position.x_nm),
+                builders::nm_to_mm(position.y_nm),
+                footprint.orientation.as_ref().unwrap().value_degrees,
+            )
+        })
+        .collect();
+    assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
+    assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
 }
