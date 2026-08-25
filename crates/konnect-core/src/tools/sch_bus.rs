@@ -240,7 +240,8 @@ async fn handle_add_bus_entry(
     // instead (#329). Judge both corners against the sheet's actual bus
     // segments and only fall back to the convention when geometry cannot
     // decide.
-    let far = (x + direction.size().0, y + direction.size().1);
+    let round6 = |value: f64| (value * 1e6).round() / 1e6;
+    let far = (round6(x + direction.size().0), round6(y + direction.size().1));
     let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
         Ok(tree) => {
             let buses = bus_segments(&tree);
