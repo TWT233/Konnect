@@ -295,7 +295,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
             }
 
-            let (creates, updates) = build_mutation_items(client, &plan, &prepared, &snapshot)?;
+            let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit("Update PCB from saved schematic", |client| {
@@ -1555,7 +1555,6 @@ fn restage_additions(
 }
 
 fn build_mutation_items(
-    client: &konnect_ipc::KiCadIpcClient,
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
@@ -1578,7 +1577,7 @@ fn build_mutation_items(
                 let part = prepared
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
-                let item = client.build_footprint_item(
+                let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
                     footprint_id,
                     reference,
                     value,
@@ -1788,77 +1787,75 @@ mod tests {
     fn footprint_with_artwork(reference: &str) -> prost_types::Any {
         use konnect_ipc::gen::kiapi;
         use prost::Message;
-        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
         let silk = || "F.SilkS".to_string();
-        let item = client
-            .build_footprint_item(
-                "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
-                reference,
-                "NE555",
-                &[konnect_ipc::IpcPadDefinition {
-                    number: "1".to_string(),
-                    pad_type: "smd".to_string(),
-                    shape: "rect".to_string(),
-                    x: 0.0,
-                    y: 0.0,
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+            "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+            reference,
+            "NE555",
+            &[konnect_ipc::IpcPadDefinition {
+                number: "1".to_string(),
+                pad_type: "smd".to_string(),
+                shape: "rect".to_string(),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                size_x: 1.0,
+                size_y: 1.0,
+                drill_x: None,
+                drill_y: None,
+                drill_oval: false,
+                layers: vec!["F.Cu".to_string()],
+                roundrect_ratio: 0.0,
+            }],
+            &[
+                konnect_ipc::IpcGraphicDefinition::Line {
+                    start: (-2.0, -2.5),
+                    end: (2.0, -2.5),
+                    layer: silk(),
+                    width: 0.12,
+                },
+                konnect_ipc::IpcGraphicDefinition::Rect {
+                    start: (-2.6, -3.0),
+                    end: (2.6, 3.0),
+                    layer: "F.CrtYd".to_string(),
+                    width: 0.05,
+                    filled: false,
+                },
+                konnect_ipc::IpcGraphicDefinition::Circle {
+                    center: (-1.8, -1.8),
+                    end: (-1.6, -1.8),
+                    layer: silk(),
+                    width: 0.12,
+                    filled: true,
+                },
+                konnect_ipc::IpcGraphicDefinition::Arc {
+                    start: (-1.0, -2.5),
+                    mid: (0.0, -2.0),
+                    end: (1.0, -2.5),
+                    layer: "F.Fab".to_string(),
+                    width: 0.1,
+                },
+                konnect_ipc::IpcGraphicDefinition::Poly {
+                    points: vec![(-1.0, 2.0), (1.0, 2.0), (0.0, 2.8)],
+                    layer: "F.Fab".to_string(),
+                    width: 0.1,
+                    filled: true,
+                },
+                konnect_ipc::IpcGraphicDefinition::Text {
+                    text: "U1".to_string(),
+                    position: (0.0, -3.5),
                     rotation: 0.0,
-                    size_x: 1.0,
-                    size_y: 1.0,
-                    drill_x: None,
-                    drill_y: None,
-                    drill_oval: false,
-                    layers: vec!["F.Cu".to_string()],
-                    roundrect_ratio: 0.0,
-                }],
-                &[
-                    konnect_ipc::IpcGraphicDefinition::Line {
-                        start: (-2.0, -2.5),
-                        end: (2.0, -2.5),
-                        layer: silk(),
-                        width: 0.12,
-                    },
-                    konnect_ipc::IpcGraphicDefinition::Rect {
-                        start: (-2.6, -3.0),
-                        end: (2.6, 3.0),
-                        layer: "F.CrtYd".to_string(),
-                        width: 0.05,
-                        filled: false,
-                    },
-                    konnect_ipc::IpcGraphicDefinition::Circle {
-                        center: (-1.8, -1.8),
-                        end: (-1.6, -1.8),
-                        layer: silk(),
-                        width: 0.12,
-                        filled: true,
-                    },
-                    konnect_ipc::IpcGraphicDefinition::Arc {
-                        start: (-1.0, -2.5),
-                        mid: (0.0, -2.0),
-                        end: (1.0, -2.5),
-                        layer: "F.Fab".to_string(),
-                        width: 0.1,
-                    },
-                    konnect_ipc::IpcGraphicDefinition::Poly {
-                        points: vec![(-1.0, 2.0), (1.0, 2.0), (0.0, 2.8)],
-                        layer: "F.Fab".to_string(),
-                        width: 0.1,
-                        filled: true,
-                    },
-                    konnect_ipc::IpcGraphicDefinition::Text {
-                        text: "U1".to_string(),
-                        position: (0.0, -3.5),
-                        rotation: 0.0,
-                        layer: silk(),
-                        size: 1.0,
-                    },
-                ],
-                &konnect_ipc::IpcFieldPlacement::default(),
-                25.0,
-                30.0,
-                0.0,
-                "F.Cu",
-            )
-            .unwrap();
+                    layer: silk(),
+                    size: 1.0,
+                },
+            ],
+            &konnect_ipc::IpcFieldPlacement::default(),
+            25.0,
+            30.0,
+            0.0,
+            "F.Cu",
+        )
+        .unwrap();
         // Give it the KIID the update path matches against.
         let mut footprint =
             kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
@@ -2066,35 +2063,33 @@ mod tests {
         use konnect_ipc::gen::kiapi;
         use prost::Message;
 
-        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
-        let item = client
-            .build_footprint_item(
-                "Resistor_SMD:R_0603_1608Metric",
-                "R1",
-                "1k",
-                &[konnect_ipc::IpcPadDefinition {
-                    number: "1".to_string(),
-                    pad_type: "smd".to_string(),
-                    shape: "rect".to_string(),
-                    x: 0.0,
-                    y: 0.0,
-                    rotation: 0.0,
-                    size_x: 1.0,
-                    size_y: 1.0,
-                    drill_x: None,
-                    drill_y: None,
-                    drill_oval: false,
-                    layers: vec!["F.Cu".to_string()],
-                    roundrect_ratio: 0.0,
-                }],
-                &[],
-                &konnect_ipc::IpcFieldPlacement::default(),
-                25.0,
-                30.0,
-                90.0,
-                "F.Cu",
-            )
-            .unwrap();
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
+            "Resistor_SMD:R_0603_1608Metric",
+            "R1",
+            "1k",
+            &[konnect_ipc::IpcPadDefinition {
+                number: "1".to_string(),
+                pad_type: "smd".to_string(),
+                shape: "rect".to_string(),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                size_x: 1.0,
+                size_y: 1.0,
+                drill_x: None,
+                drill_y: None,
+                drill_oval: false,
+                layers: vec!["F.Cu".to_string()],
+                roundrect_ratio: 0.0,
+            }],
+            &[],
+            &konnect_ipc::IpcFieldPlacement::default(),
+            25.0,
+            30.0,
+            90.0,
+            "F.Cu",
+        )
+        .unwrap();
         let mut footprint =
             kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
         footprint.id = Some(kiapi::common::types::Kiid {

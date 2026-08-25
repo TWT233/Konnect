@@ -1522,9 +1522,12 @@ impl KiCadIpcClient {
     /// coordinates: KiCAD serializes `FootprintInstance` children that way
     /// and re-creates them verbatim (issue #23 — see the `transform` module
     /// docs), so every footprint-local point is rotated and translated here.
+    ///
+    /// An associated function rather than a method: it is pure construction,
+    /// and callers that never dial KiCAD (library-side planning) must not
+    /// need a client to reach it.
     #[allow(clippy::too_many_arguments)]
     pub fn build_footprint_item(
-        &self,
         lib_id: &str,
         reference: &str,
         value: &str,
@@ -1774,7 +1777,7 @@ impl KiCadIpcClient {
         {
             anyhow::bail!("footprint reference '{reference}' already exists on the board");
         }
-        let item = self.build_footprint_item(
+        let item = Self::build_footprint_item(
             lib_id, reference, value, pads, graphics, fields, x, y, rotation, layer,
         )?;
         self.create_items_in(document.clone(), vec![item])?;
@@ -2171,23 +2174,19 @@ mod footprint_graphics_tests {
         y: f64,
         rotation: f64,
     ) -> kiapi::board::types::FootprintInstance {
-        // build_footprint_item is pure — no IPC round-trip — so the socket
-        // path is never dialed.
-        let client = KiCadIpcClient::new("tcp://never-dialed");
-        let any = client
-            .build_footprint_item(
-                "Lib:Fp",
-                "R1",
-                "R",
-                &[],
-                graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                x,
-                y,
-                rotation,
-                "F.Cu",
-            )
-            .unwrap();
+        let any = KiCadIpcClient::build_footprint_item(
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            x,
+            y,
+            rotation,
+            "F.Cu",
+        )
+        .unwrap();
         kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap()
     }
 
@@ -2408,21 +2407,19 @@ mod footprint_graphics_tests {
         };
 
         for layer in ["F.Cu", "B.Cu"] {
-            let client = KiCadIpcClient::new("tcp://never-dialed");
-            let any = client
-                .build_footprint_item(
-                    "Lib:Fp",
-                    "R1",
-                    "R",
-                    &[pad(layer)],
-                    &[],
-                    &crate::types::IpcFieldPlacement::default(),
-                    10.0,
-                    10.0,
-                    0.0,
-                    "F.Cu",
-                )
-                .unwrap();
+            let any = KiCadIpcClient::build_footprint_item(
+                "Lib:Fp",
+                "R1",
+                "R",
+                &[pad(layer)],
+                &[],
+                &crate::types::IpcFieldPlacement::default(),
+                10.0,
+                10.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap();
             let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
             let pad_any = fp
                 .definition
@@ -2462,21 +2459,19 @@ mod footprint_graphics_tests {
                 size: 1.0,
             },
         ];
-        let client = KiCadIpcClient::new("tcp://never-dialed");
-        let any = client
-            .build_footprint_item(
-                "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
-                "J1",
-                "USB_C",
-                &[],
-                &graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                100.0,
-                100.0,
-                0.0,
-                "F.Cu",
-            )
-            .expect("a Dwgs.User graphic must place");
+        let any = KiCadIpcClient::build_footprint_item(
+            "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+            "J1",
+            "USB_C",
+            &[],
+            &graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            100.0,
+            100.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect("a Dwgs.User graphic must place");
 
         let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
         let undefined = kiapi::board::types::BoardLayer::BlUndefined as i32;
@@ -2512,9 +2507,8 @@ mod footprint_graphics_tests {
     /// what stops the next one KiCAD adds from crashing it again.
     #[test]
     fn an_unmappable_layer_refuses_the_whole_footprint() {
-        let client = KiCadIpcClient::new("tcp://never-dialed");
         let build = |pads: &[IpcPadDefinition], graphics: &[IpcGraphicDefinition], layer: &str| {
-            client.build_footprint_item(
+            KiCadIpcClient::build_footprint_item(
                 "Lib:Fp",
                 "R1",
                 "R",
