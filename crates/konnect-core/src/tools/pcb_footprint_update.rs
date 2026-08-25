@@ -908,7 +908,12 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
         };
         if !matches!(
             tag,
-            "at" | "size" | "layers" | "drill" | "roundrect_rratio" | "uuid" | "tstamp"
+            "at" | "size"
+                | "layers"
+                | "drill"
+                | "roundrect_rratio"
+                | "uuid"
+                | "tstamp"
                 | "remove_unused_layers"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
@@ -1620,10 +1625,7 @@ mod tests {
         // rebuild cannot represent, so they refuse rather than silently drop.
         for (from, to) in [
             ("(embedded_fonts no)", "(embedded_fonts yes)"),
-            (
-                "(remove_unused_layers no)",
-                "(remove_unused_layers yes)",
-            ),
+            ("(remove_unused_layers no)", "(remove_unused_layers yes)"),
         ] {
             let flipped = source.replace(from, to);
             assert_ne!(flipped, source, "fixture must contain {from}");
@@ -1655,7 +1657,9 @@ mod tests {
         };
         let current = kiapi::board::types::FootprintInstance {
             position: Some(builders::vec2(10.0, 20.0)),
-            orientation: Some(kiapi::common::types::Angle { value_degrees: 90.0 }),
+            orientation: Some(kiapi::common::types::Angle {
+                value_degrees: 90.0,
+            }),
             layer: kiapi::board::types::BoardLayer::BlFCu as i32,
             definition: Some(kiapi::board::types::Footprint {
                 items: vec![pad("1", Some("GND"))],

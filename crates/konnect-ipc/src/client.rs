@@ -2175,18 +2175,18 @@ mod footprint_graphics_tests {
         rotation: f64,
     ) -> kiapi::board::types::FootprintInstance {
         let any = KiCadIpcClient::build_footprint_item(
-                "Lib:Fp",
-                "R1",
-                "R",
-                &[],
-                graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                x,
-                y,
-                rotation,
-                "F.Cu",
-            )
-            .unwrap();
+            "Lib:Fp",
+            "R1",
+            "R",
+            &[],
+            graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            x,
+            y,
+            rotation,
+            "F.Cu",
+        )
+        .unwrap();
         kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap()
     }
 
@@ -2408,18 +2408,18 @@ mod footprint_graphics_tests {
 
         for layer in ["F.Cu", "B.Cu"] {
             let any = KiCadIpcClient::build_footprint_item(
-                    "Lib:Fp",
-                    "R1",
-                    "R",
-                    &[pad(layer)],
-                    &[],
-                    &crate::types::IpcFieldPlacement::default(),
-                    10.0,
-                    10.0,
-                    0.0,
-                    "F.Cu",
-                )
-                .unwrap();
+                "Lib:Fp",
+                "R1",
+                "R",
+                &[pad(layer)],
+                &[],
+                &crate::types::IpcFieldPlacement::default(),
+                10.0,
+                10.0,
+                0.0,
+                "F.Cu",
+            )
+            .unwrap();
             let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
             let pad_any = fp
                 .definition
@@ -2460,18 +2460,18 @@ mod footprint_graphics_tests {
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(
-                "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
-                "J1",
-                "USB_C",
-                &[],
-                &graphics,
-                &crate::types::IpcFieldPlacement::default(),
-                100.0,
-                100.0,
-                0.0,
-                "F.Cu",
-            )
-            .expect("a Dwgs.User graphic must place");
+            "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+            "J1",
+            "USB_C",
+            &[],
+            &graphics,
+            &crate::types::IpcFieldPlacement::default(),
+            100.0,
+            100.0,
+            0.0,
+            "F.Cu",
+        )
+        .expect("a Dwgs.User graphic must place");
 
         let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
         let undefined = kiapi::board::types::BoardLayer::BlUndefined as i32;

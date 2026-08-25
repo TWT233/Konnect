@@ -835,37 +835,37 @@ fn record_doc(
 /// KiCad would send it.
 fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_types::Any {
     let item = KiCadIpcClient::build_footprint_item(
-            "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
-            "U1",
-            "NE555",
-            &[konnect_ipc::IpcPadDefinition {
-                number: "1".to_string(),
-                pad_type: "smd".to_string(),
-                shape: "rect".to_string(),
-                x: 0.0,
-                y: 0.0,
-                rotation: 0.0,
-                size_x: 1.0,
-                size_y: 1.0,
-                drill_x: None,
-                drill_y: None,
-                drill_oval: false,
-                layers: vec!["F.Cu".to_string()],
-                roundrect_ratio: 0.0,
-            }],
-            &[konnect_ipc::IpcGraphicDefinition::Poly {
-                points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
-                layer: "F.SilkS".to_string(),
-                width: 0.12,
-                filled: false,
-            }],
-            &konnect_ipc::IpcFieldPlacement::default(),
-            10.0,
-            10.0,
-            0.0,
-            "F.Cu",
-        )
-        .unwrap();
+        "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+        "U1",
+        "NE555",
+        &[konnect_ipc::IpcPadDefinition {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            size_x: 1.0,
+            size_y: 1.0,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec!["F.Cu".to_string()],
+            roundrect_ratio: 0.0,
+        }],
+        &[konnect_ipc::IpcGraphicDefinition::Poly {
+            points: vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0)],
+            layer: "F.SilkS".to_string(),
+            width: 0.12,
+            filled: false,
+        }],
+        &konnect_ipc::IpcFieldPlacement::default(),
+        10.0,
+        10.0,
+        0.0,
+        "F.Cu",
+    )
+    .unwrap();
 
     let mut fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
     for child in &mut fp.definition.as_mut().unwrap().items {
