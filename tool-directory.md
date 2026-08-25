@@ -324,7 +324,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `suggest_jlcpcb_alternatives` | Suggest JLCPCB-stocked alternatives for a given component value and footprint. |
 | `get_jlcpcb_database_stats` | Statistics about the local JLCPCB cache: part count, last updated, file size. |
 | `enrich_datasheets` | Fetch and cache datasheet URLs for all components in a schematic (LCSC API). |
-| `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
+| `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID — from the local JLCPCB catalog first, falling back to the LCSC API. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available. |
 
 Migration from the former `autoroute` tool: use Freerouting's KiCad ActionPlugin for
