@@ -22,7 +22,9 @@ impl SheetPin {
         SheetPin {
             name: name.into(),
             pin_type: pin_type.into(),
-            at: At::new(x, y),
+            // A sheet pin's `at` must carry all three values — KiCAD refuses
+            // to load the whole schematic when the rotation is absent.
+            at: At::with_rotation(x, y, 0.0),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
         }
@@ -572,6 +574,17 @@ mod tests {
         assert!(sheet.remove_pin("VCC"));
         assert!(sheet.pin_by_name("VCC").is_none());
         assert!(!sheet.remove_pin("VCC")); // already gone
+    }
+
+    #[test]
+    fn new_pin_serializes_with_rotation() {
+        // KiCAD requires `(at x y rotation)` on a sheet pin — a two-value `at`
+        // makes it refuse to load the whole schematic (#303).
+        let out = crate::sexp::writer::write(&SheetPin::new("VCC", "input", 90.0, 55.0).to_sexp());
+        assert!(
+            out.contains("(at 90 55 0)"),
+            "sheet pin must serialize a rotation, got: {out}"
+        );
     }
 
     #[test]

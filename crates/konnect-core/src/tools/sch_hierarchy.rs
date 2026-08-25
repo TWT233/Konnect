@@ -2269,6 +2269,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_sheet_pin_writes_a_rotation_kicad_can_load() {
+        // Regression for #303: the pin used to be written as `(at x y)` with no
+        // rotation, and KiCAD then refused to load the whole schematic.
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "TESTNET", "pin_type": "input", "x": 100.0, "y": 105.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let written = std::fs::read_to_string(&root).unwrap();
+        assert!(
+            written.contains("(at 100 105 0)"),
+            "sheet pin must be written with a rotation, got: {}",
+            written
+                .lines()
+                .skip_while(|l| !l.contains("(pin \"TESTNET\""))
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // And it must survive a reload through the same parser.
+        let parent = cse::Schematic::load(&root).unwrap();
+        let pin_rotation = parent.sheets.by_name("A").unwrap().pins[0].at.rotation;
+        assert_eq!(pin_rotation, Some(0.0));
+    }
+
+    #[tokio::test]
     async fn add_sheet_pin_rejects_duplicate_name() {
         let tmp = TempDir::new().unwrap();
         let root = blank_schematic(tmp.path(), "root.kicad_sch");
