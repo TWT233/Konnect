@@ -937,6 +937,24 @@ mod unit_pin_tests {
     }
 
     #[test]
+    fn extraction_preserves_the_electrical_pin_type() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin no_connect line (at 0 0 0) (length 0)
+      (name "NC" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27)))))))"#,
+        )
+        .unwrap();
+        let pin = extract_lib_pins(root.find("symbol").unwrap())
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(pin.electrical_type, "no_connect");
+    }
+
+    #[test]
     fn underscored_base_names_parse_their_unit_suffix() {
         assert_eq!(parse_subsymbol_unit("R_Small_1_1"), Some(1));
         assert_eq!(parse_subsymbol_unit("OP_DUAL_2_1"), Some(2));

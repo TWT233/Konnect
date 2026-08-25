@@ -19,7 +19,7 @@ use konnect_sexp::{
     FileTransition, ItemAnchor, ItemId, SchematicCommand,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
@@ -162,8 +162,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to the parent .kicad_sch file" },
                     "sheet_name": { "type": "string" },
-                    "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" },
-                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
+                    "side": { "type": "string", "enum": ["right", "left"], "description": "Which edge to place new pins on. Default: 'right'" }
                 },
                 "required": ["schematic", "sheet_name"]
             }),
@@ -341,6 +340,91 @@ fn ensure_source_root_uuid(source: &str) -> anyhow::Result<(String, String)> {
     Ok((updated, uuid))
 }
 
+/// Give every item in a duplicated document its own UUID.
+///
+/// `duplicate_sheet` rewrote only the root `(uuid ...)`. Every nested item —
+/// text, symbols, wires, labels, sheet pins — arrived in the copy still
+/// carrying the source's UUID, so two sheets claimed the same identities and
+/// anything resolving by UUID picks one of them arbitrarily.
+///
+/// Replacements are applied per quoted string rather than by substring, and a
+/// string is remapped segment by segment, so an instance `(path "/a/b")` that
+/// names a renamed item follows it instead of dangling. Matching whole segments
+/// also keeps short non-UUID identifiers, which fixtures and project names use,
+/// from being rewritten where they merely occur inside another word.
+fn regenerate_item_uuids(source: &str) -> String {
+    const DECLARATION: &str = "(uuid \"";
+
+    let mut mapping: HashMap<&str, String> = HashMap::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(DECLARATION) {
+        let body = &rest[at + DECLARATION.len()..];
+        let Some(end) = body.find('"') else { break };
+        let declared = &body[..end];
+        if !declared.is_empty() {
+            mapping
+                .entry(declared)
+                .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        }
+        rest = &body[end..];
+    }
+    if mapping.is_empty() {
+        return source.to_owned();
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find('"') {
+        out.push_str(&rest[..=at]);
+        let body = &rest[at + 1..];
+        let mut end = None;
+        let mut escaped = false;
+        for (index, ch) in body.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    end = Some(index);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            rest = body;
+            break;
+        };
+        out.push_str(&remap_uuid_string(&body[..end], &mapping));
+        out.push('"');
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remap a quoted string: either the whole value, or each `/`-separated segment
+/// of an instance path.
+fn remap_uuid_string(value: &str, mapping: &HashMap<&str, String>) -> String {
+    if let Some(replacement) = mapping.get(value) {
+        return replacement.clone();
+    }
+    if !value.contains('/') {
+        return value.to_owned();
+    }
+    value
+        .split('/')
+        .map(|segment| {
+            mapping
+                .get(segment)
+                .map_or(segment, |replacement| replacement.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> {
     let children = konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch");
     let range = children.iter().find_map(|(start, end)| {
@@ -364,21 +448,25 @@ fn replace_source_root_uuid(source: &str, uuid: &str) -> anyhow::Result<String> 
         .or_else(|_| anyhow::bail!("could not replace newly inserted schematic UUID {generated}"))
 }
 
+/// Commit one edited sheet item and report whether the document changed.
+///
+/// A command that restates the block already on disk is valid and commits as a
+/// no-op, so callers that set a value unconditionally get `false` here rather
+/// than an error.
 fn commit_edited_sheet_item(
     path: &Path,
     before: &str,
     edited: &cse::Schematic,
     uuid: &str,
     label: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let command = SchematicCommand::replace_item_from_document(
         before,
         &edited.to_source(),
         ItemId::new(uuid)?,
         label,
     )?;
-    commit_command(path, &command)?;
-    Ok(())
+    Ok(commit_command(path, &command)?.changed)
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -544,35 +632,58 @@ async fn handle_edit_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     };
     let sheet_uuid = sheet.uuid.clone();
 
+    // `requested` is what the caller asked to set, `changed` is what actually
+    // differs. They diverge when a caller re-asserts the state that is already
+    // there, which is a request the sheet can honor.
+    let mut requested = Vec::new();
     let mut changed = Vec::new();
     if let Some(new_name) = opt_str(args, "new_name") {
-        sheet.set_name(new_name);
-        changed.push("name");
+        requested.push("name");
+        if sheet.name() != new_name {
+            sheet.set_name(new_name);
+            changed.push("name");
+        }
     }
     if let Some(new_file) = opt_str(args, "new_file") {
-        sheet.set_file(new_file);
-        changed.push("file");
+        requested.push("file");
+        if sheet.file() != new_file {
+            sheet.set_file(new_file);
+            changed.push("file");
+        }
     }
     if let (Some(x), Some(y)) = (opt_f64(args, "x"), opt_f64(args, "y")) {
-        sheet.move_to(x, y);
-        changed.push("position");
+        requested.push("position");
+        if sheet.at.x != x || sheet.at.y != y {
+            sheet.move_to(x, y);
+            changed.push("position");
+        }
     }
     if let (Some(w), Some(h)) = (opt_f64(args, "width"), opt_f64(args, "height")) {
-        sheet.set_size(w, h);
-        changed.push("size");
+        requested.push("size");
+        if sheet.width != w || sheet.height != h {
+            sheet.set_size(w, h);
+            changed.push("size");
+        }
     }
 
-    if changed.is_empty() {
+    if requested.is_empty() {
         return Ok(CallToolResult::error(
             "No fields to change — provide at least one of: new_name, new_file, x+y, width+height",
         ));
     }
 
     let summary = sheet_json(sheet, &project_name);
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
+    // Skip the commit outright when nothing differs. Writing would reserialise
+    // the whole sheet (#210) and produce a diff for a request that asked for
+    // the state already on disk.
+    if !changed.is_empty() {
+        let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet")?;
+    }
     Ok(CallToolResult::json(&json!({
         "edited": sheet_name,
+        "changed": !changed.is_empty(),
         "changed_fields": changed,
+        "requested_fields": requested,
         "sheet": summary
     })))
 }
@@ -597,10 +708,14 @@ async fn handle_move_sheet(args: &Value, _ctx: &ToolContext) -> anyhow::Result<C
     match sch.sheets.by_name_mut(&sheet_name) {
         Some(sheet) => {
             let sheet_uuid = sheet.uuid.clone();
-            sheet.move_to(x, y);
-            commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
+            let changed = sheet.at.x != x || sheet.at.y != y;
+            if changed {
+                sheet.move_to(x, y);
+                let _ =
+                    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Move sheet")?;
+            }
             Ok(CallToolResult::json(
-                &json!({ "moved": sheet_name, "x": x, "y": y }),
+                &json!({ "moved": sheet_name, "x": x, "y": y, "changed": changed }),
             ))
         }
         None => Ok(CallToolResult::error(format!(
@@ -748,8 +863,11 @@ async fn handle_duplicate_sheet(
     let (parent_after, _) = prepare_command(&sch_path, &parent_base, &parent_command)?;
 
     let source_child_content = read_consistent(&source_child)?;
+    // Fresh identities for the copy's own items before the root is renamed;
+    // otherwise the duplicate shares every nested UUID with its source.
+    let refreshed_child = regenerate_item_uuids(&source_child_content);
     let duplicated_uuid = uuid::Uuid::new_v4().to_string();
-    let duplicated_base = replace_source_root_uuid(&source_child_content, &duplicated_uuid)?;
+    let duplicated_base = replace_source_root_uuid(&refreshed_child, &duplicated_uuid)?;
     let hierarchy_path = format!("{root_path}/{sheet_uuid}");
     let (duplicated_after, patched) = if let Some(command) =
         SchematicCommand::ensure_symbol_instance_path(
@@ -1082,7 +1200,7 @@ async fn handle_import_sheet_pins(
     }
 
     if !imported.is_empty() {
-        commit_edited_sheet_item(
+        let _ = commit_edited_sheet_item(
             &sch_path,
             &before,
             &parent,
@@ -1150,7 +1268,7 @@ async fn handle_add_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resul
         x,
         y,
     ));
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Add sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "added_pin": pin_name,
@@ -1223,7 +1341,7 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
     let summary = json!({
         "name": pin.name, "pin_type": pin.pin_type, "x": pin.at.x, "y": pin.at.y
     });
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Edit sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "edited_pin": pin_name,
@@ -1266,7 +1384,7 @@ async fn handle_delete_sheet_pin(
             pin_name, sheet_name
         )));
     }
-    commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
+    let _ = commit_edited_sheet_item(&sch_path, &before, &sch, &sheet_uuid, "Delete sheet pin")?;
 
     Ok(CallToolResult::json(&json!({
         "deleted_pin": pin_name,
@@ -1407,6 +1525,166 @@ mod tests {
             parent.sheets.by_name("Power Supply").unwrap().page("root"),
             Some("2")
         );
+    }
+
+    fn result_json(result: &CallToolResult) -> Value {
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn sheet_at(tmp: &TempDir, ctx: &ToolContext, x: f64, y: f64) -> PathBuf {
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_file": "power.kicad_sch",
+            "sheet_name": "Power",
+            "x": x, "y": y
+        });
+        handle_add_hierarchical_sheet(&args, ctx).await.unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_accepts_the_position_the_sheet_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let before = std::fs::read_to_string(&root).unwrap();
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error, "an idempotent edit is not an error");
+        let body = result_json(&result);
+        assert_eq!(body["changed"], json!(false));
+        assert_eq!(body["changed_fields"], json!([]));
+        assert_eq!(body["requested_fields"], json!(["position"]));
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            before,
+            "a no-op edit leaves the file alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_reports_only_the_fields_that_differ() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        // Position is restated, the name is genuinely new.
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "new_name": "Power Supply",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        let body = result_json(&result);
+        assert_eq!(body["changed"], json!(true));
+        assert_eq!(body["changed_fields"], json!(["name"]));
+        assert_eq!(body["requested_fields"], json!(["name", "position"]));
+    }
+
+    #[tokio::test]
+    async fn move_sheet_accepts_the_position_the_sheet_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 20.0, "y": 20.0
+        });
+        let result = handle_move_sheet(&args, &ctx).await.unwrap();
+
+        assert!(!result.is_error, "an idempotent move is not an error");
+        assert_eq!(result_json(&result)["changed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_is_idempotent_on_a_sheet_konnect_already_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let move_it = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "x": 30.0, "y": 30.0
+        });
+
+        // The first edit rewrites the sheet in Konnect's own serialisation, so
+        // the block round-trips byte-for-byte from here on. That is the state
+        // in which the reported error appeared.
+        let first = handle_edit_sheet(&move_it, &ctx).await.unwrap();
+        assert!(!first.is_error);
+        assert_eq!(result_json(&first)["changed"], json!(true));
+        let settled = std::fs::read_to_string(&root).unwrap();
+
+        let second = handle_edit_sheet(&move_it, &ctx).await.unwrap();
+
+        assert!(
+            !second.is_error,
+            "re-asserting the current position must not error"
+        );
+        assert_eq!(result_json(&second)["changed"], json!(false));
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), settled);
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_accepts_the_position_the_pin_already_has() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+        let add = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "pin_name": "VCC",
+            "pin_type": "input",
+            "x": 20.0, "y": 25.0
+        });
+        handle_add_sheet_pin(&add, &ctx).await.unwrap();
+
+        let restate = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power",
+            "pin_name": "VCC",
+            "x": 20.0, "y": 25.0
+        });
+        handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
+        let result = handle_edit_sheet_pin(&restate, &ctx).await.unwrap();
+
+        // This handler does no field pre-comparison; it reaches the command
+        // layer with an identical block and relies on the no-op being legal.
+        assert!(
+            !result.is_error,
+            "the relaxed command layer covers callers that do not pre-compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_still_rejects_a_call_with_no_fields() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = sheet_at(&tmp, &ctx, 20.0, 20.0).await;
+
+        let args = json!({
+            "schematic": root.display().to_string(),
+            "sheet_name": "Power"
+        });
+        let result = handle_edit_sheet(&args, &ctx).await.unwrap();
+
+        assert!(result.is_error, "asking for nothing is still an error");
     }
 
     #[tokio::test]
@@ -1594,6 +1872,164 @@ mod tests {
         let sch1 = cse::Schematic::load(tmp.path().join("amp.kicad_sch")).unwrap();
         let sch2 = cse::Schematic::load(tmp.path().join("amp2.kicad_sch")).unwrap();
         assert_ne!(sch1.uuid, sch2.uuid);
+    }
+
+    fn declared_uuids(source: &str) -> HashSet<String> {
+        const DECLARATION: &str = "(uuid \"";
+        let mut found = HashSet::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(DECLARATION) {
+            let body = &rest[at + DECLARATION.len()..];
+            let Some(end) = body.find('"') else { break };
+            found.insert(body[..end].to_owned());
+            rest = &body[end + 1..];
+        }
+        found
+    }
+
+    #[test]
+    fn regenerating_uuids_replaces_declarations_and_the_paths_that_name_them() {
+        let source = r#"(kicad_sch
+  (symbol (lib_id "Device:R") (uuid "sym-a")
+    (instances (project "demo" (path "/root-a/sym-a" (reference "R1"))))
+  )
+  (text "see sym-a in the notes" (uuid "text-a"))
+  (sheet_instances (path "/root-a" (page "2")))
+)
+"#;
+
+        let out = regenerate_item_uuids(source);
+
+        let before = declared_uuids(source);
+        let after = declared_uuids(&out);
+        assert_eq!(before.len(), 2, "fixture declares two UUIDs");
+        assert_eq!(after.len(), 2, "the copy declares two UUIDs");
+        assert!(
+            before.is_disjoint(&after),
+            "every declaration must change: {before:?} vs {after:?}"
+        );
+
+        // The instance path naming the renamed symbol follows it.
+        let new_symbol = out
+            .split_once("(uuid \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(id, _)| id.to_owned())
+            .expect("symbol uuid present");
+        assert!(
+            out.contains(&format!("(path \"/root-a/{new_symbol}\"")),
+            "the path must follow the renamed item:\n{out}"
+        );
+
+        // Strings that are not declared UUIDs are left alone — including a
+        // sentence that merely contains one, and "root-a", which is a path
+        // segment but was never declared here.
+        assert!(out.contains("(project \"demo\""), "{out}");
+        assert!(out.contains("(reference \"R1\")"), "{out}");
+        assert!(out.contains("(lib_id \"Device:R\")"), "{out}");
+        assert!(
+            out.contains("\"see sym-a in the notes\""),
+            "text content must survive verbatim:\n{out}"
+        );
+        assert!(out.contains("(path \"/root-a\" (page \"2\"))"), "{out}");
+    }
+
+    #[test]
+    fn regenerating_uuids_leaves_a_document_without_any_alone() {
+        let source = "(kicad_sch\n  (lib_symbols)\n)\n";
+        assert_eq!(regenerate_item_uuids(source), source);
+    }
+
+    /// The scan walks every quoted string in the file, so an escaped quote
+    /// inside text content must not shift it out of step — a bug there
+    /// corrupts the whole document, not just the annotation.
+    #[test]
+    fn regenerating_uuids_survives_escaped_quotes_in_text() {
+        let source = r#"(kicad_sch
+  (text "a \"b\" c" (uuid "text-a"))
+  (generator "konnect")
+)
+"#;
+
+        let out = regenerate_item_uuids(source);
+
+        assert!(
+            out.contains("(generator \"konnect\")"),
+            "a later string was corrupted by the escape:\n{out}"
+        );
+        assert!(out.contains(r#""a \"b\" c""#), "{out}");
+        assert!(!out.contains("text-a"), "{out}");
+    }
+
+    /// The report: `add_schematic_text` then `duplicate_sheet` leaves both
+    /// sheets carrying the same text UUID.
+    #[tokio::test]
+    async fn duplicate_sheet_gives_the_copy_its_own_item_uuids() {
+        const SOURCE_TEXT_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "amp.kicad_sch",
+                "sheet_name": "Amp1",
+                "x": 10.0, "y": 10.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // An annotation in the child, shaped as add_schematic_text writes one.
+        let child = tmp.path().join("amp.kicad_sch");
+        let content = std::fs::read_to_string(&child).unwrap();
+        let cut = content.rfind(')').unwrap();
+        let block = format!(
+            "\n  (text \"NOTE\"\n    (at 10 10 0)\n    \
+             (effects (font (size 1.27 1.27)) (justify left bottom))\n    \
+             (uuid \"{SOURCE_TEXT_UUID}\")\n  )\n"
+        );
+        std::fs::write(
+            &child,
+            format!("{}{}{}", &content[..cut], block, &content[cut..]),
+        )
+        .unwrap();
+
+        let result = handle_duplicate_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "source_sheet_name": "Amp1",
+                "new_sheet_name": "Amp2",
+                "new_file": "amp2.kicad_sch"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let source_ids = declared_uuids(&std::fs::read_to_string(&child).unwrap());
+        let copy_ids =
+            declared_uuids(&std::fs::read_to_string(tmp.path().join("amp2.kicad_sch")).unwrap());
+
+        assert!(
+            source_ids.contains(SOURCE_TEXT_UUID),
+            "the source keeps its own annotation"
+        );
+        assert!(
+            !copy_ids.contains(SOURCE_TEXT_UUID),
+            "the copy kept the source's text UUID"
+        );
+        assert!(
+            source_ids.is_disjoint(&copy_ids),
+            "no UUID may be shared between a sheet and its copy:\n{source_ids:?}\n{copy_ids:?}"
+        );
+        assert_eq!(
+            source_ids.len(),
+            copy_ids.len(),
+            "same items, new identities"
+        );
     }
 
     #[tokio::test]
@@ -1829,6 +2265,46 @@ mod tests {
 
         let parent = cse::Schematic::load(&root).unwrap();
         assert_eq!(parent.sheets.by_name("Power").unwrap().pins.len(), 1); // not duplicated
+    }
+
+    #[tokio::test]
+    async fn add_sheet_pin_writes_a_rotation_kicad_can_load() {
+        // Regression for #303: the pin used to be written as `(at x y)` with no
+        // rotation, and KiCAD then refused to load the whole schematic.
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "a.kicad_sch", "sheet_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_add_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "A", "pin_name": "TESTNET", "pin_type": "input", "x": 100.0, "y": 105.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let written = std::fs::read_to_string(&root).unwrap();
+        assert!(
+            written.contains("(at 100 105 0)"),
+            "sheet pin must be written with a rotation, got: {}",
+            written
+                .lines()
+                .skip_while(|l| !l.contains("(pin \"TESTNET\""))
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // And it must survive a reload through the same parser.
+        let parent = cse::Schematic::load(&root).unwrap();
+        let pin_rotation = parent.sheets.by_name("A").unwrap().pins[0].at.rotation;
+        assert_eq!(pin_rotation, Some(0.0));
     }
 
     #[tokio::test]
