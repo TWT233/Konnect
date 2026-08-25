@@ -191,15 +191,14 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "move_connected",
             "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
+            // No parameters: the handler refuses unconditionally, and the
+            // schema-parameter guard (rightly) refuses a schema that advertises
+            // arguments nothing reads. The old parameters are documented in
+            // docs/API_MIGRATIONS.md alongside #285's removals.
             json!({
                 "type": "object",
-                "properties": {
-                    "schematic": { "type": "string" },
-                    "reference": { "type": "string" },
-                    "x": { "type": "number" },
-                    "y": { "type": "number" }
-                },
-                "required": ["schematic", "reference", "x", "y"]
+                "properties": {},
+                "required": []
             }),
             |args, ctx| async move { handle_move_connected(args, ctx).await }
         ),
