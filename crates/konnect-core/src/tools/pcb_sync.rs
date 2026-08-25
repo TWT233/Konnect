@@ -295,7 +295,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
             }
 
-            let (creates, updates) = build_mutation_items(client, &plan, &prepared, &snapshot)?;
+            let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit("Update PCB from saved schematic", |client| {
@@ -1555,7 +1555,6 @@ fn restage_additions(
 }
 
 fn build_mutation_items(
-    client: &konnect_ipc::KiCadIpcClient,
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
@@ -1578,7 +1577,7 @@ fn build_mutation_items(
                 let part = prepared
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
-                let item = client.build_footprint_item(
+                let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
                     footprint_id,
                     reference,
                     value,
@@ -1788,10 +1787,8 @@ mod tests {
     fn footprint_with_artwork(reference: &str) -> prost_types::Any {
         use konnect_ipc::gen::kiapi;
         use prost::Message;
-        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
         let silk = || "F.SilkS".to_string();
-        let item = client
-            .build_footprint_item(
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
                 "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
                 reference,
                 "NE555",
@@ -2066,9 +2063,7 @@ mod tests {
         use konnect_ipc::gen::kiapi;
         use prost::Message;
 
-        let client = konnect_ipc::KiCadIpcClient::new("inproc://not-connected");
-        let item = client
-            .build_footprint_item(
+        let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
                 "Resistor_SMD:R_0603_1608Metric",
                 "R1",
                 "1k",

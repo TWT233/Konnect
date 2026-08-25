@@ -39,6 +39,7 @@ enum ChangedDomain {
 struct PreparedUpdate {
     item: prost_types::Any,
     changed_domains: BTreeSet<ChangedDomain>,
+    preserved: PreservedState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -96,17 +97,37 @@ struct PreservedState {
     instance_overrides: bool,
 }
 
-impl Default for PreservedState {
-    fn default() -> Self {
+impl PreservedState {
+    /// Derived by comparing the rebuilt instance against the one read from
+    /// the board — never asserted from policy. If a future change to
+    /// `build_updated_instance` stops carrying one of these across, the
+    /// response says so instead of echoing the intent.
+    fn derive(
+        current: &kiapi::board::types::FootprintInstance,
+        updated: &kiapi::board::types::FootprintInstance,
+        old_nets: &BTreeMap<String, kiapi::board::types::Net>,
+    ) -> Self {
+        let new_nets: BTreeMap<String, String> = updated
+            .definition
+            .iter()
+            .flat_map(|definition| definition.items.iter())
+            .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+            .filter_map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).ok())
+            .filter_map(|pad| pad.net.map(|net| (pad.number, net.name)))
+            .collect();
         Self {
-            position: true,
-            rotation: true,
-            layer: true,
-            locked: true,
-            kiid: true,
-            symbol_path: true,
-            pad_nets: true,
-            instance_overrides: true,
+            position: updated.position == current.position,
+            rotation: updated.orientation == current.orientation,
+            layer: updated.layer == current.layer,
+            locked: updated.locked == current.locked,
+            kiid: updated.id == current.id,
+            symbol_path: updated.symbol_path == current.symbol_path
+                && updated.symbol_sheet_name == current.symbol_sheet_name
+                && updated.symbol_sheet_filename == current.symbol_sheet_filename,
+            pad_nets: old_nets.iter().all(|(number, net)| {
+                new_nets.get(number).map(String::as_str) == Some(net.name.as_str())
+            }),
+            instance_overrides: updated.overrides == current.overrides,
         }
     }
 }
@@ -663,7 +684,7 @@ fn plan_updates(
                 reference: candidate.reference,
                 library_id: candidate.library_id,
                 changed_domains: prepared.changed_domains,
-                preserved: PreservedState::default(),
+                preserved: prepared.preserved,
             });
             prepared_items.push(prepared.item);
         }
@@ -759,6 +780,19 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
             "version" | "generator" | "generator_version" | "layer" | "descr" | "tags" | "attr"
             | "property" | "fp_text" | "fp_line" | "fp_rect" | "fp_circle" | "fp_arc"
             | "fp_poly" | "pad" | "model" => {}
+            // KiCad 10 writes these two flags into every footprint it saves
+            // (all 15,428 official library files carry them, every one at its
+            // default). At the default the typed rebuild loses nothing;
+            // a non-default value carries semantics it cannot represent.
+            "embedded_fonts" | "duplicate_pad_numbers_are_jumpers" => {
+                let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+                if value != Some("no") {
+                    bail!(
+                        "footprint '{tag} {}' is not supported by typed library refresh",
+                        value.unwrap_or("")
+                    );
+                }
+            }
             unsupported => {
                 bail!("footprint child '{unsupported}' is not supported by typed library refresh")
             }
@@ -875,8 +909,17 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
         if !matches!(
             tag,
             "at" | "size" | "layers" | "drill" | "roundrect_rratio" | "uuid" | "tstamp"
+                | "remove_unused_layers"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
+        }
+        if tag == "remove_unused_layers" {
+            // The typed rebuild always keeps unused layers (`UlrKeep`), so a
+            // pad that actually removes them cannot be rebuilt losslessly.
+            let value = child.get(1).and_then(konnect_sexp::SexpNode::as_str);
+            if value != Some("no") {
+                bail!("pad 'remove_unused_layers yes' is not supported by typed library refresh");
+            }
         }
         if tag == "drill" {
             for nested in child.children().unwrap_or_default().iter().skip(1) {
@@ -1064,8 +1107,7 @@ fn build_updated_instance(
     } else {
         (library.pads.clone(), library.graphics.clone())
     };
-    let client = konnect_ipc::KiCadIpcClient::new("tcp://never-dialed");
-    let packed = client.build_footprint_item(
+    let packed = konnect_ipc::KiCadIpcClient::build_footprint_item(
         &library.library_id,
         &field_text(&current.reference_field),
         &field_text(&current.value_field),
@@ -1142,9 +1184,11 @@ fn build_updated_instance(
     updated.attributes = Some(attributes);
 
     let changed_domains = changed_domains(current, &updated)?;
+    let preserved = PreservedState::derive(current, &updated, &old_nets);
     Ok(PreparedUpdate {
         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
         changed_domains,
+        preserved,
     })
 }
 
@@ -1553,6 +1597,110 @@ mod tests {
     use konnect_ipc::gen::kiapi;
     use prost::Message;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// The serialization KiCad 10 actually writes — produced by running this
+    /// module's hand-written fixture through `kicad-cli fp upgrade` — parses,
+    /// and the two universal flags KiCad stamps into every saved footprint
+    /// (`embedded_fonts no`, `duplicate_pad_numbers_are_jumpers no`, plus
+    /// `remove_unused_layers no` on pads) do not refuse it. The hand-written
+    /// fixture alone cannot catch this class: it shares this module's own
+    /// assumptions about the format (see the fixtures-from-KiCad rule in
+    /// CONTRIBUTING).
+    #[test]
+    fn a_footprint_kicad_saved_is_accepted_not_refused() {
+        let source = include_str!("../../tests/fixtures/socket_kicad10.kicad_mod");
+        let library = parse_library_footprint("Konnect:Socket", source)
+            .expect("KiCad's own serialization of the fixture must parse");
+        assert_eq!(library.pads.len(), 4, "two '1' variants plus '2' and '3'");
+        assert_eq!(library.graphics.len(), 2, "one fp_line and one fp_poly");
+        assert_eq!(library.datasheet.as_deref(), Some("new-datasheet.pdf"));
+        assert_eq!(library.models.len(), 1);
+
+        // The same flags at a non-default value carry semantics the typed
+        // rebuild cannot represent, so they refuse rather than silently drop.
+        for (from, to) in [
+            ("(embedded_fonts no)", "(embedded_fonts yes)"),
+            (
+                "(remove_unused_layers no)",
+                "(remove_unused_layers yes)",
+            ),
+        ] {
+            let flipped = source.replace(from, to);
+            assert_ne!(flipped, source, "fixture must contain {from}");
+            let error = parse_library_footprint("Konnect:Socket", &flipped)
+                .expect_err("a non-default flag must refuse")
+                .to_string();
+            assert!(
+                error.contains("not supported"),
+                "refusal names the unsupported clause: {error}"
+            );
+        }
+    }
+
+    /// `preserved` must be a comparison of the rebuilt instance against the
+    /// board's, never a policy constant: when the two instances genuinely
+    /// diverge, the flags have to say so.
+    #[test]
+    fn preserved_flags_come_from_comparison_not_policy() {
+        let pad = |number: &str, net: Option<&str>| {
+            let item = kiapi::board::types::Pad {
+                number: number.to_string(),
+                net: net.map(|name| kiapi::board::types::Net {
+                    code: Some(kiapi::board::types::NetCode { value: 3 }),
+                    name: name.to_string(),
+                }),
+                ..Default::default()
+            };
+            builders::pack_any(&item, "kiapi.board.types.Pad")
+        };
+        let current = kiapi::board::types::FootprintInstance {
+            position: Some(builders::vec2(10.0, 20.0)),
+            orientation: Some(kiapi::common::types::Angle { value_degrees: 90.0 }),
+            layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+            definition: Some(kiapi::board::types::Footprint {
+                items: vec![pad("1", Some("GND"))],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let old_nets = BTreeMap::from([(
+            "1".to_string(),
+            kiapi::board::types::Net {
+                code: Some(kiapi::board::types::NetCode { value: 3 }),
+                name: "GND".to_string(),
+            },
+        )]);
+
+        let identical = PreservedState::derive(&current, &current.clone(), &old_nets);
+        assert!(
+            identical.position
+                && identical.rotation
+                && identical.layer
+                && identical.locked
+                && identical.kiid
+                && identical.symbol_path
+                && identical.pad_nets
+                && identical.instance_overrides,
+            "an untouched instance preserves everything: {identical:?}"
+        );
+
+        let mut moved = current.clone();
+        moved.position = Some(builders::vec2(99.0, 99.0));
+        moved.definition.as_mut().unwrap().items = vec![pad("1", None)];
+        let diverged = PreservedState::derive(&current, &moved, &old_nets);
+        assert!(
+            !diverged.position,
+            "a moved instance must report position unpreserved"
+        );
+        assert!(
+            !diverged.pad_nets,
+            "a dropped pad net must report pad_nets unpreserved"
+        );
+        assert!(
+            diverged.rotation && diverged.layer && diverged.kiid,
+            "untouched fields stay preserved: {diverged:?}"
+        );
+    }
 
     const LIBRARY_FOOTPRINT: &str = r#"
 (footprint "Socket"

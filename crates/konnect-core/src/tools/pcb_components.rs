@@ -2761,7 +2761,7 @@ async fn handle_repair_corrupted_footprints(
                     continue;
                 }
 
-                let clean = client.build_footprint_item(
+                let clean = KiCadIpcClient::build_footprint_item(
                     &summary.footprint,
                     &summary.reference,
                     &summary.value,
@@ -3265,7 +3265,7 @@ async fn handle_place_array(
         let items = planned
             .iter()
             .map(|(reference, pads, x, y)| {
-                c.build_footprint_item(
+                KiCadIpcClient::build_footprint_item(
                     &footprint_id,
                     reference,
                     &value,

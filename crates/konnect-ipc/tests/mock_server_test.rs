@@ -834,9 +834,7 @@ fn record_doc(
 /// A footprint carrying one pad and one silkscreen line, both with KIIDs, as
 /// KiCad would send it.
 fn footprint_with_a_pad_and_a_line(pad_uuid: &str, line_uuid: &str) -> prost_types::Any {
-    let client = KiCadIpcClient::new("inproc://not-connected");
-    let item = client
-        .build_footprint_item(
+    let item = KiCadIpcClient::build_footprint_item(
             "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
             "U1",
             "NE555",
