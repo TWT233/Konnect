@@ -23,27 +23,10 @@ fn nm_to_mm(nm: i64) -> f64 {
 
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
 fn layer_enum_to_name(layer: i32) -> &'static str {
-    match kiapi::board::types::BoardLayer::try_from(layer) {
-        Ok(l) => match l {
-            kiapi::board::types::BoardLayer::BlFCu => "F.Cu",
-            kiapi::board::types::BoardLayer::BlBCu => "B.Cu",
-            kiapi::board::types::BoardLayer::BlIn1Cu => "In1.Cu",
-            kiapi::board::types::BoardLayer::BlIn2Cu => "In2.Cu",
-            kiapi::board::types::BoardLayer::BlFSilkS => "F.SilkS",
-            kiapi::board::types::BoardLayer::BlBSilkS => "B.SilkS",
-            kiapi::board::types::BoardLayer::BlFMask => "F.Mask",
-            kiapi::board::types::BoardLayer::BlBMask => "B.Mask",
-            kiapi::board::types::BoardLayer::BlFPaste => "F.Paste",
-            kiapi::board::types::BoardLayer::BlBPaste => "B.Paste",
-            kiapi::board::types::BoardLayer::BlFCrtYd => "F.CrtYd",
-            kiapi::board::types::BoardLayer::BlBCrtYd => "B.CrtYd",
-            kiapi::board::types::BoardLayer::BlFFab => "F.Fab",
-            kiapi::board::types::BoardLayer::BlBFab => "B.Fab",
-            kiapi::board::types::BoardLayer::BlEdgeCuts => "Edge.Cuts",
-            _ => "Unknown",
-        },
-        Err(_) => "Unknown",
-    }
+    kiapi::board::types::BoardLayer::try_from(layer)
+        .ok()
+        .and_then(crate::builders::layer_name)
+        .unwrap_or("Unknown")
 }
 
 /// A placed footprint's anchor in board nanometres, and its orientation in
