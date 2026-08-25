@@ -190,7 +190,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_connected",
-            "Move a symbol and stretch/shrink connected wire stubs to preserve connections.",
+            "REFUSED until implemented: moving a symbol while stretching its connected              wires is not built yet. Calling this returns an error naming              move_schematic_component as the working alternative — it moves the symbol              only, leaving wires where they are.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1112,11 +1112,17 @@ async fn handle_rotate_schematic_component(
 }
 
 async fn handle_move_connected(
-    args: &serde_json::Value,
-    ctx: &ToolContext,
+    _args: &serde_json::Value,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // For now: delegate to simple move. Wire adjustment is a Phase 2 enhancement.
-    handle_move_schematic_component(args, ctx).await
+    // Since the first release this silently delegated to the plain move and
+    // reported success — the symbol moved, every wire stayed put, and the
+    // caller was told the connections were preserved (#315). A tool must not
+    // claim work it does not do: refuse until the wire-carrying move exists
+    // (it needs #120's connectivity model to know which wires to stretch).
+    Ok(CallToolResult::error(
+        "move_connected is not implemented: it used to move the symbol and leave          every wire behind while reporting the connections preserved. Use          move_schematic_component (moves the symbol only), then re-route or use          connect_pins for the affected nets. Wire-carrying moves are tracked in          issue #315 and depend on the connectivity work in #120.",
+    ))
 }
 
 async fn handle_move_region(
@@ -3674,5 +3680,46 @@ mod schematic_view_tests {
             _ => panic!("expected text content"),
         };
         assert_eq!(body2["svg"], body["svg"]);
+    }
+}
+
+#[cfg(test)]
+mod move_connected_tests {
+    use super::*;
+
+    /// #315: this tool silently delegated to the plain move since the first
+    /// release — symbol moved, wires stayed, success reported. Until the
+    /// wire-carrying move exists it must refuse, naming the alternative.
+    #[tokio::test]
+    async fn move_connected_refuses_instead_of_faking_success() {
+        let result = handle_move_connected(
+            &serde_json::json!({
+                "schematic": "unused.kicad_sch",
+                "reference": "R1", "x": 10.0, "y": 10.0
+            }),
+            &crate::tools::ToolContext::new(
+                crate::tools::ServerConfig {
+                    kicad_cli: String::new(),
+                    kicad_binary: String::new(),
+                    ipc_address: String::new(),
+                    project_dir: None,
+                    jlcpcb_db_path: None,
+                    auto_load_toolsets: false,
+                    eager_toolsets: false,
+                },
+                std::sync::Arc::new(crate::router::ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.contains("move_schematic_component"),
+            "must name the working alternative: {text}"
+        );
     }
 }
