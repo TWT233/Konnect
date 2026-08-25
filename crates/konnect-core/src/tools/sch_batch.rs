@@ -139,7 +139,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "bulk_move_schematic_components",
-            "Move multiple components by a uniform dx/dy offset in a single atomic file write.",
+            "Move multiple components by a uniform dx/dy offset in a single atomic file \
+             write. Junction dots are re-judged where the pins moved: a dot the pins \
+             leave unjustified is removed and a pin landing mid-span on a wire gains \
+             one, reported as junctions_pruned_count and junctions_added_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -854,13 +857,53 @@ async fn handle_bulk_move(
         }
     }
 
+    // Pin positions before the shift, so a dot the pins vacate can be re-judged
+    // and a pin landing mid-span gets one (#120). A move changes no wires.
+    const TOL: f64 = 0.01;
+    let pins_of = |src: &str| -> Vec<(f64, f64)> {
+        konnect_sexp::parse_sexp(src)
+            .ok()
+            .map(|t| crate::tools::all_pin_endpoints(&t))
+            .unwrap_or_default()
+    };
+    // No wires means nothing can be justified and nothing can be landed on, so
+    // the whole pass — including two full symbol/lib_symbols walks — is skipped.
+    let has_wires = expected.contains("(wire");
+    let before_pins = if has_wires {
+        pins_of(&expected)
+    } else {
+        Vec::new()
+    };
+
     let new_content = apply_edits(content, edits);
+
+    let after_pins = if has_wires {
+        pins_of(&new_content)
+    } else {
+        Vec::new()
+    };
+    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        a.iter()
+            .copied()
+            .filter(|&(x, y)| {
+                !b.iter()
+                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
+            })
+            .collect()
+    };
+    let mut points = differs(&before_pins, &after_pins);
+    points.extend(differs(&after_pins, &before_pins));
+    let (new_content, junctions_added, junctions_pruned) =
+        crate::tools::sch_wiring::reconcile_junctions_at(new_content, &points);
+
     write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
         "moved": moved,
         "dx": dx, "dy": dy,
+        "junctions_added_count": junctions_added,
+        "junctions_pruned_count": junctions_pruned,
         "errors": errors
     })))
 }
@@ -2427,6 +2470,52 @@ mod bulk_move_field_tests {
         .unwrap();
         assert!(!result.is_error, "{result:?}");
         std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// #120 end to end: a dot the pin vacates is pruned, and the response says
+    /// so. #315's wire-carrying move is gated on exactly this judgement.
+    ///
+    /// Fixture is eeschema's own output (`kicad-cli sch upgrade`), not a
+    /// hand-written sheet — R1's pin sits mid-span on a wire at
+    /// (120.65, 139.7) and earns the dot there. Moving R1 away must strand it.
+    #[tokio::test]
+    async fn bulk_move_prunes_the_junction_its_pin_vacates() {
+        const SHEET: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.kicad_sch");
+        std::fs::write(&path, SHEET).unwrap();
+        let dots = |p: &std::path::Path| -> usize {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .matches("(junction")
+                .count()
+        };
+        assert_eq!(dots(&path), 3, "fixture starts with three dots");
+
+        let result = handle_bulk_move(
+            &json!({ "schematic": path.to_str().unwrap(),
+                     "references": ["R1"], "dx": 0.0, "dy": -20.32 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("(at 120.65 139.7)"),
+            "the dot R1's pin left must be pruned: {after}"
+        );
+        // The T and the bus tee are untouched — only R1's point was in scope.
+        assert_eq!(dots(&path), 2, "exactly one dot removed");
+        assert!(after.contains("(at 120.65 170.18)"), "the T survives");
+        assert!(after.contains("(at 260.35 140)"), "the bus tee survives");
+
+        let body = format!("{:?}", result.content);
+        assert!(
+            body.contains("junctions_pruned_count"),
+            "the response must report what it did: {body}"
+        );
     }
 
     /// Every property keeps its offset from the symbol — which is the same as

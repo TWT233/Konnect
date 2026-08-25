@@ -106,6 +106,10 @@ struct WireIndex<'a> {
 }
 
 impl<'a> WireIndex<'a> {
+    fn tolerance(&self) -> f64 {
+        self.tol
+    }
+
     fn build(wires: &'a [Wire], tol: f64) -> Self {
         let mut index = WireIndex {
             tol,
@@ -432,6 +436,17 @@ impl<'a> ConnectivityIndex<'a> {
     /// splitting the crossed wire.
     pub(crate) fn on_wire_interior(&self, x: f64, y: f64) -> bool {
         self.on_wire.covers_interior(x, y)
+    }
+
+    /// How many wires lie under `(x, y)` — endpoint and interior alike. The
+    /// booleans above cannot tell one wire passing from two wires crossing,
+    /// and the junction reconciler needs that distinction: a dot on a lone
+    /// wire connects nothing, a dot where two wires cross joins two nets.
+    pub(crate) fn wires_at(&self, x: f64, y: f64) -> usize {
+        self.wires
+            .iter()
+            .filter(|w| point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, self.on_wire.tolerance()))
+            .count()
     }
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {

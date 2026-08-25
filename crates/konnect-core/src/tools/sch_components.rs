@@ -160,7 +160,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "move_schematic_component",
-            "Move a component's lowest-numbered unit to a new position and translate every other placed unit by the same delta. Does NOT adjust connected wires.",
+            "Move a component's lowest-numbered unit to a new position and translate every \
+             other placed unit by the same delta. Does NOT adjust connected wires. \
+             Junction dots are re-judged where the pins moved: a dot the pins leave \
+             unjustified is removed and a pin landing mid-span on a wire gains one, \
+             reported as junctions_pruned_count and junctions_added_count.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1135,6 +1139,18 @@ async fn handle_move_schematic_component(
     };
     let (new_x, new_y) = snap_point(new_x, new_y, 1.27);
 
+    // Pin positions before the move, so the dots the pins vacate can be judged
+    // afterwards (#120). Wires do not change here — pins do. A sheet with no
+    // wires has nothing to reconcile, and skipping spares it the symbol walk.
+    let before_pins = if read_consistent(&sch_path)
+        .map(|c| c.contains("(wire"))
+        .unwrap_or(false)
+    {
+        pin_endpoints_of(&sch_path)
+    } else {
+        Vec::new()
+    };
+
     let mut sch = cse::Schematic::load(&sch_path)?;
 
     let Some(anchor) = sch
@@ -1161,13 +1177,62 @@ async fn handle_move_schematic_component(
         }));
     }
     sch.overwrite()?;
+    let (added, pruned) = reconcile_junctions_after_move(&sch_path, &before_pins)?;
     Ok(CallToolResult::json(&json!({
         "moved": reference,
         "x": new_x,
         "y": new_y,
         "moved_units": placements.len(),
-        "placements": placements
+        "placements": placements,
+        "junctions_added_count": added,
+        "junctions_pruned_count": pruned
     })))
+}
+
+/// Pin endpoints on the sheet as it currently stands on disk, or empty if it
+/// cannot be read — the caller only ever diffs two of these.
+fn pin_endpoints_of(path: &std::path::Path) -> Vec<(f64, f64)> {
+    read_consistent(path)
+        .ok()
+        .and_then(|c| konnect_sexp::parse_sexp(&c).ok())
+        .map(|t| crate::tools::all_pin_endpoints(&t))
+        .unwrap_or_default()
+}
+
+/// Re-judge junction dots wherever a pin appeared or disappeared.
+///
+/// The points that matter are exactly the symmetric difference of the pin sets:
+/// a dot at a vacated position may now be stranded, and a pin that has landed
+/// mid-span on a wire needs one. Everything else on the sheet is untouched, so
+/// unrelated dots cannot be disturbed.
+fn reconcile_junctions_after_move(
+    path: &std::path::Path,
+    before_pins: &[(f64, f64)],
+) -> anyhow::Result<(usize, usize)> {
+    const TOL: f64 = 0.01;
+    let after_pins = pin_endpoints_of(path);
+    let differs = |a: &[(f64, f64)], b: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        a.iter()
+            .copied()
+            .filter(|&(x, y)| {
+                !b.iter()
+                    .any(|&(ox, oy)| konnect_sexp::geometry::points_coincident(x, y, ox, oy, TOL))
+            })
+            .collect()
+    };
+    let mut points = differs(before_pins, &after_pins);
+    points.extend(differs(&after_pins, before_pins));
+    if points.is_empty() {
+        return Ok((0, 0));
+    }
+    let content = read_consistent(path)?;
+    let expected = content.clone();
+    let (new_content, added, pruned) =
+        crate::tools::sch_wiring::reconcile_junctions_at(content, &points);
+    if added > 0 || pruned > 0 {
+        write_atomic_if_unchanged(path, &expected, &new_content)?;
+    }
+    Ok((added, pruned))
 }
 
 async fn handle_rotate_schematic_component(
