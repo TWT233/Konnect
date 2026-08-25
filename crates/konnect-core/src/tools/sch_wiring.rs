@@ -751,6 +751,153 @@ fn wires_in_ranges(content: &str, ranges: &[(usize, usize)]) -> Vec<Wire> {
 /// So a junction is pruned when no wire is left through it, or one is and no pin
 /// sits there. Junctions no removed wire touched are left alone, and moves that
 /// strand a dot without deleting a wire are #120's half of the problem.
+/// Round to the six decimals KiCAD writes, so arithmetic noise never reaches
+/// the file.
+fn round6(v: f64) -> f64 {
+    (v * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// Re-evaluate the junction dots at `points` after geometry moved.
+///
+/// `prune_orphaned_junctions` answers the same question for a *wire* deletion:
+/// it knows which dots to look at because it knows which wires went away. A
+/// component move changes no wires at all — it moves *pins* — so the candidate
+/// set has to come from the pins that appeared or disappeared, and the dot at
+/// the vacated position has to be re-judged (#120).
+///
+/// All connectivity answers come from the shared [`ConnectivityIndex`] — this
+/// must not become a fifth private definition of "what is attached here"
+/// (#323). A dot is kept when anything still justifies it:
+///
+/// * two or more wires under the point — a T, a crossing joined on purpose, or
+///   wire ends meeting: never touched;
+/// * a pin or a hierarchical sheet pin still at the point;
+/// * pins unresolvable (`lib_symbols` lookup failed) — that is not the same as
+///   "no pin here", so only the unambiguous zero-wire case prunes then.
+///
+/// A dot is added only where a pin has landed mid-span on **exactly one** wire
+/// and no no-connect flag sits there. One wire is the unambiguous case: with
+/// two, wires that merely cross are separate nets until a junction says
+/// otherwise, and adding the dot would merge them — the same silent
+/// connectivity change this pass exists to stop. A no-connect is the user
+/// saying "this pin stays unconnected", which a move must not override.
+///
+/// Returns the content plus (added, pruned).
+pub(crate) fn reconcile_junctions_at(
+    content: String,
+    points: &[(f64, f64)],
+) -> (String, usize, usize) {
+    if points.is_empty() {
+        return (content, 0, 0);
+    }
+    let Ok(tree) = parse_sexp(&content) else {
+        return (content, 0, 0);
+    };
+    let wires = extract_wires(&tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let idx = crate::tools::sch_connectivity::ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
+    // The shared index does not model buses yet, and KiCAD has bus junctions:
+    // a dot on a bus tee joins bus segments, which no wire count can see. Any
+    // candidate point touching a bus line is therefore outside this pass's
+    // jurisdiction — neither pruned nor added at. This is a guard, not a fifth
+    // attachment answer: the moment the index learns buses, it replaces this.
+    let buses = konnect_sexp::schematic::extract_buses(&tree);
+    let on_bus = |x: f64, y: f64| {
+        buses.iter().any(|b| {
+            konnect_sexp::geometry::point_on_segment(
+                x,
+                y,
+                b.x1,
+                b.y1,
+                b.x2,
+                b.y2,
+                crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+            )
+        })
+    };
+    let pins_known = !idx.placed_pins().is_empty() || extract_symbol_instances(&tree).is_empty();
+
+    // Existing dots at the candidate points, with the byte range to delete —
+    // the one thing the index does not hold.
+    struct Dot {
+        range: (usize, usize),
+        at: (f64, f64),
+    }
+    let mut existing: Vec<Dot> = Vec::new();
+    for start in find_block_starts(&content, "junction") {
+        let Some((ws_start, block_end)) = find_block_with_leading_whitespace(&content, start)
+        else {
+            continue;
+        };
+        let Ok(node) = parse_sexp(&content[start..block_end]) else {
+            continue;
+        };
+        let Some((jx, jy, _)) = parse_at(&node) else {
+            continue;
+        };
+        existing.push(Dot {
+            range: (ws_start, block_end),
+            at: (jx, jy),
+        });
+    }
+
+    const TOL: f64 = crate::tools::sch_connectivity::COINCIDENT_TOLERANCE;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut to_add: Vec<(f64, f64)> = Vec::new();
+    for &(px, py) in points {
+        if on_bus(px, py) {
+            continue;
+        }
+        let here: Vec<&Dot> = existing
+            .iter()
+            .filter(|d| konnect_sexp::geometry::points_coincident(px, py, d.at.0, d.at.1, TOL))
+            .collect();
+        let attached = idx.has_pin(px, py) || idx.has_sheet_pin(px, py);
+        if here.is_empty() {
+            if idx.wires_at(px, py) == 1
+                && idx.on_wire_interior(px, py)
+                && idx.has_pin(px, py)
+                && !idx.has_no_connect(px, py)
+            {
+                to_add.push((px, py));
+            }
+        } else {
+            let keep = match idx.wires_at(px, py) {
+                0 => false,
+                1 => !pins_known || attached,
+                _ => true,
+            };
+            if !keep {
+                ranges.extend(here.iter().map(|d| d.range));
+            }
+        }
+    }
+
+    let pruned = ranges.len();
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut out = apply_edits(
+        content,
+        ranges
+            .into_iter()
+            .map(|(s, e)| SexpEdit::delete(s, e))
+            .collect(),
+    );
+    let added = to_add.len();
+    for (x, y) in to_add {
+        // Pin endpoints come out of arithmetic (136.19 + 3.81 = 139.70000000000002)
+        // and `format_junction` interpolates the f64 verbatim, so round to the
+        // 6 decimals KiCAD writes rather than leaking float noise into the file.
+        out = insert_before_close(&out, &format_junction(round6(x), round6(y)));
+    }
+    (out, added, pruned)
+}
+
 fn prune_orphaned_junctions(content: String, removed: &[Wire]) -> (String, usize) {
     const TOL: f64 = 0.01;
     // Two is as high as this needs to count, so it stops there.
@@ -2206,6 +2353,105 @@ mod unit_aware_wiring_tests {
         for (x, y) in tees {
             assert_eq!(junctions_at(&path, x, y), 1, "T at ({x}, {y})");
         }
+    }
+
+    /// Fixture provenance: built with Konnect tools against the stock `Device:R`,
+    /// then rewritten by `kicad-cli sch upgrade` so the committed text is
+    /// eeschema's own output — it carries `ki_fp_filters`, `embedded_fonts`,
+    /// `exclude_from_sim` and full pin geometry that a hand-written sheet does
+    /// not (CONTRIBUTING.md). One sheet holds every case at a distinct
+    /// coordinate, so each test also proves the pass leaves the others alone.
+    ///
+    ///   (120.65, 139.7)   R1's pin mid-span on a lone wire, dot earned
+    ///   (120.65, 170.18)  a real T of two wires, dot always justified
+    ///   (190.5,  140.0)   two wires merely crossing, no dot
+    ///   (190.5,  200.66)  R3's pin mid-span but flagged no-connect, no dot
+    ///   (260.35, 140.0)   a bus tee with its dot
+    const RECONCILE_SCH: &str = include_str!("../../tests/fixtures/junction_reconcile.kicad_sch");
+
+    fn dots(src: &str) -> Vec<(String, String)> {
+        regex_lite_junctions(src)
+    }
+
+    /// Junction coordinates, as written.
+    fn regex_lite_junctions(src: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for chunk in src.split("(junction").skip(1) {
+            if let Some(at) = chunk.split("(at ").nth(1) {
+                if let Some(inner) = at.split(')').next() {
+                    let mut it = inner.split_whitespace();
+                    if let (Some(x), Some(y)) = (it.next(), it.next()) {
+                        out.push((x.to_string(), y.to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn has_dot(src: &str, x: &str, y: &str) -> bool {
+        dots(src).iter().any(|(a, b)| a == x && b == y)
+    }
+
+    /// R1's pin still sits at (120.65, 139.7), so its dot is justified and must
+    /// survive being asked about. The pruning case needs the pin to actually
+    /// leave, which is a move — covered end-to-end in sch_batch against this
+    /// same fixture.
+    #[test]
+    fn reconcile_keeps_a_dot_its_pin_still_justifies() {
+        let (out, added, pruned) =
+            reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(120.65, 139.7)]);
+        assert_eq!((added, pruned), (0, 0), "the pin is still there");
+        assert!(has_dot(&out, "120.65", "139.7"));
+    }
+
+    /// A real T — two wires meeting — is never touched.
+    #[test]
+    fn reconcile_keeps_a_real_tee() {
+        let (out, added, pruned) =
+            reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(120.65, 170.18)]);
+        assert_eq!((added, pruned), (0, 0), "a T stays");
+        assert!(has_dot(&out, "120.65", "170.18"));
+    }
+
+    /// Two wires that merely CROSS are separate nets in KiCad until a junction
+    /// says otherwise. A pin landing there must NOT get one: that would merge
+    /// two nets, the silent connectivity change #120 exists to stop.
+    #[test]
+    fn a_pin_landing_on_a_crossing_does_not_merge_the_nets() {
+        let before = dots(RECONCILE_SCH).len();
+        let (out, added, pruned) =
+            reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(190.5, 140.0)]);
+        assert_eq!(
+            (added, pruned),
+            (0, 0),
+            "an ambiguous crossing is left alone"
+        );
+        assert_eq!(dots(&out).len(), before, "no dot invented at the crossing");
+    }
+
+    /// A no-connect flag is the user saying "this pin stays unconnected" — a
+    /// move landing it mid-span must not wire it up with a dot.
+    #[test]
+    fn reconcile_does_not_add_a_dot_over_a_no_connect() {
+        let (out, added, pruned) =
+            reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(190.5, 200.66)]);
+        assert_eq!((added, pruned), (0, 0), "a no-connect forbids the dot");
+        assert!(!has_dot(&out, "190.5", "200.66"));
+    }
+
+    /// A dot on a bus tee is a BUS junction — it joins bus segments, which no
+    /// wire count can see. Bus points are outside this pass's jurisdiction.
+    #[test]
+    fn reconcile_never_touches_a_dot_on_a_bus() {
+        let (out, added, pruned) =
+            reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(260.35, 140.0)]);
+        assert_eq!(
+            (added, pruned),
+            (0, 0),
+            "bus junctions are not ours to judge"
+        );
+        assert!(has_dot(&out, "260.35", "140"), "the bus tee keeps its dot");
     }
 
     /// Regression for #234: a malformed element used to default its missing
