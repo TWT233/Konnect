@@ -449,7 +449,10 @@ pub(super) fn inspect_graphics(
     let tree = konnect_sexp::parse_sexp(source)
         .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
     if tree.head() != Some("footprint") {
-        return Err(invalid("footprint_path", "file root must be a footprint"));
+        return Err(invalid(
+            "footprint_path",
+            crate::tools::footprint_root_reason(tree.head()),
+        ));
     }
 
     let mut graphics = Vec::new();
@@ -836,7 +839,10 @@ fn prepare_mutation(
     let tree = konnect_sexp::parse_sexp(source)
         .map_err(|error| invalid("footprint_path", format!("invalid S-expression: {error}")))?;
     if tree.head() != Some("footprint") {
-        return Err(invalid("footprint_path", "file root must be a footprint"));
+        return Err(invalid(
+            "footprint_path",
+            crate::tools::footprint_root_reason(tree.head()),
+        ));
     }
 
     let direct_children = find_direct_child_blocks(source, "footprint");

@@ -13,11 +13,10 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
-    geometry::{point_on_segment, points_coincident, snap_point},
+    geometry::{points_coincident, snap_point},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_lib_pins, extract_symbol_instances,
-        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
-        pin_label_rotation, read_schematic,
+        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
+        format_net_label, format_wire, pin_endpoint, pin_label_rotation, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
@@ -27,8 +26,7 @@ use konnect_sexp::{
 use serde_json::json;
 use std::collections::HashSet;
 
-// Re-use the crate-internal net-graph primitives from sch_analysis.
-use super::sch_analysis::build_net_graph;
+use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::place_one_component;
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
@@ -241,7 +239,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "x": { "type": "number", "description": "X position in mm" },
                     "y": { "type": "number", "description": "Y position in mm" },
                     "size": { "type": "number", "description": "Font size in mm", "default": 1.27 },
-                    "rotation": { "type": "number", "description": "Rotation in degrees", "default": 0 }
+                    "rotation": { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "justify": {
+                        "type": "string",
+                        "description": "Alignment of the text against x/y: at most one horizontal token (left, right) and one vertical token (top, bottom), space separated. An axis you leave out is centred - KiCad has no 'center' keyword and encodes centring by omission, so 'bottom' means horizontally centred and bottom-aligned. 'center' is shorthand for centring both axes. Defaults to 'left bottom', what KiCad itself writes for a placed annotation; a centred horizontal axis can carry a long line off the page.",
+                        "default": "left bottom"
+                    }
                 },
                 "required": ["schematic", "text", "x", "y"]
             }),
@@ -278,9 +281,10 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "validate_component_connections",
-            "Check that every non-passive pin on every component has at least one wire \
-             or label connected. Reports unconnected pins with reference, pin number, \
-             and schematic position.",
+            "Check that every connectable pin on every component has at least one wire \
+             or label connected. Symbol pins typed no_connect and pins carrying a \
+             no-connect marker are exempt. Reports unconnected pins with reference, \
+             pin number, electrical type, and schematic position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1026,6 +1030,62 @@ async fn handle_connect_passthrough(
     })))
 }
 
+/// KiCad's default alignment for a placed text annotation.
+///
+/// Measured against KiCad 10's own demo projects: every text block in the
+/// current file format carries `(justify left bottom)`.
+const DEFAULT_TEXT_JUSTIFY: &str = "left bottom";
+
+/// Translate a caller's alignment into the `(justify ...)` clause KiCad writes.
+///
+/// Alignment is per axis, and centring an axis means leaving its token out:
+/// `left` is left-aligned and vertically centred, `bottom` is horizontally
+/// centred and bottom-aligned. `"center"` centres both and so returns an empty
+/// string. There is no token for it — `(justify center)` makes KiCad refuse the
+/// whole file, the same way a misplaced item does.
+fn schematic_text_justify(value: &str) -> Result<String, String> {
+    fn claim(
+        slot: &mut Option<&'static str>,
+        value: &'static str,
+        token: &str,
+    ) -> Result<(), String> {
+        if let Some(existing) = slot {
+            return Err(format!(
+                "justify names '{existing}' and '{token}' on the same axis - use at most one horizontal (left, right) and one vertical (top, bottom) token"
+            ));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("center") {
+        return Ok(String::new());
+    }
+
+    let mut horizontal: Option<&'static str> = None;
+    let mut vertical: Option<&'static str> = None;
+    for token in trimmed.split_whitespace() {
+        match token.to_ascii_lowercase().as_str() {
+            "left" => claim(&mut horizontal, "left", token)?,
+            "right" => claim(&mut horizontal, "right", token)?,
+            "top" => claim(&mut vertical, "top", token)?,
+            "bottom" => claim(&mut vertical, "bottom", token)?,
+            _ => {
+                return Err(format!(
+                    "unknown justify token '{token}' - use left, right, top, bottom, or center"
+                ))
+            }
+        }
+    }
+
+    // KiCad writes the horizontal token first.
+    let mut parts = Vec::with_capacity(2);
+    parts.extend(horizontal);
+    parts.extend(vertical);
+    Ok(format!(" (justify {})", parts.join(" ")))
+}
+
 async fn handle_add_schematic_text(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -1045,6 +1105,14 @@ async fn handle_add_schematic_text(
     };
     let size = args["size"].as_f64().unwrap_or(1.27);
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
+    let justify = args["justify"].as_str().unwrap_or(DEFAULT_TEXT_JUSTIFY);
+    // Without a justify token KiCad centres the text on `x`, so a long line
+    // crosses the page edge and is dropped from the PDF export while the
+    // .kicad_sch still looks complete.
+    let justify_sexp = match schematic_text_justify(justify) {
+        Ok(v) => v,
+        Err(e) => return Ok(CallToolResult::error(e)),
+    };
     let uuid = new_uuid();
 
     // Escape for a KiCad quoted string. Newlines and tabs must become their
@@ -1060,7 +1128,7 @@ async fn handle_add_schematic_text(
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
-         (effects (font (size {size} {size})))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {size} {size})){justify_sexp})\n    (uuid \"{uuid}\")\n  )"
     );
 
     let content = read_consistent(&sch_path)?;
@@ -1076,6 +1144,7 @@ async fn handle_add_schematic_text(
         "x": x, "y": y,
         "size": size,
         "rotation": rotation,
+        "justify": justify,
         "uuid": uuid
     })))
 }
@@ -1159,78 +1228,14 @@ async fn handle_validate_wire_connections(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
-    let labels = extract_labels(&tree);
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let labels = extract_all_net_labels(&tree);
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
 
-    // Collect all valid pin endpoints
-    let mut pin_points: Vec<(f64, f64)> = Vec::new();
-    for inst in &instances {
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
-                pin_points.push(pin_endpoint(&pin, t));
-            }
-        }
-    }
-
-    let label_points: Vec<(f64, f64)> = labels.iter().map(|l| (l.x, l.y)).collect();
-    // All wire endpoints as a flat list (for quick counting)
-    let all_wire_eps: Vec<(f64, f64)> = wires
-        .iter()
-        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
+    let floating: Vec<serde_json::Value> = index
+        .floating_wire_ends()
+        .into_iter()
+        .map(|(x, y, wire_uuid)| json!({ "x": x, "y": y, "wire_uuid": wire_uuid }))
         .collect();
-
-    let is_connected = |px: f64, py: f64| -> bool {
-        // Another wire endpoint at the same position (count >= 2 because px/py itself is in the list)
-        let same_ep_count = all_wire_eps
-            .iter()
-            .filter(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
-            .count();
-        if same_ep_count >= 2 {
-            return true;
-        }
-
-        // T-junction: lies on the INTERIOR of another wire
-        if wires.iter().any(|w| {
-            point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol)
-                && !points_coincident(px, py, w.x1, w.y1, tol)
-                && !points_coincident(px, py, w.x2, w.y2, tol)
-        }) {
-            return true;
-        }
-
-        // Label at this point
-        if label_points
-            .iter()
-            .any(|(lx, ly)| points_coincident(px, py, *lx, *ly, tol))
-        {
-            return true;
-        }
-
-        // Pin endpoint at this point
-        if pin_points
-            .iter()
-            .any(|(ppx, ppy)| points_coincident(px, py, *ppx, *ppy, tol))
-        {
-            return true;
-        }
-
-        false
-    };
-
-    let mut floating: Vec<serde_json::Value> = Vec::new();
-    for w in &wires {
-        for (px, py) in [(w.x1, w.y1), (w.x2, w.y2)] {
-            if !is_connected(px, py) {
-                floating.push(json!({ "x": px, "y": py, "wire_uuid": w.uuid }));
-            }
-        }
-    }
 
     Ok(CallToolResult::json(&json!({
         "valid": floating.is_empty(),
@@ -1244,7 +1249,7 @@ async fn handle_validate_component_connections(
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let filter_refs: Vec<String> = args["references"]
+    let filter_refs: HashSet<String> = args["references"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -1252,87 +1257,49 @@ async fn handle_validate_component_connections(
                 .collect()
         })
         .unwrap_or_default();
-    let tol = 0.01_f64;
-
+    let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-
-    // No-connect positions (pins with intentional no-connect markers are exempt)
-    let no_connect_pts = konnect_sexp::schematic::extract_no_connects(&tree);
-
-    // Build net graph so we can check connectivity. Junctions matter: a pin
-    // sitting mid-wire is connected only through a junction dot, so without
-    // them this validator reports false "not connected" (#104).
-    let junction_pts = konnect_sexp::schematic::extract_junctions(&tree);
-    let mut g = build_net_graph(&wires, &labels, &junction_pts);
-    // Also build flat wire-endpoint list for direct presence checks
-    let all_wire_eps: Vec<(f64, f64)> = wires
-        .iter()
-        .flat_map(|w| [(w.x1, w.y1), (w.x2, w.y2)])
-        .collect();
-
-    // `g.net_at` requires &mut self, so we need a `mut` closure.
-    let mut has_connection = |px: f64, py: f64| -> bool {
-        // Connected to a wire endpoint
-        if all_wire_eps
-            .iter()
-            .any(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
-        {
-            return true;
-        }
-        // A pin landing mid-wire connects only through a junction dot — KiCad's
-        // netlister registers the unsplit wire at a junction point, so a dot
-        // alone is enough and no wire split is required (#104).
-        if junction_pts
-            .iter()
-            .any(|(jx, jy)| points_coincident(px, py, *jx, *jy, tol))
-            && wires
-                .iter()
-                .any(|w| point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol))
-        {
-            return true;
-        }
-        // Or has a named net (label at or reachable from pin via wires)
-        g.net_at(px, py).is_some()
-    };
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
 
-    for inst in &instances {
-        if !filter_refs.is_empty() && !filter_refs.contains(&inst.reference) {
+    for placed in index.placed_pins() {
+        if !filter_refs.is_empty() && !filter_refs.contains(&placed.reference) {
             continue;
         }
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
-                let (px, py) = pin_endpoint(&pin, t);
+        let (px, py) = placed.at;
 
-                // Skip intentional no-connects
-                if no_connect_pts
-                    .iter()
-                    .any(|(nx, ny)| points_coincident(px, py, *nx, *ny, tol))
-                {
-                    continue;
-                }
+        // A library-declared no-connect pin is intentional by definition and
+        // does not need a placed X marker (#267).
+        if placed.pin.electrical_type == "no_connect" {
+            continue;
+        }
+        if ignore_power_pins
+            && matches!(
+                placed.pin.electrical_type.as_str(),
+                "power_in" | "power_out"
+            )
+        {
+            continue;
+        }
 
-                if !has_connection(px, py) {
-                    unconnected.push(json!({
-                        "reference": inst.reference,
-                        "value": inst.value,
-                        "pin": pin.number,
-                        "pin_name": pin.name,
-                        "x": px,
-                        "y": py
-                    }));
-                }
-            }
+        // Skip intentional no-connects.
+        if index.has_no_connect(px, py) {
+            continue;
+        }
+
+        if !index.attaches_pin(px, py) {
+            unconnected.push(json!({
+                "reference": placed.reference,
+                "value": placed.value,
+                "pin": placed.pin.number,
+                "pin_name": placed.pin.name,
+                "pin_type": placed.pin.electrical_type,
+                "x": px,
+                "y": py
+            }));
         }
     }
 
@@ -1684,6 +1651,90 @@ mod midwire_pin_tests {
                 "with_junction={with_junction}: {body}"
             );
         }
+    }
+
+    fn typed_pin_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed-pins.kicad_sch");
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:Typed"
+      (symbol "Typed_1_1"
+        (pin no_connect line (at 0 0 0) (length 0)
+          (name "NC" (effects (font (size 1.27 1.27))))
+          (number "1" (effects (font (size 1.27 1.27)))))
+        (pin power_in line (at 0 2.54 0) (length 2.54)
+          (name "VDD" (effects (font (size 1.27 1.27))))
+          (number "2" (effects (font (size 1.27 1.27)))))
+        (pin output line (at 0 5.08 0) (length 2.54)
+          (name "OUT" (effects (font (size 1.27 1.27))))
+          (number "3" (effects (font (size 1.27 1.27))))))
+      (symbol "Typed_2_1"
+        (pin input line (at 0 7.62 0) (length 2.54)
+          (name "OTHER_UNIT" (effects (font (size 1.27 1.27))))
+          (number "4" (effects (font (size 1.27 1.27))))))))
+  (symbol
+    (lib_id "Test:Typed")
+    (at 100 80 0)
+    (unit 1)
+    (uuid "u1")
+    (property "Reference" "U1" (at 100 75 0))
+    (property "Value" "Typed" (at 100 77 0)))
+  (sheet_instances (path "/" (page "1"))))
+"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn validate_components_json(
+        schematic: &std::path::Path,
+        ignore_power_pins: bool,
+    ) -> serde_json::Value {
+        let result = handle_validate_component_connections(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "ignore_power_pins": ignore_power_pins
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn declared_no_connect_and_other_unit_pins_are_not_reported() {
+        let (_dir, path) = typed_pin_schematic();
+        let body = validate_components_json(&path, false).await;
+        let pins = body["unconnected_pins"].as_array().unwrap();
+
+        assert_eq!(body["unconnected_count"], 2);
+        assert_eq!(pins[0]["pin"], "2");
+        assert_eq!(pins[0]["pin_type"], "power_in");
+        assert_eq!(pins[1]["pin"], "3");
+        assert_eq!(pins[1]["pin_type"], "output");
+        assert!(pins.iter().all(|pin| pin["pin"] != "1"));
+        assert!(pins.iter().all(|pin| pin["pin"] != "4"));
+    }
+
+    #[tokio::test]
+    async fn ignore_power_pins_option_is_effective() {
+        let (_dir, path) = typed_pin_schematic();
+        let body = validate_components_json(&path, true).await;
+        let pins = body["unconnected_pins"].as_array().unwrap();
+
+        assert_eq!(body["unconnected_count"], 1);
+        assert_eq!(pins[0]["pin"], "3");
+        assert_eq!(pins[0]["pin_type"], "output");
     }
 }
 
@@ -2095,7 +2146,8 @@ mod multi_unit_field_tests {
 
 #[cfg(test)]
 mod add_text_placement_tests {
-    use super::tools;
+    use super::{schematic_text_justify, tools};
+    use crate::mcp::protocol::CallToolResult;
     use crate::tools::ToolContext;
     use serde_json::json;
     use std::io::Write;
@@ -2103,7 +2155,7 @@ mod add_text_placement_tests {
 
     const SCH: &str = "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\")\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 100 75 0)\n\t\t)\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
 
-    async fn add_text(text: &str) -> String {
+    async fn add_text_inner(text: &str, justify: Option<&str>) -> (String, CallToolResult) {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(SCH.as_bytes()).unwrap();
         f.flush().unwrap();
@@ -2123,12 +2175,27 @@ mod add_text_placement_tests {
         };
         let router = Arc::new(crate::router::ToolRouter::new());
         let ctx = Arc::new(ToolContext::new(cfg, router));
-        let args = json!({
+        let mut args = json!({
             "schematic": f.path().to_str().unwrap(),
             "text": text, "x": 30.0, "y": 114.3
         });
-        (def.handler)(&args, ctx).await.unwrap();
-        std::fs::read_to_string(f.path()).unwrap()
+        if let Some(j) = justify {
+            args["justify"] = json!(j);
+        }
+        let result = (def.handler)(&args, ctx).await.unwrap();
+        (std::fs::read_to_string(f.path()).unwrap(), result)
+    }
+
+    async fn add_text(text: &str) -> String {
+        add_text_inner(text, None).await.0
+    }
+
+    async fn add_text_justified(text: &str, justify: &str) -> String {
+        add_text_inner(text, Some(justify)).await.0
+    }
+
+    async fn add_text_result(text: &str, justify: &str) -> CallToolResult {
+        add_text_inner(text, Some(justify)).await.1
     }
 
     /// The regression: the text was spliced in at the file's last `)`, which
@@ -2167,6 +2234,77 @@ mod add_text_placement_tests {
     async fn quotes_backslashes_and_tabs_are_escaped() {
         let out = add_text("a \"b\" c\\d\te").await;
         assert!(out.contains(r#"(text "a \"b\" c\\d\te""#), "got:\n{out}");
+    }
+
+    /// The reported defect: with no `(justify ...)` KiCad centres the text on
+    /// `x`, so a long line crosses the left page edge and vanishes from the PDF
+    /// export while the .kicad_sch still reads as complete.
+    #[tokio::test]
+    async fn text_is_left_aligned_by_default() {
+        let out = add_text("hello").await;
+        assert!(
+            out.contains("(effects (font (size 1.27 1.27)) (justify left bottom))"),
+            "got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn justify_is_written_as_kicad_orders_it() {
+        let out = add_text_justified("hello", "top right").await;
+        assert!(
+            out.contains("(justify right top)"),
+            "horizontal token comes first, got:\n{out}"
+        );
+    }
+
+    /// KiCad has no `center` token: centred text is text with no justify at
+    /// all. This is the pre-change behaviour, still reachable on request.
+    #[tokio::test]
+    async fn center_writes_no_justify_token() {
+        let out = add_text_justified("hello", "center").await;
+        assert!(!out.contains("(justify"), "got:\n{out}");
+        assert!(
+            out.contains("(effects (font (size 1.27 1.27)))"),
+            "got:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_refused() {
+        let result = add_text_result("hello", "middle").await;
+        assert!(
+            result.is_error,
+            "an unknown alignment must not be guessed at"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_tokens_on_one_axis_are_refused() {
+        let result = add_text_result("hello", "left right").await;
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn justify_parsing_covers_the_shapes_kicad_writes() {
+        // The five forms present in KiCad 10's own demo projects.
+        for (input, expected) in [
+            ("left bottom", " (justify left bottom)"),
+            ("right bottom", " (justify right bottom)"),
+            ("left", " (justify left)"),
+            // One axis alone: the other is centred by omission.
+            ("bottom", " (justify bottom)"),
+            ("left top", " (justify left top)"),
+            ("right", " (justify right)"),
+        ] {
+            assert_eq!(schematic_text_justify(input).unwrap(), expected, "{input}");
+        }
+        assert_eq!(schematic_text_justify("center").unwrap(), "");
+        assert_eq!(
+            schematic_text_justify("  BOTTOM  Left ").unwrap(),
+            " (justify left bottom)"
+        );
+        assert!(schematic_text_justify("sideways").is_err());
+        assert!(schematic_text_justify("top bottom").is_err());
     }
 }
 

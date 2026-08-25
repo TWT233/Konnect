@@ -19,6 +19,7 @@ pub mod sch_analysis;
 pub mod sch_batch;
 pub mod sch_bus;
 pub mod sch_components;
+pub(crate) mod sch_connectivity;
 pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;
@@ -262,7 +263,7 @@ macro_rules! tool {
 /// Build a structured `InvalidArgument` CallToolResult. Used by the
 /// `require_*` helpers so every handler that uses them emits structured
 /// errors the client / observer can match on — no per-handler change needed.
-fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
+pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
     CallToolResult::error_kind(
         crate::mcp::error::ToolErrorKind::InvalidArgument {
             field: field.to_string(),
@@ -270,6 +271,22 @@ fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
         },
         format!("Argument '{}' is invalid: {}", field, reason),
     )
+}
+
+/// The reason string for a footprint file whose root is not `(footprint ...)`.
+///
+/// A pre-6.0 library file has a `(module ...)` root instead, and those are
+/// still everywhere — vendor downloads and older personal libraries. The
+/// generic "file root must be a footprint" reads like a dead end there, when
+/// one shipped command migrates the file (#304). Name the situation and the
+/// way out; keep the generic message for everything else.
+pub(crate) fn footprint_root_reason(head: Option<&str>) -> String {
+    match head {
+        Some("module") => "file root is a pre-6.0 `(module ...)` footprint — \
+             convert it with `kicad-cli fp upgrade <dir-or-file>`, then retry"
+            .to_string(),
+        _ => "file root must be a footprint".to_string(),
+    }
 }
 
 /// Extract a required string argument, returning a structured
@@ -421,12 +438,16 @@ pub(crate) fn placed_pins(
         .collect()
 }
 
-/// [`placed_pins`], grouped under the reference designator that owns each
-/// placed unit, for callers that report pins by name rather than position.
+/// [`placed_pins`], grouped under the instance that placed each unit, for
+/// callers that report pins by name rather than position. The whole instance
+/// is returned because a caller reporting a pin usually wants its reference
+/// *and* something else about the component — value, uuid, unit — and a
+/// reference alone collapses on a pre-annotation sheet where every part is
+/// `R?`.
 pub(crate) fn placed_pins_by_reference(
     tree: &konnect_sexp::SexpNode,
 ) -> Vec<(
-    String,
+    konnect_sexp::schematic::SymbolInstance,
     Vec<(
         konnect_sexp::schematic::LibPin,
         konnect_sexp::geometry::PinTransform,
@@ -452,7 +473,7 @@ pub(crate) fn placed_pins_by_reference(
             .into_iter()
             .map(|p| (p, t))
             .collect();
-        by_reference.push((inst.reference, pins));
+        by_reference.push((inst, pins));
     }
     by_reference
 }

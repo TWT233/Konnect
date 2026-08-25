@@ -1,8 +1,10 @@
 //! `pcb_board` toolset — board setup, layers, outlines, zones, and board-level items.
 //!
 //! Most operations use S-expression file manipulation so they work without a running
-//! KiCAD instance. `get_board_extents` tries the IPC API first, falling back to
-//! parsing the file for coordinate bounds.
+//! KiCad instance. `get_board_info` and `get_board_extents` try the IPC API first,
+//! falling back to parsing the file, and report which they used as `source` —
+//! the file is the last save, so it disagrees with the IPC-backed writers here
+//! whenever KiCad holds unsaved edits.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -10,7 +12,10 @@ use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::{parse_sexp, SexpNode},
-    writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
+        write_atomic, SexpEdit,
+    },
 };
 use serde_json::json;
 
@@ -29,6 +34,146 @@ fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_t
                 &builders::board_segment("Edge.Cuts", w, a, b, c, d),
                 "kiapi.board.types.BoardGraphicShape",
             )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OutlinePrimitive {
+    Line {
+        start: (f64, f64),
+        end: (f64, f64),
+    },
+    Arc {
+        start: (f64, f64),
+        mid: (f64, f64),
+        end: (f64, f64),
+    },
+}
+
+fn push_outline_line(primitives: &mut Vec<OutlinePrimitive>, start: (f64, f64), end: (f64, f64)) {
+    if (start.0 - end.0).abs() > f64::EPSILON || (start.1 - end.1).abs() > f64::EPSILON {
+        primitives.push(OutlinePrimitive::Line { start, end });
+    }
+}
+
+fn rounded_rectangle_outline(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    radius: f64,
+) -> Result<Vec<OutlinePrimitive>, (&'static str, String)> {
+    if ![x1, y1, x2, y2, radius].into_iter().all(f64::is_finite) {
+        return Err((
+            "corner_radius",
+            "coordinates and corner_radius must be finite".to_string(),
+        ));
+    }
+    let (left, right) = (x1.min(x2), x1.max(x2));
+    let (top, bottom) = (y1.min(y2), y1.max(y2));
+    let width = right - left;
+    let height = bottom - top;
+    if width <= 0.0 {
+        return Err(("x2", "must differ from x1".to_string()));
+    }
+    if height <= 0.0 {
+        return Err(("y2", "must differ from y1".to_string()));
+    }
+    if radius < 0.0 {
+        return Err(("corner_radius", "must be zero or greater".to_string()));
+    }
+    let maximum = width.min(height) / 2.0;
+    if radius > maximum {
+        return Err((
+            "corner_radius",
+            format!("{radius} mm exceeds half the shorter side ({maximum} mm)"),
+        ));
+    }
+
+    if radius == 0.0 {
+        return Ok(vec![
+            OutlinePrimitive::Line {
+                start: (left, top),
+                end: (right, top),
+            },
+            OutlinePrimitive::Line {
+                start: (right, top),
+                end: (right, bottom),
+            },
+            OutlinePrimitive::Line {
+                start: (right, bottom),
+                end: (left, bottom),
+            },
+            OutlinePrimitive::Line {
+                start: (left, bottom),
+                end: (left, top),
+            },
+        ]);
+    }
+
+    let diagonal_offset = radius * (1.0 - std::f64::consts::FRAC_1_SQRT_2);
+    let mut primitives = Vec::with_capacity(8);
+
+    push_outline_line(&mut primitives, (left + radius, top), (right - radius, top));
+    primitives.push(OutlinePrimitive::Arc {
+        start: (right - radius, top),
+        mid: (right - diagonal_offset, top + diagonal_offset),
+        end: (right, top + radius),
+    });
+    push_outline_line(
+        &mut primitives,
+        (right, top + radius),
+        (right, bottom - radius),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (right, bottom - radius),
+        mid: (right - diagonal_offset, bottom - diagonal_offset),
+        end: (right - radius, bottom),
+    });
+    push_outline_line(
+        &mut primitives,
+        (right - radius, bottom),
+        (left + radius, bottom),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (left + radius, bottom),
+        mid: (left + diagonal_offset, bottom - diagonal_offset),
+        end: (left, bottom - radius),
+    });
+    push_outline_line(
+        &mut primitives,
+        (left, bottom - radius),
+        (left, top + radius),
+    );
+    primitives.push(OutlinePrimitive::Arc {
+        start: (left, top + radius),
+        mid: (left + diagonal_offset, top + diagonal_offset),
+        end: (left + radius, top),
+    });
+    Ok(primitives)
+}
+
+fn outline_items(primitives: &[OutlinePrimitive], width: f64) -> Vec<prost_types::Any> {
+    primitives
+        .iter()
+        .map(|primitive| {
+            let shape = match primitive {
+                OutlinePrimitive::Line { start, end } => {
+                    builders::board_segment("Edge.Cuts", width, start.0, start.1, end.0, end.1)
+                }
+                OutlinePrimitive::Arc { start, mid, end } => builders::board_arc(
+                    "Edge.Cuts",
+                    width,
+                    start.0,
+                    start.1,
+                    mid.0,
+                    mid.1,
+                    end.0,
+                    end.1,
+                ),
+            };
+            builders::pack_any(&shape, "kiapi.board.types.BoardGraphicShape")
         })
         .collect()
 }
@@ -137,6 +282,101 @@ pub(crate) async fn refuse_if_board_open_in_kicad(
     }
 }
 
+// ─── Zone construction, shared by `add_zone` and its `add_copper_pour` alias ──
+
+/// KiCad's own defaults for a freshly drawn zone. Shared by both tools so the
+/// two cannot hand out different copper for the same request — they used to
+/// disagree on `min_width` (0.2 vs 0.25).
+pub(crate) const DEFAULT_ZONE_CLEARANCE_MM: f64 = 0.2;
+pub(crate) const DEFAULT_ZONE_MIN_WIDTH_MM: f64 = 0.2;
+
+/// What the caller gets back when no live KiCAD could be reached and the zone
+/// went into the file instead.
+pub(crate) const ZONE_FILE_FALLBACK_WARNING: &str =
+    "KiCAD was not reachable over IPC, so the zone was written straight into the board \
+     file. If KiCAD in fact has this board open (with the IPC API switched off, say), use \
+     File → Revert there before saving, or the zone will be discarded by KiCAD's next save.";
+
+/// The `pad_connection` argument in both the representations it needs: the IPC
+/// enum and the token KiCad's `(connect_pads …)` takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PadConnection {
+    Solid,
+    Thermal,
+    None,
+}
+
+impl PadConnection {
+    /// `thermal` is KiCad's default for a new zone, so it is ours.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("thermal") {
+            "solid" => Ok(Self::Solid),
+            "thermal" => Ok(Self::Thermal),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "Unknown pad_connection '{other}'. Expected 'solid', 'thermal' or 'none'."
+            )),
+        }
+    }
+
+    fn as_ipc(self) -> konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle {
+        use konnect_ipc::gen::kiapi::board::types::ZoneConnectionStyle;
+        match self {
+            Self::Solid => ZoneConnectionStyle::ZcsFull,
+            Self::Thermal => ZoneConnectionStyle::ZcsThermal,
+            Self::None => ZoneConnectionStyle::ZcsNone,
+        }
+    }
+
+    /// The token between `connect_pads` and its `(clearance …)`. Thermal is
+    /// spelled by writing nothing at all — that is how the file format says
+    /// "the default".
+    fn sexp_token(self) -> &'static str {
+        match self {
+            Self::Solid => " yes",
+            Self::Thermal => "",
+            Self::None => " no",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Solid => "solid",
+            Self::Thermal => "thermal",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The JSON schema both zone tools advertise. One definition so `add_zone` and
+/// `add_copper_pour` cannot drift apart again.
+pub(crate) fn zone_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "board":      { "type": "string", "description": "Path to the .kicad_pcb file" },
+            "net_name":   { "type": "string", "description": "Net name (e.g. 'GND')" },
+            "layer":      { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
+            "points": {
+                "type": "array",
+                "description": "Polygon vertices as [{x, y}], in mm",
+                "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
+            },
+            "clearance":  { "type": "number", "description": "Zone clearance in mm", "default": DEFAULT_ZONE_CLEARANCE_MM },
+            "min_width":  { "type": "number", "description": "Minimum fill width in mm", "default": DEFAULT_ZONE_MIN_WIDTH_MM },
+            "name":       { "type": "string", "description": "Optional zone name, as shown in pcbnew's zone properties" },
+            "priority":   { "type": "integer", "description": "Higher priority wins where zones overlap", "default": 0, "minimum": 0 },
+            "pad_connection": {
+                "type": "string",
+                "description": "How the pour attaches to pads on its net",
+                "enum": ["solid", "thermal", "none"],
+                "default": "thermal"
+            }
+        },
+        "required": ["board", "net_name", "layer", "points"]
+    })
+}
+
 // ─── S-expression format helpers ──────────────────────────────────────────────
 
 fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -> String {
@@ -145,6 +385,36 @@ fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -
         "\n  (gr_line\n    (start {x1} {y1})\n    (end {x2} {y2})\n    \
          (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )"
     )
+}
+
+fn format_gr_arc(
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    layer: &str,
+    width: f64,
+) -> String {
+    let uuid = new_uuid();
+    format!(
+        "\n  (gr_arc\n    (start {} {})\n    (mid {} {})\n    (end {} {})\n    \
+         (stroke (width {width}) (type solid))\n    (layer \"{layer}\")\n    (uuid \"{uuid}\")\n  )",
+        start.0, start.1, mid.0, mid.1, end.0, end.1
+    )
+}
+
+fn format_outline(primitives: &[OutlinePrimitive], layer: &str, width: f64) -> String {
+    primitives
+        .iter()
+        .map(|primitive| match primitive {
+            OutlinePrimitive::Line { start, end } => {
+                format_gr_line(start.0, start.1, end.0, end.1, layer, width)
+            }
+            OutlinePrimitive::Arc { start, mid, end } => {
+                format_gr_arc(*start, *mid, *end, layer, width)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
@@ -219,22 +489,47 @@ fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> Strin
 /// `(net_name …)` pair and singular `(layer …)`. The net reference comes from
 /// [`konnect_sexp::net::net_ref_for_write`] — resolved structurally, never by
 /// string offset, which is how zones used to land on net 0 (#192).
+///
+/// Only the fallback path writes this; the live-KiCad path goes through
+/// [`konnect_ipc::builders::build_zone`], and the two are kept in step by
+/// sharing the thermal-relief and hatch-pitch constants.
+#[allow(clippy::too_many_arguments)]
 fn format_zone_polygon(
     net: &konnect_sexp::net::NetRef,
     layer: &str,
     clearance: f64,
     min_width: f64,
     points: &[(f64, f64)],
+    name: &str,
+    priority: u32,
+    connection: PadConnection,
 ) -> String {
     let uuid = new_uuid();
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
+    // KiCad omits both of these at their defaults, and so do we: an explicit
+    // `(priority 0)` is legal but is not what pcbnew writes.
+    let name_node = if name.is_empty() {
+        String::new()
+    } else {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\n    (name \"{escaped}\")")
+    };
+    let priority_node = if priority == 0 {
+        String::new()
+    } else {
+        format!("\n    (priority {priority})")
+    };
+    let connect = connection.sexp_token();
+    let thermal = konnect_ipc::builders::ZONE_THERMAL_RELIEF_MM;
+    let hatch_pitch = konnect_ipc::builders::ZONE_BORDER_PITCH_MM;
     format!(
-        "\n  (zone {net_nodes} {layer_node} (uuid \"{uuid}\")\n    \
-         (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
-         (min_thickness {min_width})\n    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n    \
+        "\n  (zone {net_nodes} {layer_node}{name_node} (uuid \"{uuid}\"){priority_node}\n    \
+         (hatch edge {hatch_pitch})\n    (connect_pads{connect} (clearance {clearance}))\n    \
+         (min_thickness {min_width})\n    \
+         (fill yes (thermal_gap {thermal}) (thermal_bridge_width {thermal}))\n    \
          (polygon (pts{pts}\n    ))\n  )",
         net_nodes = net.zone_net_nodes(),
         layer_node = net.zone_layer_node(layer),
@@ -327,9 +622,10 @@ pub fn tools() -> Vec<ToolDef> {
             "get_board_info",
             "Return metadata about the PCB: title, revision, company, layer count, paper size, \
              and the number of distinct nets (excluding the unconnected pseudo-net). \
-             Paper size always comes from the file, and is null \
+             Reads the board open in KiCad when it is reachable, else the file — \
+             'source' says which. Paper size always comes from the file, and is null \
              when the file cannot be read. A custom (User) size also reports its \
-             dimensions in millimetres under 'paper_size_mm'.",
+             dimensions in millimetres under 'paper_size_mm' on both paths.",
             json!({
                 "type": "object",
                 "properties": {
@@ -392,7 +688,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_outline",
-            "Add a rectangular board outline on the Edge.Cuts layer at specified coordinates.",
+            "Add a rectangular board outline on Edge.Cuts, optionally using circular rounded corners.",
             json!({
                 "type": "object",
                 "properties": {
@@ -401,7 +697,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "y1":             { "type": "number", "description": "Top-left Y in mm" },
                     "x2":             { "type": "number", "description": "Bottom-right X in mm" },
                     "y2":             { "type": "number", "description": "Bottom-right Y in mm" },
-                    "corner_radius":  { "type": "number", "description": "Corner radius in mm (0 = sharp)", "default": 0 }
+                    "corner_radius":  { "type": "number", "minimum": 0, "description": "Circular corner radius in mm; must not exceed half the shorter side (0 = sharp)", "default": 0 }
                 },
                 "required": ["board", "x1", "y1", "x2", "y2"]
             }),
@@ -443,23 +739,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_zone",
-            "Add a copper fill zone polygon on a specified layer and net.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board":      { "type": "string" },
-                    "net_name":   { "type": "string", "description": "Net name (e.g. 'GND')" },
-                    "layer":      { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
-                    "points": {
-                        "type": "array",
-                        "description": "Polygon vertices as [{x, y}]",
-                        "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
-                    },
-                    "clearance":  { "type": "number", "default": 0.2 },
-                    "min_width":  { "type": "number", "default": 0.2 }
-                },
-                "required": ["board", "net_name", "layer", "points"]
-            }),
+            "Add a copper fill zone polygon on a specified layer and net. Tries KiCAD IPC \
+             first — with KiCAD live on this board the zone is created through the API and \
+             refilled, so it shows up at once and is undoable there. Only when no live KiCAD \
+             answers does it fall back to inserting the (zone …) S-expression into the file, \
+             and that result carries a warning, because a file-only edit is invisible to an \
+             open pcbnew and is lost on its next save. Refuses a net the board does not \
+             declare rather than binding copper to net 0.",
+            zone_schema(),
             |args, ctx| async move { handle_add_zone(args, ctx).await }
         ),
         tool!(
@@ -487,6 +774,66 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/// What replacing the board outline over IPC found and did.
+enum OutlineIpcOutcome {
+    /// Outline replaced; carries how many old Edge.Cuts segments were removed.
+    Replaced(usize),
+    /// The existing outline holds something a rectangle cannot honestly
+    /// replace (an arc, polygon, rounded rect…). Nothing was written.
+    NotPlainSegments(String),
+}
+
+/// Partition a live board's `KotPcbShape` items into Edge.Cuts segment KIIDs
+/// and the kinds of any non-segment Edge.Cuts shapes.
+///
+/// Pure so it can be tested without a live KiCAD; the decode is guarded by the
+/// type URL per the #244 rule — a pad-shaped `Any` must not be mistaken for a
+/// shape.
+fn partition_edge_cuts_shapes(items: &[prost_types::Any]) -> (Vec<String>, Vec<&'static str>) {
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+
+    let mut segment_ids = Vec::new();
+    let mut other_kinds = Vec::new();
+    for item in items {
+        if !builders::any_is(item, "kiapi.board.types.BoardGraphicShape") {
+            continue;
+        }
+        let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+        else {
+            continue;
+        };
+        if shape.layer != kiapi::board::types::BoardLayer::BlEdgeCuts as i32 {
+            continue;
+        }
+        use kiapi::common::types::graphic_shape::Geometry;
+        match shape.shape.as_ref().and_then(|s| s.geometry.as_ref()) {
+            Some(Geometry::Segment(_)) => {
+                if let Some(id) = shape.id.as_ref().filter(|id| !id.value.is_empty()) {
+                    segment_ids.push(id.value.clone());
+                }
+            }
+            Some(Geometry::Rectangle(_)) => other_kinds.push("rectangle"),
+            Some(Geometry::Arc(_)) => other_kinds.push("arc"),
+            Some(Geometry::Circle(_)) => other_kinds.push("circle"),
+            Some(Geometry::Polygon(_)) => other_kinds.push("polygon"),
+            Some(Geometry::Bezier(_)) => other_kinds.push("bezier"),
+            None => other_kinds.push("unknown shape"),
+        }
+    }
+    (segment_ids, other_kinds)
+}
+
+/// The refusal both write paths share when the outline is not plain segments.
+fn outline_not_replaceable(kinds: &str) -> CallToolResult {
+    CallToolResult::error(format!(
+        "The existing board outline includes {kinds} on Edge.Cuts, which a plain \
+         rectangle cannot honestly replace — Konnect refused before writing \
+         anything. Edit the outline in pcbnew, or delete the old outline first \
+         if the rectangle is really what you want."
+    ))
+}
+
 async fn handle_set_board_size(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -507,30 +854,81 @@ async fn handle_set_board_size(
     let y2 = oy + height;
     let w = 0.05_f64;
 
-    // Try IPC first (live board in KiCAD, undo-aware); fall through to file edit.
-    // ponytail: 4 segments over a single BoardRectangle keeps one builder path;
-    // switch to board_rectangle if a native rect proves less flaky.
+    // Try IPC first (live board in KiCAD, undo-aware); fall through to file
+    // edit. Both paths REPLACE the existing outline: since the first release
+    // this tool only ever appended, so every resize added a second rectangle
+    // to Edge.Cuts and the board failed DRC with a self-intersecting outline
+    // while the tool reported success (#314).
     let items = rect_outline_items(ox, oy, x2, y2, w);
     match attempt_ipc_write(
         ctx.config.ipc_address.clone(),
         &board_path,
         "board size",
-        move |c| c.create_items(items).map(|_| ()),
+        move |c| {
+            let existing =
+                c.get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbShape)?;
+            let (segment_ids, other_kinds) = partition_edge_cuts_shapes(&existing);
+            if !other_kinds.is_empty() {
+                return Ok(OutlineIpcOutcome::NotPlainSegments(other_kinds.join(", ")));
+            }
+            let removed = segment_ids.len();
+            c.run_commit("Set board size", |c| {
+                c.delete_items(segment_ids.clone())?;
+                c.create_items(items.clone()).map(|_| ())
+            })?;
+            Ok(OutlineIpcOutcome::Replaced(removed))
+        },
     )
     .await?
     {
-        BoardWrite::Ipc(()) => {
+        BoardWrite::Ipc(OutlineIpcOutcome::Replaced(removed)) => {
             return Ok(CallToolResult::json(&json!({
                 "width": width, "height": height,
                 "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+                "replaced_segments": removed,
                 "source": "ipc"
             })))
+        }
+        // The refusal is Konnect's, not KiCAD's — do not route it through the
+        // Refused arm, whose wording attributes the rejection to KiCAD (#230).
+        BoardWrite::Ipc(OutlineIpcOutcome::NotPlainSegments(kinds)) => {
+            return Ok(outline_not_replaceable(&kinds))
         }
         BoardWrite::Refused(err) => return Ok(err),
         BoardWrite::File => {}
     }
 
-    // Append 4 Edge.Cuts lines (top, right, bottom, left)
+    let content = std::fs::read_to_string(&board_path)?;
+
+    // Locate every existing top-level Edge.Cuts graphic. Plain `gr_line`s are
+    // replaced; anything else refuses, because silently deleting an arc or
+    // polygon outline would be guessing at design intent.
+    let mut edits = Vec::new();
+    let mut removed = 0usize;
+    let mut other_kinds: Vec<String> = Vec::new();
+    for (start, end) in find_direct_child_blocks(&content, "kicad_pcb") {
+        let block = &content[start..end];
+        let tag = block
+            .trim_start_matches('(')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if !tag.starts_with("gr_") || !block.contains("\"Edge.Cuts\"") {
+            continue;
+        }
+        if tag == "gr_line" {
+            let (ws_start, _) =
+                find_block_with_leading_whitespace(&content, start).unwrap_or((start, end));
+            edits.push(SexpEdit::replace(ws_start, end, String::new()));
+            removed += 1;
+        } else {
+            other_kinds.push(tag.trim_start_matches("gr_").to_string());
+        }
+    }
+    if !other_kinds.is_empty() {
+        return Ok(outline_not_replaceable(&other_kinds.join(", ")));
+    }
+
     let lines = format!(
         "{}{}{}{}",
         format_gr_line(ox, oy, x2, oy, "Edge.Cuts", w),
@@ -538,15 +936,15 @@ async fn handle_set_board_size(
         format_gr_line(x2, y2, ox, y2, "Edge.Cuts", w),
         format_gr_line(ox, y2, ox, oy, "Edge.Cuts", w),
     );
-
-    let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, lines)]);
+    edits.push(SexpEdit::insert(close_pos, lines));
+    let new_content = apply_edits(content, edits);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "width": width, "height": height,
         "x1": ox, "y1": oy, "x2": x2, "y2": y2,
+        "replaced_segments": removed,
         "source": "file"
     })))
 }
@@ -589,10 +987,55 @@ fn paper_size_mm(tree: &SexpNode) -> Option<(f64, f64)> {
 
 async fn handle_get_board_info(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    // One read+parse feeds every field of the answer. An unreadable or
+
+    // The board open in KiCad first (#207). Reading only the file reported the
+    // state of the last save — on a board with unsaved edits it disagreed with
+    // the IPC-backed writers in this toolset, most visibly as layer_count 0 /
+    // net_count 0 on a board KiCad was showing fully populated.
+    let ipc_board = board_path.clone();
+    if let Ok((title_block, enabled, nets)) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
+        let document = c.find_open_board(&ipc_board)?;
+        Ok((
+            c.get_title_block_in(document.clone())?,
+            c.get_enabled_layers_in(document.clone())?,
+            // Net 0 is KiCad's unconnected pseudo-net and GetNets returns it.
+            // The tool description promises a count without it and the file
+            // path already excludes it (konnect_sexp::net::count_distinct_nets),
+            // so a board with nothing wired must not read as one net.
+            c.get_nets_in(document)?
+                .iter()
+                .filter(|net| net.netcode != 0)
+                .count(),
+        ))
+    })
+    .await?
+    {
+        // Paper always comes from the file — KiCad's API exposes no page
+        // settings — through the same parsed-tree helpers the file path uses,
+        // so a custom User size reports its dimensions on both paths (#219).
+        let paper_tree = parsed_board(&board_path);
+        return Ok(CallToolResult::json(&json!({
+            "file": board_path.display().to_string(),
+            "title": title_block.title,
+            "date": title_block.date,
+            "revision": title_block.revision,
+            "company": title_block.company,
+            "paper": paper_tree.as_ref().map(paper_name),
+            "paper_size_mm": paper_tree
+                .as_ref()
+                .and_then(paper_size_mm)
+                .map(|(w, h)| json!({"width": w, "height": h})),
+            "layer_count": enabled.layers.len(),
+            "copper_layer_count": enabled.copper_layer_count,
+            "net_count": nets,
+            "source": "ipc"
+        })));
+    }
+
+    // One read+parse feeds every field of the file answer. An unreadable or
     // unparseable file is a hard error here: unlike the paper fields, which
     // report null rather than guess A4 (see parsed_board), the rest of the
     // response has no honest answer at all.
@@ -649,7 +1092,8 @@ async fn handle_get_board_info(
             .map(|(w, h)| json!({"width": w, "height": h})),
         "layer_count": layer_count,
         "copper_layer_count": copper_layer_count,
-        "net_count": net_count
+        "net_count": net_count,
+        "source": "file"
     })))
 }
 
@@ -659,11 +1103,13 @@ async fn handle_get_board_extents(
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
 
-    // Try IPC first; fall through to file-based computation on error
-    let requested = board_path.clone();
+    // Try IPC first; fall through to file-based computation on error.
+    // Addressed to the requested board, not the first open one — with two
+    // boards open, first-document targeting silently measures the other, and
+    // ensure_board_is_active only checks it is open somewhere.
+    let ipc_board = board_path.clone();
     if let Ok(ext) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        c.ensure_board_is_active(&requested)?;
-        c.get_board_extents()
+        c.get_board_extents_in(c.find_open_board(&ipc_board)?)
     })
     .await?
     {
@@ -897,9 +1343,41 @@ async fn handle_add_board_outline(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let corner_radius = match args.get("corner_radius") {
+        None | Some(serde_json::Value::Null) => 0.0,
+        Some(value) => match value.as_f64() {
+            Some(radius) => radius,
+            None => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "corner_radius".to_string(),
+                        reason: "must be a number".to_string(),
+                    },
+                    "Argument 'corner_radius' must be a number",
+                ));
+            }
+        },
+    };
+    let primitives = match rounded_rectangle_outline(x1, y1, x2, y2, corner_radius) {
+        Ok(primitives) => primitives,
+        Err((field, reason)) => {
+            return Ok(CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::InvalidArgument {
+                    field: field.to_string(),
+                    reason: reason.clone(),
+                },
+                format!("Argument '{field}' is invalid: {reason}"),
+            ));
+        }
+    };
     let w = 0.05_f64;
+    let line_count = primitives
+        .iter()
+        .filter(|primitive| matches!(primitive, OutlinePrimitive::Line { .. }))
+        .count();
+    let arc_count = primitives.len() - line_count;
 
-    let items = rect_outline_items(x1, y1, x2, y2, w);
+    let items = outline_items(&primitives, w);
     match attempt_ipc_write(
         ctx.config.ipc_address.clone(),
         &board_path,
@@ -912,6 +1390,8 @@ async fn handle_add_board_outline(
             return Ok(CallToolResult::json(&json!({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+                "corner_radius": corner_radius,
+                "line_count": line_count, "arc_count": arc_count,
                 "source": "ipc"
             })))
         }
@@ -919,22 +1399,18 @@ async fn handle_add_board_outline(
         BoardWrite::File => {}
     }
 
-    let lines = format!(
-        "{}{}{}{}",
-        format_gr_line(x1, y1, x2, y1, "Edge.Cuts", w),
-        format_gr_line(x2, y1, x2, y2, "Edge.Cuts", w),
-        format_gr_line(x2, y2, x1, y2, "Edge.Cuts", w),
-        format_gr_line(x1, y2, x1, y1, "Edge.Cuts", w),
-    );
+    let outline = format_outline(&primitives, "Edge.Cuts", w);
 
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, lines)]);
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, outline)]);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
         "width": (x2-x1).abs(), "height": (y2-y1).abs(),
+        "corner_radius": corner_radius,
+        "line_count": line_count, "arc_count": arc_count,
         "source": "file"
     })))
 }
@@ -1074,9 +1550,17 @@ async fn handle_add_board_text(
     })))
 }
 
-async fn handle_add_zone(
+/// Shared implementation of `add_zone` and its `add_copper_pour` alias.
+///
+/// IPC first: with KiCAD live on the board, the zone is created through the
+/// API and refilled, so it appears immediately and is part of the user's undo
+/// stack. Only when no live KiCAD answers does this fall back to inserting the
+/// `(zone …)` S-expression, which is reported with an explicit warning — a
+/// file-only edit is invisible to an open pcbnew and is discarded by its next
+/// save (#192), and that is exactly what `add_zone` used to do unconditionally.
+pub(crate) async fn add_zone_impl(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
@@ -1087,8 +1571,18 @@ async fn handle_add_zone(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let clearance = args["clearance"].as_f64().unwrap_or(0.2);
-    let min_width = args["min_width"].as_f64().unwrap_or(0.2);
+    let clearance = args["clearance"]
+        .as_f64()
+        .unwrap_or(DEFAULT_ZONE_CLEARANCE_MM);
+    let min_width = args["min_width"]
+        .as_f64()
+        .unwrap_or(DEFAULT_ZONE_MIN_WIDTH_MM);
+    let zone_name = args["name"].as_str().unwrap_or("").to_string();
+    let priority = args["priority"].as_u64().unwrap_or(0) as u32;
+    let connection = match PadConnection::parse(args["pad_connection"].as_str()) {
+        Ok(v) => v,
+        Err(message) => return Ok(CallToolResult::error(message)),
+    };
     let pts_arr = match args["points"].as_array() {
         Some(a) => a.clone(),
         None => return Ok(CallToolResult::error("Missing 'points' array")),
@@ -1103,10 +1597,52 @@ async fn handle_add_zone(
         return Ok(CallToolResult::error("Zone requires at least 3 points"));
     }
 
-    if let Some(refusal) =
-        refuse_if_board_open_in_kicad(_ctx.config.ipc_address.clone(), &board_path, "zone").await?
-    {
-        return Ok(refusal);
+    let describe = || {
+        json!({
+            "net": net_name,
+            "layer": layer,
+            "point_count": points.len(),
+            "name": zone_name,
+            "priority": priority,
+            "pad_connection": connection.as_str(),
+        })
+    };
+
+    let net_ipc = net_name.clone();
+    let layer_ipc = layer.clone();
+    let name_ipc = zone_name.clone();
+    let points_ipc = points.clone();
+    let ipc_attempt = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board_path,
+        "zone",
+        move |c| {
+            c.add_zone(&konnect_ipc::builders::ZoneSpec {
+                layer: &layer_ipc,
+                net_name: &net_ipc,
+                points: &points_ipc,
+                clearance_mm: clearance,
+                min_thickness_mm: min_width,
+                name: &name_ipc,
+                priority,
+                connection: connection.as_ipc(),
+            })
+        },
+    )
+    .await?;
+
+    match ipc_attempt {
+        BoardWrite::Refused(err) => return Ok(err),
+        BoardWrite::Ipc(zone_id) => {
+            let mut body = describe();
+            body["source"] = json!("ipc");
+            body["zone_id"] = match zone_id {
+                Some(id) => json!(id),
+                None => serde_json::Value::Null,
+            };
+            return Ok(CallToolResult::json(&body));
+        }
+        BoardWrite::File => {}
     }
 
     let content = std::fs::read_to_string(&board_path)?;
@@ -1120,16 +1656,25 @@ async fn handle_add_zone(
             board_path.display()
         )));
     };
-    let zone_sexp = format_zone_polygon(&net, &layer, clearance, min_width, &points);
+    let zone_sexp = format_zone_polygon(
+        &net, &layer, clearance, min_width, &points, &zone_name, priority, connection,
+    );
 
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
     write_atomic(&board_path, &new_content)?;
 
-    Ok(CallToolResult::json(&json!({
-        "net": net_name, "layer": layer,
-        "point_count": points.len()
-    })))
+    let mut body = describe();
+    body["source"] = json!("file");
+    body["warning"] = json!(ZONE_FILE_FALLBACK_WARNING);
+    Ok(CallToolResult::json(&body))
+}
+
+async fn handle_add_zone(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    add_zone_impl(args, ctx).await
 }
 
 async fn handle_import_svg_logo(
@@ -1648,6 +2193,72 @@ mod mounting_hole_tests {
     }
 }
 
+#[cfg(test)]
+mod rounded_outline_tests {
+    use super::*;
+
+    fn endpoints(primitive: &OutlinePrimitive) -> ((f64, f64), (f64, f64)) {
+        match primitive {
+            OutlinePrimitive::Line { start, end } | OutlinePrimitive::Arc { start, end, .. } => {
+                (*start, *end)
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_rectangle_is_a_closed_four_line_four_arc_path() {
+        let outline = rounded_rectangle_outline(10.0, 20.0, 50.0, 60.0, 5.0).unwrap();
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Line { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Arc { .. }))
+                .count(),
+            4
+        );
+        for index in 0..outline.len() {
+            let (_, end) = endpoints(&outline[index]);
+            let (next_start, _) = endpoints(&outline[(index + 1) % outline.len()]);
+            assert_eq!(end, next_start, "outline gap after primitive {index}");
+        }
+
+        let OutlinePrimitive::Arc { start, mid, end } = &outline[1] else {
+            panic!("top-right primitive should be an arc");
+        };
+        assert_eq!(*start, (45.0, 20.0));
+        assert_eq!(*end, (50.0, 25.0));
+        let center = (45.0, 25.0);
+        let mid_radius = ((mid.0 - center.0).powi(2) + (mid.1 - center.1).powi(2)).sqrt();
+        assert!((mid_radius - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capsule_outline_omits_zero_length_sides() {
+        let outline = rounded_rectangle_outline(0.0, 0.0, 30.0, 10.0, 5.0).unwrap();
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|item| matches!(item, OutlinePrimitive::Line { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(outline.len(), 6);
+    }
+
+    #[test]
+    fn corner_radius_cannot_overlap_itself() {
+        let error = rounded_rectangle_outline(0.0, 0.0, 20.0, 10.0, 5.1).unwrap_err();
+        assert_eq!(error.0, "corner_radius");
+        assert!(error.1.contains("half the shorter side"));
+    }
+}
+
 /// The board-graphics tools (`set_board_size`, `add_board_outline`,
 /// `add_board_text`, `import_svg_logo`) went to IPC on `with_ipc(..).is_ok()`,
 /// which conflated "no KiCAD there" with "KiCAD said no" and ignored the
@@ -1714,6 +2325,27 @@ mod board_write_gate_tests {
             4,
             "expected four outline segments: {updated}"
         );
+    }
+
+    #[tokio::test]
+    async fn rounded_outline_file_fallback_writes_real_kicad_arcs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = blank_board(dir.path());
+        let ctx = ctx_with_ipc(String::new());
+        let mut args = board_args(&board);
+        args["corner_radius"] = json!(3.0);
+
+        let result = handle_add_board_outline(&args, &ctx).await.unwrap();
+        assert!(!result.is_error, "handler errored: {:?}", result.content);
+        let response: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(response["corner_radius"], 3.0);
+        assert_eq!(response["line_count"], 4);
+        assert_eq!(response["arc_count"], 4);
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(updated.matches("(gr_line").count(), 4, "{updated}");
+        assert_eq!(updated.matches("(gr_arc").count(), 4, "{updated}");
+        parse_sexp(&updated).expect("rounded outline remains valid KiCad S-expression");
     }
 
     #[tokio::test]
@@ -1827,6 +2459,522 @@ mod zone_net_format_tests {
         let (result, after) = zone(LEGACY, "PWR").await;
         assert!(result.is_error, "{}", text_of(&result));
         assert_eq!(after, LEGACY);
+    }
+
+    fn body_of(r: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&text_of(r)).expect("tool results are JSON")
+    }
+
+    async fn zone_with(board: &str, extra: serde_json::Value) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board).unwrap();
+        let mut args = json!({
+            "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+            "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ]
+        });
+        for (key, value) in extra.as_object().expect("object").clone() {
+            args[key] = value;
+        }
+        let result = handle_add_zone(&args, &test_ctx()).await.unwrap();
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    /// The defect this replaced: with no IPC attempt at all, `add_zone` wrote
+    /// the file and reported plain success, so a zone added while KiCad held
+    /// the board open was invisible and was dropped by KiCad's next save
+    /// (#192). The file path is still there — it is the right thing to do when
+    /// nothing is holding the board — but it now says so.
+    #[tokio::test]
+    async fn the_file_fallback_names_itself_and_warns() {
+        let (result, _) = zone_with(KICAD_10, json!({})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body = body_of(&result);
+        assert_eq!(body["source"], json!("file"));
+        let warning = body["warning"].as_str().expect("a fallback must warn");
+        assert!(warning.contains("File → Revert"), "{warning}");
+        assert!(warning.contains("next save"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn the_new_fields_reach_the_s_expression() {
+        let (result, after) = zone_with(
+            KICAD_10,
+            json!({ "name": "ground pour", "priority": 3, "pad_connection": "solid" }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(name \"ground pour\")"), "{z}");
+        assert!(z.contains("(priority 3)"), "{z}");
+        assert!(z.contains("(connect_pads yes (clearance"), "{z}");
+        assert!(konnect_sexp::parse_sexp(&after).is_ok(), "still parses");
+
+        let body = body_of(&result);
+        assert_eq!(body["name"], json!("ground pour"));
+        assert_eq!(body["priority"], json!(3));
+        assert_eq!(body["pad_connection"], json!("solid"));
+    }
+
+    /// KiCad spells "thermal" and "priority 0" by writing nothing at all, so
+    /// the defaults must not start emitting nodes pcbnew never writes.
+    #[tokio::test]
+    async fn the_defaults_write_what_pcbnew_writes() {
+        let (result, after) = zone_with(KICAD_10, json!({})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let z = &after[after.find("(zone").expect("zone written")..];
+        assert!(z.contains("(connect_pads (clearance 0.2))"), "{z}");
+        assert!(z.contains("(min_thickness 0.2)"), "{z}");
+        assert!(!z.contains("(priority"), "priority 0 is implicit: {z}");
+        assert!(
+            !z.contains("(name"),
+            "an unnamed zone gets no name node: {z}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pad_connection_none_writes_the_no_token() {
+        let (_, after) = zone_with(KICAD_10, json!({ "pad_connection": "none" })).await;
+        let z = &after[after.find("(zone").unwrap()..];
+        assert!(z.contains("(connect_pads no (clearance"), "{z}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pad_connection_is_refused_before_anything_is_written() {
+        let (result, after) =
+            zone_with(KICAD_10, json!({ "pad_connection": "thermal_relief" })).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(text_of(&result).contains("'solid', 'thermal' or 'none'"));
+        assert_eq!(after, KICAD_10, "file must be untouched");
+    }
+
+    /// A KiCad that answers — even to say no — may be holding this board, so
+    /// the file must not be edited behind it. This is `attempt_ipc_write`'s
+    /// fail-closed rule; before this change `add_zone` reached the same
+    /// outcome through `refuse_if_board_open_in_kicad`, which had no IPC path
+    /// to offer instead.
+    #[tokio::test]
+    async fn a_rejecting_kicad_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, KICAD_10).unwrap();
+        let ctx = super::mounting_hole_tests::ctx_with_ipc(
+            super::mounting_hole_tests::spawn_rejecting_kicad(),
+        );
+        let result = handle_add_zone(
+            &json!({
+                "board": path.to_str().unwrap(), "net_name": "GND", "layer": "B.Cu",
+                "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("board file was not modified"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), KICAD_10);
+    }
+}
+
+#[cfg(test)]
+mod board_size_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A KiCad-10-shaped board (tab indentation) already carrying a 20x10
+    /// outline at the origin, the way pcbnew saves one.
+    const BOARD_WITH_OUTLINE: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(layers\n\t\t(0 \"F.Cu\" signal)\n\t\t(31 \"B.Cu\" signal)\n\t)\n\
+        \t(gr_line\n\t\t(start 0 0)\n\t\t(end 20 0)\n\t\t(stroke (width 0.05) (type default))\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+        \t(gr_line\n\t\t(start 20 0)\n\t\t(end 20 10)\n\t\t(stroke (width 0.05) (type default))\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+        \t(gr_line\n\t\t(start 20 10)\n\t\t(end 0 10)\n\t\t(stroke (width 0.05) (type default))\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+        \t(gr_line\n\t\t(start 0 10)\n\t\t(end 0 0)\n\t\t(stroke (width 0.05) (type default))\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+        )";
+
+    async fn resize(board_text: &str, w: f64, h: f64) -> (CallToolResult, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, board_text).unwrap();
+        let result = handle_set_board_size(
+            &serde_json::json!({
+                "board": path.to_str().unwrap(),
+                "width": w,
+                "height": h
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        (result, after)
+    }
+
+    fn edge_cuts_lines(content: &str) -> usize {
+        find_direct_child_blocks(content, "kicad_pcb")
+            .into_iter()
+            .filter(|&(s, e)| {
+                let b = &content[s..e];
+                b.starts_with("(gr_line") && b.contains("\"Edge.Cuts\"")
+            })
+            .count()
+    }
+
+    fn text_of_result(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// #314: since the first release this tool appended a second rectangle on
+    /// every call — the board accumulated outlines and failed DRC with a
+    /// self-intersecting Edge.Cuts while the tool reported success.
+    #[tokio::test]
+    async fn resizing_replaces_the_outline_instead_of_stacking_a_second_one() {
+        let (result, after) = resize(BOARD_WITH_OUTLINE, 45.0, 30.0).await;
+        assert!(!result.is_error);
+
+        assert_eq!(
+            edge_cuts_lines(&after),
+            4,
+            "exactly one rectangle must remain: {after}"
+        );
+        assert!(after.contains("(end 45"), "new width missing: {after}");
+        assert!(
+            !after.contains("(end 20 0)"),
+            "old outline survived: {after}"
+        );
+
+        // And the response says what actually happened, not what was asked.
+        let output: serde_json::Value = serde_json::from_str(&text_of_result(&result)).unwrap();
+        assert_eq!(output["replaced_segments"], 4);
+        assert_eq!(output["source"], "file");
+    }
+
+    /// Two resizes in a row must not accumulate either — the second replaces
+    /// the first rectangle.
+    #[tokio::test]
+    async fn a_second_resize_still_leaves_one_rectangle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, BOARD_WITH_OUTLINE).unwrap();
+        for (w, h) in [(45.0, 30.0), (60.0, 40.0)] {
+            let result = handle_set_board_size(
+                &serde_json::json!({
+                    "board": path.to_str().unwrap(),
+                    "width": w,
+                    "height": h
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error);
+        }
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(edge_cuts_lines(&after), 4, "{after}");
+        assert!(after.contains("(end 60"), "{after}");
+    }
+
+    /// An empty board still gets its first outline (the old behavior that was
+    /// actually correct).
+    #[tokio::test]
+    async fn a_board_without_an_outline_gains_one() {
+        let bare = "(kicad_pcb\n\t(version 20260206)\n\t(generator \"pcbnew\")\n)";
+        let (result, after) = resize(bare, 30.0, 20.0).await;
+        assert!(!result.is_error);
+        assert_eq!(edge_cuts_lines(&after), 4, "{after}");
+    }
+
+    /// An outline containing anything but plain segments refuses untouched:
+    /// silently deleting an arc or polygon outline would be guessing at
+    /// design intent.
+    #[tokio::test]
+    async fn a_curved_outline_refuses_and_the_file_is_untouched() {
+        let curved = "(kicad_pcb\n\
+            \t(version 20260206)\n\
+            \t(gr_line\n\t\t(start 0 0)\n\t\t(end 20 0)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            \t(gr_arc\n\t\t(start 20 0)\n\t\t(mid 25 5)\n\t\t(end 20 10)\n\t\t(layer \"Edge.Cuts\")\n\t)\n\
+            )";
+        let (result, after) = resize(curved, 45.0, 30.0).await;
+        assert!(result.is_error);
+        assert_eq!(after, curved, "a refusal must not modify the file");
+        let text = text_of_result(&result);
+        assert!(text.contains("arc"), "the refusal names the shape: {text}");
+    }
+
+    /// The live-path classifier: a pad-typed `Any` must not be counted, a
+    /// non-Edge.Cuts segment must not be deleted, and non-segment Edge.Cuts
+    /// geometry is reported by kind (#244's type-URL rule applied here).
+    #[test]
+    fn partitioning_live_shapes_is_layer_and_type_exact() {
+        use konnect_ipc::gen::kiapi;
+
+        let edge_segment = builders::pack_any(
+            &builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 20.0, 0.0),
+            "kiapi.board.types.BoardGraphicShape",
+        );
+        let silk_segment = builders::pack_any(
+            &builders::board_segment("F.SilkS", 0.12, 0.0, 0.0, 5.0, 0.0),
+            "kiapi.board.types.BoardGraphicShape",
+        );
+        let mut arc = builders::board_segment("Edge.Cuts", 0.05, 0.0, 0.0, 1.0, 1.0);
+        arc.shape = Some(kiapi::common::types::GraphicShape {
+            geometry: Some(kiapi::common::types::graphic_shape::Geometry::Arc(
+                kiapi::common::types::GraphicArcAttributes::default(),
+            )),
+            ..arc.shape.unwrap_or_default()
+        });
+        let edge_arc = builders::pack_any(&arc, "kiapi.board.types.BoardGraphicShape");
+        // A pad whose bytes would happily decode as a shape (#244).
+        let pad = builders::pack_any(
+            &kiapi::board::types::Pad::default(),
+            "kiapi.board.types.Pad",
+        );
+
+        let (ids, other) = partition_edge_cuts_shapes(&[edge_segment, silk_segment, edge_arc, pad]);
+        // The plain Edge.Cuts segment has no KIID here (builder does not set
+        // one), so ids stays empty — but the arc is still detected by kind.
+        assert!(ids.is_empty());
+        assert_eq!(other, vec!["arc"]);
+    }
+}
+
+/// `get_board_info` used to read only the file — the last save — while every
+/// writer in this toolset acts on the board KiCad holds. On a board with
+/// unsaved edits the two disagreed completely, most visibly as layer_count 0
+/// and net_count 0 for a board KiCad was showing fully populated.
+#[cfg(test)]
+mod board_info_source_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use konnect_ipc::gen::kiapi;
+    use prost::Message;
+    use std::sync::Arc;
+
+    /// A board saved before anything was placed on it: the empty stub the
+    /// file-only reader kept reporting.
+    const EMPTY_STUB: &str = "(kicad_pcb\n\t(version 20260206)\n\t(paper \"A3\")\n)\n";
+
+    fn ctx_talking_to(address: String) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: address,
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A KiCad holding `board` open with `layers` enabled, `copper` of them
+    /// copper, and `nets` real nets — none of it saved to the file.
+    ///
+    /// The net list carries KiCad's unconnected pseudo-net (code 0, empty
+    /// name) ahead of the real ones, because `GetNets` returns it and the
+    /// count must not.
+    fn spawn_kicad_holding(
+        board: &std::path::Path,
+        layers: usize,
+        copper: u32,
+        nets: usize,
+    ) -> String {
+        use nng::options::Options;
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("tcp://127.0.0.1:{port}");
+        let socket = nng::Socket::new(nng::Protocol::Rep0).expect("mock rep socket");
+        socket
+            .set_opt::<nng::options::RecvTimeout>(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        socket.listen(&url).expect("mock listen");
+
+        let board = board.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            while let Ok(message) = socket.recv() {
+                let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![kiapi::common::types::DocumentSpecifier {
+                                r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                                project: None,
+                                identifier: Some(
+                                    kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                                        board.clone(),
+                                    ),
+                                ),
+                            }],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("GetTitleBlockInfo") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::types::TitleBlockInfo {
+                            title: "Live title".to_string(),
+                            revision: "B".to_string(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.types.TitleBlockInfo",
+                    ))
+                } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            copper_layer_count: copper,
+                            layers: (0..layers as i32).collect(),
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
+                    ))
+                } else if command.type_url.ends_with("GetNets") {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: std::iter::once(kiapi::board::types::Net {
+                                code: Some(kiapi::board::types::NetCode { value: 0 }),
+                                name: String::new(),
+                            })
+                            .chain((1..=nets).map(|index| kiapi::board::types::Net {
+                                code: Some(kiapi::board::types::NetCode {
+                                    value: index as i32,
+                                }),
+                                name: format!("N{index}"),
+                            }))
+                            .collect(),
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ))
+                } else {
+                    None
+                };
+                let response = kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                };
+                let out = nng::Message::from(response.encode_to_vec().as_slice());
+                if socket.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+        url
+    }
+
+    async fn board_info(board: &std::path::Path, ctx: &ToolContext) -> serde_json::Value {
+        let result = handle_get_board_info(&json!({ "board": board.to_str().unwrap() }), ctx)
+            .await
+            .expect("handler should succeed");
+        assert!(!result.is_error, "{:?}", result.content);
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_board_is_reported_instead_of_the_last_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+        // Six copper layers among 27 enabled. Ids 3..26 are all `*.Cu`, so a
+        // tally of layer names would say 24 — the response field says 6.
+        let address = spawn_kicad_holding(&board, 27, 6, 99);
+
+        let info = board_info(&board, &ctx_talking_to(address)).await;
+
+        assert_eq!(info["source"], json!("ipc"));
+        assert_eq!(info["layer_count"], json!(27));
+        assert_eq!(info["copper_layer_count"], json!(6));
+        // 99 real nets, not 100: GetNets also returned the pseudo-net.
+        assert_eq!(info["net_count"], json!(99));
+        assert_eq!(info["title"], json!("Live title"));
+        assert_eq!(info["revision"], json!("B"));
+        // Page size has no IPC equivalent, so it stays a file reading.
+        assert_eq!(info["paper"], json!("A3"));
+    }
+
+    #[tokio::test]
+    async fn an_offline_session_still_reads_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+
+        let info = board_info(&board, &ctx_talking_to(String::new())).await;
+
+        assert_eq!(info["source"], json!("file"));
+        assert_eq!(info["net_count"], json!(0));
+        assert_eq!(info["paper"], json!("A3"));
+    }
+
+    /// The pseudo-net is the only net a freshly-created board has, and both
+    /// paths have to call that zero. The file path is covered by
+    /// `a_board_with_only_the_unconnected_pseudo_net_counts_zero`; this is the
+    /// live half, which used to report 1.
+    #[tokio::test]
+    async fn a_live_board_with_only_the_pseudo_net_counts_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+        let address = spawn_kicad_holding(&board, 2, 2, 0);
+
+        let info = board_info(&board, &ctx_talking_to(address)).await;
+
+        assert_eq!(info["source"], json!("ipc"));
+        assert_eq!(info["net_count"], json!(0));
+    }
+
+    /// KiCad's API has no page settings, so paper comes from the file even on
+    /// the live path — and when the file cannot be read there is no honest
+    /// answer. Reporting A4 would invent a page size the board never stated.
+    #[tokio::test]
+    async fn an_unreadable_file_reports_no_paper_rather_than_a4() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+        let address = spawn_kicad_holding(&board, 2, 2, 3);
+        std::fs::remove_file(&board).unwrap();
+
+        let info = board_info(&board, &ctx_talking_to(address)).await;
+
+        assert_eq!(info["source"], json!("ipc"));
+        assert_eq!(info["paper"], serde_json::Value::Null);
+        // The live half of the answer is unaffected by the missing file.
+        assert_eq!(info["net_count"], json!(3));
     }
 }
 #[cfg(test)]

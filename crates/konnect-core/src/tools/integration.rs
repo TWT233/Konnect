@@ -575,7 +575,7 @@ async fn handle_search_jlcpcb_parts(
         // The JLCPCB db schema has columns: LCSC, MFR_Part, Package, Solder_Joint,
         // Manufacturer, Library_Type, Description, Datasheet, Price, Stock
         let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE (Description LIKE ?1 OR MFR_Part LIKE ?1)"
         );
         if basic_only {
@@ -619,6 +619,13 @@ async fn handle_search_jlcpcb_parts(
 }
 
 fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    // The exact LCSC PDF URL for most parts. Omitted here once made a caller
+    // unable to get a datasheet the table already held (#255); an empty cell
+    // reads as null rather than "" so callers can test presence directly.
+    let datasheet_url = match row.get::<_, String>(6).unwrap_or_default() {
+        url if url.is_empty() => serde_json::Value::Null,
+        url => json!(url),
+    };
     Ok(json!({
         "lcsc": row.get::<_, String>(0).unwrap_or_default(),
         "mpn": row.get::<_, String>(1).unwrap_or_default(),
@@ -626,8 +633,9 @@ fn row_to_part_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         "manufacturer": row.get::<_, String>(3).unwrap_or_default(),
         "library_type": row.get::<_, String>(4).unwrap_or_default(),
         "description": row.get::<_, String>(5).unwrap_or_default(),
-        "price": row.get::<_, f64>(6).unwrap_or(0.0),
-        "stock": row.get::<_, i64>(7).unwrap_or(0)
+        "datasheet_url": datasheet_url,
+        "price": row.get::<_, f64>(7).unwrap_or(0.0),
+        "stock": row.get::<_, i64>(8).unwrap_or(0)
     }))
 }
 
@@ -657,7 +665,7 @@ async fn handle_get_jlcpcb_part(
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
             let conn = rusqlite::Connection::open(&db_path)?;
             let mut stmt = conn.prepare(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE LCSC = ?1 LIMIT 1"
         )?;
             let mut rows = stmt.query_map(rusqlite::params![lcsc_id], row_to_part_json)?;
@@ -734,7 +742,7 @@ async fn handle_suggest_alternatives(
         let like_pkg = format!("%{}%", package_hint);
 
         let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Price, Stock \
+            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
              FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
         );
         if let Some(max_p) = max_price {
@@ -909,15 +917,70 @@ async fn handle_enrich_datasheets(
     ))
 }
 
+/// The datasheet URL from the local JLCPCB catalog, keyed by LCSC ID or MPN.
+/// The database Konnect already downloads carries the exact LCSC PDF URL in
+/// its `Datasheet` column for most parts, so a hit here answers without a
+/// network round trip. `Ok(None)` is an ordinary miss; `Err` means the
+/// database could not be read at all.
+async fn datasheet_from_catalog(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    lcsc_id: Option<&str>,
+    mpn: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let db_path = resolve_db_path(args, ctx);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let lcsc_id = lcsc_id.map(String::from);
+    let mpn = mpn.map(String::from);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let (sql, param): (&str, String) = match (&lcsc_id, &mpn) {
+            // An LCSC ID is the primary key shape, so it wins when both are
+            // given — same precedence the web path used.
+            (Some(id), _) => (
+                "SELECT Datasheet FROM components WHERE LCSC = ?1 LIMIT 1",
+                id.clone(),
+            ),
+            (None, Some(mpn)) => (
+                "SELECT Datasheet FROM components WHERE MFR_Part = ?1 LIMIT 1",
+                mpn.clone(),
+            ),
+            // Unreachable: the caller rejects both-absent before calling.
+            (None, None) => return Ok(None),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query_map(rusqlite::params![param], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?.filter(|url| !url.is_empty()))
+    })
+    .await?
+}
+
 async fn handle_get_datasheet_url(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let mpn = args["mpn"].as_str();
     let lcsc_id = args["lcsc_id"].as_str();
 
     if mpn.is_none() && lcsc_id.is_none() {
         return Ok(CallToolResult::error("Provide either 'mpn' or 'lcsc_id'"));
+    }
+
+    // The local catalog first: it already holds exact URLs, so a hit saves a
+    // network round trip and works offline. Only a miss falls through to the
+    // live LCSC API.
+    if let Ok(Some(url)) = datasheet_from_catalog(args, ctx, lcsc_id, mpn).await {
+        return Ok(CallToolResult::text(
+            serde_json::to_string(&json!({
+                "mpn": mpn,
+                "lcsc_id": lcsc_id,
+                "datasheet_url": url,
+                "source": "local_catalog"
+            }))
+            .unwrap(),
+        ));
     }
 
     let client = reqwest::Client::builder()
@@ -940,7 +1003,8 @@ async fn handle_get_datasheet_url(
                         return Ok(CallToolResult::text(
                             serde_json::to_string(&json!({
                                 "lcsc_id": id,
-                                "datasheet_url": ds_url
+                                "datasheet_url": ds_url,
+                                "source": "lcsc_api"
                             }))
                             .unwrap(),
                         ));
@@ -950,12 +1014,23 @@ async fn handle_get_datasheet_url(
         }
     }
 
+    // Both sources missed — say which were tried, not just that the answer
+    // is null (#255).
+    let mut tried = vec![];
+    if resolve_db_path(&serde_json::Value::Null, ctx).exists() {
+        tried.push("local catalog");
+    } else {
+        tried.push("local catalog (database not downloaded)");
+    }
+    if lcsc_id.is_some() {
+        tried.push("LCSC API");
+    }
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({
             "mpn": mpn,
             "lcsc_id": lcsc_id,
             "datasheet_url": null,
-            "note": "Datasheet not found via LCSC API"
+            "note": format!("Datasheet not found via {}", tried.join(" or "))
         }))
         .unwrap(),
     ))
@@ -1457,14 +1532,14 @@ mod jlcpcb_cache_tests {
         conn.execute(
             "CREATE TABLE components (
                 LCSC TEXT, MFR_Part TEXT, Package TEXT, Manufacturer TEXT,
-                Library_Type TEXT, Description TEXT, Price REAL, Stock INTEGER,
-                Category TEXT
+                Library_Type TEXT, Description TEXT, Datasheet TEXT,
+                Price REAL, Stock INTEGER, Category TEXT
             )",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 "C14663",
                 "RC0402FR-0710KL",
@@ -1472,6 +1547,7 @@ mod jlcpcb_cache_tests {
                 "YAGEO",
                 "Basic",
                 "10k resistor 0402",
+                "https://www.lcsc.com/datasheet/C14663.pdf",
                 0.01,
                 5000,
                 "Resistors / Chip Resistor - Surface Mount"
@@ -1554,5 +1630,84 @@ mod jlcpcb_cache_tests {
             crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
             _ => panic!("expected text content"),
         }
+    }
+
+    /// The defect in #255: the local catalog holds exact datasheet URLs, but
+    /// get_datasheet_url only ever asked the live LCSC API and returned null.
+    /// A catalog hit must answer directly — no network involved.
+    #[tokio::test]
+    async fn get_datasheet_url_answers_from_the_local_catalog() {
+        let (_dir, db_path) = seed_test_db();
+        let ctx = test_ctx();
+
+        let by_lcsc = handle_get_datasheet_url(
+            &json!({ "lcsc_id": "C14663", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body = response_json(&by_lcsc);
+        assert_eq!(
+            body["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+        assert_eq!(body["source"], json!("local_catalog"));
+
+        let by_mpn = handle_get_datasheet_url(
+            &json!({ "mpn": "RC0402FR-0710KL", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&by_mpn)["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+    }
+
+    /// The catalog projections hid the column too — a caller could not get a
+    /// URL from part lookup either.
+    #[tokio::test]
+    async fn catalog_lookups_carry_the_datasheet_url() {
+        let (_dir, db_path) = seed_test_db();
+        let ctx = test_ctx();
+
+        let part = handle_get_jlcpcb_part(
+            &json!({ "lcsc_id": "C14663", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&part)["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+
+        let search = handle_search_jlcpcb_parts(
+            &json!({ "query": "10k", "output_path": db_path.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response_json(&search)["results"][0]["datasheet_url"],
+            json!("https://www.lcsc.com/datasheet/C14663.pdf")
+        );
+    }
+
+    /// With no database at all the tool degrades to its old behaviour — web
+    // lookup (unreachable in tests), then null with a note naming what was
+    // tried rather than blaming only the API (#255).
+    #[tokio::test]
+    async fn a_catalog_miss_falls_through_and_the_note_names_the_sources() {
+        let ctx = test_ctx(); // jlcpcb_db_path: None → default path absent
+
+        let result = handle_get_datasheet_url(&json!({ "lcsc_id": "C99999999" }), &ctx)
+            .await
+            .unwrap();
+        let body = response_json(&result);
+        assert_eq!(body["datasheet_url"], serde_json::Value::Null);
+        let note = body["note"].as_str().unwrap();
+        assert!(note.contains("local catalog"), "{note}");
     }
 }

@@ -7,7 +7,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
-use konnect_sexp::writer::{apply_edits, new_uuid, write_atomic, SexpEdit};
+use konnect_sexp::writer::{apply_edits, write_atomic, SexpEdit};
 use serde_json::json;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
@@ -25,9 +25,15 @@ where
 }
 
 macro_rules! ipc {
-    ($ctx:expr, |$c:ident| $body:expr) => {{
+    ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
         let addr = $ctx.config.ipc_address.clone();
-        match with_ipc(addr, move |$c| $body).await? {
+        let requested_board = get_path($args, "board")?;
+        match with_ipc(addr, move |$c| {
+            $c.ensure_board_is_active(&requested_board)?;
+            $body
+        })
+        .await?
+        {
             Ok(v) => v,
             Err(msg) => {
                 return Ok(CallToolResult::error(format!(
@@ -37,46 +43,6 @@ macro_rules! ipc {
             }
         }
     }};
-}
-
-// ─── S-expression helpers ─────────────────────────────────────────────────────
-
-/// A zone S-expression in the same format the rest of the board uses: KiCad 10
-/// gets `(net "GND")` and `(layers …)`, legacy boards keep the id +
-/// `(net_name …)` pair and singular `(layer …)`. The net reference comes from
-/// [`konnect_sexp::net::net_ref_for_write`] — resolved structurally, never by
-/// string offset, which is how zones used to land on net 0 (#192).
-fn format_zone(
-    net: &konnect_sexp::net::NetRef,
-    layer: &str,
-    clearance: f64,
-    min_w: f64,
-    pts: &[(f64, f64)],
-) -> String {
-    let uuid = new_uuid();
-    let pt_str: String = pts
-        .iter()
-        .map(|(x, y)| format!("\n      (xy {x} {y})"))
-        .collect();
-    format!(
-        "\n  (zone {net_nodes} {layer_node} (uuid \"{uuid}\")\n    \
-         (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
-         (min_thickness {min_w})\n    (fill yes)\n    \
-         (polygon (pts{pt_str}\n    ))\n  )",
-        net_nodes = net.zone_net_nodes(),
-        layer_node = net.zone_layer_node(layer),
-    )
-}
-
-/// The refusal for a net name a legacy board's table does not declare.
-fn unknown_net_error(net_name: &str, board: &std::path::Path) -> CallToolResult {
-    CallToolResult::error(format!(
-        "Net '{net_name}' is not declared in {}'s net table. On this legacy-format board a \
-         zone must reference a declared net id — writing it anyway would attach the copper \
-         to net 0, the unconnected pseudo-net (#192). Declare it first with add_net, or \
-         check the name with get_nets_list.",
-        board.display()
-    ))
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -154,22 +120,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_copper_pour",
-            "Add a copper fill zone polygon on a layer/net via S-expression file insert.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "board":     { "type": "string" },
-                    "net_name":  { "type": "string" },
-                    "layer":     { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
-                    "points": {
-                        "type": "array",
-                        "items": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } } }
-                    },
-                    "clearance": { "type": "number", "default": 0.2 },
-                    "min_width": { "type": "number", "default": 0.25 }
-                },
-                "required": ["board", "net_name", "layer", "points"]
-            }),
+            "Alias of pcb_board's add_zone, kept for compatibility: identical arguments, \
+             defaults and behaviour. Adds a copper fill zone polygon on a layer/net, trying \
+             KiCAD IPC first and falling back to an S-expression file insert (with a warning) \
+             only when no live KiCAD answers.",
+            crate::tools::pcb_board::zone_schema(),
             |args, ctx| async move { handle_add_copper_pour(args, ctx).await }
         ),
         tool!(
@@ -402,7 +357,7 @@ async fn handle_route_trace(
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| c
+    ipc!(ctx, args, |c| c
         .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
     Ok(CallToolResult::json(&json!({
         "net": net_name, "layer": layer, "width": width,
@@ -453,7 +408,7 @@ async fn handle_route_pad_to_pad(
 
     if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
         // Already axis-aligned: single segment
-        ipc!(ctx, |c| c
+        ipc!(ctx, args, |c| c
             .add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2));
     } else {
         // L-bend: horizontal then vertical
@@ -463,7 +418,7 @@ async fn handle_route_pad_to_pad(
         let net_b = net_name.clone();
         let layer_a = layer.clone();
         let layer_b = layer.clone();
-        ipc!(ctx, |c| {
+        ipc!(ctx, args, |c| {
             c.add_track(&net_a, &layer_a, width, x1, y1, mid_x, mid_y)?;
             c.add_track(&net_b, &layer_b, width, mid_x, mid_y, x2, y2)?;
             Ok(())
@@ -539,63 +494,21 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
+    ipc!(ctx, args, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
     Ok(CallToolResult::json(
         &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
     ))
 }
 
+/// `add_copper_pour` is an alias of `add_zone`; both build the same zone
+/// through [`crate::tools::pcb_board::add_zone_impl`]. They were two
+/// near-identical copies that had already drifted (different `min_width`
+/// defaults, and the #192 net-lookup bug had to be fixed twice).
 async fn handle_add_copper_pour(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let clearance = args["clearance"].as_f64().unwrap_or(0.2);
-    let min_w = args["min_width"].as_f64().unwrap_or(0.25);
-    let pts_arr = match args["points"].as_array() {
-        Some(a) => a.clone(),
-        None => return Ok(CallToolResult::error("Missing 'points' array")),
-    };
-
-    let pts: Vec<(f64, f64)> = pts_arr
-        .iter()
-        .filter_map(|p| Some((p["x"].as_f64()?, p["y"].as_f64()?)))
-        .collect();
-    if pts.len() < 3 {
-        return Ok(CallToolResult::error("Zone requires at least 3 points"));
-    }
-
-    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
-        ctx.config.ipc_address.clone(),
-        &board_path,
-        "copper pour",
-    )
-    .await?
-    {
-        return Ok(refusal);
-    }
-
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = konnect_sexp::parse_sexp(&content)?;
-    let Some(net) = konnect_sexp::net::net_ref_for_write(&tree, &net_name) else {
-        return Ok(unknown_net_error(&net_name, &board_path));
-    };
-    let zone_s = format_zone(&net, &layer, clearance, min_w, &pts);
-    let close = content.rfind(')').unwrap_or(content.len());
-    let new_content = apply_edits(content, vec![SexpEdit::insert(close, zone_s)]);
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(
-        &json!({ "net": net_name, "layer": layer, "points": pts.len() }),
-    ))
+    crate::tools::pcb_board::add_zone_impl(args, ctx).await
 }
 
 async fn handle_delete_trace(
@@ -608,7 +521,7 @@ async fn handle_delete_trace(
     };
 
     let uuid_ipc = uuid.clone();
-    ipc!(ctx, |c| c.delete_track(&uuid_ipc));
+    ipc!(ctx, args, |c| c.delete_track(&uuid_ipc));
     Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
 }
 
@@ -619,7 +532,9 @@ async fn handle_query_traces(
     let net = args["net_name"].as_str().map(String::from);
     let layer = args["layer"].as_str().map(String::from);
 
-    let tracks = ipc!(ctx, |c| { c.get_tracks(net.as_deref(), layer.as_deref()) });
+    let tracks = ipc!(ctx, args, |c| {
+        c.get_tracks(net.as_deref(), layer.as_deref())
+    });
 
     let items: Vec<serde_json::Value> = tracks
         .iter()
@@ -639,10 +554,10 @@ async fn handle_query_traces(
 }
 
 async fn handle_get_nets_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let nets = ipc!(ctx, |c| c.get_nets());
+    let nets = ipc!(ctx, args, |c| c.get_nets());
     let items: Vec<serde_json::Value> = nets
         .iter()
         .map(|n| json!({ "name": n.name, "netcode": n.netcode }))
@@ -689,7 +604,7 @@ async fn handle_modify_trace(
     let uuid_ipc = uuid.clone();
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    ipc!(ctx, args, |c| {
         c.delete_track(&uuid_ipc)?;
         c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
     });
@@ -1119,7 +1034,7 @@ async fn handle_route_diff_pair(
     let np_ipc = net_pos.clone();
     let nn_ipc = net_neg.clone();
     let layer_ipc = layer.clone();
-    ipc!(ctx, |c| {
+    ipc!(ctx, args, |c| {
         c.add_track(
             &np_ipc,
             &layer_ipc,
@@ -1877,5 +1792,54 @@ mod zone_net_format_tests {
         assert!(result.is_error, "{}", text_of(&result));
         assert!(text_of(&result).contains("add_net"), "{}", text_of(&result));
         assert_eq!(after, LEGACY, "file must be untouched");
+    }
+
+    /// `add_copper_pour` is `add_zone` under an older name. They were two
+    /// near-identical copies that had already drifted — `min_width` defaulted
+    /// to 0.25 here and 0.2 there, and the #192 net-lookup bug had to be fixed
+    /// in both — so the alias is asserted to carry the shared defaults.
+    #[tokio::test]
+    async fn the_alias_carries_add_zone_s_defaults_and_fallback_warning() {
+        let (result, after) = pour(KICAD_10, "GND").await;
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let zone = &after[after.find("(zone").expect("zone written")..];
+        assert!(
+            zone.contains("(min_thickness 0.2)"),
+            "the alias used to default min_width to 0.25: {zone}"
+        );
+        assert!(zone.contains("(connect_pads (clearance 0.2))"), "{zone}");
+
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["source"], json!("file"));
+        assert!(body["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("File → Revert")));
+    }
+
+    /// The new arguments reach the alias too — it is the same handler, and a
+    /// schema that advertised them on only one of the two would be a lie.
+    #[tokio::test]
+    async fn the_alias_accepts_the_new_zone_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pcb");
+        std::fs::write(&path, KICAD_10).unwrap();
+        let result = handle_add_copper_pour(
+            &json!({
+                "board": path.to_str().unwrap(), "net_name": "GND", "layer": "F.Cu",
+                "points": [ {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0} ],
+                "name": "pour", "priority": 1, "pad_connection": "none"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let zone = &after[after.find("(zone").expect("zone written")..];
+        assert!(zone.contains("(name \"pour\")"), "{zone}");
+        assert!(zone.contains("(priority 1)"), "{zone}");
+        assert!(zone.contains("(connect_pads no (clearance"), "{zone}");
     }
 }
