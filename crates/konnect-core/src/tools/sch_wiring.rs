@@ -2414,6 +2414,77 @@ mod unit_aware_wiring_tests {
         assert!(has_dot(&out, "120.65", "139.7"));
     }
 
+    /// A hierarchical sheet pin justifies a dot exactly as a symbol pin does —
+    /// the `|| idx.has_sheet_pin(..)` half of the keep rule, which nothing else
+    /// reaches. Candidate points come from moved *symbol* pins, so the branch
+    /// only decides anything when a symbol pin vacates a point a sheet pin also
+    /// holds: in this fixture R1's pin, `test`'s SHPIN and the dot all sit at
+    /// (139.7, 190.5) on a wire's interior. Ask about it with R1 gone — the
+    /// post-move state — and the dot must stay.
+    ///
+    /// Its own fixture rather than an addition to `junction_reconcile`, so the
+    /// tests already merged against that sheet keep the inputs they were written
+    /// for. Built with Konnect tools, then rewritten by `kicad-cli sch upgrade`
+    /// so the committed text is eeschema's own — including the sheet-pin
+    /// placement, which KiCad snaps to the sheet border.
+    #[test]
+    fn reconcile_keeps_a_dot_a_sheet_pin_still_justifies() {
+        const SHEET_PIN_SCH: &str =
+            include_str!("../../tests/fixtures/junction_sheet_pin.kicad_sch");
+        let without_r1 = fixture_without_symbol(SHEET_PIN_SCH, "R1");
+
+        let (out, added, pruned) = reconcile_junctions_at(without_r1, &[(139.7, 190.5)]);
+        assert_eq!(
+            (added, pruned),
+            (0, 0),
+            "the sheet pin still justifies the dot"
+        );
+        assert!(
+            has_dot(&out, "139.7", "190.5"),
+            "the dot must survive: {out}"
+        );
+    }
+
+    /// The fixture with one placed symbol removed, so its pins vanish — the
+    /// post-move state without needing a move.
+    ///
+    /// Guarded, because a silent failure here would be invisible:
+    /// `reconcile_junctions_at` returns its input unchanged when the sheet does
+    /// not parse, which is exactly what a passing sheet-pin test looks like. If
+    /// this ever stops removing what it should, the assertions below fail loudly
+    /// instead of the test going quietly green.
+    fn fixture_without_symbol(src: &str, reference: &str) -> String {
+        let needle = format!("(property \"Reference\" \"{reference}\"");
+        let at = src.find(&needle).expect("fixture carries that reference");
+        let start = src[..at]
+            .rfind("(symbol")
+            .expect("reference sits inside a symbol");
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > start, "never closed the symbol block");
+        let out = format!("{}{}", &src[..start], &src[end..]);
+        assert!(!out.contains(&needle), "the symbol is still there");
+        assert_eq!(
+            out.matches('(').count(),
+            out.matches(')').count(),
+            "removal left unbalanced parens, so the sheet would not parse"
+        );
+        out
+    }
+
     /// A real T — two wires meeting — is never touched.
     #[test]
     fn reconcile_keeps_a_real_tee() {
