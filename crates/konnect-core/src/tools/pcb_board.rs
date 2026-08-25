@@ -11,7 +11,7 @@ use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::builders;
 use konnect_sexp::{
-    parser::parse_sexp,
+    parser::{parse_sexp, SexpNode},
     writer::{
         apply_edits, find_block_with_leading_whitespace, find_direct_child_blocks, new_uuid,
         write_atomic, SexpEdit,
@@ -624,7 +624,8 @@ pub fn tools() -> Vec<ToolDef> {
              and the number of distinct nets (excluding the unconnected pseudo-net). \
              Reads the board open in KiCad when it is reachable, else the file — \
              'source' says which. Paper size always comes from the file, and is null \
-             when the file cannot be read.",
+             when the file cannot be read. A custom (User) size also reports its \
+             dimensions in millimetres under 'paper_size_mm' on both paths.",
             json!({
                 "type": "object",
                 "properties": {
@@ -948,27 +949,40 @@ async fn handle_set_board_size(
     })))
 }
 
-/// The page size, which is only ever read from the file: KiCad's API exposes
-/// no page settings, so even the live path answers this one field from disk.
-/// The page size the board file states, or `None` when the file cannot be read
-/// or parsed.
+/// The board file, read and parsed — `None` when either fails. The paper
+/// helpers take an already-parsed tree so every field of one
+/// `get_board_info` answer comes from a single parse of the file.
 ///
-/// KiCad's API exposes no page settings, so the live path has to ask the file.
 /// The two failure modes are not the same answer: a board that parses and
 /// carries no `(paper …)` really is A4, which is KiCad's default, while a board
 /// we could not read tells us nothing. Returning `"A4"` for the second is the
 /// "plausible answer rather than a failure" this change refuses elsewhere, so
-/// it reports `null` instead.
-fn paper_from_file(board_path: &std::path::Path) -> Option<String> {
+/// `paper` reports `null` instead — and `paper_size_mm` with it.
+fn parsed_board(board_path: &std::path::Path) -> Option<SexpNode> {
     let content = std::fs::read_to_string(board_path).ok()?;
-    let tree = parse_sexp(&content).ok()?;
-    Some(
-        tree.find("paper")
-            .and_then(|n| n.get(1))
-            .and_then(|n| n.as_str())
-            .unwrap_or("A4")
-            .to_string(),
-    )
+    parse_sexp(&content).ok()
+}
+
+/// The paper size named in an already-parsed board tree — `"A4"` when there is
+/// no `(paper …)` at all, which is KiCad's default.
+fn paper_name(tree: &SexpNode) -> String {
+    tree.find("paper")
+        .and_then(|n| n.get(1))
+        .and_then(|n| n.as_str())
+        .unwrap_or("A4")
+        .to_string()
+}
+
+/// The page dimensions in millimetres from an already-parsed tree, for sizes
+/// whose name does not imply them (`(paper "User" 431.8 279.4)`). `None` for
+/// named sizes and for an absent `(paper …)` — a named size is its own answer,
+/// and a missing node has nothing to measure. Taking the tree rather than the
+/// path keeps this on the caller's parse: the file branch of
+/// `handle_get_board_info` already holds one, and re-reading here could race
+/// the read that produced it.
+fn paper_size_mm(tree: &SexpNode) -> Option<(f64, f64)> {
+    let paper = tree.find("paper")?;
+    Some((paper.get_f64(2)?, paper.get_f64(3)?))
 }
 
 async fn handle_get_board_info(
@@ -977,9 +991,9 @@ async fn handle_get_board_info(
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
 
-    // The board open in KiCad first. Reading only the file reported the state
-    // of the last save — on a board with unsaved edits it disagreed with the
-    // IPC-backed writers in this toolset, most visibly as layer_count 0 /
+    // The board open in KiCad first (#207). Reading only the file reported the
+    // state of the last save — on a board with unsaved edits it disagreed with
+    // the IPC-backed writers in this toolset, most visibly as layer_count 0 /
     // net_count 0 on a board KiCad was showing fully populated.
     let ipc_board = board_path.clone();
     if let Ok((title_block, enabled, nets)) = with_ipc(ctx.config.ipc_address.clone(), move |c| {
@@ -999,16 +1013,21 @@ async fn handle_get_board_info(
     })
     .await?
     {
-        // The copper count is KiCad's own field, not a tally of layer names
-        // ending in `.Cu` — the two agree on an ordinary stackup, and that is
-        // the kind of agreement that stops holding on an unusual one.
+        // Paper always comes from the file — KiCad's API exposes no page
+        // settings — through the same parsed-tree helpers the file path uses,
+        // so a custom User size reports its dimensions on both paths (#219).
+        let paper_tree = parsed_board(&board_path);
         return Ok(CallToolResult::json(&json!({
             "file": board_path.display().to_string(),
             "title": title_block.title,
             "date": title_block.date,
             "revision": title_block.revision,
             "company": title_block.company,
-            "paper": paper_from_file(&board_path),
+            "paper": paper_tree.as_ref().map(paper_name),
+            "paper_size_mm": paper_tree
+                .as_ref()
+                .and_then(paper_size_mm)
+                .map(|(w, h)| json!({"width": w, "height": h})),
             "layer_count": enabled.layers.len(),
             "copper_layer_count": enabled.copper_layer_count,
             "net_count": nets,
@@ -1016,8 +1035,14 @@ async fn handle_get_board_info(
         })));
     }
 
-    let content = std::fs::read_to_string(&board_path)?;
-    let tree = parse_sexp(&content)?;
+    // One read+parse feeds every field of the file answer. An unreadable or
+    // unparseable file is a hard error here: unlike the paper fields, which
+    // report null rather than guess A4 (see parsed_board), the rest of the
+    // response has no honest answer at all.
+    let tree = match parsed_board(&board_path) {
+        Some(tree) => tree,
+        None => anyhow::bail!("could not read or parse {}", board_path.display()),
+    };
 
     let tb = tree.find("title_block");
     let title = tb
@@ -1051,12 +1076,7 @@ async fn handle_get_board_info(
     let stack = konnect_sexp::layers::layers(&tree);
     let layer_count = stack.len();
     let copper_layer_count = konnect_sexp::layers::copper(&stack).len();
-    let paper = tree
-        .find("paper")
-        .and_then(|n| n.get(1))
-        .and_then(|n| n.as_str())
-        .unwrap_or("A4")
-        .to_string();
+    let paper = paper_name(&tree);
 
     // Not find_all("net"): that counts only direct children of (kicad_pcb …),
     // i.e. the top-level net table — which KiCad 10 does not write at all, so
@@ -1068,6 +1088,8 @@ async fn handle_get_board_info(
         "file": board_path.display().to_string(),
         "title": title, "date": date, "revision": rev, "company": company,
         "paper": paper,
+        "paper_size_mm": paper_size_mm(&tree)
+            .map(|(w, h)| json!({"width": w, "height": h})),
         "layer_count": layer_count,
         "copper_layer_count": copper_layer_count,
         "net_count": net_count,
@@ -2953,5 +2975,80 @@ mod board_info_source_tests {
         assert_eq!(info["paper"], serde_json::Value::Null);
         // The live half of the answer is unaffected by the missing file.
         assert_eq!(info["net_count"], json!(3));
+    }
+}
+#[cfg(test)]
+mod board_info_paper_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// Deliberately empty ipc_address: with_ipc fails fast against it, so the
+    /// handler takes the file path this PR changes.
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A board saved before anything was placed on it: the empty stub the
+    /// file-only reader kept reporting.
+    const EMPTY_STUB: &str = "(kicad_pcb\n\t(version 20260206)\n\t(paper \"A3\")\n)\n";
+
+    async fn board_info(board: &std::path::Path, ctx: &ToolContext) -> serde_json::Value {
+        let result = handle_get_board_info(&json!({ "board": board.to_str().unwrap() }), ctx)
+            .await
+            .expect("handler should succeed");
+        assert!(!result.is_error, "{:?}", result.content);
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A custom size is `(paper "User" W H)`: the name alone answers nothing,
+    /// so the dimensions ride along. This is the defect in #219 — the response
+    /// used to carry only the token "User".
+    #[tokio::test]
+    async fn a_user_paper_size_reports_its_dimensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\t(version 20260206)\n\t(paper \"User\" 431.8 279.4)\n)\n",
+        )
+        .unwrap();
+
+        let info = board_info(&board, &test_ctx()).await;
+
+        assert_eq!(info["paper"], json!("User"));
+        assert_eq!(
+            info["paper_size_mm"],
+            json!({"width": 431.8, "height": 279.4})
+        );
+    }
+
+    /// A named size implies its dimensions, so `paper_size_mm` is null rather
+    /// than a redundant copy of what every caller already knows about A3.
+    #[tokio::test]
+    async fn a_named_paper_size_reports_no_dimensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, EMPTY_STUB).unwrap();
+
+        let info = board_info(&board, &test_ctx()).await;
+
+        assert_eq!(info["paper"], json!("A3"));
+        assert_eq!(info["paper_size_mm"], serde_json::Value::Null);
     }
 }
