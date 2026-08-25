@@ -107,6 +107,71 @@ pub fn layer_from_name(name: &str) -> kiapi::board::types::BoardLayer {
     }
 }
 
+/// The canonical KiCAD name for a board layer — the exact inverse of
+/// [`layer_from_name`] over every layer it can represent.
+///
+/// `None` for a value with no name (including `BL_UNDEFINED`); callers
+/// rendering a response decide how to say "unknown" rather than this map
+/// quietly inventing one. Kept next to the forward map because #237's fix
+/// widened only the forward direction, and the narrow reverse map surfaced
+/// as 28 `"Unknown"` strings in every through-hole pad's `layers` list.
+pub fn layer_name(layer: kiapi::board::types::BoardLayer) -> Option<&'static str> {
+    use kiapi::board::types::BoardLayer;
+
+    const IN_CU: [&str; 30] = [
+        "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "In5.Cu", "In6.Cu", "In7.Cu", "In8.Cu", "In9.Cu",
+        "In10.Cu", "In11.Cu", "In12.Cu", "In13.Cu", "In14.Cu", "In15.Cu", "In16.Cu", "In17.Cu",
+        "In18.Cu", "In19.Cu", "In20.Cu", "In21.Cu", "In22.Cu", "In23.Cu", "In24.Cu", "In25.Cu",
+        "In26.Cu", "In27.Cu", "In28.Cu", "In29.Cu", "In30.Cu",
+    ];
+    const USER: [&str; 45] = [
+        "User.1", "User.2", "User.3", "User.4", "User.5", "User.6", "User.7", "User.8", "User.9",
+        "User.10", "User.11", "User.12", "User.13", "User.14", "User.15", "User.16", "User.17",
+        "User.18", "User.19", "User.20", "User.21", "User.22", "User.23", "User.24", "User.25",
+        "User.26", "User.27", "User.28", "User.29", "User.30", "User.31", "User.32", "User.33",
+        "User.34", "User.35", "User.36", "User.37", "User.38", "User.39", "User.40", "User.41",
+        "User.42", "User.43", "User.44", "User.45",
+    ];
+
+    let value = layer as i32;
+    // The same contiguous runs the forward map computes over: In1..=In30
+    // directly after BL_F_Cu, and User.1..=User.45 split around BL_Rescue.
+    if value > BoardLayer::BlFCu as i32 && value <= BoardLayer::BlFCu as i32 + 30 {
+        return Some(IN_CU[(value - BoardLayer::BlFCu as i32 - 1) as usize]);
+    }
+    if (BoardLayer::BlUser1 as i32..=BoardLayer::BlUser9 as i32).contains(&value) {
+        return Some(USER[(value - BoardLayer::BlUser1 as i32) as usize]);
+    }
+    if (BoardLayer::BlUser10 as i32..=BoardLayer::BlUser10 as i32 + 35).contains(&value) {
+        return Some(USER[(value - BoardLayer::BlUser10 as i32 + 9) as usize]);
+    }
+
+    match layer {
+        BoardLayer::BlFCu => Some("F.Cu"),
+        BoardLayer::BlBCu => Some("B.Cu"),
+        BoardLayer::BlFAdhes => Some("F.Adhes"),
+        BoardLayer::BlBAdhes => Some("B.Adhes"),
+        BoardLayer::BlFSilkS => Some("F.SilkS"),
+        BoardLayer::BlBSilkS => Some("B.SilkS"),
+        BoardLayer::BlFMask => Some("F.Mask"),
+        BoardLayer::BlBMask => Some("B.Mask"),
+        BoardLayer::BlFPaste => Some("F.Paste"),
+        BoardLayer::BlBPaste => Some("B.Paste"),
+        BoardLayer::BlFCrtYd => Some("F.CrtYd"),
+        BoardLayer::BlBCrtYd => Some("B.CrtYd"),
+        BoardLayer::BlFFab => Some("F.Fab"),
+        BoardLayer::BlBFab => Some("B.Fab"),
+        BoardLayer::BlDwgsUser => Some("Dwgs.User"),
+        BoardLayer::BlCmtsUser => Some("Cmts.User"),
+        BoardLayer::BlEco1User => Some("Eco1.User"),
+        BoardLayer::BlEco2User => Some("Eco2.User"),
+        BoardLayer::BlEdgeCuts => Some("Edge.Cuts"),
+        BoardLayer::BlMargin => Some("Margin"),
+        BoardLayer::BlRescue => Some("Rescue"),
+        _ => None,
+    }
+}
+
 /// As [`layer_from_name`], but refusing a name this build cannot represent.
 ///
 /// Use this on every path that puts a layer into a message bound for KiCAD.
@@ -579,6 +644,52 @@ pub fn board_text(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    /// `layer_name` is the exact inverse of `layer_from_name` over every
+    /// representable layer — computed runs included. The forward map was
+    /// widened for #237; a reverse map that lags it turns real layers into
+    /// "Unknown" in pad and track responses.
+    #[test]
+    fn layer_name_round_trips_every_representable_layer() {
+        use kiapi::board::types::BoardLayer;
+        let mut named = 0;
+        for value in 0..=200 {
+            let Ok(layer) = BoardLayer::try_from(value) else {
+                continue;
+            };
+            if layer == BoardLayer::BlUndefined {
+                assert_eq!(layer_name(layer), None, "BL_UNDEFINED has no name");
+                continue;
+            }
+            if let Some(name) = layer_name(layer) {
+                named += 1;
+                assert_eq!(
+                    layer_from_name(name),
+                    layer,
+                    "'{name}' must map back to {layer:?}"
+                );
+            }
+        }
+        // 2 outer + 30 inner copper, 45 user, and the 19 named non-copper
+        // layers the forward map lists.
+        assert_eq!(named, 96, "every representable layer carries a name");
+
+        for (name, expected) in [
+            ("In3.Cu", true),
+            ("In30.Cu", true),
+            ("User.9", true),
+            ("User.10", true),
+            ("User.45", true),
+            ("Rescue", true),
+        ] {
+            let layer = layer_from_name(name);
+            assert_eq!(
+                layer_name(layer) == Some(name),
+                expected,
+                "spot check {name} -> {layer:?}"
+            );
+        }
+    }
 
     /// The builder is the only thing standing between an `add_zone` request
     /// and the board, so every user-visible choice is asserted here: the mock
