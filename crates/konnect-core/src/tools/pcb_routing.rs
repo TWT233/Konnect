@@ -222,7 +222,10 @@ pub fn tools() -> Vec<ToolDef> {
              changes only the values you name, and this is the only way to see the \
              rest. A net can match several classes: KiCad takes each property from \
              the highest-priority class that sets it (lower number = higher \
-             priority) and falls back to Default.",
+             priority) and falls back to Default. Settings are reported \
+             resolved, with 'inherits' naming the ones a class takes from the \
+             Default rather than setting itself; 'missing_fields' on the \
+             Default names settings nothing can resolve.",
             json!({
                 "type": "object",
                 "properties": {
@@ -682,9 +685,9 @@ fn kicad_default_class() -> serde_json::Value {
         "bus_width": 12,
         "line_style": 0,
         "clearance": 0.2,
-        "track_width": 0.25,
-        "via_diameter": 0.8,
-        "via_drill": 0.4,
+        "track_width": 0.2,
+        "via_diameter": 0.6,
+        "via_drill": 0.3,
         "microvia_diameter": 0.3,
         "microvia_drill": 0.1,
         "diff_pair_width": 0.2,
@@ -781,8 +784,9 @@ async fn handle_create_netclass(
         false
     } else {
         // Sparse on purpose: a key omitted here resolves from the Default, so
-        // writing the full set would sever that inheritance.
-        let mut class = json!({ "name": name, "priority": 0 });
+        // writing the full set would sever that inheritance. -1 is what
+        // KiCad's constructor gives every non-default class.
+        let mut class = json!({ "name": name, "priority": -1 });
         for (key, arg, default) in FIELDS {
             class[key] = json!(opt_f64(args, arg).unwrap_or(default));
         }
@@ -820,6 +824,7 @@ async fn handle_create_netclass(
     Ok(CallToolResult::json(&json!({
         "created_netclass": name,
         "updated_existing": updated,
+        "is_default": is_default,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
         "file": pro.display().to_string(),
@@ -867,6 +872,10 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
 /// The four settings `create_netclass` writes, as (KiCad's key, this API's
 /// name). Reported per class so a caller can see what a class holds before
 /// overwriting it — the gap that made #220 hard to review.
+///
+/// A key absent from a named class means inheritance, not an unset value, so
+/// these are reported resolved with `inherits` naming what came from the
+/// Default (#326).
 const NETCLASS_FIELDS: [(&str, &str); 4] = [
     ("clearance", "clearance"),
     ("track_width", "trace_width"),
@@ -923,6 +932,16 @@ async fn handle_get_netclasses(
         ),
     };
 
+    // What an omitted key resolves to. A Default in the file is the whole
+    // fallback, holes included; KiCad's seeded one applies only when the file
+    // has none.
+    let seeded = kicad_default_class();
+    let effective_default = classes
+        .iter()
+        .find(|c| c["name"] == json!(DEFAULT_CLASS_NAME))
+        .cloned()
+        .unwrap_or_else(|| seeded.clone());
+
     let mut out = Vec::new();
     for class in &classes {
         let name = class["name"].as_str().unwrap_or_default().to_string();
@@ -954,8 +973,40 @@ async fn handle_get_netclasses(
             "patterns": pattern_strings,
             "matched_nets": matched,
         });
+        let mut inherits: Vec<&str> = Vec::new();
         for (key, api) in NETCLASS_FIELDS {
-            entry[api] = class[key].clone();
+            let own = class.get(key).filter(|v| !v.is_null());
+            entry[api] = match own {
+                Some(value) => value.clone(),
+                None if !is_default => {
+                    let inherited = effective_default[key].clone();
+                    if !inherited.is_null() {
+                        inherits.push(api);
+                    }
+                    inherited
+                }
+                None => serde_json::Value::Null,
+            };
+        }
+        entry["inherits"] = json!(inherits);
+
+        // Nothing backfills the Default, so a key missing here is missing
+        // project-wide — and KiCad reports none of it.
+        if is_default {
+            let missing: Vec<&str> = seeded
+                .as_object()
+                .expect("kicad_default_class builds an object")
+                .keys()
+                .filter(|key| class.get(*key).is_none_or(|v| v.is_null()))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                entry["note"] = json!(format!(
+                    "Incomplete Default: KiCad resolves these from nothing. Repair with \
+                     create_netclass(name=\"Default\")."
+                ));
+            }
+            entry["missing_fields"] = json!(missing);
         }
         out.push(entry);
     }
@@ -1370,6 +1421,12 @@ mod netclass_tests {
         assert_eq!(default["wire_width"], json!(6), "{default}");
         assert_eq!(default["bus_width"], json!(12), "{default}");
         assert_eq!(default["line_style"], json!(0), "{default}");
+        // KiCad's own values, not this tool's schema defaults: a written
+        // Default replaces the seeded one, so anything else silently re-specs
+        // the board's routing rules.
+        assert_eq!(default["track_width"], json!(0.2), "{default}");
+        assert_eq!(default["via_diameter"], json!(0.6), "{default}");
+        assert_eq!(default["via_drill"], json!(0.3), "{default}");
         assert_eq!(default["priority"], json!(i32::MAX), "{default}");
         for key in ["schematic_color", "pcb_color", "tuning_profile"] {
             assert!(default.get(key).is_some(), "{key} missing from {default}");
@@ -1438,6 +1495,8 @@ mod netclass_tests {
         let hv = project_json(&board)["net_settings"]["classes"][0].clone();
         assert!(hv.get("wire_width").is_none(), "{hv}");
         assert!(hv.get("diff_pair_gap").is_none(), "{hv}");
+        // KiCad's constructor gives every non-default class -1.
+        assert_eq!(hv["priority"], json!(-1), "{hv}");
     }
 
     /// A project with no Default in its file keeps the one KiCad seeds at
@@ -1810,6 +1869,72 @@ mod netclass_tests {
                 "both classes claim the net: {class}"
             );
         }
+    }
+
+    /// A key absent from a named class is inheritance, not an unset value:
+    /// KiCad fills it from the Default at load. Reporting the raw absence as
+    /// null told a caller a class had no clearance when it had the Default's,
+    /// which is exactly what this tool exists to prevent (#326).
+    #[tokio::test]
+    async fn get_netclasses_reports_inherited_settings_as_inherited() {
+        let (_dir, board) = fixture(true);
+        let pro_path = board.with_extension("kicad_pro");
+        let mut settings = project_json(&board);
+        settings["net_settings"] = json!({
+            "classes": [
+                { "name": "Default", "clearance": 0.3, "track_width": 0.2,
+                  "via_diameter": 0.6, "via_drill": 0.3, "wire_width": 6 },
+                { "name": "HV", "clearance": 0.9 }
+            ],
+            "netclass_patterns": []
+        });
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        let hv = body["netclasses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "HV")
+            .unwrap()
+            .clone();
+        assert_eq!(hv["clearance"], json!(0.9), "its own value: {hv}");
+        assert_eq!(hv["trace_width"], json!(0.2), "resolved from Default: {hv}");
+        assert_eq!(
+            hv["inherits"],
+            json!(["trace_width", "via_drill", "via_diameter"]),
+            "{hv}"
+        );
+    }
+
+    /// The Default is the root of that inheritance and nothing backfills it,
+    /// so a key missing here is missing project-wide, with no ERC violation
+    /// and no visible error in KiCad. Naming it is the only way a caller finds
+    /// out before the junction dots stop working.
+    #[tokio::test]
+    async fn get_netclasses_names_what_an_incomplete_default_cannot_resolve() {
+        let (_dir, board) = fixture(true);
+        let pro_path = board.with_extension("kicad_pro");
+        let mut settings = project_json(&board);
+        settings["net_settings"] = json!({
+            "classes": [{ "name": "Default", "clearance": 0.2, "track_width": 0.25,
+                          "via_drill": 0.4, "via_diameter": 0.8 }],
+            "netclass_patterns": []
+        });
+        std::fs::write(&pro_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let body = get_classes(&board).await;
+        let default = body["netclasses"][0].clone();
+        let missing = default["missing_fields"].as_array().unwrap();
+        assert!(missing.contains(&json!("wire_width")), "{default}");
+        assert!(!missing.contains(&json!("clearance")), "{default}");
+        assert!(
+            default["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Default"),
+            "{default}"
+        );
     }
 
     /// A pattern naming a class that does not exist does nothing in KiCad and
