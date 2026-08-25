@@ -312,6 +312,21 @@ fn adding_a_zone_creates_it_on_the_live_board() {
 
     // Distinctive so the read-back cannot pick up a zone the board already had.
     let name = "konnect live add_zone";
+
+    // Leftovers from an earlier run of this very test survive in the live
+    // session (nothing here saves the board), so a rerun against the same
+    // pcbnew found 4 zones where it asserted 1. Start clean.
+    let stale: Vec<String> = client
+        .get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbZone)
+        .expect("pre-test zone query failed")
+        .iter()
+        .filter_map(|item| Zone::decode(item.value.as_slice()).ok())
+        .filter(|zone| zone.name == name)
+        .filter_map(|zone| zone.id.map(|id| id.value))
+        .collect();
+    client
+        .delete_items(stale)
+        .expect("pre-test zone cleanup failed");
     // Inside the EuroCard outline (55, 45)-(215, 145), clear of its mounting
     // holes, and straddling the fixture's GND track so the fill has something
     // on its own net to connect to.
@@ -330,14 +345,31 @@ fn adding_a_zone_creates_it_on_the_live_board() {
         })
         .expect("add_zone reported an error");
 
+    // KiCad refills the zone right after creation and answers AS_BUSY to any
+    // request that lands mid-fill — deterministically on a board this size,
+    // not as a flake. Busy-then-fine is normal here; give it a bounded retry.
     let read_back = || -> Vec<Zone> {
-        client
-            .get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbZone)
-            .expect("zone query failed")
-            .iter()
-            .filter_map(|item| Zone::decode(item.value.as_slice()).ok())
-            .filter(|zone| zone.name == name)
-            .collect()
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match client
+                .get_items(konnect_ipc::gen::kiapi::common::types::KiCadObjectType::KotPcbZone)
+            {
+                Ok(items) => {
+                    return items
+                        .iter()
+                        .filter_map(|item| Zone::decode(item.value.as_slice()).ok())
+                        .filter(|zone| zone.name == name)
+                        .collect()
+                }
+                Err(error)
+                    if error.to_string().contains("AS_BUSY")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(error) => panic!("zone query failed: {error:#}"),
+            }
+        }
     };
 
     let found = read_back();
