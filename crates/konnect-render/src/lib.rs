@@ -11,6 +11,12 @@
 use anyhow::{bail, Context, Result};
 use resvg::{tiny_skia, usvg};
 
+/// Identity of the rendering stack, stored in every visual baseline and
+/// compared before a baseline diff is trusted. The version half MUST move
+/// with the exact pins in the workspace manifest — a resvg bump that changes
+/// antialiasing by one ulp per edge would otherwise read as design drift.
+pub const RENDERER_ID: &str = "resvg-0.48.1";
+
 /// A rasterized image plus the facts a caller reports about it.
 #[derive(Debug)]
 pub struct Rendered {
@@ -78,8 +84,16 @@ pub fn svg_to_png(svg: &[u8], width_px: u32) -> Result<Rendered> {
 pub struct PixelDiff {
     pub changed_pixels: u64,
     pub total_pixels: u64,
-    /// Percentage in [0, 100], rounded to 3 decimals.
+    /// Pixels that are non-white in either image: the drawing, as opposed to
+    /// the paper. Drift thresholds compare against this — a schematic sheet
+    /// is mostly blank page, and a percentage of the page under-reports
+    /// design change by an order of magnitude.
+    pub content_pixels: u64,
+    /// Percentage of the page in [0, 100], rounded to 3 decimals.
     pub changed_pct: f64,
+    /// Percentage of the CONTENT in [0, 100], rounded to 3 decimals; 0 when
+    /// both images are blank.
+    pub changed_pct_of_content: f64,
     /// Bounding box of all changed pixels (x_min, y_min, x_max, y_max),
     /// None when nothing changed.
     pub changed_bbox: Option<(u32, u32, u32, u32)>,
@@ -101,13 +115,22 @@ pub fn diff_pngs(before: &[u8], after: &[u8]) -> Result<PixelDiff> {
 
     let width = a.width().max(b.width());
     let height = a.height().max(b.height());
+
+    // The paper is whatever color dominates — kicad-cli paints its own
+    // background rect, so "white" is not a safe assumption. Content is any
+    // pixel that differs from the dominant color in either image.
+    let background = dominant_color(&a);
     let mut changed: u64 = 0;
+    let mut content: u64 = 0;
     let mut bbox: Option<(u32, u32, u32, u32)> = None;
 
     for y in 0..height {
         for x in 0..width {
             let pa = pixel_or_white(&a, x, y);
             let pb = pixel_or_white(&b, x, y);
+            if pa != background || pb != background {
+                content += 1;
+            }
             let delta = pa
                 .iter()
                 .zip(pb.iter())
@@ -125,17 +148,41 @@ pub fn diff_pngs(before: &[u8], after: &[u8]) -> Result<PixelDiff> {
     }
 
     let total = u64::from(width) * u64::from(height);
+    let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
     let pct = if total == 0 {
         0.0
     } else {
-        (changed as f64 / total as f64 * 100.0 * 1000.0).round() / 1000.0
+        round3(changed as f64 / total as f64 * 100.0)
+    };
+    let pct_of_content = if content == 0 {
+        0.0
+    } else {
+        round3(changed as f64 / content as f64 * 100.0)
     };
     Ok(PixelDiff {
         changed_pixels: changed,
         total_pixels: total,
+        content_pixels: content,
         changed_pct: pct,
+        changed_pct_of_content: pct_of_content,
         changed_bbox: bbox,
     })
+}
+
+/// The most frequent flattened color in an image: the paper. A render is
+/// mostly background by construction, so the mode is unambiguous.
+fn dominant_color(img: &image::RgbaImage) -> [u8; 3] {
+    let mut counts: std::collections::HashMap<[u8; 3], u64> = std::collections::HashMap::new();
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            *counts.entry(pixel_or_white(img, x, y)).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(c, _)| c)
+        .unwrap_or([255, 255, 255])
 }
 
 /// Flatten onto white outside an image's bounds and under transparency, so
