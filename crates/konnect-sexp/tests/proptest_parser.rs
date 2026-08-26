@@ -48,6 +48,47 @@ fn sexp_text_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// Scalar atoms as a hostile file might carry them: ordinary numbers, but
+/// also the strings `f64::parse` happily accepts and geometry must reject.
+fn scalar_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => r"-?[0-9]{1,4}(\.[0-9]{1,4})?",
+        1 => Just("NaN".to_string()),
+        1 => Just("inf".to_string()),
+        1 => Just("-inf".to_string()),
+        1 => Just("0".to_string()),
+        1 => Just("junk".to_string()),
+    ]
+}
+
+/// A `(segment …)` with every field individually present, absent, or hostile —
+/// the shapes a truncated or hand-mangled board file produces.
+fn segment_strategy() -> impl Strategy<Value = String> {
+    (
+        prop::option::of((scalar_strategy(), scalar_strategy())),
+        prop::option::of((scalar_strategy(), scalar_strategy())),
+        prop::option::of(scalar_strategy()),
+        prop::option::of(Just("F.Cu".to_string())),
+    )
+        .prop_map(|(start, end, width, layer)| {
+            let mut s = String::from("(segment");
+            if let Some((x, y)) = start {
+                s.push_str(&format!(" (start {x} {y})"));
+            }
+            if let Some((x, y)) = end {
+                s.push_str(&format!(" (end {x} {y})"));
+            }
+            if let Some(w) = width {
+                s.push_str(&format!(" (width {w})"));
+            }
+            if let Some(l) = layer {
+                s.push_str(&format!(" (layer \"{l}\")"));
+            }
+            s.push(')');
+            s
+        })
+}
+
 // ─── Properties ──────────────────────────────────────────────────────────────
 
 proptest! {
@@ -92,6 +133,53 @@ proptest! {
             let _ = node.find_all("wire");
             let _ = node.get(0);
             let _ = node.get_f64(1);
+        }
+    }
+
+    /// Board scans are total over arbitrary well-formed trees: no panic, and
+    /// no returned item ever violates the invariants `board::Track` promises —
+    /// finite coordinates and strictly positive finite width — however wrong
+    /// the input's shape is.
+    #[test]
+    fn board_scans_are_total_over_arbitrary_trees(text in sexp_text_strategy()) {
+        if let Ok(tree) = parse_sexp(&text) {
+            for t in &konnect_sexp::board::tracks(&tree).items {
+                prop_assert!(t.width.is_finite() && t.width > 0.0);
+                for c in [t.x1, t.y1, t.x2, t.y2] {
+                    prop_assert!(c.is_finite());
+                }
+            }
+            for v in &konnect_sexp::board::vias(&tree).items {
+                prop_assert!(v.size.is_finite() && v.size > 0.0);
+                prop_assert!(v.drill.is_finite() && v.drill > 0.0);
+                prop_assert!(!v.layers.is_empty());
+            }
+            for z in &konnect_sexp::board::zones(&tree).items {
+                prop_assert!(z.points.len() >= 3);
+                prop_assert!(!z.layers.is_empty());
+            }
+            if let Some((x0, y0, x1, y1)) = konnect_sexp::board::board_outline_bbox(&tree) {
+                prop_assert!(x0 <= x1 && y0 <= y1);
+            }
+        }
+    }
+
+    /// Nothing vanishes silently: over boards made of arbitrarily mangled
+    /// segments, every segment node is either parsed or counted as skipped —
+    /// and the parsed ones all hold the width/coordinate invariants.
+    #[test]
+    fn every_segment_is_parsed_or_counted(
+        segments in prop::collection::vec(segment_strategy(), 0..12)
+    ) {
+        let board = format!("(kicad_pcb {})", segments.join(" "));
+        let tree = parse_sexp(&board).unwrap();
+        let scan = konnect_sexp::board::tracks(&tree);
+        prop_assert_eq!(scan.items.len() + scan.skipped, segments.len());
+        for t in &scan.items {
+            prop_assert!(t.width.is_finite() && t.width > 0.0);
+            for c in [t.x1, t.y1, t.x2, t.y2] {
+                prop_assert!(c.is_finite());
+            }
         }
     }
 
