@@ -1161,67 +1161,7 @@ fn moved_pin_anchors(
 /// Roots under which KiCAD ships its bundled libraries — the directory that
 /// directly contains `symbols/`, `footprints/` and `3dmodels/`.
 fn kicad_share_roots() -> Vec<std::path::PathBuf> {
-    let mut roots: Vec<std::path::PathBuf> = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        // Keep these majors in step with the ones find_kicad_library_dirs
-        // reads environment variables for. A major listed there but missing
-        // here is invisible on any machine where KiCad did not export its
-        // variable — which is every machine where Konnect was not launched
-        // by KiCad.
-        for c in [
-            r"C:\KiCad\10.0\share\kicad",
-            r"C:\Program Files\KiCad\10.0\share\kicad",
-            r"C:\KiCad\9.0\share\kicad",
-            r"C:\Program Files\KiCad\9.0\share\kicad",
-            r"C:\KiCad\8.0\share\kicad",
-            r"C:\Program Files\KiCad\8.0\share\kicad",
-        ] {
-            roots.push(std::path::PathBuf::from(c));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // KiCad on macOS ships its libraries inside the app bundle.
-        roots.push(std::path::PathBuf::from(
-            "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
-        ));
-        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
-        // Homebrew (Apple Silicon prefix)
-        roots.push(std::path::PathBuf::from("/opt/homebrew/share/kicad"));
-        if let Ok(home) = std::env::var("HOME") {
-            // Per-user install (KiCad.app dragged into ~/Applications)
-            roots.push(
-                std::path::PathBuf::from(home)
-                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
-            );
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        roots.push(std::path::PathBuf::from("/usr/share/kicad"));
-        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
-        roots.push(std::path::PathBuf::from("/opt/kicad/share/kicad"));
-        // Flatpak: system-wide and per-user installs
-        roots.push(std::path::PathBuf::from(
-            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
-        ));
-        if let Ok(home) = std::env::var("HOME") {
-            roots.push(
-                std::path::PathBuf::from(&home).join(
-                    ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
-                ),
-            );
-        }
-        // Snap
-        roots.push(std::path::PathBuf::from(
-            "/snap/kicad/current/usr/share/kicad",
-        ));
-    }
-
-    roots.retain(|p| p.is_dir());
-    roots
+    crate::kicad_install::share_roots()
 }
 
 /// Find directories holding a bundled KiCAD library kind — `"symbols"`,
