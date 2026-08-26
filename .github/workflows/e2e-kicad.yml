@@ -72,6 +72,13 @@ jobs:
       - name: Demo-corpus conformance (115+ eeschema-authored schematics)
         run: cargo test -p konnect-core --test conformance_test -- --nocapture
 
+      # The variant grammar of record (fixtures/variants/README.md) is
+      # evidence adjudicated by kicad-cli; this re-runs the adjudication so a
+      # KiCad update that changes variant handling is noticed here, not by a
+      # user. kicad-cli-only — no GUI session required.
+      - name: Variant-grammar adjudication (kicad-cli acceptance)
+        run: cargo test -p konnect-sexp --test variant_fixture_test -- --ignored --nocapture
+
       - name: IPC wedge timeout regression
         run: cargo test -p konnect-ipc --test mock_server_test -- --ignored --nocapture
 

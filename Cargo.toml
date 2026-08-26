@@ -6,6 +6,8 @@ members = [
     "crates/konnect-sexp",
     "crates/konnect-ipc",
     "crates/konnect-schematic-editor",
+    "crates/konnect-render",
+    "crates/konnect-vcs",
 ]
 exclude = [
     "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`
@@ -73,8 +75,22 @@ dirs = "6"
 # SVG parsing (import_svg_logo)
 usvg = "0.48"
 
+# Rasterization for the visual-feedback tools (konnect-render). resvg and
+# tiny-skia are pinned EXACTLY: visual baselines compare pixel output across
+# machines, so a silent renderer bump must be a deliberate decision.
+resvg = "=0.48.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Pure-Rust git for the vcs toolset (konnect-vcs). No libgit2, no C.
+# Default features for now — the T2.1 spike trims to the plumbing actually
+# used once the API surface is settled (default-features=false breaks
+# gix-hash's backend selection).
+gix = { version = "0.87", features = ["status", "worktree-mutation"] }
+
 # Internal crates
 konnect-sexp = { path = "crates/konnect-sexp" }
 konnect-ipc = { path = "crates/konnect-ipc" }
 konnect-core = { path = "crates/konnect-core" }
 konnect-schematic-editor = { path = "crates/konnect-schematic-editor" }
+konnect-render = { path = "crates/konnect-render" }
+konnect-vcs = { path = "crates/konnect-vcs" }
