@@ -44,6 +44,26 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_export_svg(args, ctx).await }
         ),
         tool!(
+            "render_schematic_png",
+            "Render a schematic sheet to PNG: kicad-cli SVG export rasterized in-process \
+             (deterministic stroke-font rendering, no system fonts consulted). Returns the \
+             PNG path and its actual pixel dimensions; with 'inline' true the response also \
+             carries the image as base64 so the caller can inspect its own output. Width is \
+             capped at 4096 px.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "output":    { "type": "string", "description": "Output PNG path (default: alongside the schematic)" },
+                    "width_px":  { "type": "integer", "description": "Output width in pixels", "default": 1600, "maximum": 4096 },
+                    "inline":    { "type": "boolean", "description": "Also return the PNG as base64 content", "default": false },
+                    "monochrome": { "type": "boolean", "description": "Render in black and white", "default": false }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_render_png(args, ctx).await }
+        ),
+        tool!(
             "export_schematic_pdf",
             "Export a schematic sheet to a PDF file using kicad-cli.",
             json!({
@@ -175,6 +195,76 @@ async fn handle_export_svg(
         "black_and_white": options.black_and_white,
         "theme": options.theme
     })))
+}
+
+async fn handle_render_png(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let width_px = match args.get("width_px") {
+        None => 1600,
+        Some(v) => match v.as_u64() {
+            Some(w) if (1..=4096).contains(&w) => w as u32,
+            _ => {
+                return Ok(CallToolResult::error_kind(
+                    crate::mcp::error::ToolErrorKind::InvalidArgument {
+                        field: "width_px".into(),
+                        reason: "must be an integer in 1..=4096".into(),
+                    },
+                    "Argument 'width_px' must be an integer between 1 and 4096",
+                ))
+            }
+        },
+    };
+    let inline = args["inline"].as_bool().unwrap_or(false);
+    let monochrome = args["monochrome"].as_bool().unwrap_or(false);
+
+    let output_path = match args.get("output").and_then(|v| v.as_str()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => sch_path.with_extension("png"),
+    };
+
+    // Render the SVG into a temp dir so the intermediate never collides with
+    // caller files, then rasterize in-process.
+    let svg_dir = tempfile::tempdir()?;
+    let options = cli::SchematicSvgOptions {
+        black_and_white: monochrome,
+        theme: None,
+    };
+    let svg_path =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, svg_dir.path(), &options)
+            .await?;
+    let svg_bytes = std::fs::read(&svg_path)?;
+
+    let rendered = match konnect_render::svg_to_png(&svg_bytes, width_px) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "kicad-cli exported the sheet but rasterization refused it: {error}"
+            )))
+        }
+    };
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, &rendered.png)?;
+
+    // Dimensions come from the produced image, never echoed from the request.
+    let mut response = json!({
+        "rendered": output_path.display().to_string(),
+        "width_px": rendered.width_px,
+        "height_px": rendered.height_px,
+        "png_bytes": rendered.png.len(),
+        "monochrome": monochrome
+    });
+    if inline {
+        use base64::Engine as _;
+        response["png_base64"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(&rendered.png));
+    }
+    Ok(CallToolResult::json(&response))
 }
 
 async fn handle_export_pdf(
@@ -689,6 +779,35 @@ fn canonical(p: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn render_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig::default(),
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn render_png_refuses_an_out_of_range_width() {
+        let result = handle_render_png(
+            &json!({ "schematic": "unused.kicad_sch", "width_px": 9000 }),
+            &render_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("width_px"), "{text}");
+    }
+
+    #[test]
+    fn render_png_is_registered_in_this_toolset() {
+        let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
+        assert!(names.contains(&"render_schematic_png"), "{names:?}");
+        assert_eq!(names.len(), 8, "sch_export tool count");
+    }
 
     /// A root sheet holding one sub-sheet reference. The `(sheet …)` block is
     /// shaped the way KiCad 10 writes one — trimmed to the fields the loader
