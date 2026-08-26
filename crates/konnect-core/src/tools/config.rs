@@ -33,7 +33,24 @@ fn default_user_config() -> serde_json::Value {
             "net_prefix_power": "VCC_",
             "net_prefix_ground": "GND"
         },
-        "design_rules": []
+        "design_rules": [],
+        // Sourcing policy consumed by the upcoming derating/AVL checks.
+        // Derating limits are max operating/rated utilization — conservative
+        // general practice, not MIL-HDBK-217. An empty AVL means "not
+        // enforced", which those checks report as a warning, never a pass.
+        "sourcing": {
+            "avl": [],
+            "derating": {
+                "capacitor": { "voltage": 0.80 },
+                "resistor": { "power": 0.60 },
+                "inductor": { "current": 0.80 },
+                "mosfet": { "vds": 0.80, "id": 0.80 },
+                "diode": { "vr": 0.80, "if": 0.80 },
+                "led": { "if": 0.80 },
+                "connector": { "current": 0.80 },
+                "regulator": { "power": 0.70, "current": 0.80 }
+            }
+        }
     })
 }
 
@@ -41,7 +58,11 @@ fn default_project_config() -> serde_json::Value {
     json!({
         "design_rules": [],
         "fab_constraints": {},
-        "naming_conventions": {}
+        "naming_conventions": {},
+        // Project-side sourcing overrides. NOTE: deep_merge REPLACES arrays,
+        // so a project-level "avl" supersedes the user list entirely rather
+        // than appending to it — the same semantics design_rules has.
+        "sourcing": {}
     })
 }
 
@@ -519,6 +540,30 @@ mod dot_path_and_merge_tests {
         assert_eq!(merged["fab_constraints"]["fab_house"], "JLCPCB");
         assert_eq!(merged["fab_constraints"]["layer_count"], 4);
         assert_eq!(merged["design_rules"], json!([]));
+    }
+
+    /// The sourcing policy the derating/AVL checks read must exist in the
+    /// defaults with the documented limits — a missing key would make those
+    /// checks silently unenforceable, the #218 class.
+    #[test]
+    fn default_sourcing_policy_is_present_with_conservative_limits() {
+        let user = default_user_config();
+        assert_eq!(user["sourcing"]["avl"], json!([]));
+        assert_eq!(user["sourcing"]["derating"]["capacitor"]["voltage"], 0.80);
+        assert_eq!(user["sourcing"]["derating"]["resistor"]["power"], 0.60);
+        assert_eq!(user["sourcing"]["derating"]["regulator"]["power"], 0.70);
+        assert_eq!(default_project_config()["sourcing"], json!({}));
+    }
+
+    /// A project-level AVL REPLACES the user list (deep_merge array
+    /// semantics) — pinned so a future "append" change is a decision, not
+    /// an accident.
+    #[test]
+    fn project_avl_replaces_user_avl_wholesale() {
+        let user = json!({ "sourcing": { "avl": ["Murata", "TDK"] } });
+        let project = json!({ "sourcing": { "avl": ["Vishay"] } });
+        let merged = deep_merge(&user, &project);
+        assert_eq!(merged["sourcing"]["avl"], json!(["Vishay"]));
     }
 
     #[test]
