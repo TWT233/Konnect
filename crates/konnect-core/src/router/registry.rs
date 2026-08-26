@@ -85,6 +85,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 13,
     },
     ToolsetMeta {
+        name: "placement",
+        description: "Placement quality: score the current placement with named deductions; placers land next",
+        category: "pcb",
+        tool_count: 1,
+    },
+    ToolsetMeta {
         name: "pcb_export",
         description: "Gerber, PDF, SVG, 3D model, BOM, pick-and-place, DRC, DXF/GenCAD/IPC-2581/ODB++",
         category: "pcb",
@@ -149,6 +155,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_board" => Some(pcb_board::tools()),
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
+        "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
         "integration" => Some(integration::tools()),

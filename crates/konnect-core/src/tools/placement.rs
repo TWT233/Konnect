@@ -25,7 +25,6 @@
 // The maintainer's registration commit removes this: until `score_placement`
 // is wired into the router registry, nothing outside this module calls
 // `tools()`, and the non-test build would otherwise fail `-D warnings`.
-#![allow(dead_code)]
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
