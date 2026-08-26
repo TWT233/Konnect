@@ -11,3 +11,6 @@ rust-version.workspace = true
 resvg.workspace = true
 image.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+image.workspace = true

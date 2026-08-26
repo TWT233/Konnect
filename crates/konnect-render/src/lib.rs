@@ -23,10 +23,12 @@ pub struct Rendered {
 /// Rasterize SVG bytes to a PNG at the given pixel width (height follows the
 /// SVG's aspect ratio).
 ///
-/// Refuses an SVG containing `<text>` elements: with an empty fontdb they
-/// would render as nothing (or worse, differently once a font sneaks in),
-/// and kicad-cli schematic exports draw text as stroke-font paths, so a text
-/// element here means the input is not what this renderer is for.
+/// Refuses an SVG containing VISIBLE `<text>` elements: with an empty fontdb
+/// they would render differently per machine. kicad-cli schematic exports
+/// draw all visible text as stroke-font path data and pair it with
+/// `opacity="0"` text elements for searchability; those render nothing by
+/// construction and are allowed (verified against real 10.0.5 exports:
+/// every text element carries opacity="0" stroke-opacity="0").
 pub fn svg_to_png(svg: &[u8], width_px: u32) -> Result<Rendered> {
     if width_px == 0 || width_px > 8192 {
         bail!("width_px must be 1..=8192, got {width_px}");
@@ -35,13 +37,13 @@ pub fn svg_to_png(svg: &[u8], width_px: u32) -> Result<Rendered> {
     let options = usvg::Options::default();
     let tree = usvg::Tree::from_data(svg, &options).context("SVG did not parse")?;
 
-    // usvg resolves text during parsing against options.fontdb — empty here.
-    // Any text node in the source is therefore a determinism hazard; refuse.
-    if svg_contains_text_element(svg) {
+    // usvg resolves text during parsing against options.fontdb (empty here).
+    // A VISIBLE text node is a determinism hazard; refuse it. Invisible
+    // (opacity 0) text, which kicad-cli emits for searchability alongside
+    // its stroke-font paths, paints nothing regardless of fonts.
+    if svg_contains_visible_text(svg) {
         bail!(
-            "SVG contains <text> elements; rendering them requires fonts and \
-             is not deterministic. KiCad schematic exports use stroke-font \
-             paths — re-export, or rasterize elsewhere."
+            "SVG contains visible <text> elements; rendering them requires              fonts and is not deterministic. KiCad schematic exports draw              text as stroke-font paths."
         );
     }
 
@@ -148,9 +150,21 @@ fn pixel_or_white(img: &image::RgbaImage, x: u32, y: u32) -> [u8; 3] {
     [over(p[0]), over(p[1]), over(p[2])]
 }
 
-/// Cheap structural probe for `<text` elements (tag open, not attribute).
-fn svg_contains_text_element(svg: &[u8]) -> bool {
-    svg.windows(5).any(|w| w == b"<text")
+/// Probe for `<text` elements whose opening tag does NOT declare full
+/// transparency. kicad-cli stamps `opacity="0"` on every text element it
+/// emits; anything else is treated as visible and refused.
+fn svg_contains_visible_text(svg: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(svg);
+    let mut rest = text.as_ref();
+    while let Some(i) = rest.find("<text") {
+        let tag_body = &rest[i..];
+        let end = tag_body.find('>').unwrap_or(tag_body.len());
+        if !tag_body[..end].contains("opacity=\"0\"") {
+            return true;
+        }
+        rest = &tag_body[end..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -183,10 +197,19 @@ mod tests {
     }
 
     #[test]
-    fn text_elements_are_refused_not_silently_dropped() {
+    fn visible_text_is_refused_not_silently_dropped() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><text x="0" y="8">hi</text></svg>"##;
         let err = svg_to_png(svg, 100).unwrap_err().to_string();
-        assert!(err.contains("<text>"), "{err}");
+        assert!(err.contains("visible <text>"), "{err}");
+    }
+
+    /// kicad-cli pairs every visible string with an invisible text element
+    /// (opacity 0) for searchability; those must render, not refuse.
+    #[test]
+    fn kicads_invisible_searchability_text_is_allowed() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><text x="0" y="8" opacity="0" stroke-opacity="0">R1</text><rect x="2" y="2" width="10" height="5" fill="#000000"/></svg>"##;
+        let out = svg_to_png(svg, 100).unwrap();
+        assert_eq!(out.width_px, 100);
     }
 
     #[test]
