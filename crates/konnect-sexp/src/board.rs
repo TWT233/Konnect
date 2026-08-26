@@ -31,7 +31,7 @@
 
 use crate::net;
 use crate::parser::SexpNode;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Every footprint on a board, in file order.
 ///
@@ -368,6 +368,423 @@ fn resolve_net(item: &SexpNode, table: &HashMap<String, String>) -> Option<Strin
     }
 }
 
+// ─── Footprint courtyards ────────────────────────────────────────────────────
+
+/// Which side of the board a footprint is mounted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Front,
+    Back,
+}
+
+/// Where a [`FootprintCourtyard`]'s bbox came from — always stated, never
+/// implied, so a placement tool can tell a real courtyard from a stand-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CourtyardSource {
+    /// The footprint draws `F.CrtYd`/`B.CrtYd` artwork; the bbox bounds it.
+    Courtyard,
+    /// No courtyard artwork; the bbox bounds the footprint's pads (center ±
+    /// rotated half-size). Smaller than a real courtyard would be — it has no
+    /// body outline and no clearance margin — but never silently absent.
+    PadsFallback,
+    /// No courtyard artwork *and* no pads (a logo, a fiducial-less doc
+    /// footprint): the bbox degenerates to the anchor point itself. Zero area,
+    /// real position.
+    AnchorOnly,
+}
+
+/// One footprint's courtyard extent in **board** coordinates.
+///
+/// # Transform convention (verified, not derived — see the fixture tests)
+///
+/// Footprint children are stored in footprint-local coordinates in the same
+/// Y-down orientation as the board; the file bakes **no rotation and no
+/// translation** into them. Board position of any child point is
+/// `(at) + R(rot)·local` where `R` is KiCAD's Y-down screen-CCW rotation
+/// ([`crate::geometry::transform_pad`] — note the non-textbook sign pattern).
+///
+/// A **back-side** footprint needs *no additional mirroring*: KiCAD's flip
+/// rewrites the stored child coordinates themselves, so the same rigid-body
+/// transform holds for both sides. Verified against routed copper in the
+/// pic_programmer demo: JP1 (B.Cu) pad 1 (net `VCC`, local x = −0.725)
+/// lands at board x = 147.357 next to the B.Cu VCC track end at 147.447 —
+/// mirroring would put it at 148.807, 1.36 mm away on the wrong side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FootprintCourtyard {
+    /// The reference designator (`property "Reference"`, or the legacy
+    /// `fp_text reference`); `None` when the footprint carries neither.
+    pub reference: Option<String>,
+    /// The footprint anchor `(at x y …)` in board coordinates.
+    pub at: (f64, f64),
+    /// The root `(at … rot)` angle in degrees, 0 when absent.
+    pub rotation_deg: f64,
+    /// Board side, from the footprint's own `(layer …)`.
+    pub layer_side: Side,
+    /// `(min_x, min_y, max_x, max_y)` in board coordinates. Exact for
+    /// cardinal rotations; for a non-cardinal angle it is the axis-aligned
+    /// hull of the rotated local bbox — a superset of the artwork, never a
+    /// subset.
+    pub bbox: (f64, f64, f64, f64),
+    /// What the bbox actually bounds.
+    pub bbox_source: CourtyardSource,
+}
+
+/// Per-footprint courtyard bboxes in board coordinates, in file order.
+///
+/// Skipped-and-counted (never guessed): a footprint whose root `(at …)` is
+/// missing/non-finite, whose `(layer …)` names no F./B. side, or whose
+/// courtyard/pad geometry is partially unreadable. Partial geometry is
+/// all-or-nothing for the same reason as [`board_outline_bbox`]: a bbox that
+/// silently lost one courtyard line looks exactly like a complete one.
+pub fn footprint_courtyards(tree: &SexpNode) -> Scan<FootprintCourtyard> {
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for fp in footprints(tree) {
+        match footprint_courtyard(fp) {
+            Some(c) => items.push(c),
+            None => skipped += 1,
+        }
+    }
+    Scan { items, skipped }
+}
+
+/// Tags a footprint graphic child can carry.
+const FP_SHAPE_TAGS: [&str; 5] = ["fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly"];
+
+fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
+    let (fx, fy, rot) = footprint_root_at(fp)?;
+    let layer_side = footprint_side(fp)?;
+
+    // Hull of the courtyard artwork in footprint-local coordinates.
+    // All-or-nothing: one unreadable courtyard shape poisons the footprint.
+    let mut local: Option<(f64, f64, f64, f64)> = None;
+    for child in fp.children().unwrap_or(&[]) {
+        let Some(head) = child.head() else { continue };
+        if !FP_SHAPE_TAGS.contains(&head) {
+            continue;
+        }
+        match child.find_str("layer") {
+            Some("F.CrtYd") | Some("B.CrtYd") => {}
+            _ => continue,
+        }
+        let bb = fp_shape_bbox(child, head)?;
+        local = Some(merge_bbox(local, bb));
+    }
+
+    let (bbox, bbox_source) = match local {
+        Some(lb) => (
+            transform_local_bbox(lb, fx, fy, rot),
+            CourtyardSource::Courtyard,
+        ),
+        None => {
+            // Pad fallback, computed directly in board space: the stored pad
+            // angle is the board-space angle (the file writes pad rotation
+            // *including* the footprint's — R1 at −90° in the ecc83 demo
+            // stores its pads at 270°), so center ± rotated half-size is
+            // exact at any angle. All-or-nothing over the pads.
+            let pads = fp.find_all("pad");
+            if pads.is_empty() {
+                ((fx, fy, fx, fy), CourtyardSource::AnchorOnly)
+            } else {
+                let mut acc: Option<(f64, f64, f64, f64)> = None;
+                for pad in &pads {
+                    let (lx, ly) = point(pad, "at")?;
+                    let (cx, cy) = crate::geometry::transform_pad(lx, ly, fx, fy, rot);
+                    let size = pad.find("size")?;
+                    let (w, h) = (size.get_f64(1)?, size.get_f64(2)?);
+                    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+                        return None;
+                    }
+                    let angle = pad.find("at").and_then(|a| a.get_f64(3)).unwrap_or(0.0);
+                    let (s, c) = angle.to_radians().sin_cos();
+                    let ext_x = (w / 2.0 * c).abs() + (h / 2.0 * s).abs();
+                    let ext_y = (w / 2.0 * s).abs() + (h / 2.0 * c).abs();
+                    acc = Some(merge_bbox(
+                        acc,
+                        (cx - ext_x, cy - ext_y, cx + ext_x, cy + ext_y),
+                    ));
+                }
+                (acc?, CourtyardSource::PadsFallback)
+            }
+        }
+    };
+
+    Some(FootprintCourtyard {
+        reference: footprint_reference(fp),
+        at: (fx, fy),
+        rotation_deg: rot,
+        layer_side,
+        bbox,
+        bbox_source,
+    })
+}
+
+/// The footprint's root `(at x y [rot])`. The rotation defaults to 0 when
+/// absent — that is the file's own convention — but x/y are load-bearing.
+fn footprint_root_at(fp: &SexpNode) -> Option<(f64, f64, f64)> {
+    let at = fp.find("at")?;
+    let (x, y) = (at.get_f64(1)?, at.get_f64(2)?);
+    let rot = at.get_f64(3).unwrap_or(0.0);
+    (x.is_finite() && y.is_finite() && rot.is_finite()).then_some((x, y, rot))
+}
+
+/// Which side the footprint's own `(layer …)` puts it on. A footprint layer
+/// is always `F.Cu` or `B.Cu` in KiCAD-authored files; anything else is
+/// malformed rather than a third side.
+fn footprint_side(fp: &SexpNode) -> Option<Side> {
+    match fp.find_str("layer")? {
+        "F.Cu" => Some(Side::Front),
+        "B.Cu" => Some(Side::Back),
+        _ => None,
+    }
+}
+
+/// The reference designator: `(property "Reference" "R1" …)` in current
+/// formats, `(fp_text reference "R1" …)` in legacy ones.
+fn footprint_reference(fp: &SexpNode) -> Option<String> {
+    for prop in fp.find_all("property") {
+        if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
+            return prop.get(2).and_then(|n| n.as_str()).map(str::to_string);
+        }
+    }
+    for text in fp.find_all("fp_text") {
+        if text.get(1).and_then(|n| n.as_str()) == Some("reference") {
+            return text.get(2).and_then(|n| n.as_str()).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Local (footprint-frame) bbox of one `fp_*` graphic; `None` when a
+/// load-bearing coordinate is missing or non-finite. Centerline geometry —
+/// stroke width is not expanded, matching what the courtyard outline means.
+fn fp_shape_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
+    match head {
+        "fp_line" | "fp_rect" => {
+            let (x1, y1) = point(node, "start")?;
+            let (x2, y2) = point(node, "end")?;
+            Some((x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)))
+        }
+        "fp_arc" => {
+            let start = point(node, "start")?;
+            let mid = point(node, "mid")?;
+            let end = point(node, "end")?;
+            Some(crate::geometry::arc_bbox(start, mid, end))
+        }
+        "fp_circle" => {
+            let (cx, cy) = point(node, "center")?;
+            let (ex, ey) = point(node, "end")?;
+            let r = (ex - cx).hypot(ey - cy);
+            Some((cx - r, cy - r, cx + r, cy + r))
+        }
+        "fp_poly" => {
+            let pts = node.find("pts")?;
+            let mut acc: Option<(f64, f64, f64, f64)> = None;
+            for xy in pts.find_all("xy") {
+                let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
+                if !x.is_finite() || !y.is_finite() {
+                    return None;
+                }
+                acc = Some(merge_bbox(acc, (x, y, x, y)));
+            }
+            acc
+        }
+        _ => None,
+    }
+}
+
+fn merge_bbox(acc: Option<(f64, f64, f64, f64)>, bb: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    match acc {
+        None => bb,
+        Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),
+    }
+}
+
+/// Push a local-frame bbox through the footprint's rigid-body transform:
+/// rotate its four corners ([`crate::geometry::transform_pad`]) and hull.
+/// Exact for cardinal rotations; a superset for any other angle.
+fn transform_local_bbox(
+    (lx0, ly0, lx1, ly1): (f64, f64, f64, f64),
+    fx: f64,
+    fy: f64,
+    rot: f64,
+) -> (f64, f64, f64, f64) {
+    let mut acc: Option<(f64, f64, f64, f64)> = None;
+    for (x, y) in [(lx0, ly0), (lx1, ly0), (lx0, ly1), (lx1, ly1)] {
+        let (bx, by) = crate::geometry::transform_pad(x, y, fx, fy, rot);
+        acc = Some(merge_bbox(acc, (bx, by, bx, by)));
+    }
+    acc.expect("four corners were merged")
+}
+
+// ─── Connectivity index ──────────────────────────────────────────────────────
+
+/// One pad, located in board coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PadSite {
+    /// The owning footprint's reference designator.
+    pub reference: String,
+    /// The pad's own number/name as written (`"1"`, `"A7"`, `"SH"`, or `""`
+    /// on mechanical pads). Not unique within a footprint: multi-hole pads
+    /// share a number.
+    pub pad_number: String,
+    /// Pad anchor in board coordinates — the pad's local `(at …)` pushed
+    /// through the footprint's rigid-body transform (see
+    /// [`FootprintCourtyard`] for the convention and its verification).
+    pub at: (f64, f64),
+    /// The **footprint's** mounting side. A through-hole pad is physically
+    /// reachable from both sides regardless; this records where its
+    /// footprint sits.
+    pub layer_side: Side,
+}
+
+/// Net-keyed index over a board's pads and routed segments.
+///
+/// # Net identity
+///
+/// Keys are net **names**, never numeric codes — codes are renumbered on
+/// every save, so an index keyed by them goes stale the moment KiCAD touches
+/// the file. Both file formats resolve through the same rules as the scans
+/// (see the module docs). Pads on the unconnected pseudo-net are indexed
+/// separately and stay reachable via [`pads_without_net`] — test-point
+/// tooling needs mechanical/TH pads whether or not they carry a net.
+///
+/// # Loss accounting
+///
+/// The constructor never guesses: a pad without a readable number or
+/// position, or one whose footprint root is unreadable, is dropped and
+/// counted in [`skipped_pads`]; segments inherit [`tracks`]' policy via
+/// [`skipped_tracks`]. Non-zero counts on a KiCAD-authored board mean the
+/// parse cannot be trusted, not that the board is odd.
+///
+/// [`pads_without_net`]: PcbConnectivityIndex::pads_without_net
+/// [`skipped_pads`]: PcbConnectivityIndex::skipped_pads
+/// [`skipped_tracks`]: PcbConnectivityIndex::skipped_tracks
+#[derive(Debug, Clone, PartialEq)]
+pub struct PcbConnectivityIndex {
+    pads_by_net: BTreeMap<String, Vec<PadSite>>,
+    unconnected_pads: Vec<PadSite>,
+    segments_by_net: BTreeMap<String, Vec<Track>>,
+    /// `(reference, pad_number) → net name`, first occurrence wins for the
+    /// (shared-number) multi-hole case — all KiCAD-authored duplicates share
+    /// one net.
+    net_by_pad: HashMap<(String, String), String>,
+    skipped_pads: usize,
+    skipped_tracks: usize,
+}
+
+impl PcbConnectivityIndex {
+    /// Build the index from a parsed `.kicad_pcb` tree.
+    pub fn build(tree: &SexpNode) -> Self {
+        let table = top_level_net_table(tree);
+        let mut pads_by_net: BTreeMap<String, Vec<PadSite>> = BTreeMap::new();
+        let mut unconnected_pads = Vec::new();
+        let mut net_by_pad = HashMap::new();
+        let mut skipped_pads = 0usize;
+
+        for fp in footprints(tree) {
+            let root = footprint_root_at(fp).zip(footprint_side(fp));
+            let reference = footprint_reference(fp);
+            for pad in fp.find_all("pad") {
+                let site = (|| {
+                    let ((fx, fy, rot), layer_side) = root?;
+                    let reference = reference.clone()?;
+                    let pad_number = pad.get(1)?.as_str()?.to_string();
+                    let (lx, ly) = point(pad, "at")?;
+                    let at = crate::geometry::transform_pad(lx, ly, fx, fy, rot);
+                    Some(PadSite {
+                        reference,
+                        pad_number,
+                        at,
+                        layer_side,
+                    })
+                })();
+                let Some(site) = site else {
+                    skipped_pads += 1;
+                    continue;
+                };
+                match resolve_net(pad, &table) {
+                    Some(net) => {
+                        net_by_pad
+                            .entry((site.reference.clone(), site.pad_number.clone()))
+                            .or_insert_with(|| net.clone());
+                        pads_by_net.entry(net).or_default().push(site);
+                    }
+                    None => unconnected_pads.push(site),
+                }
+            }
+        }
+
+        let scan = tracks(tree);
+        let mut segments_by_net: BTreeMap<String, Vec<Track>> = BTreeMap::new();
+        for track in scan.items {
+            if let Some(net) = track.net.clone() {
+                segments_by_net.entry(net).or_default().push(track);
+            }
+        }
+
+        PcbConnectivityIndex {
+            pads_by_net,
+            unconnected_pads,
+            segments_by_net,
+            net_by_pad,
+            skipped_pads,
+            skipped_tracks: scan.skipped,
+        }
+    }
+
+    /// Every pad on `net`, in file order; empty for a net the board never
+    /// pads (including unknown names — asking is not an error).
+    pub fn pads_of_net(&self, net: &str) -> &[PadSite] {
+        self.pads_by_net.get(net).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every routed segment on `net`, in file order.
+    pub fn segments_of_net(&self, net: &str) -> &[Track] {
+        self.segments_by_net.get(net).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every net the index knows — any net with a pad or a routed segment —
+    /// sorted by name.
+    pub fn nets(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .pads_by_net
+            .keys()
+            .chain(self.segments_by_net.keys())
+            .map(String::as_str)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The net of pad `pad_number` on footprint `reference`; `None` when the
+    /// pad is unknown *or* unconnected — [`Self::pads_without_net`]
+    /// distinguishes the two.
+    pub fn net_of_pad(&self, reference: &str, pad_number: &str) -> Option<&str> {
+        self.net_by_pad
+            .get(&(reference.to_string(), pad_number.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Pads on the unconnected pseudo-net (mounting holes, shields,
+    /// mechanical pads), in file order. Indexed under no net but never
+    /// dropped.
+    pub fn pads_without_net(&self) -> &[PadSite] {
+        &self.unconnected_pads
+    }
+
+    /// Pads dropped for missing load-bearing fields. See the type docs.
+    pub fn skipped_pads(&self) -> usize {
+        self.skipped_pads
+    }
+
+    /// Segments dropped by the underlying [`tracks`] scan.
+    pub fn skipped_tracks(&self) -> usize {
+        self.skipped_tracks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +1113,224 @@ mod tests {
     fn outline_bbox_is_none_without_edge_cuts() {
         let tree = parse_sexp("(kicad_pcb\n\t(version 20260206)\n)").unwrap();
         assert_eq!(board_outline_bbox(&tree), None);
+    }
+
+    // ─── Courtyards ──────────────────────────────────────────────────────
+
+    fn assert_bbox_close(got: (f64, f64, f64, f64), want: (f64, f64, f64, f64), label: &str) {
+        let ok = (got.0 - want.0).abs() < 1e-9
+            && (got.1 - want.1).abs() < 1e-9
+            && (got.2 - want.2).abs() < 1e-9
+            && (got.3 - want.3).abs() < 1e-9;
+        assert!(ok, "{label}: got {got:?}, expected {want:?}");
+    }
+
+    /// Non-cardinal rotation, hand-computed. Footprint at (100, 100, 45°),
+    /// courtyard rect local (−1, −2)…(1, 2). KiCAD's Y-down CCW rotation is
+    /// (x, y) → (x·cosθ + y·sinθ, y·cosθ − x·sinθ); at 45° (c = s = √2/2)
+    /// the corners map to (±3·√2/2, ±√2/2) and (±√2/2, ∓3·√2/2), so the
+    /// hull is ±3·√2/2 = ±2.121320343… about the anchor on both axes.
+    #[test]
+    fn courtyard_bbox_at_45_degrees_hand_computed() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(footprint \"X\"\n\t\t(layer \"F.Cu\")\n\t\t(at 100 100 45)\n\
+             \t\t(property \"Reference\" \"U9\")\n\
+             \t\t(fp_rect (start -1 -2) (end 1 2) (layer \"F.CrtYd\"))\n\t))",
+        )
+        .unwrap();
+        let scan = footprint_courtyards(&tree);
+        assert_eq!(scan.skipped, 0);
+        let c = &scan.items[0];
+        assert_eq!(c.reference.as_deref(), Some("U9"));
+        assert_eq!(c.rotation_deg, 45.0);
+        assert_eq!(c.bbox_source, CourtyardSource::Courtyard);
+        let e = 3.0 * std::f64::consts::SQRT_2 / 2.0; // 2.1213203435596424
+        assert_bbox_close(c.bbox, (100.0 - e, 100.0 - e, 100.0 + e, 100.0 + e), "45°");
+    }
+
+    /// Pads fallback, hand-computed with a rotated pad: footprint at
+    /// (10, 10, 90°), pad local (2, 0), size 2×1, stored pad angle 90° (the
+    /// file writes pad angles *including* the footprint's). Center lands at
+    /// (10 + 0·2, 10 − 2) = (10, 8); at 90° the 2×1 rect turns into 1×2, so
+    /// extents are (0.5, 1).
+    #[test]
+    fn pads_fallback_bbox_hand_computed() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(footprint \"R\"\n\t\t(layer \"F.Cu\")\n\t\t(at 10 10 90)\n\
+             \t\t(property \"Reference\" \"R7\")\n\
+             \t\t(pad \"1\" smd rect (at 2 0 90) (size 2 1))\n\t))",
+        )
+        .unwrap();
+        let scan = footprint_courtyards(&tree);
+        assert_eq!(scan.skipped, 0);
+        let c = &scan.items[0];
+        assert_eq!(c.bbox_source, CourtyardSource::PadsFallback);
+        assert_bbox_close(c.bbox, (9.5, 7.0, 10.5, 9.0), "pad fallback");
+    }
+
+    /// A footprint with neither courtyard nor pads (a logo) keeps its anchor
+    /// as a zero-area bbox — stated as such, never silently dropped.
+    #[test]
+    fn courtyardless_padless_footprint_is_anchor_only() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(footprint \"Logo\"\n\t\t(layer \"F.Cu\")\n\t\t(at 5 6)\n\
+             \t\t(fp_line (start 0 0) (end 1 1) (layer \"F.SilkS\"))\n\t))",
+        )
+        .unwrap();
+        let scan = footprint_courtyards(&tree);
+        assert_eq!(scan.skipped, 0);
+        let c = &scan.items[0];
+        assert_eq!(c.bbox_source, CourtyardSource::AnchorOnly);
+        assert_eq!(c.bbox, (5.0, 6.0, 5.0, 6.0));
+        assert_eq!(c.reference, None);
+    }
+
+    /// All-or-nothing over the courtyard artwork, same rationale as
+    /// [`board_outline_bbox`]: a partially-read courtyard looks complete.
+    #[test]
+    fn courtyard_with_a_broken_shape_is_skipped_and_counted() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(footprint \"A\"\n\t\t(layer \"F.Cu\")\n\t\t(at 0 0)\n\
+             \t\t(fp_line (start 0 0) (layer \"F.CrtYd\"))\n\t)\n\
+             \t(footprint \"B\"\n\t\t(layer \"F.Cu\")\n\
+             \t\t(fp_rect (start 0 0) (end 1 1) (layer \"F.CrtYd\"))\n\t)\n\
+             \t(footprint \"C\"\n\t\t(layer \"F.SilkS\")\n\t\t(at 0 0)\n\
+             \t\t(fp_rect (start 0 0) (end 1 1) (layer \"F.CrtYd\"))\n\t)\n\
+             )",
+        )
+        .unwrap();
+        // A: courtyard line without an end. B: no root (at …). C: layer that
+        // names no side. All dropped, all counted.
+        let scan = footprint_courtyards(&tree);
+        assert_eq!((scan.items.len(), scan.skipped), (0, 3));
+    }
+
+    /// A back-side footprint keeps the same rigid-body transform — the file
+    /// stores its children already flipped (verified against pic_programmer
+    /// copper in the fixture tests; this pins the unit-level behavior).
+    #[test]
+    fn back_side_footprint_is_not_mirrored_again() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(footprint \"J\"\n\t\t(layer \"B.Cu\")\n\t\t(at 100 50)\n\
+             \t\t(property \"Reference\" \"JP9\")\n\
+             \t\t(fp_rect (start -2 -1) (end 3 1) (layer \"B.CrtYd\"))\n\t))",
+        )
+        .unwrap();
+        let scan = footprint_courtyards(&tree);
+        let c = &scan.items[0];
+        assert_eq!(c.layer_side, Side::Back);
+        // Asymmetric on purpose: mirroring would report (97, 49, 102, 51).
+        assert_bbox_close(c.bbox, (98.0, 49.0, 103.0, 51.0), "back side");
+    }
+
+    // ─── Connectivity index ──────────────────────────────────────────────
+
+    /// KiCad ≤ 9 shapes: pads write `(net N "NAME")`, segments bare `(net N)`.
+    const INDEX_K9: &str = "(kicad_pcb\n\
+        \t(version 20241229)\n\
+        \t(net 0 \"\")\n\t(net 1 \"GND\")\n\t(net 2 \"VCC\")\n\
+        \t(footprint \"R\"\n\t\t(layer \"F.Cu\")\n\t\t(at 10 20 90)\n\
+        \t\t(property \"Reference\" \"R1\")\n\
+        \t\t(pad \"1\" thru_hole circle (at 0 0 90) (size 1.6 1.6) (net 1 \"GND\"))\n\
+        \t\t(pad \"2\" thru_hole circle (at 7.62 0 90) (size 1.6 1.6) (net 2 \"VCC\"))\n\t)\n\
+        \t(footprint \"H\"\n\t\t(layer \"B.Cu\")\n\t\t(at 50 50)\n\
+        \t\t(property \"Reference\" \"H1\")\n\
+        \t\t(pad \"\" np_thru_hole circle (at 0 0) (size 3 3) (net 0 \"\"))\n\t)\n\
+        \t(segment (start 10 20) (end 10 12.38) (width 0.5) (layer \"F.Cu\") (net 1))\n\
+        \t(segment (start 0 0) (end 1 0) (width 0.5) (layer \"F.Cu\") (net 0))\n\
+        )";
+
+    #[test]
+    fn index_transforms_pads_and_keys_nets_by_name() {
+        let tree = parse_sexp(INDEX_K9).unwrap();
+        let ix = PcbConnectivityIndex::build(&tree);
+        assert_eq!((ix.skipped_pads(), ix.skipped_tracks()), (0, 0));
+
+        // R1 pad 2: local (7.62, 0) through (10, 20, 90°) → (10, 20 − 7.62).
+        let vcc = ix.pads_of_net("VCC");
+        assert_eq!(vcc.len(), 1);
+        assert_eq!(vcc[0].reference, "R1");
+        assert_eq!(vcc[0].pad_number, "2");
+        assert!((vcc[0].at.0 - 10.0).abs() < 1e-9 && (vcc[0].at.1 - 12.38).abs() < 1e-9);
+        assert_eq!(vcc[0].layer_side, Side::Front);
+
+        assert_eq!(ix.net_of_pad("R1", "1"), Some("GND"));
+        assert_eq!(ix.net_of_pad("R1", "2"), Some("VCC"));
+        assert_eq!(ix.net_of_pad("R1", "3"), None);
+        assert_eq!(ix.net_of_pad("H1", ""), None); // unconnected, not unknown
+
+        // Nets are names, sorted; the pseudo-net never appears.
+        assert_eq!(ix.nets(), vec!["GND", "VCC"]);
+
+        // The unconnected mounting hole stays reachable.
+        let free = ix.pads_without_net();
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].reference, "H1");
+        assert_eq!(free[0].layer_side, Side::Back);
+
+        // Segments: keyed by resolved name; the net-0 one is not on a net.
+        assert_eq!(ix.segments_of_net("GND").len(), 1);
+        assert_eq!(ix.segments_of_net("VCC").len(), 0);
+    }
+
+    #[test]
+    fn index_reads_kicad_10_names_in_place() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(version 20260206)\n\
+             \t(footprint \"C\"\n\t\t(layer \"F.Cu\")\n\t\t(at 0 0)\n\
+             \t\t(property \"Reference\" \"C1\")\n\
+             \t\t(pad \"1\" smd rect (at -1 0) (size 1 1) (net \"VDD\"))\n\
+             \t\t(pad \"2\" smd rect (at 1 0) (size 1 1) (net \"GND\"))\n\t)\n\
+             \t(segment (start 0 0) (end 1 0) (width 0.2) (layer \"F.Cu\") (net \"VDD\"))\n\
+             )",
+        )
+        .unwrap();
+        let ix = PcbConnectivityIndex::build(&tree);
+        assert_eq!(ix.nets(), vec!["GND", "VDD"]);
+        assert_eq!(ix.net_of_pad("C1", "1"), Some("VDD"));
+        assert_eq!(ix.segments_of_net("VDD").len(), 1);
+    }
+
+    /// A net that exists only as routed copper (no pads) is still a net the
+    /// index reports — and vice versa.
+    #[test]
+    fn nets_is_the_union_of_pad_and_segment_nets() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(version 20260206)\n\
+             \t(footprint \"T\"\n\t\t(layer \"F.Cu\")\n\t\t(at 0 0)\n\
+             \t\t(property \"Reference\" \"TP1\")\n\
+             \t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (net \"PAD_ONLY\"))\n\t)\n\
+             \t(segment (start 0 0) (end 1 0) (width 0.2) (layer \"F.Cu\") (net \"SEG_ONLY\"))\n\
+             )",
+        )
+        .unwrap();
+        let ix = PcbConnectivityIndex::build(&tree);
+        assert_eq!(ix.nets(), vec!["PAD_ONLY", "SEG_ONLY"]);
+        assert!(ix.pads_of_net("SEG_ONLY").is_empty());
+        assert!(ix.segments_of_net("PAD_ONLY").is_empty());
+    }
+
+    /// Loss accounting: a pad without a position and a footprint without a
+    /// readable root drop their pads into `skipped_pads`, never into a
+    /// zero-filled site at the origin.
+    #[test]
+    fn index_counts_unreadable_pads() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\t(version 20260206)\n\
+             \t(footprint \"A\"\n\t\t(layer \"F.Cu\")\n\t\t(at 1 1)\n\
+             \t\t(property \"Reference\" \"U1\")\n\
+             \t\t(pad \"1\" smd rect (size 1 1) (net \"N\"))\n\
+             \t\t(pad \"2\" smd rect (at 0 0) (size 1 1) (net \"N\"))\n\t)\n\
+             \t(footprint \"B\"\n\t\t(layer \"F.Cu\")\n\
+             \t\t(property \"Reference\" \"U2\")\n\
+             \t\t(pad \"1\" smd rect (at 0 0) (size 1 1) (net \"N\"))\n\t)\n\
+             )",
+        )
+        .unwrap();
+        let ix = PcbConnectivityIndex::build(&tree);
+        assert_eq!(ix.skipped_pads(), 2);
+        assert_eq!(ix.pads_of_net("N").len(), 1);
+        assert_eq!(ix.pads_of_net("N")[0].reference, "U1");
     }
 }
