@@ -8,13 +8,15 @@
 use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::sch_connectivity::{net_graph_for, NetGraph};
 use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
-        find_lib_symbol, pin_endpoint, read_schematic,
+        extract_all_net_labels, extract_lib_pins, extract_lib_pins_for_unit,
+        extract_symbol_instances, extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
+        Label, LabelKind,
     },
 };
 use serde_json::{json, Value};
@@ -143,20 +145,23 @@ async fn handle_audit_decoupling(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running decoupling audit");
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut graph = net_graph_for(&tree, &wires, &labels);
 
     let mut findings = Vec::new();
     let mut pass_count = 0;
     let mut total_power_pins = 0;
 
     // Collect all capacitor references and their net connections
-    let cap_nets = collect_capacitor_nets(&content, &instances, &lib_syms);
+    let (cap_nets, _) = capacitor_nets(&mut graph, &instances, &lib_syms);
 
     // For each IC (non-passive, non-connector component), check power pins
     for inst in &instances {
@@ -191,7 +196,7 @@ async fn handle_audit_decoupling(
             let (px, py) = pin_endpoint(pin, inst.pin_transform());
 
             // Check if there's a capacitor connected to a net that this pin is on
-            let pin_net = find_net_at_point(&content, px, py);
+            let pin_net = graph.net_at(px, py);
 
             let has_decoupling = if let Some(ref net) = pin_net {
                 cap_nets.contains(net)
@@ -249,13 +254,17 @@ async fn handle_audit_connections(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running connection audit");
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut graph = net_graph_for(&tree, &wires, &labels);
+    let pull_up_nets = pull_up_nets(&mut graph, &instances, &lib_syms);
 
     let mut findings = Vec::new();
 
@@ -275,9 +284,9 @@ async fn handle_audit_connections(
             for (pin_name, pin) in [("SDA", sda_pin), ("SCL", scl_pin)] {
                 if let Some(pin) = pin {
                     let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                    let net = find_net_at_point(&content, px, py);
+                    let net = graph.net_at(px, py);
                     if let Some(ref net_name) = net {
-                        if !has_pull_up_on_net(&content, &instances, &lib_syms, net_name) {
+                        if !pull_up_nets.contains(net_name) {
                             findings.push(AuditFinding {
                                 severity: "warning",
                                 category: "connection",
@@ -304,9 +313,9 @@ async fn handle_audit_connections(
                 && !name_upper.contains("OUT")
             {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                let net = find_net_at_point(&content, px, py);
+                let net = graph.net_at(px, py);
                 if let Some(ref net_name) = net {
-                    if !has_pull_up_on_net(&content, &instances, &lib_syms, net_name) {
+                    if !pull_up_nets.contains(net_name) {
                         findings.push(AuditFinding {
                             severity: "warning",
                             category: "connection",
@@ -344,22 +353,24 @@ async fn handle_audit_power_rails(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running power rail audit");
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let mut graph = net_graph_for(&tree, &wires, &labels);
 
     let mut findings = Vec::new();
 
     // Find all power nets (from power symbols and labels)
-    let power_nets = collect_power_nets(&content);
+    let power_nets = collect_power_nets(&labels);
 
     // Check each power net for bulk capacitance
-    let cap_nets = collect_capacitor_nets(&content, &instances, &lib_syms);
-    let bulk_cap_nets = collect_bulk_cap_nets(&content, &instances, &lib_syms);
+    let (cap_nets, bulk_cap_nets) = capacitor_nets(&mut graph, &instances, &lib_syms);
 
     for net in &power_nets {
         if net.to_uppercase().contains("GND") || net.to_uppercase().contains("VSS") {
@@ -389,7 +400,7 @@ async fn handle_audit_power_rails(
     }
 
     // Check for test points on power rails
-    let test_point_nets = collect_test_point_nets(&content, &instances);
+    let test_point_nets = test_point_nets(&mut graph, &instances, &lib_syms);
     for net in &power_nets {
         if net.to_uppercase().contains("GND") {
             continue;
@@ -690,7 +701,7 @@ fn inspect_schematic_coverage(
         .map(|node| node.find_all("symbol"))
         .unwrap_or_default();
     coverage.symbol_instances += instances.len();
-    coverage.named_nets += extract_labels(&tree)
+    coverage.named_nets += extract_all_net_labels(&tree)
         .into_iter()
         .map(|label| label.net)
         .collect::<HashSet<_>>()
@@ -1131,130 +1142,129 @@ fn has_i2c_pins(pins: &[konnect_sexp::schematic::LibPin]) -> bool {
     names.iter().any(|n| n.contains("SDA")) && names.iter().any(|n| n.contains("SCL"))
 }
 
-/// Collect nets that have at least one capacitor connected.
-fn collect_capacitor_nets(
-    content: &str,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
+/// Every net a component's pins reach.
+///
+/// Nets come from the shared net graph, so a pin reaches its net along the
+/// wires and junctions it is drawn with, and a rail named by a power symbol is
+/// a net like any other. The audits used to scan the file for a label within
+/// 0.5 mm of the pin, which followed neither.
+///
+/// Not unit-aware: `extract_lib_pins` superimposes every unit of a multi-unit
+/// symbol, which is #182. This is the walk that fix rewrites.
+fn pin_nets(
+    graph: &mut NetGraph,
+    inst: &konnect_sexp::schematic::SymbolInstance,
     lib_syms: &[&konnect_sexp::parser::SexpNode],
 ) -> HashSet<String> {
     let mut nets = HashSet::new();
-    for inst in instances {
-        if !inst.reference.starts_with('C') || inst.reference.starts_with("CN") {
-            continue; // Only capacitors
-        }
-        let lib_sym = find_lib_symbol(lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
-            for pin in &pins {
-                let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                if let Some(net) = find_net_at_point(content, px, py) {
-                    nets.insert(net);
-                }
-            }
+    let Some(sym) = find_lib_symbol(lib_syms, inst) else {
+        return nets;
+    };
+    for pin in extract_lib_pins(sym) {
+        let (px, py) = pin_endpoint(&pin, inst.pin_transform());
+        if let Some(net) = graph.net_at(px, py) {
+            nets.insert(net);
         }
     }
     nets
 }
 
-/// Collect nets that have bulk capacitors (>= 10uF).
-fn collect_bulk_cap_nets(
-    content: &str,
+/// `C1` is a capacitor, `CN1` is a connector.
+fn is_capacitor(inst: &konnect_sexp::schematic::SymbolInstance) -> bool {
+    inst.reference.starts_with('C') && !inst.reference.starts_with("CN")
+}
+
+/// Whether a capacitor's value reads as bulk capacitance (>= 10uF).
+///
+/// The `10µ`/`22µ`/`47µ` arms never match — `to_uppercase` maps U+00B5 MICRO
+/// SIGN to Greek `Μ`. Left as found: that is a value-parsing bug, not a
+/// net-resolution one.
+fn is_bulk_capacitor_value(value: &str) -> bool {
+    let upper = value.to_uppercase();
+    upper.contains("10U")
+        || upper.contains("22U")
+        || upper.contains("47U")
+        || upper.contains("100U")
+        || upper.contains("220U")
+        || upper.contains("470U")
+        || upper.contains("1000U")
+        || upper.contains("10µ")
+        || upper.contains("22µ")
+        || upper.contains("47µ")
+}
+
+/// Nets with a capacitor on them, and the subset carrying bulk capacitance
+/// (>= 10uF). One pass, since the second is a subset of the first.
+fn capacitor_nets(
+    graph: &mut NetGraph,
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::parser::SexpNode],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut all = HashSet::new();
+    let mut bulk = HashSet::new();
+    for inst in instances.iter().filter(|inst| is_capacitor(inst)) {
+        let nets = pin_nets(graph, inst, lib_syms);
+        if is_bulk_capacitor_value(&inst.value) {
+            bulk.extend(nets.iter().cloned());
+        }
+        all.extend(nets);
+    }
+    (all, bulk)
+}
+
+/// Nets with a test point on them.
+fn test_point_nets(
+    graph: &mut NetGraph,
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
 ) -> HashSet<String> {
+    let is_test_point = |inst: &konnect_sexp::schematic::SymbolInstance| {
+        inst.reference.starts_with("TP") || inst.value.to_uppercase().contains("TESTPOINT")
+    };
     let mut nets = HashSet::new();
-    for inst in instances {
-        if !inst.reference.starts_with('C') || inst.reference.starts_with("CN") {
-            continue;
-        }
-        // Check if value suggests bulk cap (>= 10uF)
-        let val_upper = inst.value.to_uppercase();
-        let is_bulk = val_upper.contains("10U")
-            || val_upper.contains("22U")
-            || val_upper.contains("47U")
-            || val_upper.contains("100U")
-            || val_upper.contains("220U")
-            || val_upper.contains("470U")
-            || val_upper.contains("1000U")
-            || val_upper.contains("10µ")
-            || val_upper.contains("22µ")
-            || val_upper.contains("47µ");
-
-        if !is_bulk {
-            continue;
-        }
-
-        let lib_sym = find_lib_symbol(lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
-            for pin in &pins {
-                let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                if let Some(net) = find_net_at_point(content, px, py) {
-                    nets.insert(net);
-                }
-            }
-        }
+    for inst in instances.iter().filter(|inst| is_test_point(inst)) {
+        nets.extend(pin_nets(graph, inst, lib_syms));
     }
     nets
 }
 
-/// Collect power net names from power symbols and labels.
-fn collect_power_nets(content: &str) -> Vec<String> {
-    let mut nets = HashSet::new();
-
-    // Find power symbols (reference starts with #PWR)
-    // and net labels with power-like names
-    let _search = content.as_bytes();
-    let mut pos = 0;
-    while pos < content.len() {
-        // Look for plain labels with power-ish names. KiCAD's tag is `label`;
-        // `net_label` is not in the schematic format and matched nothing.
-        if let Some(label_pos) = content[pos..].find("(label \"") {
-            let abs = pos + label_pos + 8;
-            if let Some(end) = content[abs..].find('"') {
-                let name = &content[abs..abs + end];
-                if is_power_net_name(name) {
-                    nets.insert(name.to_string());
-                }
-            }
-            pos = abs + 1;
-        } else {
-            break;
+/// Nets a resistor pulls up: one of its pins is on a power net, so the nets
+/// its other pins reach are pulled to that rail.
+///
+/// Built once per sheet. Asking per pin instead re-walked every resistor on
+/// the sheet for each I2C or reset pin found.
+fn pull_up_nets(
+    graph: &mut NetGraph,
+    instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::parser::SexpNode],
+) -> HashSet<String> {
+    let mut pulled = HashSet::new();
+    for inst in instances
+        .iter()
+        .filter(|inst| inst.reference.starts_with('R'))
+    {
+        let nets = pin_nets(graph, inst, lib_syms);
+        if nets.iter().any(|net| is_power_net_name(net)) {
+            pulled.extend(nets);
         }
     }
+    pulled
+}
 
-    // Also check global labels
-    pos = 0;
-    while pos < content.len() {
-        if let Some(label_pos) = content[pos..].find("(global_label \"") {
-            let abs = pos + label_pos + 15;
-            if let Some(end) = content[abs..].find('"') {
-                let name = &content[abs..abs + end];
-                if is_power_net_name(name) {
-                    nets.insert(name.to_string());
-                }
-            }
-            pos = abs + 1;
-        } else {
-            break;
-        }
-    }
-
-    // Also check power_port symbols
-    pos = 0;
-    while pos < content.len() {
-        if let Some(pp_pos) = content[pos..].find("(power_port \"") {
-            let abs = pos + pp_pos + 13;
-            if let Some(end) = content[abs..].find('"') {
-                nets.insert(content[abs..abs + end].to_string());
-            }
-            pos = abs + 1;
-        } else {
-            break;
-        }
-    }
-
-    nets.into_iter().collect()
+/// The power rails on the sheet: every net a power symbol names, plus every
+/// label whose name reads like a rail.
+///
+/// `labels` must be `extract_all_net_labels` — a `+3V3` symbol names a rail
+/// exactly as a label does. `PWR_FLAG` is not a rail and does not appear: its
+/// pin is `power_out`, which the extractor skips.
+fn collect_power_nets(labels: &[Label]) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::PowerSymbol || is_power_net_name(&label.net))
+        .map(|label| label.net.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn is_power_net_name(name: &str) -> bool {
@@ -1270,113 +1280,6 @@ fn is_power_net_name(name: &str) -> bool {
         || upper == "AGND"
         || upper.starts_with("+")
         || upper.starts_with("V+")
-}
-
-/// Collect nets that have test points connected.
-fn collect_test_point_nets(
-    _content: &str,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
-) -> HashSet<String> {
-    let nets = HashSet::new();
-    for inst in instances {
-        if inst.reference.starts_with("TP") || inst.value.to_uppercase().contains("TESTPOINT") {
-            // Find the net this test point is on (simplified: look for nearby label)
-            // A proper implementation would trace the wire
-        }
-    }
-    nets
-}
-
-fn has_pull_up_on_net(
-    content: &str,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
-    lib_syms: &[&konnect_sexp::parser::SexpNode],
-    net_name: &str,
-) -> bool {
-    // Check if any resistor has one pin on this net and the other on a power net
-    for inst in instances {
-        if !inst.reference.starts_with('R') {
-            continue;
-        }
-        let lib_sym = find_lib_symbol(lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
-            let pin_nets: Vec<Option<String>> = pins
-                .iter()
-                .map(|p| {
-                    let (px, py) = pin_endpoint(p, inst.pin_transform());
-                    find_net_at_point(content, px, py)
-                })
-                .collect();
-
-            let has_target_net = pin_nets.iter().any(|n| n.as_deref() == Some(net_name));
-            let has_power_net = pin_nets.iter().any(|n| {
-                n.as_ref()
-                    .map(|name| is_power_net_name(name))
-                    .unwrap_or(false)
-            });
-            if has_target_net && has_power_net {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Find the net name at a given schematic point by checking nearby labels and wires.
-fn find_net_at_point(content: &str, x: f64, y: f64) -> Option<String> {
-    // Check plain labels near this point (KiCAD's tag is `label`, not
-    // `net_label` — the latter matched nothing in any real schematic).
-    let tolerance = 0.5; // mm
-    let mut search = 0;
-    while let Some(pos) = content[search..].find("(label \"") {
-        let abs = search + pos;
-        let after = &content[abs + 8..];
-        let name_end = after.find('"')?;
-        let name = &after[..name_end];
-
-        // Find the (at X Y) in this label
-        let block_end = content[abs..].find(")\n").unwrap_or(200) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-        if let Some(at_pos) = block.find("(at ") {
-            let at_str = &block[at_pos + 4..];
-            let parts: Vec<&str> = at_str.split([' ', ')']).take(2).collect();
-            if parts.len() >= 2 {
-                if let (Ok(lx), Ok(ly)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                    if (lx - x).abs() < tolerance && (ly - y).abs() < tolerance {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        search = abs + 1;
-    }
-
-    // Also check global_labels
-    search = 0;
-    while let Some(pos) = content[search..].find("(global_label \"") {
-        let abs = search + pos;
-        let after = &content[abs + 15..];
-        let name_end = after.find('"')?;
-        let name = &after[..name_end];
-
-        let block_end = content[abs..].find(")\n").unwrap_or(200) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-        if let Some(at_pos) = block.find("(at ") {
-            let at_str = &block[at_pos + 4..];
-            let parts: Vec<&str> = at_str.split([' ', ')']).take(2).collect();
-            if parts.len() >= 2 {
-                if let (Ok(lx), Ok(ly)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                    if (lx - x).abs() < tolerance && (ly - y).abs() < tolerance {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        search = abs + 1;
-    }
-
-    None
 }
 
 fn check_silkscreen_overlap(
@@ -1458,30 +1361,23 @@ fn extract_findings(result: &CallToolResult) -> Result<Vec<Value>, String> {
     Ok(findings.clone())
 }
 
+/// A context with no `kicad_cli`, no board and no project — every field of
+/// `ServerConfig` at its default. Both test modules below run tools that only
+/// read a schematic off disk.
+#[cfg(test)]
+fn test_ctx() -> ToolContext {
+    ToolContext::new(
+        crate::tools::ServerConfig::default(),
+        std::sync::Arc::new(crate::router::ToolRouter::new()),
+    )
+}
+
 #[cfg(test)]
 mod review_completion_tests {
     use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
     use konnect_sexp::schematic::HierarchicalSheetSpec;
     use konnect_sexp::schematic::{format_blank_schematic, format_hierarchical_sheet};
-    use std::sync::Arc;
     use tempfile::TempDir;
-
-    fn test_ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig {
-                kicad_cli: String::new(),
-                kicad_binary: String::new(),
-                ipc_address: String::new(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            Arc::new(ToolRouter::new()),
-        )
-    }
 
     fn single_unit_schematic(footprint: &str) -> String {
         format!(
@@ -1901,5 +1797,333 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|item| item["code"] == "zero_pads"));
+    }
+}
+
+/// The audits used to resolve a pin's net by scanning the file for a label
+/// within 0.5 mm of it. On a sheet drawn the normal way — a wire from the pin
+/// to a label somewhere along it, rails named by power symbols — almost every
+/// pin was netless, so `audit_decoupling` reported decoupled ICs as
+/// undecoupled, `audit_power_rails` reported capped rails as uncapped and did
+/// not see power-symbol rails at all, and `run_design_review` returned
+/// NOT READY on a correct schematic. These sheets are that shape.
+#[cfg(test)]
+mod net_resolution_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn sheet(body: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn audit_json(result: CallToolResult) -> Value {
+        assert!(!result.is_error, "audit failed: {:?}", result.content);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("audit result must be text JSON")
+        };
+        serde_json::from_str(text).expect("audit result must be valid JSON")
+    }
+
+    /// U1's VCC pin, a wire to a `VBUS` label 20 mm away, C1 (100 nF) hanging
+    /// off that wire under a junction dot, a test point at the wire's far end,
+    /// and a `+3V3` rail named by a power symbol with C2 (10 µF) on it.
+    ///
+    /// Nothing here is near enough to a label for the old scan: C1's pin is
+    /// 11.8 mm from the `VBUS` label, and `+3V3` has no label at all.
+    const WIRED_SHEET: &str = r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols
+    (symbol "power:+3V3"
+      (power)
+      (symbol "+3V3_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "+3V3") (number "1"))
+      )
+    )
+    (symbol "Device:C"
+      (symbol "C_1_1"
+        (pin passive line (at 0 3.81 270) (length 2.54) (name "~") (number "1"))
+        (pin passive line (at 0 -3.81 90) (length 2.54) (name "~") (number "2"))
+      )
+    )
+    (symbol "Connector:TestPoint"
+      (symbol "TestPoint_1_1"
+        (pin passive line (at 0 0 90) (length 0) (name "~") (number "1"))
+      )
+    )
+    (symbol "MCU:U"
+      (symbol "U_1_1"
+        (pin power_in line (at 0 0 180) (length 2.54) (name "VCC") (number "1"))
+      )
+    )
+  )
+  (wire (pts (xy 100 100) (xy 130 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000001"))
+  (wire (pts (xy 110 106.19) (xy 110 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000002"))
+  (wire (pts (xy 140 120) (xy 140 130)) (uuid "aaaaaaaa-0000-4000-8000-000000000003"))
+  (junction (at 110 100) (uuid "bbbbbbbb-0000-4000-8000-000000000001"))
+  (label "VBUS" (at 120 100 0) (uuid "cccccccc-0000-4000-8000-000000000001"))
+  (symbol
+    (lib_id "MCU:U")
+    (at 100 100 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000001")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "MCU" (at 100 100 0))
+    (property "Footprint" "Package_QFP:LQFP-48_7x7mm_P0.5mm" (at 100 100 0))
+  )
+  (symbol
+    (lib_id "Device:C")
+    (at 110 110 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000002")
+    (property "Reference" "C1" (at 110 110 0))
+    (property "Value" "100nF" (at 110 110 0))
+    (property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 110 110 0))
+  )
+  (symbol
+    (lib_id "Connector:TestPoint")
+    (at 130 100 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000003")
+    (property "Reference" "TP1" (at 130 100 0))
+    (property "Value" "TestPoint" (at 130 100 0))
+    (property "Footprint" "TestPoint:TestPoint_Pad_D1.0mm" (at 130 100 0))
+  )
+  (symbol
+    (lib_id "power:+3V3")
+    (at 140 120 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000004")
+    (property "Reference" "#PWR01" (at 140 120 0))
+    (property "Value" "+3V3" (at 140 120 0))
+  )
+  (symbol
+    (lib_id "Device:C")
+    (at 140 133.81 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000005")
+    (property "Reference" "C2" (at 140 133.81 0))
+    (property "Value" "10uF" (at 140 133.81 0))
+    (property "Footprint" "Capacitor_SMD:C_0805_2012Metric" (at 140 133.81 0))
+  )
+)
+"##;
+
+    /// A capacitor reaches a power pin through the wire they share, not by
+    /// sitting on top of the label that names it.
+    #[tokio::test]
+    async fn a_capacitor_across_a_wire_decouples_the_pin_at_the_other_end() {
+        let file = sheet(WIRED_SHEET);
+        let body = audit_json(
+            handle_audit_decoupling(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(body["total_power_pins"], 1, "{body}");
+        assert_eq!(body["pass_count"], 1, "{body}");
+        assert_eq!(body["findings"].as_array().unwrap().len(), 0, "{body}");
+    }
+
+    /// A rail named by a power symbol is a rail, and the caps, bulk caps and
+    /// test points on it are found through the same graph.
+    #[tokio::test]
+    async fn a_power_symbol_rail_is_audited_like_a_labelled_one() {
+        let file = sheet(WIRED_SHEET);
+        let body = audit_json(
+            handle_audit_power_rails(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(body["power_nets"], json!(["+3V3", "VBUS"]), "{body}");
+
+        let findings = body["findings"].as_array().unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding["severity"] == "error"),
+            "both rails are decoupled: {body}"
+        );
+        // VBUS carries only a 100 nF part, and only +3V3 lacks a test point.
+        let issues: Vec<&str> = findings
+            .iter()
+            .map(|finding| finding["issue"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            issues,
+            [
+                "Power rail 'VBUS' has no bulk capacitance (>= 10uF)",
+                "Power rail '+3V3' has no test point"
+            ],
+            "{body}"
+        );
+    }
+
+    /// `run_design_review`'s coverage counts the rails power symbols name, and
+    /// the review it fronts finds no fault on this sheet.
+    #[tokio::test]
+    async fn a_correctly_drawn_sheet_is_not_reported_as_not_ready() {
+        let file = sheet(WIRED_SHEET);
+        let body = audit_json(
+            handle_run_design_review(
+                &json!({ "schematic": file.path().to_str().unwrap(), "severity_filter": "info" }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        let review = &body["design_review"];
+
+        assert_eq!(review["coverage"]["schematic"]["named_nets"], 2, "{review}");
+        assert_eq!(review["errors"], 0, "{review}");
+        assert!(
+            !review["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["category"] == "decoupling"),
+            "{review}"
+        );
+    }
+
+    /// U2's SDA and SCL pins, each on a wire whose label sits 8 mm along it.
+    /// `pull_ups` is R1 and R2 tying those wires to a `+3V3` power symbol —
+    /// two resistors whose own pins are 5 mm from any label.
+    fn i2c_sheet(pull_ups: &str) -> String {
+        format!(
+            r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols
+    (symbol "power:+3V3"
+      (power)
+      (symbol "+3V3_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "+3V3") (number "1"))
+      )
+    )
+    (symbol "Device:R"
+      (symbol "R_1_1"
+        (pin passive line (at 0 2.54 270) (length 1.27) (name "~") (number "1"))
+        (pin passive line (at 0 -2.54 90) (length 1.27) (name "~") (number "2"))
+      )
+    )
+    (symbol "MCU:I2C"
+      (symbol "I2C_1_1"
+        (pin bidirectional line (at 0 0 180) (length 2.54) (name "SDA") (number "1"))
+        (pin bidirectional line (at 0 -5.08 180) (length 2.54) (name "SCL") (number "2"))
+      )
+    )
+  )
+  (wire (pts (xy 100 100) (xy 115 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000001"))
+  (wire (pts (xy 100 105.08) (xy 125 105.08)) (uuid "aaaaaaaa-0000-4000-8000-000000000002"))
+  (label "SDA" (at 108 100 0) (uuid "cccccccc-0000-4000-8000-000000000001"))
+  (label "SCL" (at 108 105.08 0) (uuid "cccccccc-0000-4000-8000-000000000002"))
+  (symbol
+    (lib_id "MCU:I2C")
+    (at 100 100 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000001")
+    (property "Reference" "U2" (at 100 100 0))
+    (property "Value" "SENSOR" (at 100 100 0))
+    (property "Footprint" "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" (at 100 100 0))
+  )
+{pull_ups})
+"##
+        )
+    }
+
+    const I2C_PULL_UPS: &str = r##"  (symbol
+    (lib_id "Device:R")
+    (at 115 97.46 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000002")
+    (property "Reference" "R1" (at 115 97.46 0))
+    (property "Value" "4.7k" (at 115 97.46 0))
+    (property "Footprint" "Resistor_SMD:R_0402_1005Metric" (at 115 97.46 0))
+  )
+  (symbol
+    (lib_id "Device:R")
+    (at 125 102.54 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000003")
+    (property "Reference" "R2" (at 125 102.54 0))
+    (property "Value" "4.7k" (at 125 102.54 0))
+    (property "Footprint" "Resistor_SMD:R_0402_1005Metric" (at 125 102.54 0))
+  )
+  (symbol
+    (lib_id "power:+3V3")
+    (at 115 94.92 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000004")
+    (property "Reference" "#PWR02" (at 115 94.92 0))
+    (property "Value" "+3V3" (at 115 94.92 0))
+  )
+  (symbol
+    (lib_id "power:+3V3")
+    (at 125 100 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000005")
+    (property "Reference" "#PWR03" (at 125 100 0))
+    (property "Value" "+3V3" (at 125 100 0))
+  )
+"##;
+
+    async fn connection_findings(schematic: &str) -> Vec<Value> {
+        let file = sheet(schematic);
+        let body = audit_json(
+            handle_audit_connections(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        body["findings"].as_array().unwrap().clone()
+    }
+
+    /// The missing pull-up this audit exists to report. A pin whose net the
+    /// old scan could not resolve was skipped silently, so the fault went
+    /// unreported — the same blindness as the false positives, pointing the
+    /// other way.
+    #[tokio::test]
+    async fn a_missing_i2c_pull_up_is_reported_with_the_net_it_is_missing_from() {
+        let findings = connection_findings(&i2c_sheet("")).await;
+        let issues: Vec<&str> = findings
+            .iter()
+            .map(|finding| finding["issue"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            issues,
+            [
+                "I2C SDA pin on U2 (net: SDA) has no pull-up resistor",
+                "I2C SCL pin on U2 (net: SCL) has no pull-up resistor"
+            ],
+            "{findings:?}"
+        );
+    }
+
+    /// And the same sheet with the pull-ups fitted is silent. Neither resistor
+    /// pin sits on a label: one reaches its net down a wire, the other through
+    /// the power symbol naming the rail.
+    #[tokio::test]
+    async fn a_pull_up_is_found_through_the_wire_and_the_power_symbol() {
+        let findings = connection_findings(&i2c_sheet(I2C_PULL_UPS)).await;
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }
