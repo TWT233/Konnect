@@ -1,4 +1,4 @@
-* text=auto
-*.png binary
-*.ico binary
-*.icns binary
+# KiCad-authored fixtures are byte-evidence: never eol-normalize them.
+crates/konnect-sexp/tests/fixtures/** -text
+crates/konnect-core/tests/fixtures/** -text
+crates/konnect-ipc/tests/fixtures/** -text

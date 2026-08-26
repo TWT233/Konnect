@@ -92,7 +92,11 @@ mod tests {
         assert_eq!(combined_status([Pass, Pass]), Pass);
         assert_eq!(combined_status([Pass, Warn]), Warn);
         assert_eq!(combined_status([Warn, Fail, Pass]), Fail);
-        assert_eq!(combined_status([Fail, Blocked]), Blocked, "unevaluable outranks failed");
+        assert_eq!(
+            combined_status([Fail, Blocked]),
+            Blocked,
+            "unevaluable outranks failed"
+        );
         assert_eq!(combined_status([Blocked, Empty, Fail]), Empty);
     }
 
@@ -108,7 +112,7 @@ mod tests {
         use GateStatus::*;
         for non_pass in [Warn, Fail, Blocked, Empty] {
             for position in 0..3 {
-                let mut outcomes = vec![Pass, Pass, Pass];
+                let mut outcomes = [Pass, Pass, Pass];
                 outcomes[position] = non_pass;
                 assert_ne!(
                     combined_status(outcomes.iter().copied()),
