@@ -19,8 +19,12 @@
 //! - `pic_programmer.kicad_pcb` — KiCad 10 format (20260206): no net table,
 //!   `(net "NAME")` in place on segments, vias and zones.
 
-use konnect_sexp::board::{board_outline_bbox, tracks, vias, zones};
+use konnect_sexp::board::{
+    board_outline_bbox, count_pads, footprint_courtyards, footprints, tracks, vias, zones,
+    CourtyardSource, FootprintCourtyard, PcbConnectivityIndex, Side,
+};
 use konnect_sexp::parse_sexp;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> konnect_sexp::SexpNode {
@@ -181,6 +185,348 @@ fn fixture_corpus_scans_are_total() {
     assert_eq!(seen, 3, "expected the three committed board fixtures");
 }
 
+// ─── Courtyards: hand-computed ground truth ──────────────────────────────────
+
+fn courtyard_of<'a>(scan: &'a [FootprintCourtyard], reference: &str) -> &'a FootprintCourtyard {
+    scan.iter()
+        .find(|c| c.reference.as_deref() == Some(reference))
+        .unwrap_or_else(|| panic!("no courtyard entry for {reference}"))
+}
+
+/// ecc83 courtyards against numbers computed by hand from the file text
+/// (root `(at …)` plus the F.CrtYd artwork coordinates), never from the code
+/// under test.
+///
+/// C1 (rotated 90°): root `(at 141.605 99.695 90)`; its courtyard is a single
+/// `fp_circle` center (2.5, 0), end (7.75, 0) → r = 5.25, local bbox
+/// (−2.75, −5.25, 7.75, 5.25). KiCAD's Y-down CCW rotation at 90° maps
+/// (x, y) → (y, −x), so the corners land on (∓5.25, ±2.75 / ∓7.75) with hull
+/// (−5.25, −7.75, 5.25, 2.75); plus the anchor:
+/// (136.355, 91.945, 146.855, 102.445).
+///
+/// R1 (rotated −90°): root `(at 136.271 107.95 -90)`, local courtyard hull
+/// (−1.05, −1.5, 8.67, 1.5) from its four fp_lines. At −90°, (x, y) → (−y, x):
+/// hull (−1.5, −1.05, 1.5, 8.67); plus the anchor:
+/// (134.771, 106.9, 137.771, 116.62). The same transform puts R1 pad 2
+/// (local (7.62, 0)) at (136.271, 115.57) — where the file has a routed
+/// segment of that pad's net starting, which is what pins the convention to
+/// ground truth rather than to another calculation.
+#[test]
+fn ecc83_courtyards_match_hand_computed_transforms() {
+    let tree = fixture("ecc83-pp.kicad_pcb");
+    let scan = footprint_courtyards(&tree);
+    assert_eq!(scan.skipped, 0, "pcbnew-authored footprints must all parse");
+    assert_eq!(scan.items.len(), 15); // grep -c '(footprint ' = 15
+    assert!(scan
+        .items
+        .iter()
+        .all(|c| c.bbox_source == CourtyardSource::Courtyard));
+
+    let c1 = courtyard_of(&scan.items, "C1");
+    assert_eq!(c1.rotation_deg, 90.0);
+    assert_eq!(c1.layer_side, Side::Front);
+    assert_eq!(c1.at, (141.605, 99.695));
+    assert_bbox_eq(c1.bbox, (136.355, 91.945, 146.855, 102.445), "C1 rot 90");
+
+    let r1 = courtyard_of(&scan.items, "R1");
+    assert_eq!(r1.rotation_deg, -90.0);
+    assert_bbox_eq(r1.bbox, (134.771, 106.9, 137.771, 116.62), "R1 rot -90");
+}
+
+/// pic_programmer's JP1 is the corpus's back-side footprint: `(layer "B.Cu")`,
+/// root `(at 148.082 97.79)`, courtyard hull (−1.65, −1.25, 1.65, 1.25) from
+/// four B.CrtYd fp_lines. The file stores back-side children already flipped,
+/// so the bbox is the plain translation (146.432, 96.54, 149.732, 99.04) —
+/// verified against routed copper: the B.Cu VCC track ends at (147.447,
+/// 97.79), inside pad 1 whose anchor this transform puts at (147.357, 97.79);
+/// mirroring the footprint would move that pad to 148.807, the wrong side.
+#[test]
+fn pic_programmer_back_side_footprint_is_stored_preflipped() {
+    let tree = fixture("pic_programmer.kicad_pcb");
+    let scan = footprint_courtyards(&tree);
+    assert_eq!(scan.skipped, 0);
+    assert_eq!(scan.items.len(), 63); // grep -c '(footprint ' = 63
+
+    let jp1 = courtyard_of(&scan.items, "JP1");
+    assert_eq!(jp1.layer_side, Side::Back);
+    assert_eq!(jp1.rotation_deg, 0.0);
+    assert_bbox_eq(jp1.bbox, (146.432, 96.54, 149.732, 99.04), "JP1 back side");
+
+    // And the pad the copper pinned: JP1 pad 1 (net VCC) at 148.082 − 0.725.
+    let ix = PcbConnectivityIndex::build(&tree);
+    let vcc_pad = ix
+        .pads_of_net("VCC")
+        .iter()
+        .find(|p| p.reference == "JP1")
+        .expect("JP1 pad 1 is on VCC");
+    assert!((vcc_pad.at.0 - 147.357).abs() < 1e-9 && (vcc_pad.at.1 - 97.79).abs() < 1e-9);
+    assert_eq!(vcc_pad.layer_side, Side::Back);
+}
+
+/// The NFC antenna board is the fallback corpus: neither footprint draws a
+/// courtyard. J1 falls back to its pads — two 0.3×1.5 pads at local
+/// (±0.5, 0.75), root `(at 151.44971 66.560695)`, so the hull is
+/// (−0.65, 0, 0.65, 1.5) translated: (150.79971, 66.560695, 152.09971,
+/// 68.060695). The logo footprint has no pads either and degrades to its
+/// anchor. Nothing is silently absent: 2 footprints, 2 entries, 0 skipped.
+#[test]
+fn nfc_antenna_footprints_fall_back_when_courtyards_are_missing() {
+    let tree = fixture("RoyalBlue54L-NFC-Antenna.kicad_pcb");
+    let scan = footprint_courtyards(&tree);
+    assert_eq!((scan.items.len(), scan.skipped), (2, 0));
+
+    let j1 = courtyard_of(&scan.items, "J1");
+    assert_eq!(j1.bbox_source, CourtyardSource::PadsFallback);
+    assert_bbox_eq(
+        j1.bbox,
+        (150.79971, 66.560695, 152.09971, 68.060695),
+        "J1 pads fallback",
+    );
+
+    let logo = courtyard_of(&scan.items, "REF**");
+    assert_eq!(logo.bbox_source, CourtyardSource::AnchorOnly);
+    assert_bbox_eq(
+        logo.bbox,
+        (153.1125, 118.976103, 153.1125, 118.976103),
+        "logo anchor",
+    );
+}
+
+// ─── Connectivity index: pinned counts ───────────────────────────────────────
+//
+// Every expected number below was derived OUTSIDE the code under test — an
+// independent Python s-expression walker over the raw fixture text (and
+// grep for the footprint counts) — never by running the index and copying
+// its output.
+
+/// ecc83: 33 pads on 15 footprints, all netted, 13 distinct nets across pads
+/// and segments (independently counted from the file's net references).
+#[test]
+fn ecc83_index_pinned_counts() {
+    let tree = fixture("ecc83-pp.kicad_pcb");
+    let ix = PcbConnectivityIndex::build(&tree);
+    assert_eq!((ix.skipped_pads(), ix.skipped_tracks()), (0, 0));
+
+    let nets = ix.nets();
+    assert_eq!(nets.len(), 13);
+    let total: usize = nets.iter().map(|n| ix.pads_of_net(n).len()).sum();
+    assert_eq!(total, 33);
+    assert_eq!(ix.pads_without_net().len(), 0);
+
+    // Per-net spot checks, counted by hand from the pad (net …) nodes.
+    assert_eq!(ix.pads_of_net("GND").len(), 7);
+    assert_eq!(ix.net_of_pad("R1", "1"), Some("Net-(U1A-G)"));
+    assert_eq!(ix.net_of_pad("R1", "2"), Some("Net-(U1A-K)"));
+    // The 17 Net-(U1A-G) segments were pinned in the T0.3a track tests; the
+    // index must agree with the same scan, not re-derive it.
+    assert_eq!(ix.segments_of_net("Net-(U1A-G)").len(), 17);
+
+    // R1 pad 2 through (136.271, 107.95, −90°): local (7.62, 0) → (136.271,
+    // 115.57), where the file has a routed Net-(U1A-K) segment starting.
+    let k = ix.pads_of_net("Net-(U1A-K)");
+    let p = k.iter().find(|p| p.reference == "R1").expect("R1 pad 2");
+    assert!((p.at.0 - 136.271).abs() < 1e-9 && (p.at.1 - 115.57).abs() < 1e-9);
+}
+
+/// pic_programmer (KiCad 10): 247 pads on 63 footprints — 236 netted, 11 on
+/// no net — over 111 distinct nets; VCC pads 12 of them.
+#[test]
+fn pic_programmer_index_pinned_counts() {
+    let tree = fixture("pic_programmer.kicad_pcb");
+    let ix = PcbConnectivityIndex::build(&tree);
+    assert_eq!((ix.skipped_pads(), ix.skipped_tracks()), (0, 0));
+
+    let nets = ix.nets();
+    assert_eq!(nets.len(), 111);
+    let netted: usize = nets.iter().map(|n| ix.pads_of_net(n).len()).sum();
+    assert_eq!(netted, 236);
+    assert_eq!(ix.pads_without_net().len(), 11);
+    assert_eq!(ix.pads_of_net("VCC").len(), 12);
+    assert_eq!(
+        ix.net_of_pad("JP1", "2"),
+        Some("/pic_sockets/VCC_PIC"),
+        "JP1 pad 2 net, read straight from the file"
+    );
+}
+
+/// NFC antenna: 2 pads, both on /ANT — the board's only net.
+#[test]
+fn nfc_antenna_index_pinned_counts() {
+    let tree = fixture("RoyalBlue54L-NFC-Antenna.kicad_pcb");
+    let ix = PcbConnectivityIndex::build(&tree);
+    assert_eq!((ix.skipped_pads(), ix.skipped_tracks()), (0, 0));
+    assert_eq!(ix.nets(), vec!["/ANT"]);
+    assert_eq!(ix.pads_of_net("/ANT").len(), 2);
+    assert_eq!(ix.pads_without_net().len(), 0);
+    // J1 pad 1: local (−0.5, 0.75) + (151.44971, 66.560695), unrotated.
+    let p = &ix.pads_of_net("/ANT")[0];
+    assert!((p.at.0 - 150.94971).abs() < 1e-9 && (p.at.1 - 67.310695).abs() < 1e-9);
+}
+
+// ─── Connectivity index: invariants (proptest over the fixtures) ─────────────
+
+/// The references a board's footprints carry, extracted directly in the test
+/// (the index's own extraction is what is under test).
+fn reference_set(tree: &konnect_sexp::SexpNode) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for fp in footprints(tree) {
+        for prop in fp.find_all("property") {
+            if prop.get(1).and_then(|n| n.as_str()) == Some("Reference") {
+                if let Some(r) = prop.get(2).and_then(|n| n.as_str()) {
+                    out.insert(r.to_string());
+                }
+            }
+        }
+        for text in fp.find_all("fp_text") {
+            if text.get(1).and_then(|n| n.as_str()) == Some("reference") {
+                if let Some(r) = text.get(2).and_then(|n| n.as_str()) {
+                    out.insert(r.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Index invariants that must hold on any board. `strict_net_of_pad` demands
+/// `net_of_pad(p) == Some(n)` for every pad of every net — true wherever no
+/// two same-numbered pads sit on different nets (all three fixtures; some
+/// demo boards break it with per-hole `unconnected-…_N` nets, so the demo
+/// oracle uses the membership form instead).
+fn assert_index_invariants(tree: &konnect_sexp::SexpNode, label: &str, strict_net_of_pad: bool) {
+    let ix = PcbConnectivityIndex::build(tree);
+    let refs = reference_set(tree);
+
+    // 1. Every PadSite's reference exists among the board's footprints.
+    let all_sites = || {
+        ix.nets()
+            .into_iter()
+            .flat_map(|n| ix.pads_of_net(n).iter())
+            .chain(ix.pads_without_net().iter())
+    };
+    for site in all_sites() {
+        assert!(
+            refs.contains(&site.reference),
+            "{label}: PadSite references {} which no footprint carries",
+            site.reference
+        );
+        assert!(site.at.0.is_finite() && site.at.1.is_finite());
+    }
+
+    // 2. pads_of_net ∪ pads_without_net partitions all readable pads.
+    let netted: usize = ix.nets().iter().map(|n| ix.pads_of_net(n).len()).sum();
+    assert_eq!(
+        netted + ix.pads_without_net().len() + ix.skipped_pads(),
+        count_pads(tree),
+        "{label}: netted + unconnected + skipped must cover every pad node"
+    );
+    let key = |p: &konnect_sexp::board::PadSite| {
+        (
+            p.reference.clone(),
+            p.pad_number.clone(),
+            p.at.0.to_bits(),
+            p.at.1.to_bits(),
+        )
+    };
+    let with_net: HashSet<_> = ix
+        .nets()
+        .into_iter()
+        .flat_map(|n| ix.pads_of_net(n).iter().map(key))
+        .collect();
+    assert!(
+        !ix.pads_without_net()
+            .iter()
+            .map(key)
+            .any(|k| with_net.contains(&k)),
+        "{label}: a pad is indexed both under a net and as unconnected"
+    );
+
+    // 3. net_of_pad is consistent with pads_of_net.
+    for net in ix.nets() {
+        for pad in ix.pads_of_net(net) {
+            let got = ix.net_of_pad(&pad.reference, &pad.pad_number);
+            if strict_net_of_pad {
+                assert_eq!(
+                    got,
+                    Some(net),
+                    "{label}: net_of_pad({}, {}) disagrees with pads_of_net",
+                    pad.reference,
+                    pad.pad_number
+                );
+            } else {
+                let m = got.unwrap_or_else(|| {
+                    panic!(
+                        "{label}: pad {}:{} indexed under {net} but net_of_pad knows it not",
+                        pad.reference, pad.pad_number
+                    )
+                });
+                assert!(
+                    ix.pads_of_net(m)
+                        .iter()
+                        .any(|q| q.reference == pad.reference && q.pad_number == pad.pad_number),
+                    "{label}: net_of_pad answer {m} holds no such pad"
+                );
+            }
+        }
+    }
+    // …and unconnected pads never get a net answer through some other pad of
+    // the same footprint+number (fixtures only — demo jumper footprints may
+    // legitimately share a number between netted and unconnected pads).
+    if strict_net_of_pad {
+        for pad in ix.pads_without_net() {
+            assert_eq!(
+                ix.net_of_pad(&pad.reference, &pad.pad_number),
+                None,
+                "{label}: unconnected pad {}:{} reports a net",
+                pad.reference,
+                pad.pad_number
+            );
+        }
+    }
+}
+
+static FIXTURE_TREES: std::sync::OnceLock<Vec<(&'static str, konnect_sexp::SexpNode)>> =
+    std::sync::OnceLock::new();
+
+fn fixture_trees() -> &'static [(&'static str, konnect_sexp::SexpNode)] {
+    FIXTURE_TREES.get_or_init(|| {
+        [
+            "ecc83-pp.kicad_pcb",
+            "pic_programmer.kicad_pcb",
+            "RoyalBlue54L-NFC-Antenna.kicad_pcb",
+        ]
+        .into_iter()
+        .map(|name| (name, fixture(name)))
+        .collect()
+    })
+}
+
+proptest::proptest! {
+    /// The invariants hold for the whole corpus, and for every net the index
+    /// claims: pads_of_net answers are stable, in-corpus, and non-empty
+    /// exactly when the net has pads.
+    #[test]
+    fn index_invariants_hold_across_the_fixture_corpus(
+        fixture_ix in 0usize..3,
+        net_pick in proptest::num::usize::ANY,
+    ) {
+        let (name, tree) = &fixture_trees()[fixture_ix];
+        assert_index_invariants(tree, name, true);
+
+        let ix = PcbConnectivityIndex::build(tree);
+        let nets = ix.nets();
+        proptest::prop_assume!(!nets.is_empty());
+        let net = nets[net_pick % nets.len()];
+        // A net the index reports must have a pad or a segment (that is what
+        // being in the index means)…
+        proptest::prop_assert!(
+            !ix.pads_of_net(net).is_empty() || !ix.segments_of_net(net).is_empty()
+        );
+        // …and never the pseudo-net.
+        proptest::prop_assert!(!net.is_empty());
+    }
+}
+
 // ─── Installed-demo oracle (skips without KiCad) ─────────────────────────────
 
 fn demo_dirs() -> Option<PathBuf> {
@@ -291,4 +637,82 @@ fn every_installed_demo_board_scans_losslessly() {
     assert!(n_vias >= 8, "suspiciously few vias ({n_vias})");
     assert!(n_zones >= 2, "suspiciously few zones ({n_zones})");
     assert!(n_bboxes >= 3, "suspiciously few outlines ({n_bboxes})");
+}
+
+/// Courtyards and the connectivity index over every installed demo board:
+/// each board indexes without loss, the index invariants hold (membership
+/// form of net_of_pad — some demo footprints put same-numbered pads on
+/// distinct per-hole `unconnected-…` nets), and every footprint yields a
+/// courtyard entry with a well-formed bbox.
+#[test]
+fn every_installed_demo_board_indexes_consistently() {
+    let Some(root) = demo_dirs() else {
+        eprintln!("SKIP: no KiCAD demos found (set KICAD_DEMOS to enable)");
+        return;
+    };
+    let boards = collect_boards(&root);
+    assert!(!boards.is_empty());
+
+    let (mut n_pads, mut n_nets, mut n_courtyards, mut n_fallbacks) = (0usize, 0, 0, 0);
+    let mut failures = Vec::new();
+    for board in &boards {
+        let content = std::fs::read_to_string(board).unwrap_or_default();
+        let Ok(tree) = parse_sexp(&content) else {
+            failures.push(format!("{}: parse failure", board.display()));
+            continue;
+        };
+        let label = board.display().to_string();
+
+        let ix = PcbConnectivityIndex::build(&tree);
+        if ix.skipped_pads() + ix.skipped_tracks() > 0 {
+            failures.push(format!(
+                "{label}: skipped {} pads / {} tracks from a pcbnew-authored board",
+                ix.skipped_pads(),
+                ix.skipped_tracks()
+            ));
+            continue;
+        }
+        assert_index_invariants(&tree, &label, false);
+        n_pads += ix
+            .nets()
+            .iter()
+            .map(|n| ix.pads_of_net(n).len())
+            .sum::<usize>()
+            + ix.pads_without_net().len();
+        n_nets += ix.nets().len();
+
+        let scan = footprint_courtyards(&tree);
+        if scan.skipped > 0 {
+            failures.push(format!(
+                "{label}: {} footprints yielded no courtyard entry",
+                scan.skipped
+            ));
+        }
+        if scan.items.len() != footprints(&tree).len() {
+            failures.push(format!("{label}: courtyard entries != footprints"));
+        }
+        for c in &scan.items {
+            let (x0, y0, x1, y1) = c.bbox;
+            if !(x0 <= x1 && y0 <= y1 && x0.is_finite() && y1.is_finite()) {
+                failures.push(format!("{label}: malformed courtyard bbox {:?}", c.bbox));
+            }
+            match c.bbox_source {
+                CourtyardSource::Courtyard => n_courtyards += 1,
+                CourtyardSource::PadsFallback | CourtyardSource::AnchorOnly => n_fallbacks += 1,
+            }
+        }
+    }
+    eprintln!(
+        "indexed {} demo boards: {n_pads} pads, {n_nets} nets, \
+         {n_courtyards} courtyards + {n_fallbacks} fallbacks",
+        boards.len()
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // Vacuity guards, far below the real corpus numbers.
+    assert!(n_pads > 1000, "suspiciously few pads ({n_pads})");
+    assert!(n_nets > 100, "suspiciously few nets ({n_nets})");
+    assert!(
+        n_courtyards > 100,
+        "suspiciously few courtyards ({n_courtyards})"
+    );
 }
