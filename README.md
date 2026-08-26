@@ -152,8 +152,10 @@ konnect status --client codex
 konnect uninstall --client codex
 ```
 
-Keep `--client codex` in the MCP server command so first-launch setup also stays
-inside Codex's directories. For example, register a standalone binary with the
+MCP server startup never installs or restores guidance. Run `konnect init`
+explicitly when you want those files installed; after `konnect uninstall`,
+starting the server leaves them removed. `--client` remains accepted in server
+commands for compatibility. For example, register a standalone binary with the
 Codex CLI using:
 
 ```bash
