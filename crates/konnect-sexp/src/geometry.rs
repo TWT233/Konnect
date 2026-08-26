@@ -162,6 +162,107 @@ pub fn transform_pad(
     )
 }
 
+/// Axis-aligned bounding box of a circular arc given in KiCAD's three-point
+/// form: `(start …) (mid …) (end …)`, where `mid` is any point on the arc
+/// strictly between the endpoints.
+///
+/// The endpoints alone are **not** the bbox: an arc bulges past them wherever
+/// it crosses an axis direction of its own circle. This derives the center and
+/// radius from the three points, then adds each of the four axis-extreme
+/// points (center ± r along x/y) that actually lies on the swept portion —
+/// the sweep being the one that passes through `mid`, so both windings are
+/// handled without any orientation convention. This is direction-agnostic and
+/// therefore identical in Y-up and Y-down coordinates.
+///
+/// Collinear (or coincident) input has no finite circle; the bbox of the
+/// three points themselves is returned, which is exact for the degenerate
+/// straight "arc" KiCAD would render.
+///
+/// Returns `(min_x, min_y, max_x, max_y)`.
+///
+/// # Examples
+/// ```
+/// use konnect_sexp::geometry::arc_bbox;
+///
+/// // Semicircle of radius 2 about the origin, bulging through (0, 2):
+/// // the top extreme lies on the arc, the bottom one does not.
+/// let (x0, y0, x1, y1) = arc_bbox((2.0, 0.0), (0.0, 2.0), (-2.0, 0.0));
+/// assert!((x0 - -2.0).abs() < 1e-9 && (y0 - 0.0).abs() < 1e-9);
+/// assert!((x1 - 2.0).abs() < 1e-9 && (y1 - 2.0).abs() < 1e-9);
+/// ```
+pub fn arc_bbox(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> (f64, f64, f64, f64) {
+    let (x1, y1) = start;
+    let (x2, y2) = mid;
+    let (x3, y3) = end;
+
+    let three_point_hull = || {
+        (
+            x1.min(x2).min(x3),
+            y1.min(y2).min(y3),
+            x1.max(x2).max(x3),
+            y1.max(y2).max(y3),
+        )
+    };
+
+    // Circumcenter. `d` is 4× the signed triangle area, so comparing it
+    // against the squared span makes the collinearity test scale-invariant:
+    // a hair-thin arc across a whole board and a tiny fillet both degrade to
+    // the point hull only when the circle genuinely cannot be recovered.
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    let span = (x1 - x3)
+        .hypot(y1 - y3)
+        .max((x1 - x2).hypot(y1 - y2))
+        .max((x2 - x3).hypot(y2 - y3));
+    if !d.is_finite() || d.abs() < 1e-9 * span * span.max(1.0) {
+        return three_point_hull();
+    }
+
+    let q1 = x1 * x1 + y1 * y1;
+    let q2 = x2 * x2 + y2 * y2;
+    let q3 = x3 * x3 + y3 * y3;
+    let ux = (q1 * (y2 - y3) + q2 * (y3 - y1) + q3 * (y1 - y2)) / d;
+    let uy = (q1 * (x3 - x2) + q2 * (x1 - x3) + q3 * (x2 - x1)) / d;
+    let r = (x1 - ux).hypot(y1 - uy);
+
+    let tau = 2.0 * PI;
+    let a_s = (y1 - uy).atan2(x1 - ux);
+    let a_m = (y2 - uy).atan2(x2 - ux);
+    let a_e = (y3 - uy).atan2(x3 - ux);
+
+    // Walk CCW from start: if mid comes before end, the arc is the CCW sweep;
+    // otherwise it is the complement. An axis extreme belongs to the bbox only
+    // when its angle lies inside that sweep.
+    let d_e = (a_e - a_s).rem_euclid(tau);
+    let d_m = (a_m - a_s).rem_euclid(tau);
+    let ccw = d_m <= d_e;
+    let on_arc = |t: f64| {
+        let dt = (t - a_s).rem_euclid(tau);
+        if ccw {
+            dt <= d_e
+        } else {
+            dt >= d_e
+        }
+    };
+
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (x1.min(x3), y1.min(y3), x1.max(x3), y1.max(y3));
+    let extremes = [
+        (0.0, ux + r, uy),
+        (PI / 2.0, ux, uy + r),
+        (PI, ux - r, uy),
+        (3.0 * PI / 2.0, ux, uy - r),
+    ];
+    for (t, px, py) in extremes {
+        if on_arc(t) {
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max(px);
+            max_y = max_y.max(py);
+        }
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
 /// Snap a coordinate to KiCAD's schematic grid (default 1.27 mm = 50 mil).
 pub fn snap_to_grid(value: f64, grid: f64) -> f64 {
     (value / grid).round() * grid
@@ -472,6 +573,104 @@ mod tests {
         let (x, y) = transform_pin(1.0, 0.0, t(0.0, 0.0, 180.0, false, false));
         assert!((x - -1.0).abs() < 1e-6, "x={}", x);
         assert!((y).abs() < 1e-6, "y={}", y);
+    }
+
+    fn assert_bbox(got: (f64, f64, f64, f64), expected: (f64, f64, f64, f64), label: &str) {
+        let ok = (got.0 - expected.0).abs() < 1e-9
+            && (got.1 - expected.1).abs() < 1e-9
+            && (got.2 - expected.2).abs() < 1e-9
+            && (got.3 - expected.3).abs() < 1e-9;
+        assert!(ok, "{label}: got {got:?}, expected {expected:?}");
+    }
+
+    /// Quarter arc from 45° to 135° through 90° (center origin, r = 1).
+    /// The +Y extreme (0, 1) lies mid-sweep, so the bbox must reach y = 1 even
+    /// though both endpoints sit at y = √2/2 — the exact failure mode of an
+    /// endpoints-only bbox.
+    #[test]
+    fn arc_bbox_quarter_arc_includes_axis_crossing() {
+        let h = std::f64::consts::FRAC_1_SQRT_2; // √2/2
+        assert_bbox(
+            arc_bbox((h, h), (0.0, 1.0), (-h, h)),
+            (-h, h, h, 1.0),
+            "quarter 45°→135°",
+        );
+    }
+
+    /// Semicircle from (2, 0) to (−2, 0) through (0, 2): the top extreme is on
+    /// the arc, the bottom one is on the *other* half of the circle and must
+    /// not leak into the bbox.
+    #[test]
+    fn arc_bbox_semicircle() {
+        assert_bbox(
+            arc_bbox((2.0, 0.0), (0.0, 2.0), (-2.0, 0.0)),
+            (-2.0, 0.0, 2.0, 2.0),
+            "upper semicircle",
+        );
+    }
+
+    /// Tiny arc from 10° to 20° (r = 1): it crosses no axis, so the bbox is
+    /// exactly the endpoints' box. Hand-computed: cos/sin of 10° and 20°.
+    #[test]
+    fn arc_bbox_tiny_arc_is_endpoint_hull() {
+        let (s, m, e) = (
+            (0.984_807_753_012_208, 0.173_648_177_666_930_33),
+            (0.965_925_826_289_068_3, 0.258_819_045_102_520_74),
+            (0.939_692_620_785_908_4, 0.342_020_143_325_668_7),
+        );
+        assert_bbox(
+            arc_bbox(s, m, e),
+            (
+                0.939_692_620_785_908_4,
+                0.173_648_177_666_930_33,
+                0.984_807_753_012_208,
+                0.342_020_143_325_668_7,
+            ),
+            "10°→20°",
+        );
+    }
+
+    /// The same geometric quarter-circle swept the other way round: from
+    /// (0, 1) down through (1, 0) to (0, −1). Mid selects the +X half, so
+    /// x = 1 is on the arc and x = −1 (the far side) must be excluded.
+    /// A winding-convention bug flips exactly this case.
+    #[test]
+    fn arc_bbox_respects_sweep_direction() {
+        assert_bbox(
+            arc_bbox((0.0, 1.0), (1.0, 0.0), (0.0, -1.0)),
+            (0.0, -1.0, 1.0, 1.0),
+            "clockwise-in-math-coords right half",
+        );
+    }
+
+    /// Collinear points have no circumcircle; the three-point hull is the
+    /// exact bbox of the straight segment KiCAD renders for such an arc.
+    #[test]
+    fn arc_bbox_collinear_degrades_to_point_hull() {
+        assert_bbox(
+            arc_bbox((0.0, 0.0), (1.0, 1.0), (2.0, 2.0)),
+            (0.0, 0.0, 2.0, 2.0),
+            "collinear",
+        );
+    }
+
+    /// A real corner fillet from an Edge.Cuts outline (RoyalBlue54L NFC
+    /// antenna demo, KiCAD-authored): quarter arc, center (148.94971,
+    /// 71.060695), r = 1, in Y-down board coordinates. Its −Y extreme
+    /// coincides with the end tangent point at y = 70.060695.
+    #[test]
+    fn arc_bbox_kicad_edge_cuts_fillet() {
+        let got = arc_bbox(
+            (147.94971, 71.060695),
+            (148.242_603, 70.353_588),
+            (148.94971, 70.060695),
+        );
+        let expected = (147.94971, 70.060695, 148.94971, 71.060695);
+        let ok = (got.0 - expected.0).abs() < 1e-4
+            && (got.1 - expected.1).abs() < 1e-4
+            && (got.2 - expected.2).abs() < 1e-4
+            && (got.3 - expected.3).abs() < 1e-4;
+        assert!(ok, "fillet: got {got:?}, expected {expected:?}");
     }
 
     #[test]
