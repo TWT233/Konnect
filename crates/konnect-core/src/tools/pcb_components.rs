@@ -380,6 +380,14 @@ fn text_size(node: &konnect_sexp::SexpNode) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Explicit font stroke width, falling back to KiCad's 15%-of-size default.
+fn text_stroke_width(node: &konnect_sexp::SexpNode) -> f64 {
+    node.find("effects")
+        .and_then(|effects| effects.find("font"))
+        .and_then(|font| font.find_f64("thickness"))
+        .unwrap_or_else(|| text_size(node) * 0.15)
+}
+
 /// Text position and angle from `(at x y [rot])`.
 fn text_at(node: &konnect_sexp::SexpNode, kind: &str) -> anyhow::Result<((f64, f64), f64)> {
     let at = node
@@ -522,6 +530,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer: graphic_layer(text, "fp_text")?,
             size: text_size(text),
+            stroke_width: text_stroke_width(text),
         });
     }
     for property in footprint.find_all("property") {
@@ -546,6 +555,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer,
             size: text_size(property),
+            stroke_width: text_stroke_width(property),
         });
     }
     Ok(graphics)

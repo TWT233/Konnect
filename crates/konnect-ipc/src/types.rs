@@ -127,6 +127,8 @@ pub enum IpcGraphicDefinition {
         layer: String,
         /// Glyph size (width and height) in mm.
         size: f64,
+        /// Font stroke width in mm.
+        stroke_width: f64,
     },
 }
 

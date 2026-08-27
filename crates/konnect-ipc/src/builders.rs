@@ -607,6 +607,30 @@ pub fn board_text(
     rotation_deg: f64,
     mirror: bool,
 ) -> kiapi::board::types::BoardText {
+    board_text_with_stroke_width(
+        layer,
+        text,
+        x,
+        y,
+        size_mm,
+        size_mm * 0.15,
+        rotation_deg,
+        mirror,
+    )
+}
+
+/// Build a BoardText while preserving an explicit font stroke width.
+#[allow(clippy::too_many_arguments)]
+pub fn board_text_with_stroke_width(
+    layer: &str,
+    text: &str,
+    x: f64,
+    y: f64,
+    size_mm: f64,
+    stroke_width_mm: f64,
+    rotation_deg: f64,
+    mirror: bool,
+) -> kiapi::board::types::BoardText {
     kiapi::board::types::BoardText {
         id: None,
         text: Some(kiapi::common::types::Text {
@@ -621,7 +645,7 @@ pub fn board_text(
                     value_degrees: rotation_deg,
                 }),
                 line_spacing: 1.0,
-                stroke_width: Some(distance(size_mm * 0.15)),
+                stroke_width: Some(distance(stroke_width_mm)),
                 italic: false,
                 bold: false,
                 underlined: false,
@@ -984,8 +1008,23 @@ pub(crate) mod tests {
         assert_eq!(text.position.unwrap().x_nm, 12_000_000);
         let attrs = text.attributes.expect("attrs");
         assert_eq!(attrs.size.unwrap().x_nm, 1_500_000);
+        assert!((attrs.stroke_width.unwrap().value_nm - 225_000).abs() <= 1);
         assert_eq!(attrs.angle.unwrap().value_degrees, 90.0);
         assert!(!attrs.mirrored);
+
+        let explicit =
+            board_text_with_stroke_width("F.Fab", "${REFERENCE}", 0.0, 0.0, 0.8, 0.11, 0.0, false);
+        assert_eq!(
+            explicit
+                .text
+                .unwrap()
+                .attributes
+                .unwrap()
+                .stroke_width
+                .unwrap()
+                .value_nm,
+            110_000
+        );
     }
 
     #[test]
