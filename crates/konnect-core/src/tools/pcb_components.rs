@@ -530,7 +530,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer: graphic_layer(text, "fp_text")?,
             size: text_size(text),
-            stroke_width: text_stroke_width(text),
+            stroke_width_mm: text_stroke_width(text),
         });
     }
     for property in footprint.find_all("property") {
@@ -555,7 +555,7 @@ pub(crate) fn extract_graphic_definitions(
             rotation,
             layer,
             size: text_size(property),
-            stroke_width: text_stroke_width(property),
+            stroke_width_mm: text_stroke_width(property),
         });
     }
     Ok(graphics)

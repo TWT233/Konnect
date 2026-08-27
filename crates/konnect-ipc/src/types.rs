@@ -128,7 +128,7 @@ pub enum IpcGraphicDefinition {
         /// Glyph size (width and height) in mm.
         size: f64,
         /// Font stroke width in mm.
-        stroke_width: f64,
+        stroke_width_mm: f64,
     },
 }
 

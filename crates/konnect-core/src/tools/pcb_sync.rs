@@ -1847,7 +1847,7 @@ mod tests {
                     rotation: 0.0,
                     layer: silk(),
                     size: 1.0,
-                    stroke_width: 0.15,
+                    stroke_width_mm: 0.15,
                 },
             ],
             &konnect_ipc::IpcFieldPlacement::default(),

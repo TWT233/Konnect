@@ -443,7 +443,7 @@ fn place_footprint_sends_graphics_children() {
             rotation: 0.0,
             layer: "F.Fab".to_string(),
             size: 0.26,
-            stroke_width: 0.04,
+            stroke_width_mm: 0.04,
         },
     ];
 

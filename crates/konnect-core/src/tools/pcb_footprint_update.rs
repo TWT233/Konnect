@@ -843,6 +843,7 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
     let mut saw_at = false;
     let mut saw_layer = false;
     let mut saw_effects = false;
+    let mut identifier = None;
     for clause in text.children().unwrap_or_default().iter().skip(3) {
         let tag = clause
             .head()
@@ -881,6 +882,12 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
                 }
             }
             "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "fp_text user contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
                 if clause.children().map_or(0, |children| children.len()) != 2
                     || clause
                         .get(1)
@@ -1451,14 +1458,14 @@ fn mirror_graphic(
             rotation,
             layer,
             size,
-            stroke_width,
+            stroke_width_mm,
         } => Graphic::Text {
             text: text.clone(),
             position: point(*position),
             rotation: 180.0 - rotation,
             layer: flip_layer_name(layer)?,
             size: *size,
-            stroke_width: *stroke_width,
+            stroke_width_mm: *stroke_width_mm,
         },
     })
 }
@@ -1788,13 +1795,13 @@ mod tests {
                     rotation,
                     layer,
                     size,
-                    stroke_width,
+                    stroke_width_mm,
                 } if text == "${REFERENCE}"
                     && *position == (0.0, 1.5)
                     && *rotation == 0.0
                     && layer == "F.Fab"
                     && *size == 1.0
-                    && *stroke_width == 0.15
+                    && *stroke_width_mm == 0.15
             )
         }));
         assert_eq!(library.datasheet.as_deref(), Some("new-datasheet.pdf"));
@@ -2051,9 +2058,9 @@ mod tests {
             konnect_ipc::IpcGraphicDefinition::Text {
                 text,
                 size,
-                stroke_width,
+                stroke_width_mm,
                 ..
-            } if text == "${REFERENCE}" && *size == 0.8 && *stroke_width == 0.11
+            } if text == "${REFERENCE}" && *size == 0.8 && *stroke_width_mm == 0.11
         )));
         assert_eq!(library.models.len(), 1);
         let model = &library.models[0];
@@ -2270,6 +2277,16 @@ mod tests {
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
                 "(effects (font (size 0.8 0.8)))",
                 "missing its thickness",
+            ),
+            (
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\")",
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\") (uuid \"duplicate\")",
+                "multiple identifier clauses",
+            ),
+            (
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\")",
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\") (tstamp \"legacy-too\")",
+                "multiple identifier clauses",
             ),
         ] {
             let unsupported = LIBRARY_FOOTPRINT.replacen(from, to, 1);
