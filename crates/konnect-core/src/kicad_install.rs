@@ -133,6 +133,16 @@ pub fn share_roots() -> Vec<PathBuf> {
         }
     }
 
+    if roots.is_empty() {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                target: "konnect::kicad_install",
+                "no KiCad bundled-library root was resolved; stock symbols, footprints, and 3D models may be unavailable; configure kicad_cli or the KICAD<major>_*_DIR variables"
+            );
+        });
+    }
+
     roots
 }
 
