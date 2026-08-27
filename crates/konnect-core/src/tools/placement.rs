@@ -742,6 +742,9 @@ fn sorted_unique(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 // ─── Decoupling ──────────────────────────────────────────────────────────────
 
+/// A courtyard bounding box: (x_min, y_min, x_max, y_max) in mm.
+type Bbox = (f64, f64, f64, f64);
+
 /// One decoupling cap that sits further from its nearest shared-net IC than
 /// its value family allows.
 struct DecouplingViolation {
@@ -773,7 +776,7 @@ fn decoupling_check(
         }
     }
 
-    let ics: Vec<(&str, (f64, f64, f64, f64))> = items
+    let ics: Vec<(&str, Bbox)> = items
         .iter()
         .filter_map(|c| {
             let reference = c.reference.as_deref()?;
