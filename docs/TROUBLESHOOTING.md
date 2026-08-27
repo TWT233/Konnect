@@ -185,7 +185,8 @@ call it. That is the symptom in
 [#169](https://github.com/mixelpixx/Konnect/issues/169) — reported against
 Claude Desktop.
 
-The fix for those clients is to make the *first* listing complete:
+For clients that cache the initial list but do not also cap the number of
+callable tools, the fix is to make the *first* listing complete:
 
 ```json
 { "eager_toolsets": true }
@@ -200,6 +201,48 @@ It is off by default because it costs what the router exists to save: roughly
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the
 tool name — so it does nothing for a client whose tool list is stale.
+
+## VS Code Copilot says a tool is "currently disabled by the user"
+
+That exact message comes from the VS Code Copilot client layer, not Konnect.
+In the confirmed report in
+[#325](https://github.com/mixelpixx/Konnect/issues/325), the attempted calls did
+not appear in Konnect's `get_recent_calls` output because Copilot refused them
+before they reached the server.
+
+Two Copilot behaviors make the normal toolset settings ineffective:
+
+- With `eager_toolsets = false`, Copilot caches the initial `tools/list` and
+  does not re-fetch it after `notifications/tools/list_changed`. Tools loaded
+  later therefore remain unavailable to the model.
+- With `eager_toolsets = true`, Konnect advertises its full catalog at startup,
+  but Copilot applies its own total callable-tool budget across all configured
+  MCP servers. The #325 reporter measured a 128-tool ceiling and saw only an
+  arbitrary, changing subset of Konnect tools exposed. Tools outside that
+  subset produced "currently disabled by the user."
+
+Changing Konnect from stdio to HTTP/SSE does not remove a limit applied by the
+client after it receives `tools/list`. Reloading the VS Code window also does
+not make an over-budget catalog callable.
+
+Current options are:
+
+1. Disable unrelated MCP servers or tools if that brings the complete set you
+   need below the client's budget.
+2. Use an MCP client that honors `tools/list_changed` or can expose Konnect's
+   full catalog.
+3. Use the community two-tool proxy pattern demonstrated in
+   [the #325 follow-up](https://github.com/mixelpixx/Konnect/issues/325#issuecomment-5407317596):
+   expose only `konnect_help` and `konnect_call` to Copilot, let
+   `konnect_help()` list names or return one tool's description and schema,
+   and let `konnect_call(tool, arguments)` forward the actual call to a child
+   Konnect process started with `eager_toolsets = true`.
+
+The proxy is a community workaround attached to the issue, not code shipped or
+reviewed by Konnect; inspect it and configure its executable path before use.
+A native compact tool-surface mode and MCP tool-directory resource are planned
+in the [client compatibility roadmap](../ROADMAP.md#4-client-compatibility),
+but are not available yet.
 
 ## Plugin doesn't appear in KiCAD
 
