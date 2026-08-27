@@ -1167,6 +1167,47 @@ impl KiCadIpcClient {
     }
 
     /// Delete a track by UUID.
+    /// One BGA-fanout element: a via and the stub track reaching it.
+    pub fn apply_fanout(
+        &self,
+        net_stubs: &[(String, f64, f64, f64, f64)],
+        vias: &[(String, f64, f64)],
+        layer: &str,
+        track_width: f64,
+        via_drill: f64,
+        via_pad: f64,
+    ) -> Result<usize> {
+        // Every element in ONE create_items inside one commit: a fanout is a
+        // single design decision and must be a single undo step.
+        self.run_commit("BGA fanout", |client| {
+            let mut items = Vec::with_capacity(net_stubs.len() + vias.len());
+            for (net, x1, y1, x2, y2) in net_stubs {
+                // Netless copper (a fanout of unconnected BGA pads) uses net
+                // code 0 rather than failing name resolution on "".
+                let code = if net.is_empty() {
+                    0
+                } else {
+                    client.resolve_net_code(net)?
+                };
+                let track =
+                    crate::builders::build_track(net, code, layer, track_width, *x1, *y1, *x2, *y2);
+                items.push(crate::builders::pack_any(&track, "kiapi.board.types.Track"));
+            }
+            for (net, x, y) in vias {
+                let code = if net.is_empty() {
+                    0
+                } else {
+                    client.resolve_net_code(net)?
+                };
+                let via = crate::builders::build_via(net, code, *x, *y, via_drill, via_pad);
+                items.push(crate::builders::pack_any(&via, "kiapi.board.types.Via"));
+            }
+            let count = items.len();
+            client.create_items(items)?;
+            Ok(count)
+        })
+    }
+
     pub fn delete_track(&self, uuid: &str) -> Result<()> {
         self.delete_items(vec![uuid.to_string()])
     }

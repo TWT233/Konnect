@@ -950,7 +950,7 @@ enum FootprintPlacementUpdate {
 /// forbids two screens up, and it left every case except the missing
 /// reference surfacing as an unstructured `handler_error` (#194's class).
 #[derive(Debug)]
-enum ClosedBoardError {
+pub(crate) enum ClosedBoardError {
     /// No footprint on this board carries that reference.
     ReferenceNotFound(String),
     /// More than one does, so "the" footprint is ambiguous.
@@ -964,7 +964,7 @@ enum ClosedBoardError {
 impl ClosedBoardError {
     /// The result to hand back. Never `Err`: every one of these is something
     /// the caller can act on, and all of them leave the board untouched.
-    fn into_result(self) -> CallToolResult {
+    pub(crate) fn into_result(self) -> CallToolResult {
         match self {
             Self::ReferenceNotFound(reference) => CallToolResult::error_kind(
                 crate::mcp::error::ToolErrorKind::InvalidArgument {
@@ -1007,7 +1007,7 @@ fn update_closed_board_footprint(
     Ok(())
 }
 
-fn update_closed_board_footprints(
+pub(crate) fn update_closed_board_footprints(
     board_path: &Path,
     placements: &[konnect_ipc::types::IpcFootprintPlacement],
 ) -> Result<Vec<konnect_ipc::types::IpcFootprintPlacement>, ClosedBoardError> {
