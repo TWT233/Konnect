@@ -235,6 +235,23 @@ Finds floating wires, labels, and symbols that are not connected to anything.
 
 ---
 
+## Visual feedback loop
+
+The agent can see its own schematic. After meaningful edits:
+
+1. `render_schematic_png` — rasterize the sheet (pass `inline` true to get
+   the image back as base64 and actually look at it).
+2. `set_visual_baseline` — capture the known-good render before a batch of
+   edits (stored under the project's own state directory with the source
+   hash and renderer identity).
+3. `compare_visual_baseline` — after edits: PASS/DRIFT against a 2% content
+   threshold with the changed region's bounding box. "No baseline stored" is
+   a normal state, and a baseline from an older renderer is flagged rather
+   than silently trusted.
+
+Use the loop to catch what connectivity checks cannot: overlapping symbols,
+text collisions, a component moved somewhere absurd.
+
 ## Rules
 
 1. **Never edit .kicad_sch files directly** — all changes go through MCP tools

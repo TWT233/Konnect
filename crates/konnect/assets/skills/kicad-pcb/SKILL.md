@@ -114,6 +114,26 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 
+### Score-first automation
+
+Load `load_toolset('placement')` for the automation loop. The discipline is
+score, change, re-score — every planner reports the board's score before and
+after its own plan, so a change is judged before it is made:
+
+1. `score_placement` — 0-100 with named deductions; hard failures (courtyard
+   overlaps, parts outside the outline) decide the verdict regardless of the
+   number, and a board with no outline can never pass.
+2. `auto_place_from_schematic` — deterministic first placement by net
+   clusters; explicitly a starting point, not a final layout.
+3. `refine_placement_force_directed` — deterministic spring embedder; pass
+   `locked` for parts that must not move. Same input, same plan.
+4. `place_decoupling_caps` — plans a row beside an IC, paired by shared nets.
+5. `plan_bga_fanout` — pitch detected from the pad grid; `apply` executes as
+   one KiCad undo commit over live IPC.
+
+Every planner is dry-run by default; apply refuses while KiCad holds the
+board open live (fanout apply is the inverse: it REQUIRES the live board).
+
 ### Placement Tips
 
 - Use mm coordinates (KiCAD default for PCB)

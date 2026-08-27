@@ -94,6 +94,45 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_bga_fanout(args, ctx).await }
         ),
+        tool!(
+            "auto_place_from_schematic",
+            "Deterministic first placement: cluster footprints by shared nets (union-find), \
+             lay clusters out as tight grids inside the board outline, courtyards \
+             non-overlapping. A starting point for refinement, not a final layout — the \
+             response says so, and carries the board's score before and after the plan. \
+             Dry-run by default.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "margin_mm": { "type": "number", "default": 2.0, "description": "Clearance from the board outline" },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_auto_place(args, ctx).await }
+        ),
+        tool!(
+            "refine_placement_force_directed",
+            "Refine placement with a deterministic spring embedder: shared nets pull \
+             connected parts together (power nets weighted 3x, differential pairs 5x), \
+             courtyards repel, the board edge constrains. No randomness, no clocks: the \
+             same input always yields the same plan, converging when the grid-snapped \
+             layout stops changing. Locked references exert force but never move. \
+             Dry-run by default; the response carries before/after scores.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "references": { "type": "array", "items": { "type": "string" }, "description": "Components to refine (default: all)" },
+                    "locked": { "type": "array", "items": { "type": "string" }, "description": "References that must not move" },
+                    "iterations": { "type": "integer", "default": 300, "description": "Iteration ceiling" },
+                    "dry_run": { "type": "boolean", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_force_directed(args, ctx).await }
+        ),
     ]
 }
 
@@ -715,6 +754,504 @@ async fn handle_bga_fanout(
     Ok(CallToolResult::json(&response))
 }
 
+// ─── auto_place_from_schematic ───────────────────────────────────────────────
+
+async fn handle_auto_place(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let margin = args["margin_mm"].as_f64().unwrap_or(2.0);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+
+    let content = konnect_sexp::writer::read_consistent(&board)?;
+    let tree = konnect_sexp::parse_sexp(&content)?;
+    let scan = footprint_courtyards(&tree);
+    let index = PcbConnectivityIndex::build(&tree);
+    let Some(outline) = board_outline_bbox(&tree) else {
+        return Ok(CallToolResult::error(
+            "auto placement needs a board outline; add Edge.Cuts first (set_board_size)",
+        ));
+    };
+
+    // Union-find over references joined by shared nets.
+    let mut parts: Vec<&FootprintCourtyard> = scan
+        .items
+        .iter()
+        .filter(|c| c.reference.is_some())
+        .collect();
+    parts.sort_by_key(|c| c.reference.clone());
+    let ref_index: HashMap<&str, usize> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.reference.as_deref().expect("filtered"), i))
+        .collect();
+    let mut parent: Vec<usize> = (0..parts.len()).collect();
+    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
+        if parent[i] != i {
+            let root = find(parent, parent[i]);
+            parent[i] = root;
+        }
+        parent[i]
+    }
+    for net in index.nets() {
+        let mut prev: Option<usize> = None;
+        for pad in index.pads_of_net(net) {
+            if let Some(&i) = ref_index.get(pad.reference.as_str()) {
+                if let Some(p) = prev {
+                    let (a, b) = (find(&mut parent, p), find(&mut parent, i));
+                    parent[a.max(b)] = a.min(b);
+                }
+                prev = Some(i);
+            }
+        }
+    }
+
+    // Clusters in deterministic order: by smallest member reference.
+    let mut clusters: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..parts.len() {
+        let root = find(&mut parent, i);
+        clusters.entry(root).or_default().push(i);
+    }
+
+    // Lay each cluster as a near-square grid; clusters flow left-to-right,
+    // wrapping when the outline width is exhausted. Parts within a cluster
+    // descend by courtyard area so big parts anchor their group.
+    const GRID: f64 = 1.27;
+    let snap = |v: f64| (v / GRID).round() * GRID;
+    let (ox0, oy0, ox1, _oy1) = outline;
+    let mut placements = Vec::new();
+    let mut planned_moves = Vec::new();
+    let mut cursor_x = ox0 + margin;
+    let mut cursor_y = oy0 + margin;
+    let mut row_height: f64 = 0.0;
+    for members in clusters.values() {
+        let mut ordered: Vec<&FootprintCourtyard> = members.iter().map(|&i| parts[i]).collect();
+        ordered.sort_by(|a, b| {
+            let area = |c: &FootprintCourtyard| (c.bbox.2 - c.bbox.0) * (c.bbox.3 - c.bbox.1);
+            area(b)
+                .total_cmp(&area(a))
+                .then_with(|| a.reference.cmp(&b.reference))
+        });
+        let count = ordered.len() as f64;
+        let cols = count.sqrt().ceil() as usize;
+
+        // Cluster cell size: max part dims + margin padding per cell.
+        let cell_w = ordered
+            .iter()
+            .map(|c| c.bbox.2 - c.bbox.0)
+            .fold(0.0f64, f64::max)
+            + margin;
+        let cell_h = ordered
+            .iter()
+            .map(|c| c.bbox.3 - c.bbox.1)
+            .fold(0.0f64, f64::max)
+            + margin;
+        let cluster_w = cell_w * cols as f64;
+        let rows = ordered.len().div_ceil(cols);
+        let cluster_h = cell_h * rows as f64;
+
+        if cursor_x + cluster_w > ox1 - margin {
+            cursor_x = ox0 + margin;
+            cursor_y += row_height + margin;
+            row_height = 0.0;
+        }
+        row_height = row_height.max(cluster_h);
+
+        for (slot, part) in ordered.iter().enumerate() {
+            let col = slot % cols;
+            let row = slot / cols;
+            let target_center = (
+                cursor_x + cell_w * (col as f64 + 0.5),
+                cursor_y + cell_h * (row as f64 + 0.5),
+            );
+            let (bcx, bcy) = bbox_center(part.bbox);
+            let (ax, ay) = part.at;
+            let target = (
+                snap(target_center.0 + (ax - bcx)),
+                snap(target_center.1 + (ay - bcy)),
+            );
+            let reference = part.reference.clone().expect("filtered");
+            placements.push(konnect_ipc::types::IpcFootprintPlacement {
+                reference: reference.clone(),
+                x: target.0,
+                y: target.1,
+                rotation: part.rotation_deg,
+            });
+            planned_moves.push(json!({
+                "reference": reference,
+                "from": { "x": round3(ax), "y": round3(ay) },
+                "to": { "x": round3(target.0), "y": round3(target.1) },
+            }));
+        }
+        cursor_x += cluster_w + margin;
+    }
+
+    let score_before = score_of_content(ctx, &content).await?;
+    let planned_content = apply_placements_to_content(&content, &placements)?;
+    let score_after = score_of_content(ctx, &planned_content).await?;
+
+    let cluster_report: Vec<serde_json::Value> = clusters
+        .values()
+        .map(|members| {
+            json!(members
+                .iter()
+                .map(|&i| parts[i].reference.as_deref().expect("filtered"))
+                .collect::<Vec<_>>())
+        })
+        .collect();
+
+    if dry_run {
+        return Ok(CallToolResult::json(&json!({
+            "dry_run": true,
+            "note": "a starting point for refinement, not a final layout",
+            "clusters": cluster_report,
+            "planned_moves": planned_moves,
+            "score_before": score_before["score"],
+            "score_after_plan": score_after["score"],
+            "verdict_after_plan": score_after["verdict"],
+        })));
+    }
+
+    if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "auto_place_from_schematic",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+    let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
+        Ok(applied) => applied,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let written = konnect_sexp::writer::read_consistent(&board)?;
+    let score_written = score_of_content(ctx, &written).await?;
+    Ok(CallToolResult::json(&json!({
+        "dry_run": false,
+        "note": "a starting point for refinement, not a final layout",
+        "clusters": cluster_report,
+        "applied_count": applied.len(),
+        "score_before": score_before["score"],
+        "score_after": score_written["score"],
+        "verdict_after": score_written["verdict"],
+    })))
+}
+
+// ─── refine_placement_force_directed ─────────────────────────────────────────
+
+/// Ported spring-embedder constants (attributed in THIRD_PARTY.md).
+const FD_K_SPRING: f64 = 0.4;
+const FD_K_REPEL: f64 = 80.0;
+const FD_K_WALL: f64 = 5.0;
+const FD_DAMPING: f64 = 0.85;
+const FD_MIN_DIST: f64 = 0.5;
+const FD_GRID_MM: f64 = 0.5;
+const FD_PATIENCE: usize = 4;
+
+fn net_weight(net: &str) -> f64 {
+    let upper = net.to_ascii_uppercase();
+    if upper.is_empty() || upper == "NC" || upper.starts_with("UNCONNECTED") {
+        0.0
+    } else if upper.ends_with("_P") || upper.ends_with("_N") {
+        5.0
+    } else if ["GND", "GNDA", "GNDD", "VCC", "VDD", "VSS"].contains(&upper.as_str())
+        || upper.starts_with('+')
+        || upper.starts_with('-')
+    {
+        3.0
+    } else {
+        1.0
+    }
+}
+
+async fn handle_force_directed(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let iterations = args["iterations"].as_u64().unwrap_or(300).min(10_000) as usize;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let locked: BTreeSet<String> = args["locked"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let selected: Option<BTreeSet<String>> = args["references"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
+
+    let content = konnect_sexp::writer::read_consistent(&board)?;
+    let tree = konnect_sexp::parse_sexp(&content)?;
+    let scan = footprint_courtyards(&tree);
+    let index = PcbConnectivityIndex::build(&tree);
+    let Some((ox0, oy0, ox1, oy1)) = board_outline_bbox(&tree) else {
+        return Ok(CallToolResult::error(
+            "force-directed refinement needs a board outline (Edge.Cuts)",
+        ));
+    };
+    let (board_w, board_h) = (ox1 - ox0, oy1 - oy0);
+
+    // Deterministic ordering is the whole determinism story: parts sorted by
+    // reference, nets walked in the index's sorted order, no RNG, no clocks.
+    let mut parts: Vec<&FootprintCourtyard> = scan
+        .items
+        .iter()
+        .filter(|c| c.reference.is_some())
+        .collect();
+    parts.sort_by_key(|c| c.reference.clone());
+    let ref_of = |i: usize| parts[i].reference.as_deref().expect("filtered");
+    let movable = |i: usize| {
+        let name = ref_of(i);
+        !locked.contains(name) && selected.as_ref().map(|s| s.contains(name)).unwrap_or(true)
+    };
+
+    // Spring graph: accumulated weight per part pair sharing nets.
+    let ref_index: HashMap<&str, usize> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.reference.as_deref().expect("filtered"), i))
+        .collect();
+    let mut springs: HashMap<(usize, usize), f64> = HashMap::new();
+    for net in index.nets() {
+        let weight = net_weight(net);
+        if weight == 0.0 {
+            continue;
+        }
+        let members: Vec<usize> = index
+            .pads_of_net(net)
+            .iter()
+            .filter_map(|p| ref_index.get(p.reference.as_str()).copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for (ai, &a) in members.iter().enumerate() {
+            for &b in &members[ai + 1..] {
+                *springs.entry((a.min(b), a.max(b))).or_insert(0.0) += weight;
+            }
+        }
+    }
+
+    let mut pos: Vec<(f64, f64)> = parts.iter().map(|c| bbox_center(c.bbox)).collect();
+    let sizes: Vec<(f64, f64)> = parts
+        .iter()
+        .map(|c| (c.bbox.2 - c.bbox.0, c.bbox.3 - c.bbox.1))
+        .collect();
+    let mut vel: Vec<(f64, f64)> = vec![(0.0, 0.0); parts.len()];
+    let step = board_w.min(board_h) * 0.05;
+    let snap = |v: f64| (v / FD_GRID_MM).round() * FD_GRID_MM;
+
+    let mut last_snapshot: Vec<(f64, f64)> = Vec::new();
+    let mut stable = 0usize;
+    let mut iterations_run = 0usize;
+    let mut converged = false;
+    for iteration in 0..iterations {
+        iterations_run = iteration + 1;
+        let temperature = step * (1.0 - iteration as f64 / iterations as f64) + 0.1;
+        let mut force: Vec<(f64, f64)> = vec![(0.0, 0.0); parts.len()];
+
+        // Pairwise repulsion, boosted sharply inside the clearance ring.
+        for i in 0..parts.len() {
+            for j in (i + 1)..parts.len() {
+                let dx = pos[i].0 - pos[j].0;
+                let dy = pos[i].1 - pos[j].1;
+                let dist = dx.hypot(dy).max(FD_MIN_DIST);
+                let min_clear = (sizes[i].0 + sizes[j].0) * 0.5 + 1.0;
+                let mut k = FD_K_REPEL;
+                if dist < min_clear {
+                    k *= (min_clear / dist).powi(2);
+                }
+                let magnitude = k / (dist * dist);
+                let (ux, uy) = (dx / dist, dy / dist);
+                force[i].0 += ux * magnitude;
+                force[i].1 += uy * magnitude;
+                force[j].0 -= ux * magnitude;
+                force[j].1 -= uy * magnitude;
+            }
+        }
+        // Spring attraction along shared nets.
+        for (&(a, b), &weight) in springs.iter().collect::<std::collections::BTreeMap<_, _>>() {
+            let dx = pos[b].0 - pos[a].0;
+            let dy = pos[b].1 - pos[a].1;
+            let dist = dx.hypot(dy).max(FD_MIN_DIST);
+            let magnitude = FD_K_SPRING * weight * dist;
+            let (ux, uy) = (dx / dist, dy / dist);
+            force[a].0 += ux * magnitude;
+            force[a].1 += uy * magnitude;
+            force[b].0 -= ux * magnitude;
+            force[b].1 -= uy * magnitude;
+        }
+        // Walls push inward.
+        for i in 0..parts.len() {
+            force[i].0 += FD_K_WALL / (pos[i].0 - ox0).max(0.01);
+            force[i].0 -= FD_K_WALL / (ox1 - pos[i].0).max(0.01);
+            force[i].1 += FD_K_WALL / (pos[i].1 - oy0).max(0.01);
+            force[i].1 -= FD_K_WALL / (oy1 - pos[i].1).max(0.01);
+        }
+
+        // Integrate: damped velocity clamped to the cooling temperature;
+        // locked/unselected parts exert force but never move.
+        for i in 0..parts.len() {
+            if !movable(i) {
+                vel[i] = (0.0, 0.0);
+                continue;
+            }
+            vel[i].0 = (vel[i].0 + force[i].0) * FD_DAMPING;
+            vel[i].1 = (vel[i].1 + force[i].1) * FD_DAMPING;
+            let speed = vel[i].0.hypot(vel[i].1);
+            if speed > temperature {
+                let scale = temperature / speed;
+                vel[i].0 *= scale;
+                vel[i].1 *= scale;
+            }
+            pos[i].0 = (pos[i].0 + vel[i].0).clamp(ox0 + sizes[i].0 / 2.0, ox1 - sizes[i].0 / 2.0);
+            pos[i].1 = (pos[i].1 + vel[i].1).clamp(oy0 + sizes[i].1 / 2.0, oy1 - sizes[i].1 / 2.0);
+        }
+
+        // Convergence: the SNAPPED layout unchanged for `patience` rounds.
+        let snapshot: Vec<(f64, f64)> = pos.iter().map(|p| (snap(p.0), snap(p.1))).collect();
+        if snapshot == last_snapshot {
+            stable += 1;
+            if stable >= FD_PATIENCE {
+                converged = true;
+                break;
+            }
+        } else {
+            stable = 0;
+            last_snapshot = snapshot;
+        }
+    }
+
+    // Collision resolution: forces cluster connected parts, but nothing in
+    // the physics forbids courtyard overlap — the reference resolved
+    // candidate positions against collisions every step, and without that
+    // pass the springs simply crush a net's members into one spot. Walk the
+    // parts in sorted order; any part overlapping an already-settled one
+    // spirals outward on the snap grid to the nearest free cell —
+    // deterministic by construction.
+    let overlaps = |a: (f64, f64), sa: (f64, f64), b: (f64, f64), sb: (f64, f64)| {
+        (a.0 - b.0).abs() < (sa.0 + sb.0) * 0.5 && (a.1 - b.1).abs() < (sa.1 + sb.1) * 0.5
+    };
+    // Immovable parts are obstacles from the start — settle them all before
+    // any movable part looks for a free cell, or a cap processed earlier in
+    // reference order would never see the locked IC it is about to overlap.
+    let mut settled: Vec<usize> = (0..parts.len()).filter(|&i| !movable(i)).collect();
+    for i in 0..parts.len() {
+        if !movable(i) {
+            continue;
+        }
+        pos[i] = (snap(pos[i].0), snap(pos[i].1));
+        let collides = |p: (f64, f64), settled: &[usize], pos: &[(f64, f64)]| {
+            settled.iter().any(|&j| {
+                parts[j].layer_side == parts[i].layer_side
+                    && overlaps(p, sizes[i], pos[j], sizes[j])
+            })
+        };
+        if collides(pos[i], &settled, &pos) {
+            'search: for ring in 1..200 {
+                let r = ring as f64 * FD_GRID_MM;
+                for (dx, dy) in [
+                    (r, 0.0),
+                    (0.0, r),
+                    (-r, 0.0),
+                    (0.0, -r),
+                    (r, r),
+                    (-r, r),
+                    (r, -r),
+                    (-r, -r),
+                ] {
+                    let candidate = (
+                        (pos[i].0 + dx).clamp(ox0 + sizes[i].0 / 2.0, ox1 - sizes[i].0 / 2.0),
+                        (pos[i].1 + dy).clamp(oy0 + sizes[i].1 / 2.0, oy1 - sizes[i].1 / 2.0),
+                    );
+                    if !collides(candidate, &settled, &pos) {
+                        pos[i] = candidate;
+                        break 'search;
+                    }
+                }
+            }
+        }
+        settled.push(i);
+    }
+
+    // Final positions: snapped centers, translated back to root anchors.
+    let mut placements = Vec::new();
+    let mut planned_moves = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if !movable(i) {
+            continue;
+        }
+        let (bcx, bcy) = bbox_center(part.bbox);
+        let target = (snap(pos[i].0), snap(pos[i].1));
+        if (target.0 - bcx).abs() < 1e-9 && (target.1 - bcy).abs() < 1e-9 {
+            continue;
+        }
+        let (ax, ay) = part.at;
+        let reference = part.reference.clone().expect("filtered");
+        placements.push(konnect_ipc::types::IpcFootprintPlacement {
+            reference: reference.clone(),
+            x: ((target.0 + (ax - bcx)) * 1e3).round() / 1e3,
+            y: ((target.1 + (ay - bcy)) * 1e3).round() / 1e3,
+            rotation: part.rotation_deg,
+        });
+        planned_moves.push(json!({
+            "reference": reference,
+            "from": { "x": round3(ax), "y": round3(ay) },
+            "to": {
+                "x": round3(target.0 + (ax - bcx)),
+                "y": round3(target.1 + (ay - bcy)),
+            },
+        }));
+    }
+
+    let score_before = score_of_content(ctx, &content).await?;
+    let planned_content = apply_placements_to_content(&content, &placements)?;
+    let score_after = score_of_content(ctx, &planned_content).await?;
+
+    if dry_run {
+        return Ok(CallToolResult::json(&json!({
+            "dry_run": true,
+            "iterations_run": iterations_run,
+            "converged": converged,
+            "planned_moves": planned_moves,
+            "score_before": score_before["score"],
+            "score_after_plan": score_after["score"],
+            "verdict_after_plan": score_after["verdict"],
+        })));
+    }
+
+    if let Some(refusal) = super::pcb_board::refuse_if_board_open_in_kicad(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "refine_placement_force_directed",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+    let applied = match super::pcb_components::update_closed_board_footprints(&board, &placements) {
+        Ok(applied) => applied,
+        Err(error) => return Ok(error.into_result()),
+    };
+    let written = konnect_sexp::writer::read_consistent(&board)?;
+    let score_written = score_of_content(ctx, &written).await?;
+    Ok(CallToolResult::json(&json!({
+        "dry_run": false,
+        "iterations_run": iterations_run,
+        "converged": converged,
+        "applied_count": applied.len(),
+        "score_before": score_before["score"],
+        "score_after": score_written["score"],
+        "verdict_after": score_written["verdict"],
+    })))
+}
+
 /// The dominant nearest-neighbor spacing along both axes; None when the two
 /// axes disagree or no regular spacing exists.
 fn detect_grid_pitch(pads: &[(String, (f64, f64), Option<String>)]) -> Option<f64> {
@@ -1203,6 +1740,51 @@ mod tests {
                 "dogbone offset must be 0.55*pitch = 0.44 mm, got {magnitude} for {via}"
             );
         }
+    }
+
+    /// The auto-placer must produce a legal layout on the fixture: all 8
+    /// parts planned, everything inside the 60x45 outline minus margin, no
+    /// planned courtyard overlaps — asserted by re-scoring the PLANNED
+    /// content, which reuses the hard-failure checker as the witness.
+    #[tokio::test]
+    async fn auto_place_plans_a_legal_deterministic_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({ "board": board.to_string_lossy() });
+        let a = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(a["dry_run"], true);
+        assert_eq!(a["planned_moves"].as_array().unwrap().len(), 8, "{a}");
+        assert_ne!(
+            a["verdict_after_plan"], "hard_fail",
+            "planned layout must be legal: {a}"
+        );
+        let b = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(a, b, "same input, same plan");
+    }
+
+    /// Determinism and safety of the spring embedder: run-twice identical,
+    /// locked parts never move, and the plan never introduces hard failures
+    /// the board did not have.
+    #[tokio::test]
+    async fn force_directed_is_deterministic_and_respects_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({
+            "board": board.to_string_lossy(),
+            "locked": ["U1"],
+        });
+        let a = text_of(&handle_force_directed(&args, &test_ctx()).await.unwrap()).await;
+        let b = text_of(&handle_force_directed(&args, &test_ctx()).await.unwrap()).await;
+        assert_eq!(a, b, "same seedless input, same plan");
+        assert!(a["iterations_run"].as_u64().unwrap() >= 1);
+        assert!(a["converged"].is_boolean(), "honest convergence field");
+        for mv in a["planned_moves"].as_array().unwrap() {
+            assert_ne!(mv["reference"], "U1", "locked reference moved: {mv}");
+        }
+        assert_ne!(
+            a["verdict_after_plan"], "hard_fail",
+            "refinement must not create hard failures: {a}"
+        );
     }
 
     #[tokio::test]
