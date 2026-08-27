@@ -2232,6 +2232,152 @@ mod multi_unit_field_tests {
 }
 
 #[cfg(test)]
+mod multi_unit_handler_tests {
+    use super::*;
+    use crate::tools::{ServerConfig, ToolContext};
+    use konnect_sexp::schematic::{extract_symbol_instances, read_schematic, SymbolInstance};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    fn fixture_file() -> tempfile::NamedTempFile {
+        let mut schematic = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        schematic.write_all(ECC83.as_bytes()).unwrap();
+        schematic.flush().unwrap();
+        schematic
+    }
+
+    fn instances(path: &std::path::Path) -> Vec<SymbolInstance> {
+        let (_, tree) = read_schematic(path).unwrap();
+        extract_symbol_instances(&tree)
+    }
+
+    async fn call(
+        path: &std::path::Path,
+        tool: &str,
+        mut args: serde_json::Value,
+    ) -> serde_json::Value {
+        args["schematic"] = json!(path.to_str().unwrap());
+        let definition = tools()
+            .into_iter()
+            .find(|tool_def| tool_def.name == tool)
+            .unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = (definition.handler)(&args, Arc::new(context))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{tool} failed: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bulk_move_moves_every_ecc83_unit_and_no_neighbor() {
+        let schematic = fixture_file();
+        let before = instances(schematic.path());
+        let result = call(
+            schematic.path(),
+            "bulk_move_schematic_components",
+            json!({ "references": ["U1"], "dx": 12.7, "dy": 2.54 }),
+        )
+        .await;
+        assert_eq!(result["moved_count"], 1);
+        assert_eq!(result["moved"][0]["units"], 3);
+
+        let after = instances(schematic.path());
+        for old in before.iter().filter(|instance| instance.reference == "U1") {
+            let new = after
+                .iter()
+                .find(|instance| instance.uuid == old.uuid)
+                .expect("every ECC83 unit remains placed");
+            assert!((new.x - old.x - 12.7).abs() < 1e-9, "unit {} x", old.unit);
+            assert!((new.y - old.y - 2.54).abs() < 1e-9, "unit {} y", old.unit);
+        }
+        let old_r1 = before
+            .iter()
+            .find(|instance| instance.reference == "R1")
+            .unwrap();
+        let new_r1 = after
+            .iter()
+            .find(|instance| instance.reference == "R1")
+            .unwrap();
+        assert_eq!((new_r1.x, new_r1.y), (old_r1.x, old_r1.y));
+    }
+
+    #[tokio::test]
+    async fn batch_edit_updates_every_ecc83_unit() {
+        let schematic = fixture_file();
+        let original_r1 = instances(schematic.path())
+            .into_iter()
+            .find(|instance| instance.reference == "R1")
+            .unwrap()
+            .value;
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "edits": [{
+                    "reference": "U1",
+                    "value": "ECC83-TEST",
+                    "footprint": "Package_DIP:DIP-9_W7.62mm"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(result["updated_count"], 1);
+
+        let after = instances(schematic.path());
+        let units: Vec<_> = after
+            .iter()
+            .filter(|instance| instance.reference == "U1")
+            .collect();
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|instance| instance.value == "ECC83-TEST"));
+        assert!(units
+            .iter()
+            .all(|instance| instance.footprint == "Package_DIP:DIP-9_W7.62mm"));
+        assert_eq!(
+            after
+                .iter()
+                .find(|instance| instance.reference == "R1")
+                .unwrap()
+                .value,
+            original_r1
+        );
+    }
+
+    #[tokio::test]
+    async fn both_reference_delete_tools_remove_every_ecc83_unit() {
+        for tool in ["batch_delete", "batch_delete_schematic_components"] {
+            let schematic = fixture_file();
+            let result = call(schematic.path(), tool, json!({ "references": ["U1"] })).await;
+            assert_eq!(result["deleted_count"], 1, "{tool}: {result}");
+
+            let after = instances(schematic.path());
+            assert!(
+                after.iter().all(|instance| instance.reference != "U1"),
+                "{tool} left an ECC83 unit"
+            );
+            assert!(
+                after.iter().any(|instance| instance.reference == "R1"),
+                "{tool} removed a neighbor"
+            );
+            let content = std::fs::read_to_string(schematic.path()).unwrap();
+            assert!(
+                content.contains(r#"(symbol "ecc83-pp:ECC83""#),
+                "{tool} removed the embedded library definition"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod add_text_placement_tests {
     use super::{schematic_text_justify, tools};
     use crate::mcp::protocol::CallToolResult;
