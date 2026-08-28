@@ -244,6 +244,16 @@ pub fn tools() -> Vec<ToolDef> {
                     "y": { "type": "number", "description": "Y position in mm" },
                     "size": { "type": "number", "description": "Font size in mm", "default": 1.27 },
                     "rotation": { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "bold": { "type": "boolean", "description": "Draw the text bold (default false).", "default": false },
+                    "italic": { "type": "boolean", "description": "Draw the text italic (default false).", "default": false },
+                    "thickness": { "type": "number", "description": "Stroke thickness in mm. KiCad pairs it with size - it writes 0.254 at size 1.27 and 0.4 at size 2. Omitted, KiCad picks its own." },
+                    "color": {
+                        "type": "array",
+                        "description": "Text colour as KiCad writes it: [r, g, b] or [r, g, b, a], channels 0-255 and alpha 0-1 (default 1). Omitted, the text takes the sheet's default colour.",
+                        "items": { "type": "number" },
+                        "minItems": 3,
+                        "maxItems": 4
+                    },
                     "justify": {
                         "type": "string",
                         "description": "Alignment of the text against x/y: at most one horizontal token (left, right) and one vertical token (top, bottom), space separated. An axis you leave out is centred - KiCad has no 'center' keyword and encodes centring by omission, so 'bottom' means horizontally centred and bottom-aligned. 'center' is shorthand for centring both axes. Defaults to 'left bottom', what KiCad itself writes for a placed annotation; a centred horizontal axis can carry a long line off the page.",
@@ -1076,6 +1086,88 @@ async fn handle_connect_passthrough(
     })))
 }
 
+/// The font attributes KiCad writes inside `(effects (font …))`, in its own
+/// order: size, thickness, bold, italic, colour.
+///
+/// Measured against KiCad 10's bundled demos — of 949 `(text …)` blocks, 362
+/// carry `(bold yes)`, 145 a `(thickness …)`, 77 a `(color …)` and 10
+/// `(italic yes)`. All of them sit inside `(font …)`, not beside it.
+fn schematic_text_font(args: &serde_json::Value, size: f64) -> Result<String, String> {
+    let mut font = format!("(size {size} {size})");
+
+    if let Some(thickness) = args.get("thickness") {
+        let thickness = thickness
+            .as_f64()
+            .ok_or_else(|| "thickness must be a number".to_string())?;
+        if !(thickness.is_finite() && thickness > 0.0) {
+            return Err(format!(
+                "thickness must be a positive number, got {thickness}"
+            ));
+        }
+        font.push_str(&format!(" (thickness {thickness})"));
+    }
+    // KiCad writes the token only when it is on, and omits it otherwise.
+    if args["bold"].as_bool().unwrap_or(false) {
+        font.push_str(" (bold yes)");
+    }
+    if args["italic"].as_bool().unwrap_or(false) {
+        font.push_str(" (italic yes)");
+    }
+    if let Some(color) = args.get("color") {
+        font.push_str(&format!(" {}", schematic_text_color(color)?));
+    }
+
+    Ok(format!("(font {font})"))
+}
+
+/// Translate a caller's colour into KiCad's `(color R G B A)`.
+///
+/// Accepts `[r, g, b]` or `[r, g, b, a]`. The three channels are 0–255
+/// integers as KiCad writes them; alpha is 0–1 and defaults to 1, because a
+/// colour given without one is meant to be seen.
+fn schematic_text_color(value: &serde_json::Value) -> Result<String, String> {
+    let parts = value
+        .as_array()
+        .ok_or_else(|| "color must be an array [r, g, b] or [r, g, b, a]".to_string())?;
+    if parts.len() != 3 && parts.len() != 4 {
+        return Err(format!(
+            "color takes 3 or 4 values [r, g, b(, a)], got {}",
+            parts.len()
+        ));
+    }
+
+    let mut channels = [0u16; 3];
+    for (channel, part) in channels.iter_mut().zip(parts) {
+        let raw = part
+            .as_f64()
+            .ok_or_else(|| "color channels must be numbers".to_string())?;
+        if !(0.0..=255.0).contains(&raw) || raw.fract() != 0.0 {
+            return Err(format!(
+                "color channels are whole numbers from 0 to 255, got {raw}"
+            ));
+        }
+        *channel = raw as u16;
+    }
+
+    let alpha = match parts.get(3) {
+        None => 1.0,
+        Some(value) => {
+            let alpha = value
+                .as_f64()
+                .ok_or_else(|| "color alpha must be a number".to_string())?;
+            if !(0.0..=1.0).contains(&alpha) {
+                return Err(format!("color alpha runs from 0 to 1, got {alpha}"));
+            }
+            alpha
+        }
+    };
+
+    Ok(format!(
+        "(color {} {} {} {})",
+        channels[0], channels[1], channels[2], alpha
+    ))
+}
+
 /// KiCad's default alignment for a placed text annotation.
 ///
 /// Measured against KiCad 10's own demo projects: every text block in the
@@ -1159,6 +1251,10 @@ async fn handle_add_schematic_text(
         Ok(v) => v,
         Err(e) => return Ok(CallToolResult::error(e)),
     };
+    let font_sexp = match schematic_text_font(args, size) {
+        Ok(v) => v,
+        Err(e) => return Ok(CallToolResult::error(e)),
+    };
     let uuid = new_uuid();
 
     // Escape for a KiCad quoted string. Newlines and tabs must become their
@@ -1174,7 +1270,7 @@ async fn handle_add_schematic_text(
 
     let text_sexp = format!(
         "\n  (text \"{escaped}\"\n    (at {x} {y} {rotation})\n    \
-         (effects (font (size {size} {size})){justify_sexp})\n    (uuid \"{uuid}\")\n  )"
+         (effects {font_sexp}{justify_sexp})\n    (uuid \"{uuid}\")\n  )"
     );
 
     let content = read_consistent(&sch_path)?;
@@ -1191,6 +1287,7 @@ async fn handle_add_schematic_text(
         "size": size,
         "rotation": rotation,
         "justify": justify,
+        "font": font_sexp,
         "uuid": uuid
     })))
 }
@@ -2321,6 +2418,111 @@ mod add_text_placement_tests {
     async fn quotes_backslashes_and_tabs_are_escaped() {
         let out = add_text("a \"b\" c\\d\te").await;
         assert!(out.contains(r#"(text "a \"b\" c\\d\te""#), "got:\n{out}");
+    }
+
+    async fn add_text_formatted(text: &str, extra: serde_json::Value) -> (String, CallToolResult) {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "add_schematic_text")
+            .unwrap();
+        let cfg = crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+        };
+        let router = Arc::new(crate::router::ToolRouter::new());
+        let ctx = Arc::new(ToolContext::new(cfg, router));
+        let mut args = json!({
+            "schematic": f.path().to_str().unwrap(),
+            "text": text, "x": 30.0, "y": 114.3
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        let result = (def.handler)(&args, ctx).await.unwrap();
+        (std::fs::read_to_string(f.path()).unwrap(), result)
+    }
+
+    /// Nothing asked for, nothing written: a plain call keeps the font block it
+    /// always had, so existing callers see no change.
+    #[tokio::test]
+    async fn an_unformatted_call_writes_only_the_size() {
+        let out = add_text_formatted("plain", json!({})).await.0;
+        assert!(
+            out.contains("(effects (font (size 1.27 1.27)) (justify left bottom))"),
+            "got:\n{out}"
+        );
+    }
+
+    /// KiCad's own order inside `(font …)`: size, thickness, bold, italic,
+    /// colour. Measured against its bundled demos.
+    #[tokio::test]
+    async fn the_font_tokens_are_written_in_kicads_order() {
+        let out = add_text_formatted(
+            "styled",
+            json!({ "bold": true, "italic": true, "thickness": 0.4, "color": [0, 194, 194, 1] }),
+        )
+        .await
+        .0;
+
+        assert!(
+            out.contains(
+                "(font (size 1.27 1.27) (thickness 0.4) (bold yes) (italic yes) (color 0 194 194 1))"
+            ),
+            "got:\n{out}"
+        );
+    }
+
+    /// KiCad writes the flag only when it is on, never `(bold no)`.
+    #[tokio::test]
+    async fn a_false_flag_writes_no_token() {
+        let out = add_text_formatted("plain", json!({ "bold": false, "italic": false }))
+            .await
+            .0;
+        assert!(!out.contains("bold"), "got:\n{out}");
+        assert!(!out.contains("italic"), "got:\n{out}");
+    }
+
+    /// A colour without alpha is meant to be seen, so it defaults to opaque
+    /// rather than to KiCad's transparent zero.
+    #[tokio::test]
+    async fn a_colour_without_alpha_is_opaque() {
+        let out = add_text_formatted("red", json!({ "color": [255, 0, 0] }))
+            .await
+            .0;
+        assert!(out.contains("(color 255 0 0 1)"), "got:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_colour_is_refused() {
+        for bad in [
+            json!({ "color": [255, 0] }),
+            json!({ "color": [300, 0, 0] }),
+            json!({ "color": [255, 0, 0, 4] }),
+            json!({ "color": [1.5, 0, 0] }),
+            json!({ "color": "red" }),
+        ] {
+            let (out, result) = add_text_formatted("bad", bad.clone()).await;
+            assert!(result.is_error, "{bad} must be refused");
+            assert!(
+                !out.contains("(text \"bad\""),
+                "a refused call must write nothing:\n{out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_positive_thickness_is_refused() {
+        let (_, result) = add_text_formatted("bad", json!({ "thickness": 0.0 })).await;
+        assert!(result.is_error);
     }
 
     /// The reported defect: with no `(justify ...)` KiCad centres the text on
