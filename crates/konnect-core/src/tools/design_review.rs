@@ -9,7 +9,9 @@ use super::cli;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::{net_graph_for, NetGraph};
-use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, placed_pins_by_reference, project_name_for, sch_hierarchy, ToolContext, ToolDef,
+};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     parser::parse_sexp,
@@ -147,11 +149,7 @@ async fn handle_audit_decoupling(
     info!(schematic = %sch_path.display(), "[BETA] Running decoupling audit");
     let (_, tree) = read_schematic(&sch_path)?;
 
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed = placed_pins_by_reference(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
@@ -161,17 +159,10 @@ async fn handle_audit_decoupling(
     let mut total_power_pins = 0;
 
     // Collect all capacitor references and their net connections
-    let (cap_nets, _) = capacitor_nets(&mut graph, &instances, &lib_syms);
+    let (cap_nets, _) = capacitor_nets(&mut graph, &placed);
 
     // For each IC (non-passive, non-connector component), check power pins
-    for inst in &instances {
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        let lib_sym = match lib_sym {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let pins = extract_lib_pins(lib_sym);
+    for (inst, pins) in &placed {
         let is_passive = inst.lib_id.contains("R_")
             || inst.lib_id.contains("C_")
             || inst.lib_id.contains("L_")
@@ -185,7 +176,7 @@ async fn handle_audit_decoupling(
         }
 
         // Find power pins (power_in type, or named VCC/VDD/VBUS/3V3/etc.)
-        for pin in &pins {
+        for (pin, transform) in pins {
             let is_power_pin = is_power_pin_name(&pin.name);
             if !is_power_pin {
                 continue;
@@ -193,7 +184,7 @@ async fn handle_audit_decoupling(
             total_power_pins += 1;
 
             // Get the endpoint position of this power pin
-            let (px, py) = pin_endpoint(pin, inst.pin_transform());
+            let (px, py) = pin_endpoint(pin, *transform);
 
             // Check if there's a capacitor connected to a net that this pin is on
             let pin_net = graph.net_at(px, py);
@@ -256,34 +247,25 @@ async fn handle_audit_connections(
     info!(schematic = %sch_path.display(), "[BETA] Running connection audit");
     let (_, tree) = read_schematic(&sch_path)?;
 
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed = placed_pins_by_reference(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
-    let pull_up_nets = pull_up_nets(&mut graph, &instances, &lib_syms);
+    let pull_up_nets = pull_up_nets(&mut graph, &placed);
 
     let mut findings = Vec::new();
 
-    for inst in &instances {
-        let lib_sym = match find_lib_symbol(&lib_syms, inst) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let pins = extract_lib_pins(lib_sym);
-
+    for (inst, pins) in &placed {
         // Check for I2C pull-ups
-        if has_i2c_pins(&pins) {
-            let sda_pin = pins.iter().find(|p| p.name.to_uppercase().contains("SDA"));
-            let scl_pin = pins.iter().find(|p| p.name.to_uppercase().contains("SCL"));
+        if has_i2c_pins(pins) {
+            let named = |needle: &str| {
+                pins.iter()
+                    .find(|(pin, _)| pin.name.to_uppercase().contains(needle))
+            };
 
-            for (pin_name, pin) in [("SDA", sda_pin), ("SCL", scl_pin)] {
-                if let Some(pin) = pin {
-                    let (px, py) = pin_endpoint(pin, inst.pin_transform());
+            for (pin_name, placed_pin) in [("SDA", named("SDA")), ("SCL", named("SCL"))] {
+                if let Some((pin, transform)) = placed_pin {
+                    let (px, py) = pin_endpoint(pin, *transform);
                     let net = graph.net_at(px, py);
                     if let Some(ref net_name) = net {
                         if !pull_up_nets.contains(net_name) {
@@ -307,12 +289,12 @@ async fn handle_audit_connections(
         }
 
         // Check for reset pins without pull-up
-        for pin in &pins {
+        for (pin, transform) in pins {
             let name_upper = pin.name.to_uppercase();
             if (name_upper.contains("RESET") || name_upper.contains("NRST") || name_upper == "RST")
                 && !name_upper.contains("OUT")
             {
-                let (px, py) = pin_endpoint(pin, inst.pin_transform());
+                let (px, py) = pin_endpoint(pin, *transform);
                 let net = graph.net_at(px, py);
                 if let Some(ref net_name) = net {
                     if !pull_up_nets.contains(net_name) {
@@ -355,11 +337,7 @@ async fn handle_audit_power_rails(
     info!(schematic = %sch_path.display(), "[BETA] Running power rail audit");
     let (_, tree) = read_schematic(&sch_path)?;
 
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed = placed_pins_by_reference(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut graph = net_graph_for(&tree, &wires, &labels);
@@ -370,7 +348,7 @@ async fn handle_audit_power_rails(
     let power_nets = collect_power_nets(&labels);
 
     // Check each power net for bulk capacitance
-    let (cap_nets, bulk_cap_nets) = capacitor_nets(&mut graph, &instances, &lib_syms);
+    let (cap_nets, bulk_cap_nets) = capacitor_nets(&mut graph, &placed);
 
     for net in &power_nets {
         if net.to_uppercase().contains("GND") || net.to_uppercase().contains("VSS") {
@@ -400,7 +378,7 @@ async fn handle_audit_power_rails(
     }
 
     // Check for test points on power rails
-    let test_point_nets = test_point_nets(&mut graph, &instances, &lib_syms);
+    let test_point_nets = test_point_nets(&mut graph, &placed);
     for net in &power_nets {
         if net.to_uppercase().contains("GND") {
             continue;
@@ -722,20 +700,15 @@ fn inspect_schematic_coverage(
         };
         coverage.resolved_symbols += 1;
 
-        // The design-review call sites tracked by #182 still use the
-        // unit-agnostic extractor. Until that issue lands, surface every such
-        // component as partial coverage rather than pretending it was audited.
+        // A count, not a diagnostic: the audits select the placed unit's own
+        // pins, so a multi-unit component is reviewed like any other. It stays
+        // in coverage because "which parts here have several units" is what a
+        // reader checks this number against.
         if extract_lib_pins(lib_symbol).len()
             > extract_lib_pins_for_unit(lib_symbol, instance.unit).len()
             && multi_unit_references.insert(instance.reference.clone())
         {
             coverage.multi_unit_symbols += 1;
-            diagnostics.push(json!({
-                "code": "multi_unit_review_incomplete",
-                "source": path.display().to_string(),
-                "reference": instance.reference,
-                "message": "design-review pin analysis is not unit-aware yet; tracked by issue #182"
-            }));
         }
     }
 }
@@ -1137,31 +1110,34 @@ fn is_power_pin_name(name: &str) -> bool {
         || upper.contains("PWR")
 }
 
-fn has_i2c_pins(pins: &[konnect_sexp::schematic::LibPin]) -> bool {
-    let names: Vec<String> = pins.iter().map(|p| p.name.to_uppercase()).collect();
+fn has_i2c_pins(pins: &[PlacedPin]) -> bool {
+    let names: Vec<String> = pins.iter().map(|(p, _)| p.name.to_uppercase()).collect();
     names.iter().any(|n| n.contains("SDA")) && names.iter().any(|n| n.contains("SCL"))
 }
 
-/// Every net a component's pins reach.
+/// One pin of one placed unit, with the transform that put it on the sheet.
+type PlacedPin = (
+    konnect_sexp::schematic::LibPin,
+    konnect_sexp::geometry::PinTransform,
+);
+
+/// A placed unit and the pins it draws — one entry of [`placed_pins_by_reference`].
+type PlacedUnit = (konnect_sexp::schematic::SymbolInstance, Vec<PlacedPin>);
+
+/// Every net a placed unit's pins reach.
 ///
 /// Nets come from the shared net graph, so a pin reaches its net along the
 /// wires and junctions it is drawn with, and a rail named by a power symbol is
 /// a net like any other. The audits used to scan the file for a label within
 /// 0.5 mm of the pin, which followed neither.
 ///
-/// Not unit-aware: `extract_lib_pins` superimposes every unit of a multi-unit
-/// symbol, which is #182. This is the walk that fix rewrites.
-fn pin_nets(
-    graph: &mut NetGraph,
-    inst: &konnect_sexp::schematic::SymbolInstance,
-    lib_syms: &[&konnect_sexp::parser::SexpNode],
-) -> HashSet<String> {
+/// `pins` comes from [`placed_pins_by_reference`], so it holds this unit's pins
+/// only: a triode of an ECC83 does not report the heater's net at its own
+/// coordinates (#182).
+fn pin_nets(graph: &mut NetGraph, pins: &[PlacedPin]) -> HashSet<String> {
     let mut nets = HashSet::new();
-    let Some(sym) = find_lib_symbol(lib_syms, inst) else {
-        return nets;
-    };
-    for pin in extract_lib_pins(sym) {
-        let (px, py) = pin_endpoint(&pin, inst.pin_transform());
+    for (pin, transform) in pins {
+        let (px, py) = pin_endpoint(pin, *transform);
         if let Some(net) = graph.net_at(px, py) {
             nets.insert(net);
         }
@@ -1197,13 +1173,12 @@ fn is_bulk_capacitor_value(value: &str) -> bool {
 /// (>= 10uF). One pass, since the second is a subset of the first.
 fn capacitor_nets(
     graph: &mut NetGraph,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
-    lib_syms: &[&konnect_sexp::parser::SexpNode],
+    placed: &[PlacedUnit],
 ) -> (HashSet<String>, HashSet<String>) {
     let mut all = HashSet::new();
     let mut bulk = HashSet::new();
-    for inst in instances.iter().filter(|inst| is_capacitor(inst)) {
-        let nets = pin_nets(graph, inst, lib_syms);
+    for (inst, pins) in placed.iter().filter(|(inst, _)| is_capacitor(inst)) {
+        let nets = pin_nets(graph, pins);
         if is_bulk_capacitor_value(&inst.value) {
             bulk.extend(nets.iter().cloned());
         }
@@ -1213,17 +1188,13 @@ fn capacitor_nets(
 }
 
 /// Nets with a test point on them.
-fn test_point_nets(
-    graph: &mut NetGraph,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
-    lib_syms: &[&konnect_sexp::parser::SexpNode],
-) -> HashSet<String> {
+fn test_point_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<String> {
     let is_test_point = |inst: &konnect_sexp::schematic::SymbolInstance| {
         inst.reference.starts_with("TP") || inst.value.to_uppercase().contains("TESTPOINT")
     };
     let mut nets = HashSet::new();
-    for inst in instances.iter().filter(|inst| is_test_point(inst)) {
-        nets.extend(pin_nets(graph, inst, lib_syms));
+    for (_, pins) in placed.iter().filter(|(inst, _)| is_test_point(inst)) {
+        nets.extend(pin_nets(graph, pins));
     }
     nets
 }
@@ -1233,17 +1204,13 @@ fn test_point_nets(
 ///
 /// Built once per sheet. Asking per pin instead re-walked every resistor on
 /// the sheet for each I2C or reset pin found.
-fn pull_up_nets(
-    graph: &mut NetGraph,
-    instances: &[konnect_sexp::schematic::SymbolInstance],
-    lib_syms: &[&konnect_sexp::parser::SexpNode],
-) -> HashSet<String> {
+fn pull_up_nets(graph: &mut NetGraph, placed: &[PlacedUnit]) -> HashSet<String> {
     let mut pulled = HashSet::new();
-    for inst in instances
+    for (_, pins) in placed
         .iter()
-        .filter(|inst| inst.reference.starts_with('R'))
+        .filter(|(inst, _)| inst.reference.starts_with('R'))
     {
-        let nets = pin_nets(graph, inst, lib_syms);
+        let nets = pin_nets(graph, pins);
         if nets.iter().any(|net| is_power_net_name(net)) {
             pulled.extend(nets);
         }
@@ -1595,21 +1562,19 @@ mod review_completion_tests {
         assert_eq!(report["coverage"]["schematic"]["named_nets"], 1);
     }
 
+    /// A multi-unit part is counted, not held against the review: the audits
+    /// walk each placement's own pins, so nothing about it is unreviewed.
     #[tokio::test]
-    async fn multi_unit_symbol_is_partial_until_issue_182_lands() {
+    async fn multi_unit_symbol_is_counted_without_degrading_the_review() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("multi.kicad_sch");
         std::fs::write(&root, multi_unit_schematic()).unwrap();
 
         let result = review(&root, None).await;
         let report = &result["design_review"];
-        assert_eq!(report["status"], "partial");
+        assert_eq!(report["status"], "complete");
         assert_eq!(report["coverage"]["schematic"]["multi_unit_symbols"], 1);
-        assert!(report["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["code"] == "multi_unit_review_incomplete"));
+        assert!(report["diagnostics"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2125,5 +2090,152 @@ mod net_resolution_tests {
     async fn a_pull_up_is_found_through_the_wire_and_the_power_symbol() {
         let findings = connection_findings(&i2c_sheet(I2C_PULL_UPS)).await;
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// A dual amplifier whose power pin lives on a third unit: unit 1 at
+    /// (100, 100) and unit 2 at (100, 120) carry only an output, unit 3 at
+    /// (140, 100) carries `V+`, wired to a `VCC` label with C1 on it.
+    ///
+    /// Every pin sits at its unit's origin, so a walk that superimposes all
+    /// three units reports a `V+` pin at (100, 100) and (100, 120) too — where
+    /// no rail is drawn (#182).
+    const MULTI_UNIT_POWER_SHEET: &str = r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect")
+  (generator_version "10.0")
+  (uuid "11111111-1111-4111-8111-111111111111")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:C"
+      (symbol "C_1_1"
+        (pin passive line (at 0 3.81 270) (length 0) (name "~") (number "1"))
+        (pin passive line (at 0 -3.81 90) (length 0) (name "~") (number "2"))
+      )
+    )
+    (symbol "Amplifier:DUAL"
+      (symbol "DUAL_1_1"
+        (pin output line (at 0 0 180) (length 0) (name "OUT") (number "1"))
+      )
+      (symbol "DUAL_2_1"
+        (pin output line (at 0 0 180) (length 0) (name "OUT") (number "7"))
+      )
+      (symbol "DUAL_3_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "V+") (number "8"))
+      )
+    )
+  )
+  (wire (pts (xy 140 100) (xy 160 100)) (uuid "aaaaaaaa-0000-4000-8000-000000000001"))
+  (label "VCC" (at 150 100 0) (uuid "cccccccc-0000-4000-8000-000000000001"))
+  (symbol
+    (lib_id "Amplifier:DUAL")
+    (at 100 100 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000001")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "DUAL" (at 100 100 0))
+    (property "Footprint" "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" (at 100 100 0))
+  )
+  (symbol
+    (lib_id "Amplifier:DUAL")
+    (at 100 120 0)
+    (unit 2)
+    (uuid "dddddddd-0000-4000-8000-000000000002")
+    (property "Reference" "U1" (at 100 120 0))
+    (property "Value" "DUAL" (at 100 120 0))
+    (property "Footprint" "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" (at 100 120 0))
+  )
+  (symbol
+    (lib_id "Amplifier:DUAL")
+    (at 140 100 0)
+    (unit 3)
+    (uuid "dddddddd-0000-4000-8000-000000000003")
+    (property "Reference" "U1" (at 140 100 0))
+    (property "Value" "DUAL" (at 140 100 0))
+    (property "Footprint" "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" (at 140 100 0))
+  )
+  (symbol
+    (lib_id "Device:C")
+    (at 150 103.81 0)
+    (unit 1)
+    (uuid "dddddddd-0000-4000-8000-000000000004")
+    (property "Reference" "C1" (at 150 103.81 0))
+    (property "Value" "100nF" (at 150 103.81 0))
+    (property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 150 103.81 0))
+  )
+)
+"##;
+
+    /// The power pin belongs to the unit that draws it: one pin, decoupled,
+    /// and no phantom copy of it reported at the other two placements.
+    #[tokio::test]
+    async fn a_power_pin_is_audited_only_at_the_unit_that_draws_it() {
+        let file = sheet(MULTI_UNIT_POWER_SHEET);
+        let body = audit_json(
+            handle_audit_decoupling(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert_eq!(body["total_power_pins"], 1, "{body}");
+        assert_eq!(body["pass_count"], 1, "{body}");
+        assert_eq!(body["findings"].as_array().unwrap().len(), 0, "{body}");
+    }
+
+    /// The same sheet through `run_design_review`: a multi-unit part no longer
+    /// makes the review incomplete, because its units are now audited.
+    #[tokio::test]
+    async fn a_multi_unit_part_no_longer_holds_the_review_open() {
+        let file = sheet(MULTI_UNIT_POWER_SHEET);
+        let body = audit_json(
+            handle_run_design_review(
+                &json!({ "schematic": file.path().to_str().unwrap() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap(),
+        );
+        let review = &body["design_review"];
+
+        assert_eq!(review["status"], "complete", "{review}");
+        assert_eq!(review["coverage"]["schematic"]["multi_unit_symbols"], 1);
+        assert_eq!(review["errors"], 0, "{review}");
+    }
+
+    /// A real three-unit part from the KiCAD demos: each ECC83 placement walks
+    /// its own pins and no others. The two triodes and the heater are placed
+    /// apart, so a unit-agnostic walk would put pins 4/5/9 on a triode's
+    /// coordinates and report nets from there.
+    ///
+    /// Asserted on the pins the audits walk rather than on their findings:
+    /// this sheet labels none of the nets at those pins.
+    #[test]
+    fn each_placed_ecc83_unit_walks_only_its_own_pins() {
+        let tree = konnect_sexp::parser::parse_sexp(include_str!(
+            "../../tests/fixtures/ecc83_multiunit.kicad_sch"
+        ))
+        .unwrap();
+
+        let tube_units: Vec<(u32, Vec<String>)> = placed_pins_by_reference(&tree)
+            .into_iter()
+            .filter(|(inst, _)| inst.lib_id.ends_with(":ECC83"))
+            .map(|(inst, pins)| {
+                let mut numbers: Vec<String> =
+                    pins.into_iter().map(|(pin, _)| pin.number).collect();
+                numbers.sort();
+                (inst.unit, numbers)
+            })
+            .collect();
+
+        assert_eq!(
+            tube_units,
+            vec![
+                (1, vec!["6".into(), "7".into(), "8".into()]),
+                (2, vec!["1".into(), "2".into(), "3".into()]),
+                (3, vec!["4".into(), "5".into(), "9".into()]),
+            ]
+        );
     }
 }
