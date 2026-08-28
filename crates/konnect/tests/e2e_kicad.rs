@@ -182,6 +182,13 @@ fn full_design_loop_with_real_kicad() {
         }),
     );
     p.tool(
+        "add_schematic_component",
+        json!({
+            "schematic": sch.to_string_lossy(), "lib_id": "Regulator_Linear:LM7805_TO220",
+            "reference": "U1", "x": 140.0, "y": 100.0
+        }),
+    );
+    p.tool(
         "connect_pins",
         json!({
             "schematic": sch.to_string_lossy(),
@@ -209,7 +216,49 @@ fn full_design_loop_with_real_kicad() {
         .into_iter()
         .map(|s| s.reference)
         .collect();
-    assert!(refs.contains(&"R1".to_string()) && refs.contains(&"C1".to_string()));
+    assert!(
+        refs.contains(&"R1".to_string())
+            && refs.contains(&"C1".to_string())
+            && refs.contains(&"U1".to_string())
+    );
+
+    // KiCad's BOM exporter reads Datasheet and Description from the placed
+    // instance, not the embedded lib_symbols fallback. Both rows must retain
+    // the descriptions copied from the real Device library (#226).
+    let bom_file = proj.join("metadata.csv");
+    let bom_output = Command::new(&kicad_cli)
+        .args(["sch", "export", "bom", "--output"])
+        .arg(&bom_file)
+        .args([
+            "--fields",
+            "Reference,Datasheet,Description",
+            "--labels",
+            "Reference,Datasheet,Description",
+        ])
+        .arg(&sch)
+        .output()
+        .expect("failed to run KiCad BOM exporter");
+    assert!(
+        bom_output.status.success(),
+        "KiCad BOM export failed: {}",
+        String::from_utf8_lossy(&bom_output.stderr)
+    );
+    let bom = std::fs::read_to_string(&bom_file).expect("KiCad wrote no BOM");
+    for reference in ["R1", "C1", "U1"] {
+        let prefix = format!("\"{reference}\",");
+        let row = bom
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("BOM has no {reference} row:\n{bom}"));
+        assert!(
+            !row.ends_with(",\"\""),
+            "{reference} lost its library Description in KiCad's BOM:\n{bom}"
+        );
+    }
+    assert!(
+        !bom.lines().any(|line| line.starts_with("\"U1\",\"\",\"")),
+        "U1 lost the regulator library Datasheet in KiCad's BOM:\n{bom}"
+    );
 
     // ── ERC through real eeschema ────────────────────────────────────────
     p.load("sch_export");

@@ -604,6 +604,7 @@ pub(crate) fn place_one_component(
     if !cse::library::ensure_lib_symbol(sch, lib_id, src) {
         return Err(crate::tools::lib_symbol_not_found_error(lib_id, src));
     }
+    let metadata = cse::library::symbol_metadata(sch, lib_id);
 
     // Validate the unit against the resolved symbol BEFORE writing anything:
     // eeschema silently renders an out-of-range unit as unit 1 and the
@@ -623,7 +624,10 @@ pub(crate) fn place_one_component(
 
     // Reference and Value go where the library anchors them, carried through
     // the placement transform so they follow a rotated body (#101);
-    // Footprint/Datasheet stay hidden at the origin.
+    // Footprint/Datasheet/Description stay hidden at the origin. KiCad copies
+    // Datasheet and Description from the resolved library symbol onto every
+    // placed instance; without those copies its BOM exporter leaves both
+    // columns blank even though lib_symbols still carries the values (#226).
     // Power symbols get their Reference hidden too, matching eeschema: a
     // #PWR designator is never shown on the sheet.
     let hide_reference = lib_id.starts_with("power:") || reference.starts_with("#PWR");
@@ -661,8 +665,24 @@ pub(crate) fn place_one_component(
     ));
     sym.properties
         .push(positioned("Footprint", "", x, y, 0.0, true, centred));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Datasheet",
+        &metadata.datasheet,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
+    sym.properties.push(positioned(
+        "Description",
+        &metadata.description,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -2939,6 +2959,55 @@ mod tests {
         assert!(
             !reference.contains("justify"),
             "a centred library field must not gain a justify: {reference}"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_copies_library_datasheet_and_description() {
+        // Pre-seed two real KiCad field shapes so this remains independent of
+        // an installed symbol library: one URL and one no-datasheet sentinel.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 2.032 0 90))\n      (property \"Value\" \"R\" (at 0 0 90))\n      (property \"Datasheet\" \"https://example.com/resistor.pdf\" (at 0 0 0))\n      (property \"Description\" \"Resistor\" (at 0 0 0))\n    )\n    (symbol \"Device:C\"\n      (property \"Reference\" \"C\" (at 2.032 0 90))\n      (property \"Value\" \"C\" (at 0 0 90))\n      (property \"Datasheet\" \"~\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        for (lib_id, reference, x) in [("Device:R", "R1", 100.0), ("Device:C", "C1", 120.0)] {
+            let result = handle_add_schematic_component(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "lib_id": lib_id,
+                    "reference": reference,
+                    "x": x,
+                    "y": 50.0
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{result:?}");
+        }
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let field = |reference: &str, name: &str| {
+            sch.symbols
+                .iter()
+                .find(|symbol| symbol.reference() == Some(reference))
+                .and_then(|symbol| symbol.properties.iter().find(|p| p.name == name))
+                .map(|property| property.value.as_str())
+        };
+        assert_eq!(
+            field("R1", "Datasheet"),
+            Some("https://example.com/resistor.pdf")
+        );
+        assert_eq!(field("R1", "Description"), Some("Resistor"));
+        assert_eq!(field("C1", "Datasheet"), Some("~"));
+        assert_eq!(
+            field("C1", "Description"),
+            Some(""),
+            "KiCad writes the mandatory Description field even when empty"
         );
     }
 
