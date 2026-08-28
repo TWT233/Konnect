@@ -30,6 +30,9 @@ usvg.workspace = true
 zip.workspace = true
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true
+
 [dev-dependencies]
 # The pcb_components fallback tests spawn a mock KiCAD NNG endpoint to prove
 # a reachable-but-rejecting KiCAD never triggers the file-editing fallback.

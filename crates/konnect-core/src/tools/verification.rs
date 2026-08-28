@@ -476,43 +476,16 @@ fn ui_running(process_detected: bool, ipc_responsive: bool) -> bool {
 }
 
 /// Resolve the KiCAD binary path from config or well-known locations.
-fn find_kicad_binary(config_binary: &str) -> String {
-    if !config_binary.is_empty() && std::path::Path::new(config_binary).exists() {
-        return config_binary.to_string();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // Scan common install roots and KiCAD version directories
-        let roots = [
-            r"C:\Program Files\KiCad",
-            r"C:\KiCad",
-            r"D:\KiCad",
-            r"D:\Program Files\KiCad",
-        ];
-        let versions = ["10.0", "9.0", "8.0"];
-        for root in &roots {
-            for ver in &versions {
-                let path = format!(r"{}\{}\bin\kicad.exe", root, ver);
-                if std::path::Path::new(&path).exists() {
-                    return path;
-                }
+fn find_kicad_binary(config_binary: &str, config_cli: &str) -> String {
+    crate::kicad_install::find_gui(config_binary, config_cli)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "kicad.exe".to_string()
+            } else {
+                "kicad".to_string()
             }
-            // Also check without version subdir
-            let path = format!(r"{}\bin\kicad.exe", root);
-            if std::path::Path::new(&path).exists() {
-                return path;
-            }
-        }
-        "kicad".to_string()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad".to_string()
-    }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        "kicad".to_string()
-    }
+        })
 }
 
 fn health_timeout_seconds(args: &serde_json::Value) -> Result<u64, CallToolResult> {
@@ -601,7 +574,7 @@ async fn handle_launch_kicad_ui(
 ) -> anyhow::Result<CallToolResult> {
     let wait_ready = args["wait_ready"].as_bool().unwrap_or(true);
     let timeout_secs = args["timeout_seconds"].as_u64().unwrap_or(30);
-    let binary = find_kicad_binary(&ctx.config.kicad_binary);
+    let binary = find_kicad_binary(&ctx.config.kicad_binary, &ctx.config.kicad_cli);
 
     let mut cmd = tokio::process::Command::new(&binary);
     if let Some(project) = args["project"].as_str() {
