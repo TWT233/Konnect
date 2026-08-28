@@ -426,3 +426,117 @@ fn snake_words(line: &str) -> Vec<String> {
     flush(&mut word, started_clean, &mut out);
     out
 }
+
+// ─── Library identifiers in guidance (skips without KiCad) ───────────────────
+
+/// Every `Lib:Symbol` identifier the bundled guidance quotes must resolve to a
+/// symbol in the installed KiCad libraries.
+///
+/// v0.10.0 shipped eleven that did not. Four transistors were listed under
+/// `Device:` when they live in `Transistor_BJT`/`Transistor_FET`,
+/// `Device:Ferrite_Bead` has never existed (it is `FerriteBead`), and two ICs
+/// carried pre-KiCad-10 family names. The duplicated table in
+/// `kicad-schematic/SKILL.md` had additionally drifted from its own reference,
+/// disagreeing on the BJT suffix.
+///
+/// An LLM following a bad identifier cannot place the part at all, so this is
+/// mechanically checkable and therefore checked. Skips silently when KiCad is
+/// not installed — CI on Linux/macOS runners has no symbol libraries, and the
+/// e2e-kicad workflow is where this runs for real.
+#[test]
+fn library_ids_in_guidance_resolve_against_installed_kicad() {
+    let Some(symbols) = kicad_symbol_root() else {
+        eprintln!("skipping: no installed KiCad symbol libraries found");
+        return;
+    };
+
+    // `Lib:Symbol` inside backticks. Library and symbol names are conservative
+    // so this never matches prose, tool names, or `mcp__konnect__*`.
+    let mut unresolved: Vec<String> = Vec::new();
+    for path in asset_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for token in text
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| t.contains(':') && !t.contains(' '))
+        {
+            let Some((lib, sym)) = token.split_once(':') else {
+                continue;
+            };
+            if lib.is_empty()
+                || sym.is_empty()
+                || !lib.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || !sym
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-+.".contains(c))
+            {
+                continue;
+            }
+            if !library_exists(&symbols, lib) {
+                // A library this KiCad build does not ship is not evidence of
+                // a bad identifier; only judge symbols in libraries we have.
+                continue;
+            }
+            if !symbol_exists(&symbols, lib, sym) {
+                unresolved.push(format!(
+                    "{}:{}  ({})",
+                    lib,
+                    sym,
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    unresolved.sort();
+    unresolved.dedup();
+    assert!(
+        unresolved.is_empty(),
+        "bundled guidance quotes {} library identifier(s) that do not exist in \
+         the installed KiCad libraries:\n  {}\n\nFix the identifier, or drop it \
+         if the part is no longer a sensible default.",
+        unresolved.len(),
+        unresolved.join("\n  ")
+    );
+}
+
+fn kicad_symbol_root() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("KICAD_SYMBOLS") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            r"C:\KiCad\10.0\share\kicad\symbols",
+            r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &["/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"]
+    } else {
+        &["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"]
+    };
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+/// KiCad 10 stores each library as a `<Lib>.kicad_symdir` directory of
+/// one-symbol files; older installs use a single `<Lib>.kicad_sym`.
+fn library_exists(root: &Path, lib: &str) -> bool {
+    root.join(format!("{lib}.kicad_symdir")).is_dir()
+        || root.join(format!("{lib}.kicad_sym")).is_file()
+}
+
+fn symbol_exists(root: &Path, lib: &str, sym: &str) -> bool {
+    let dir = root.join(format!("{lib}.kicad_symdir"));
+    if dir.is_dir() {
+        return dir.join(format!("{sym}.kicad_sym")).is_file();
+    }
+    let file = root.join(format!("{lib}.kicad_sym"));
+    std::fs::read_to_string(file)
+        .map(|s| s.contains(&format!("(symbol \"{sym}\"")))
+        .unwrap_or(false)
+}
