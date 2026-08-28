@@ -1596,6 +1596,7 @@ async fn handle_add_power_symbol(
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
+    let metadata = cse::library::symbol_metadata(&sch, &lib_id);
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -1647,8 +1648,24 @@ async fn handle_add_power_symbol(
     ));
     sym.properties
         .push(positioned("Footprint", "", x, y, 0.0, true, centred));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Datasheet",
+        &metadata.datasheet,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
+    sym.properties.push(positioned(
+        "Description",
+        &metadata.description,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -3367,6 +3384,51 @@ mod power_symbol_tests {
         assert!(
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),
             "must not write a bare Reference with no (at)"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_copies_library_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-metadata.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        assert_eq!(
+            sym.properties
+                .iter()
+                .find(|p| p.name == "Datasheet")
+                .map(|p| p.value.as_str()),
+            Some("https://example.com/gnd.pdf")
+        );
+        assert_eq!(
+            sym.properties
+                .iter()
+                .find(|p| p.name == "Description")
+                .map(|p| p.value.as_str()),
+            Some("Ground power symbol")
         );
     }
 

@@ -416,6 +416,40 @@ fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a
         .find(|s| s.value() == Some(lib_id))
 }
 
+/// Library-owned fields that KiCad copies onto each placed symbol instance.
+///
+/// Read these from the embedded definition rather than resolving the library
+/// again: the embedded copy is already flattened for derived symbols and is
+/// the exact definition the schematic instance refers to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolMetadata {
+    pub datasheet: String,
+    pub description: String,
+}
+
+/// Read the metadata fields of `lib_id` from the schematic's embedded symbol.
+/// Missing fields and an unknown symbol both produce empty values, matching
+/// KiCad's mandatory placed-field representation.
+pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
+    let Some(symbol) = embedded_lib_symbol(schematic, lib_id) else {
+        return SymbolMetadata::default();
+    };
+    let value = |name: &str| {
+        symbol
+            .find_all("property")
+            .into_iter()
+            .find(|property| property.value() == Some(name))
+            .and_then(|property| property.args().get(1))
+            .and_then(SexpNode::text)
+            .unwrap_or_default()
+            .to_string()
+    };
+    SymbolMetadata {
+        datasheet: value("Datasheet"),
+        description: value("Description"),
+    }
+}
+
 /// [`FieldAnchors`] of a resolved symbol node.
 ///
 /// Only direct `(property …)` children count: a unit sub-symbol carries its
@@ -742,6 +776,11 @@ mod suggestion_tests {
             out.contains("lm2904.pdf"),
             "properties the child lacks are inherited:\n{out}"
         );
+        assert_eq!(
+            symbol_metadata(&sch, "Amp:NE5532").datasheet,
+            "lm2904.pdf",
+            "placed-instance metadata must follow the flattened definition"
+        );
         // Pins from both units present exactly once.
         assert_eq!(out.matches("(number \"1\"").count(), 1);
         assert_eq!(out.matches("(number \"7\"").count(), 1);
@@ -913,6 +952,21 @@ mod field_anchor_tests {
         let anchors = field_anchors(&sch, "Device:R");
         assert_eq!(anchors.reference_at, Some((2.032, 0.0, 90.0)));
         assert_eq!(anchors.value_at, Some((0.0, 0.0, 90.0)));
+    }
+
+    #[test]
+    fn reads_instance_metadata_from_direct_library_properties_only() {
+        let (sch, _dir) = schematic_with(
+            "(symbol \"Device:R\" (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Resistor\" (at 0 0 0)) (symbol \"R_0_1\" (property \"Description\" \"nested\" (at 0 0 0))))",
+        );
+        assert_eq!(
+            symbol_metadata(&sch, "Device:R"),
+            SymbolMetadata {
+                datasheet: "~".to_string(),
+                description: "Resistor".to_string(),
+            }
+        );
+        assert_eq!(symbol_metadata(&sch, "Device:C"), SymbolMetadata::default());
     }
 
     /// The anchor alone is not enough: `Regulator_Linear:AP2112K-3.3` puts
