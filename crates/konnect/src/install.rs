@@ -1,7 +1,7 @@
 //! Client-aware installer for Konnect's bundled guidance.
 //!
-//! Handles client-scoped install, uninstall, status, first-launch setup, and
-//! Claude hook integration without writing into another client's directories.
+//! Handles explicit client-scoped install, uninstall, status, and Claude hook
+//! integration without writing into another client's directories.
 
 use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{bail, Context, Result};
@@ -95,10 +95,6 @@ pub fn run_install(client: InstallClient) -> Result<()> {
     run_install_at(client, &InstallPaths::for_current_user()?, true)
 }
 
-pub fn run_install_silent(client: InstallClient) -> Result<()> {
-    run_install_at(client, &InstallPaths::for_current_user()?, false)
-}
-
 pub fn run_uninstall(client: InstallClient) -> Result<()> {
     run_uninstall_at(client, &InstallPaths::for_current_user()?, true)
 }
@@ -123,12 +119,6 @@ pub fn print_skill_content(name: &str) -> Result<()> {
     }
     eprintln!("Unknown skill: {}", name);
     std::process::exit(1);
-}
-
-pub fn needs_install(client: InstallClient) -> bool {
-    InstallPaths::for_current_user()
-        .map(|paths| !has_install_marker(client, &paths))
-        .unwrap_or(false)
 }
 
 /// Double-click behavior remains Claude-focused for backward compatibility.
@@ -389,10 +379,6 @@ fn install_marker(client: InstallClient, paths: &InstallPaths) -> Option<PathBuf
         return Some(paths.legacy_marker());
     }
     None
-}
-
-fn has_install_marker(client: InstallClient, paths: &InstallPaths) -> bool {
-    install_marker(client, paths).is_some()
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -713,8 +699,8 @@ mod tests {
         let paths = test_paths(&temp);
         fs::create_dir_all(paths.data_dir()).unwrap();
         fs::write(paths.legacy_marker(), "0.4.0").unwrap();
-        assert!(has_install_marker(InstallClient::Claude, &paths));
-        assert!(!has_install_marker(InstallClient::Codex, &paths));
+        assert!(install_marker(InstallClient::Claude, &paths).is_some());
+        assert!(install_marker(InstallClient::Codex, &paths).is_none());
     }
 
     #[test]

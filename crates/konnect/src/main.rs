@@ -98,12 +98,9 @@ async fn main() -> Result<()> {
         return install::run_double_click_install();
     }
 
-    let client = install::client_from_server_args(&args[1..])?;
-
-    // ─── Auto-install on first MCP launch (safety net) ──────────────
-    if install::needs_install(client) {
-        let _ = install::run_install_silent(client);
-    }
+    // Keep accepting the public `--client` option, but MCP startup is
+    // deliberately non-mutating: guidance installation requires `konnect init`.
+    let _client = install::client_from_server_args(&args[1..])?;
 
     // --config <path>: load config from specified file
     let config_path = args
