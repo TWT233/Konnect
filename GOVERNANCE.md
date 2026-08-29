@@ -49,6 +49,9 @@ The queue is only legible if claims are visible.
 
 ## Releases
 
+- **Never hand-edit tool counts.** `cargo xtask fix-doc-counts` rewrites them
+  all from `router/registry.rs`. Hand-editing is what made every tool-adding PR
+  conflict with every other one.
 - **Announce intent before bumping**, and **land count-changing PRs first.**
   Every PR that adds a tool touches the same handful of documented counts, so a
   release that moves those counts conflicts with the entire open queue at once.

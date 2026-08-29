@@ -8,6 +8,7 @@ members = [
     "crates/konnect-schematic-editor",
     "crates/konnect-render",
     "crates/konnect-vcs",
+    "xtask",
 ]
 exclude = [
     "crates/schematic-viewer",  # Tauri app — built separately with `cargo tauri build`

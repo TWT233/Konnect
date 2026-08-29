@@ -76,10 +76,18 @@ These are exactly the commands CI runs — if they pass locally, CI should be gr
   refused every stock demo board, because KiCAD writes
   `(property ki_fp_filters "…")` — no position, no layer — into every footprint
   it places from a library, and the hand-written fixture had no such thing.
-- If you added or removed tools: update `tool_count` in `router/registry.rs`,
-  regenerate the matching section of `tool-directory.md`, and update the total tool
-  counts in DEV.md's "Current Stats" and the README — those three counts have
-  drifted apart before precisely because only one of them got updated
+- If you added or removed tools: set `tool_count` in `router/registry.rs`, add the
+  tool's row to `tool-directory.md`, then run
+
+  ```
+  cargo xtask fix-doc-counts
+  ```
+
+  which rewrites every count in every document from the registry. Do not edit the
+  numbers by hand. Roughly seven files quote them, so two PRs that both add a tool
+  used to conflict by construction, and a release that moved the counts conflicted
+  with the whole open queue at once. The guard (`doc_tool_counts`) still fails if
+  anything is stale; the command is how you satisfy it.
 
 First PR from a fork? CI workflows may sit at "waiting for approval" until a
 maintainer approves the run — that's a GitHub setting for first-time contributors,
