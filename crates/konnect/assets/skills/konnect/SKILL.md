@@ -56,6 +56,8 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 | "Rename net /CLK to /SYS_CLK" | 1 | Warn about downstream effects, then MCP tools |
 | "Run DRC" | 1 | `load_toolset("verification")` then `run_drc` |
 | "Add track widths to the PCB dropdown" | 1 | `load_toolset("verification")` then `set_predefined_sizes` |
+| "Add a conditional KiCad clearance exception" | 1 | `load_toolset("verification")` then `set_custom_rule` |
+| "Show active custom clearance rules" | 1 | `load_toolset("verification")` then `list_custom_rules` |
 | "Export Gerbers" | 1 | `load_toolset("pcb_export")` then `export_gerber` |
 | "Just patch line 247 of the .kicad_sch" | REFUSE | Explain risks, offer MCP alternative |
 | "Add ESD protection to USB lines" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |

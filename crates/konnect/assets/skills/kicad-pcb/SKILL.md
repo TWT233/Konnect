@@ -52,7 +52,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, set_design_rules, set_predefined_sizes, check_clearance
+ load_toolset('verification')     # run_drc, set_design_rules, set_predefined_sizes, check_clearance, set_custom_rule, list_custom_rules
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -235,6 +235,26 @@ set_predefined_sizes(board, track_widths=[0.2, 0.5, 0.8],
 
 A leading 0 mm / 0,0 via is always kept as “use netclass values”. These sizes
 are not DRC limits. KiCad reads the list on next project open.
+
+### Conditional custom rules
+
+Use `set_custom_rule` when board setup must keep a global minimum while a narrow,
+explicit KiCad condition carves out the only allowed exception:
+
+```
+set_custom_rule(board, name, constraint, minimum_mm, condition, layer?)
+list_custom_rules(board)
+```
+
+- `constraint` is currently `clearance`
+- `minimum_mm` is the rule floor in mm
+- `condition` must be the exact KiCad custom-rule expression you want enforced
+- `layer` is optional; omit it for all copper layers
+- `list_custom_rules` reads back named rules from the sibling KiCad custom-rule file
+
+Prefer this for audited exceptions such as "all copper must stay at 0.25 mm
+except this exact same-footprint pad pair may remain at the 0.20 mm board
+minimum". Do not treat it as a generic workaround for poor placement.
 
 ---
 

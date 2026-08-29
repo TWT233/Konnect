@@ -20,7 +20,7 @@ Load the required toolsets for design review:
 
 ```
 load_toolset('sch_analysis')     # find_orphan_items, find_shorted_nets, find_single_pin_nets
-load_toolset('verification')     # run_drc, check_clearance, get_design_rules
+ load_toolset('verification')     # run_drc, check_clearance, get_design_rules, list_custom_rules
 load_toolset('sch_export')       # run_erc
 load_toolset('pcb_export')       # get_drc_violations
 load_toolset('manufacturing')    # validate_for_manufacturing
@@ -107,6 +107,10 @@ Checks PCB-level rules:
 - Unrouted connections (incomplete routing)
 - Zone fill issues
 - Courtyard overlaps
+
+If the board relies on conditional KiCad exceptions, call `list_custom_rules()`
+before judging clearance findings so the review captures the active named rules
+instead of assuming only the Board Setup baseline.
 
 **Every DRC error must be resolved or explicitly justified before manufacturing.**
 

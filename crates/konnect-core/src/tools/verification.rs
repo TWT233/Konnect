@@ -3,11 +3,12 @@
 //! DRC delegates to `kicad-cli`. Design rules are read/written as S-expressions.
 //! KiCAD UI management uses process inspection + subprocess spawning.
 
+use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use anyhow::Context;
-use konnect_sexp::writer::write_atomic;
+use konnect_sexp::writer::{write_atomic, write_atomic_if_unchanged};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -198,6 +199,39 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "layer"]
             }),
             |args, ctx| async move { handle_set_layer_constraints(args, ctx).await }
+        ),
+        tool!(
+            "set_custom_rule",
+            "Atomically upsert one named custom DRC rule in the sibling `.kicad_dru` file. \
+             Board Setup is still the absolute minimum floor; use this for narrower conditional \
+             constraints such as tightening general copper clearance while explicitly excluding \
+             a proven same-footprint pad pair.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "name": { "type": "string", "description": "Stable rule name to upsert" },
+                    "constraint": { "type": "string", "description": "Constraint kind. Currently only 'clearance' is supported." },
+                    "minimum_mm": { "type": "number", "description": "Constraint minimum in mm" },
+                    "condition": { "type": "string", "description": "Restricted KiCad condition expression." },
+                    "layer": { "type": "string", "description": "Optional layer filter such as 'F.Cu'" }
+                },
+                "required": ["board", "name", "constraint", "minimum_mm", "condition"]
+            }),
+            |args, ctx| async move { handle_set_custom_rule(args, ctx).await }
+        ),
+        tool!(
+            "list_custom_rules",
+            "List the named custom DRC rules currently defined in the sibling `.kicad_dru` file, \
+             including constraint, minimum, optional layer, and condition read back from KiCad syntax.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_list_custom_rules(args, ctx).await }
         ),
         tool!(
             "check_clearance",
@@ -399,8 +433,248 @@ fn upsert_named_rule(content: &str, name: &str, rule: &str) -> String {
     result
 }
 
+fn invalid_result(field: &str, reason: impl Into<String>) -> CallToolResult {
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        ToolErrorKind::InvalidArgument {
+            field: field.to_string(),
+            reason: reason.clone(),
+        },
+        format!("Argument '{field}' is invalid: {reason}"),
+    )
+}
+
+fn conflict_result(path: &Path) -> CallToolResult {
+    CallToolResult::error_kind(
+        ToolErrorKind::Conflict {
+            paths: vec![path.display().to_string()],
+        },
+        "Custom rules were not changed because the file changed after it was read",
+    )
+}
+
 fn layer_rule(name: &str, constraint: &str, value: f64, layer: &str) -> String {
     format!("(rule \"{name}\"\n  (constraint {constraint} (min {value}mm))\n  (layer \"{layer}\"))")
+}
+
+fn escape_rule_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn validate_rule_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if !name.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, ':' | '_' | '-' | '.')
+    }) {
+        return Err(
+            "contains unsupported characters; allowed: ASCII letters, digits, ':', '_', '-', '.'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_constraint(constraint: &str) -> Result<(), String> {
+    if constraint == "clearance" {
+        Ok(())
+    } else {
+        Err("must be 'clearance'".to_string())
+    }
+}
+
+fn validate_minimum_mm(value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err("must be finite".to_string());
+    }
+    if value < 0.0 {
+        return Err("must be greater than or equal to 0".to_string());
+    }
+    Ok(())
+}
+
+fn validate_layer_name(layer: &str) -> Result<(), String> {
+    if layer.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if !layer
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '.' || character == '_')
+    {
+        return Err("contains unsupported characters".to_string());
+    }
+    Ok(())
+}
+
+fn validate_condition_expression(condition: &str) -> Result<(), String> {
+    if condition.trim().is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if condition.len() > 512 {
+        return Err("is too long".to_string());
+    }
+    if condition.contains('"')
+        || condition.contains('\n')
+        || condition.contains('\r')
+        || condition.contains('#')
+    {
+        return Err("must stay on one line and must not contain quotes or comments".to_string());
+    }
+    for disallowed in [
+        "layerOf(",
+        "existsOnLayer(",
+        "fromTo(",
+        "hasNetclass(",
+        "intersectsArea(",
+        "intersectsCourtyard(",
+        "insideArea(",
+        "enclosedByArea(",
+        "isCoupledDiffPair(",
+        "inDiffPair(",
+    ] {
+        if condition.contains(disallowed) {
+            return Err(format!("uses unsupported function '{disallowed}'"));
+        }
+    }
+    if !condition.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                ' ' | '\t' | '(' | ')' | '\'' | '_' | '.' | ':' | '*' | '?' | '!' | '&' | '|' | '='
+            )
+    }) {
+        return Err("contains unsupported characters".to_string());
+    }
+
+    let mut depth = 0i32;
+    for character in condition.chars() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("has unmatched ')'".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err("has unmatched '('".to_string());
+    }
+
+    let condensed = condition.replace('\t', " ");
+    for required in ["A.", "B.", "memberOfFootprint("] {
+        if !condensed.contains(required) {
+            return Err(format!("must reference '{required}'"));
+        }
+    }
+    for required in ["A.Type", "B.Type"] {
+        if !condensed.contains(required) {
+            return Err(format!("must reference '{required}'"));
+        }
+    }
+    if !(condensed.contains("Reference") || condensed.contains("Parent.Reference")) {
+        return Err("must reference Reference or Parent.Reference".to_string());
+    }
+    if !condensed.contains("==") && !condensed.contains("!=") {
+        return Err("must contain at least one equality comparison".to_string());
+    }
+    Ok(())
+}
+
+fn custom_rule(
+    name: &str,
+    constraint: &str,
+    minimum_mm: f64,
+    condition: &str,
+    layer: Option<&str>,
+) -> String {
+    let mut rule = format!(
+        "(rule \"{}\"\n  (constraint {} (min {}mm))",
+        escape_rule_string(name),
+        constraint,
+        minimum_mm
+    );
+    if let Some(layer) = layer {
+        rule.push_str(&format!("\n  (layer \"{}\")", escape_rule_string(layer)));
+    }
+    rule.push_str(&format!(
+        "\n  (condition \"{}\"))",
+        escape_rule_string(condition)
+    ));
+    rule
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CustomRuleRecord {
+    name: String,
+    constraint: String,
+    minimum_mm: f64,
+    condition: String,
+    layer: Option<String>,
+}
+
+fn extract_quoted_value(line: &str) -> Option<String> {
+    let start = line.find('"')?;
+    let end = line[start + 1..].find('"')? + start + 1;
+    Some(line[start + 1..end].to_string())
+}
+
+fn extract_constraint(block: &str) -> Option<(String, f64)> {
+    let line = block
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("(constraint "))?;
+    let rest = line.strip_prefix("(constraint ")?;
+    let constraint = rest.split_whitespace().next()?.to_string();
+    let min_start = line.find("(min ")? + "(min ".len();
+    let min_end = line[min_start..].find("mm)")? + min_start;
+    let minimum_mm = line[min_start..min_end].trim().parse().ok()?;
+    Some((constraint, minimum_mm))
+}
+
+fn parse_named_rules(content: &str) -> Vec<CustomRuleRecord> {
+    let mut rules = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(relative) = content[search_from..].find("(rule \"") {
+        let start = search_from + relative;
+        let rest = &content[start..];
+        let name_start = "(rule \"".len();
+        let Some(name_end_rel) = rest[name_start..].find('"') else {
+            break;
+        };
+        let name = rest[name_start..name_start + name_end_rel].to_string();
+        let Some((_, end)) = named_rule_range(rest, &name) else {
+            break;
+        };
+        let block = &rest[..end];
+        let Some((constraint, minimum_mm)) = extract_constraint(block) else {
+            search_from = start + end;
+            continue;
+        };
+        let layer = block
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("(layer "))
+            .and_then(extract_quoted_value);
+        let condition = block
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("(condition "))
+            .and_then(extract_quoted_value)
+            .unwrap_or_default();
+        rules.push(CustomRuleRecord {
+            name,
+            constraint,
+            minimum_mm,
+            condition,
+            layer,
+        });
+        search_from = start + end;
+    }
+    rules
 }
 
 async fn handle_set_design_rules(
@@ -1194,6 +1468,114 @@ async fn handle_set_layer_constraints(
     ))
 }
 
+async fn handle_set_custom_rule(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let name = match require_str(args, "name") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    if let Err(reason) = validate_rule_name(&name) {
+        return Ok(invalid_result("name", reason));
+    }
+
+    let constraint = match require_str(args, "constraint") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    if let Err(reason) = validate_constraint(&constraint) {
+        return Ok(invalid_result("constraint", reason));
+    }
+
+    let minimum_mm = match require_f64(args, "minimum_mm") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    if let Err(reason) = validate_minimum_mm(minimum_mm) {
+        return Ok(invalid_result("minimum_mm", reason));
+    }
+
+    let condition = match require_str(args, "condition") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+    if let Err(reason) = validate_condition_expression(&condition) {
+        return Ok(invalid_result("condition", reason));
+    }
+
+    let layer = match args.get("layer") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(layer)) => {
+            if let Err(reason) = validate_layer_name(layer) {
+                return Ok(invalid_result("layer", reason));
+            }
+            Some(layer.to_string())
+        }
+        Some(_) => return Ok(invalid_result("layer", "missing or not a string")),
+    };
+
+    let rules_path = sibling_custom_rules_path(&board);
+    let original = match std::fs::read_to_string(&rules_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "(version 1)\n".to_string(),
+        Err(error) => return Err(error.into()),
+    };
+    let rule = custom_rule(&name, &constraint, minimum_mm, &condition, layer.as_deref());
+    let updated = upsert_named_rule(&original, &name, &rule);
+
+    if updated != original {
+        if rules_path.exists() {
+            if let Err(error) = write_atomic_if_unchanged(&rules_path, &original, &updated) {
+                return match error {
+                    konnect_sexp::SexpError::Conflict { .. } => Ok(conflict_result(&rules_path)),
+                    other => Err(other.into()),
+                };
+            }
+        } else {
+            write_atomic(&rules_path, &updated)?;
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "rules_file": rules_path.display().to_string(),
+        "rule": {
+            "name": name,
+            "constraint": constraint,
+            "minimum_mm": minimum_mm,
+            "condition": condition,
+            "layer": layer
+        }
+    })))
+}
+
+async fn handle_list_custom_rules(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let rules_path = sibling_custom_rules_path(&board);
+    let rules = match std::fs::read_to_string(&rules_path) {
+        Ok(content) => parse_named_rules(&content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(CallToolResult::json(&json!({
+        "board": board.display().to_string(),
+        "rules_file": rules_path.display().to_string(),
+        "count": rules.len(),
+        "rules": rules.into_iter().map(|rule| json!({
+            "name": rule.name,
+            "constraint": rule.constraint,
+            "minimum_mm": rule.minimum_mm,
+            "condition": rule.condition,
+            "layer": rule.layer
+        })).collect::<Vec<_>>()
+    })))
+}
+
 // ─── Check clearance ─────────────────────────────────────────────────────────
 
 async fn handle_check_clearance(
@@ -1561,6 +1943,191 @@ mod tests {
         assert!(rules.contains("(constraint clearance (min 0.25mm))"));
         assert!(rules.contains("(constraint track_width (min 0.25mm))"));
         assert!(rules.contains("(layer \"F.Cu\")"));
+    }
+
+    #[test]
+    fn verification_toolset_registers_custom_rule_api() {
+        let defs = tools();
+        let set_rule = defs
+            .iter()
+            .find(|tool| tool.name == "set_custom_rule")
+            .expect("set_custom_rule registered");
+        let list_rules = defs
+            .iter()
+            .find(|tool| tool.name == "list_custom_rules")
+            .expect("list_custom_rules registered");
+        assert_eq!(
+            set_rule.input_schema["required"],
+            json!(["board", "name", "constraint", "minimum_mm", "condition"])
+        );
+        assert_eq!(list_rules.input_schema["required"], json!(["board"]));
+    }
+
+    #[test]
+    fn custom_rule_condition_is_restricted_to_the_safe_subset() {
+        let ok = "A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)";
+        assert!(validate_condition_expression(ok).is_ok(), "{ok}");
+
+        for (bad, field) in [
+            ("", "empty"),
+            ("A.Type == 'Pad'", "missing b"),
+            ("A.Type == 'Pad' && B.Type == 'Pad'", "missing function"),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*')",
+                "missing reference",
+            ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint(\"C*\")",
+                "quote",
+            ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.fromTo('U1-1','U2-1')",
+                "unsupported function",
+            ),
+        ] {
+            assert!(
+                validate_condition_expression(bad).is_err(),
+                "{field}: {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_custom_rule_upserts_idempotently_and_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = dir.path().join("board.kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(
+            &rules,
+            "(version 1)\n# preserve me\n\n(rule \"keep\"\n  (constraint clearance (min 0.3mm))\n  (condition \"A.Type == 'Track' && B.Type == 'Track'\"))\n",
+        )
+        .await
+        .unwrap();
+        let args = json!({
+            "board": board,
+            "name": "konnect:c2856805:except_same_footprint",
+            "constraint": "clearance",
+            "minimum_mm": 0.25,
+            "condition": "A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)"
+        });
+
+        for _ in 0..2 {
+            let result = handle_set_custom_rule(&args, &test_ctx()).await.unwrap();
+            assert!(!result.is_error, "{:?}", result.content);
+        }
+
+        let written = tokio::fs::read_to_string(&rules).await.unwrap();
+        assert!(
+            written.starts_with("(version 1)\n# preserve me"),
+            "{written}"
+        );
+        assert!(written.contains("(rule \"keep\""), "{written}");
+        assert_eq!(
+            written
+                .matches("(rule \"konnect:c2856805:except_same_footprint\"")
+                .count(),
+            1,
+            "{written}"
+        );
+        assert!(
+            written.contains("(constraint clearance (min 0.25mm))"),
+            "{written}"
+        );
+        assert!(written.contains("(condition \"A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)\")"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn set_custom_rule_rejects_invalid_inputs_and_stale_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = dir.path().join("board.kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+
+        let invalid_name = handle_set_custom_rule(
+            &json!({
+                "board": board,
+                "name": "",
+                "constraint": "clearance",
+                "minimum_mm": 0.25,
+                "condition": "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference != B.Reference"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(invalid_name.is_error);
+        let invalid_name: Value = serde_json::from_str(&text_of(&invalid_name)).unwrap();
+        assert_eq!(invalid_name["error"]["kind"], "invalid_argument");
+        assert_eq!(invalid_name["error"]["field"], "name");
+        assert!(!rules.exists(), "invalid input must not write a rules file");
+
+        let invalid_condition = handle_set_custom_rule(
+            &json!({
+                "board": board,
+                "name": "ok",
+                "constraint": "clearance",
+                "minimum_mm": 0.25,
+                "condition": "A.fromTo('U1-1','U2-1')"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(invalid_condition.is_error);
+        let invalid_condition: Value = serde_json::from_str(&text_of(&invalid_condition)).unwrap();
+        assert_eq!(invalid_condition["error"]["kind"], "invalid_argument");
+        assert_eq!(invalid_condition["error"]["field"], "condition");
+
+        std::fs::write(&rules, "(version 1)\n# baseline\n").unwrap();
+        let original = std::fs::read_to_string(&rules).unwrap();
+        let updated = upsert_named_rule(
+            &original,
+            "ok",
+            &custom_rule(
+                "ok",
+                "clearance",
+                0.25,
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference != B.Reference",
+                None,
+            ),
+        );
+        std::fs::write(&rules, "(version 1)\n# changed elsewhere\n").unwrap();
+        let error = write_atomic_if_unchanged(&rules, &original, &updated).unwrap_err();
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&rules).unwrap(),
+            "(version 1)\n# changed elsewhere\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_custom_rules_reads_back_named_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = dir.path().join("board.kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(
+            &rules,
+            "(version 1)\n(rule \"konnect:clearance\"\n  (constraint clearance (min 0.25mm))\n  (layer \"F.Cu\")\n  (condition \"A.Type == 'Pad' && B.Type == 'Pad' && A.Reference != B.Reference\"))\n",
+        )
+        .await
+        .unwrap();
+
+        let listed = handle_list_custom_rules(&json!({ "board": board }), &test_ctx())
+            .await
+            .unwrap();
+        assert!(!listed.is_error, "{}", text_of(&listed));
+        let listed: Value = serde_json::from_str(&text_of(&listed)).unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["rules"][0]["name"], "konnect:clearance");
+        assert_eq!(listed["rules"][0]["constraint"], "clearance");
+        assert_eq!(listed["rules"][0]["minimum_mm"], 0.25);
+        assert_eq!(listed["rules"][0]["layer"], "F.Cu");
+        assert_eq!(
+            listed["rules"][0]["condition"],
+            "A.Type == 'Pad' && B.Type == 'Pad' && A.Reference != B.Reference"
+        );
     }
 }
 

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **217 registered tools** + **6 always-visible meta-tools** = **223 total**
+- **219 registered tools** + **6 always-visible meta-tools** = **225 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -359,8 +359,8 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 
 ## Verification
 
-### `verification` · 10 tools
-**Purpose:** DRC, design rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
+### `verification` · 12 tools
+**Purpose:** DRC, design rules, custom rules, layer constraints, clearance checks, KiCAD UI control. ERC lives in `sch_export` (`run_erc`), not here.
 **Source:** [`crates/konnect-core/src/tools/verification.rs`](crates/konnect-core/src/tools/verification.rs)
 
 | Tool | Description |
@@ -374,6 +374,8 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
 | `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) as named rules in the sibling `.kicad_dru` custom-rules file. |
+| `set_custom_rule` | Atomically upsert one named custom DRC rule in the sibling `.kicad_dru` file. Board Setup remains the absolute floor; use this to tighten conditional constraints such as excluding a proven same-footprint pad pair from a broader clearance rule. |
+| `list_custom_rules` | List the named custom DRC rules currently defined in the sibling `.kicad_dru` file, including constraint, minimum, optional layer, and condition. |
 | `check_clearance` | Check the physical clearance (distance) between two components on the PCB. |
 
 ---

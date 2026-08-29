@@ -492,3 +492,275 @@ fn a_written_default_netclass_still_plots_wires() {
         "a sparse named class changed the junction dot: {radius} -> {after}"
     );
 }
+
+fn drc_report(
+    kicad_cli: &str,
+    board: &std::path::Path,
+) -> (std::process::Output, serde_json::Value) {
+    let out = board.parent().unwrap().join("coupon-drc.json");
+    let output = Command::new(kicad_cli)
+        .args(["pcb", "drc", "--format", "json", "--output"])
+        .arg(&out)
+        .arg(board)
+        .output()
+        .expect("failed to run kicad-cli pcb drc");
+    let body: Value = serde_json::from_str(
+        &std::fs::read_to_string(&out).expect("kicad-cli wrote no DRC report"),
+    )
+    .expect("DRC JSON must parse");
+    (output, body)
+}
+
+fn write_coupon_project(project: &std::path::Path) {
+    std::fs::write(
+        project,
+        serde_json::to_string_pretty(&json!({
+            "meta": {"filename": "coupon.kicad_pro", "version": 1},
+            "board": {"design_settings": {"rules": {
+                "min_clearance": 0.2,
+                "min_track_width": 0.2,
+                "min_via_diameter": 0.6,
+                "min_through_hole_diameter": 0.3,
+                "min_hole_to_hole": 0.25
+            }}},
+            "boards": [],
+            "cvpcb": {},
+            "libraries": {},
+            "pcbnew": {},
+            "schematic": {},
+            "sheets": [],
+            "text_variables": {}
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+}
+
+fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
+    let track_one_end = 111.0;
+    let track_two_start = track_one_end + 0.2 + unrelated_gap_mm;
+    let board_text = format!(
+        r#"(kicad_pcb
+  (version 20250610)
+  (generator "pcbnew")
+  (generator_version "10.0")
+  (general
+    (thickness 1.6)
+    (legacy_teardrops no)
+  )
+  (paper "A4")
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (32 "B.Adhes" user "B.Adhesive")
+    (33 "F.Adhes" user "F.Adhesive")
+    (34 "B.Paste" user)
+    (35 "F.Paste" user)
+    (36 "B.SilkS" user "B.Silkscreen")
+    (37 "F.SilkS" user "F.Silkscreen")
+    (38 "B.Mask" user)
+    (39 "F.Mask" user)
+    (44 "Edge.Cuts" user)
+    (45 "Margin" user)
+    (46 "B.CrtYd" user "B.Courtyard")
+    (47 "F.CrtYd" user "F.Courtyard")
+    (48 "B.Fab" user)
+    (49 "F.Fab" user)
+  )
+  (setup
+    (pad_to_mask_clearance 0)
+    (allow_soldermask_bridges_in_footprints no)
+  )
+  (net 0 "")
+  (net 1 "N1")
+  (net 2 "N2")
+  (net 3 "N3")
+  (gr_rect
+    (start 95 95)
+    (end 120 105)
+    (stroke (width 0.05) (type default))
+    (fill no)
+    (layer "Edge.Cuts")
+    (uuid "00000000-0000-0000-0000-000000000201")
+  )
+  (footprint "Capacitor_SMD:C_0402_1005Metric"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-000000000001")
+    (at 100 100)
+    (property "Reference" "C1"
+      (at 0 -1 0)
+      (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (property "Value" "C2856805"
+      (at 0 1 0)
+      (layer "F.Fab")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (attr smd)
+    (pad "1" smd roundrect
+      (at -0.2 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 1 "N1")
+      (uuid "00000000-0000-0000-0000-000000000011")
+    )
+    (pad "2" smd roundrect
+      (at 0.2 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 2 "N2")
+      (uuid "00000000-0000-0000-0000-000000000012")
+    )
+  )
+  (footprint "Capacitor_SMD:C_0402_1005Metric"
+    (layer "F.Cu")
+    (uuid "00000000-0000-0000-0000-000000000002")
+    (at 103 100)
+    (property "Reference" "C2"
+      (at 0 -1 0)
+      (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (property "Value" "C2856805"
+      (at 0 1 0)
+      (layer "F.Fab")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (attr smd)
+    (pad "1" smd roundrect
+      (at -0.2 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 2 "N2")
+      (uuid "00000000-0000-0000-0000-000000000021")
+    )
+    (pad "2" smd roundrect
+      (at 0.2 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 3 "N3")
+      (uuid "00000000-0000-0000-0000-000000000022")
+    )
+  )
+  (segment
+    (start 110 100)
+    (end 111 100)
+    (width 0.2)
+    (layer "F.Cu")
+    (net 1)
+    (uuid "00000000-0000-0000-0000-000000000101")
+  )
+  (segment
+    (start {track_two_start:.2} 100)
+    (end {track_two_end:.2} 100)
+    (width 0.2)
+    (layer "F.Cu")
+    (net 2)
+    (uuid "00000000-0000-0000-0000-000000000102")
+  )
+)"#,
+        track_two_start = track_two_start,
+        track_two_end = track_two_start + 1.0
+    );
+    std::fs::write(board, board_text).unwrap();
+}
+
+fn write_coupon_rules(rules: &std::path::Path) {
+    std::fs::write(
+        rules,
+        r#"(version 1)
+(rule "konnect:c2856805:except_same_footprint"
+  (constraint clearance (min 0.25mm))
+  (condition "A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)")
+)
+(rule "konnect:general-copper-clearance"
+  (constraint clearance (min 0.25mm))
+  (condition "!(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)")
+)
+"#,
+    )
+    .unwrap();
+}
+
+fn has_clearance_violation(report: &Value, actual_mm: &str) -> bool {
+    report["violations"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .any(|violation| {
+            violation["type"] == "clearance"
+                && violation["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&format!("actual {actual_mm} mm"))
+        })
+}
+
+fn has_clearance_pair(report: &Value, first: &str, second: &str) -> bool {
+    report["violations"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter(|violation| violation["type"] == "clearance")
+        .any(|violation| {
+            let items = violation["items"].as_array().cloned().unwrap_or_default();
+            let descriptions: Vec<&str> = items
+                .iter()
+                .filter_map(|item| item["description"].as_str())
+                .collect();
+            descriptions
+                .iter()
+                .any(|description| description.contains(first))
+                && descriptions
+                    .iter()
+                    .any(|description| description.contains(second))
+        })
+}
+
+#[test]
+#[ignore = "requires kicad-cli; run via e2e workflow"]
+fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCad (this test is e2e-only)");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("coupon.kicad_pro");
+    let board = tmp.path().join("coupon.kicad_pcb");
+    let rules = tmp.path().join("coupon.kicad_dru");
+    write_coupon_project(&project);
+    write_coupon_rules(&rules);
+
+    write_coupon_board(&board, 0.24);
+    let (fail_output, fail_report) = drc_report(&kicad_cli, &board);
+    assert!(
+        fail_output.status.success(),
+        "KiCad DRC failed to run: {}",
+        String::from_utf8_lossy(&fail_output.stderr)
+    );
+    assert!(
+        has_clearance_violation(&fail_report, "0.2400"),
+        "0.24 mm unrelated copper must fail the 0.25 mm custom rule: {fail_report}"
+    );
+    assert!(
+        !has_clearance_pair(&fail_report, "Pad 1 [N1] of C1", "Pad 2 [N2] of C1"),
+        "same-footprint C2856805 pads must stay exempt at the 0.20 mm board floor: {fail_report}"
+    );
+
+    write_coupon_board(&board, 0.25);
+    let (pass_output, pass_report) = drc_report(&kicad_cli, &board);
+    assert!(
+        pass_output.status.success(),
+        "KiCad DRC failed to run: {}",
+        String::from_utf8_lossy(&pass_output.stderr)
+    );
+    assert!(
+        !has_clearance_violation(&pass_report, "0.2500"),
+        "0.25 mm unrelated copper must satisfy the custom rule: {pass_report}"
+    );
+}
