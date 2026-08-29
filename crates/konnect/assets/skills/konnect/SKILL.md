@@ -55,6 +55,7 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 | "Add a 100nF cap to U3 VCC" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Rename net /CLK to /SYS_CLK" | 1 | Warn about downstream effects, then MCP tools |
 | "Run DRC" | 1 | `load_toolset("verification")` then `run_drc` |
+| "Add track widths to the PCB dropdown" | 1 | `load_toolset("verification")` then `set_predefined_sizes` |
 | "Export Gerbers" | 1 | `load_toolset("pcb_export")` then `export_gerber` |
 | "Just patch line 247 of the .kicad_sch" | REFUSE | Explain risks, offer MCP alternative |
 | "Add ESD protection to USB lines" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |

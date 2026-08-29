@@ -8,7 +8,7 @@ use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_sexp::writer::write_atomic;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
 
@@ -73,6 +73,54 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_design_rules(args, ctx).await }
+        ),
+        tool!(
+            "set_predefined_sizes",
+            "Write the PCB editor Pre-defined Sizes list (track widths and via pad/drill \
+             pairs) into the sibling .kicad_pro. These populate the Track/Via dropdowns \
+             and W/Shift+W while routing; they are not DRC limits and do not change \
+             netclasses. A leading 0 mm track and 0/0 via is always kept as the \
+             'use netclass' sentinel. Pass only the lists you want to replace. KiCad \
+             reads the change on next project open. The board file is not modified.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is edited" },
+                    "track_widths": {
+                        "type": "array",
+                        "description": "Track widths in mm for the router dropdown, excluding the 0 mm netclass sentinel (that row is always prepended). An empty array leaves only the sentinel.",
+                        "items": { "type": "number" }
+                    },
+                    "via_dimensions": {
+                        "type": "array",
+                        "description": "Via pad/drill pairs in mm for the router dropdown, excluding the 0/0 netclass sentinel (that row is always prepended). An empty array leaves only the sentinel.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "diameter": { "type": "number", "description": "Via pad diameter in mm" },
+                                "drill": { "type": "number", "description": "Via drill diameter in mm" }
+                            },
+                            "required": ["diameter", "drill"]
+                        }
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_set_predefined_sizes(args, ctx).await }
+        ),
+        tool!(
+            "get_predefined_sizes",
+            "Return the PCB editor Pre-defined Sizes list from the sibling .kicad_pro: \
+             track_widths (mm) and via_dimensions (diameter/drill mm), including the \
+             0 / 0,0 netclass sentinel KiCad keeps at the front of each list.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file; the sibling .kicad_pro is read" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_get_predefined_sizes(args, ctx).await }
         ),
         tool!(
             "check_kicad_ui",
@@ -426,6 +474,241 @@ async fn handle_get_design_rules(
         }))
         .unwrap(),
     ))
+}
+
+// ─── Pre-defined sizes (Board Setup → Design Rules → Pre-defined Sizes) ───────
+//
+// KiCad stores the router palette in board.design_settings.track_widths /
+// via_dimensions. A leading 0 (track) or {diameter:0, drill:0} (via) is the
+// "use netclass values" sentinel the dropdown always shows first. These lists
+// are not DRC floors and are not netclass widths.
+
+fn project_design_settings_mut(
+    project: &mut Value,
+) -> anyhow::Result<&mut serde_json::Map<String, Value>> {
+    let project = project
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("KiCAD project root must be a JSON object"))?;
+    let board = project
+        .entry("board")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("KiCAD project 'board' must be a JSON object"))?;
+    board
+        .entry("design_settings")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("KiCAD project 'board.design_settings' must be a JSON object")
+        })
+}
+
+fn load_sibling_project(board: &Path) -> anyhow::Result<Result<(PathBuf, Value), CallToolResult>> {
+    let project_path = sibling_project_path(board);
+    if !project_path.exists() {
+        return Ok(Err(CallToolResult::error(format!(
+            "No project file at {} — Pre-defined Sizes live in the .kicad_pro, \
+             and a list written anywhere else is never read. Create the project \
+             (KiCad: File > Save a Copy, or place the board inside a project) and retry.",
+            project_path.display()
+        ))));
+    }
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&project_path)?)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", project_path.display()))?;
+    Ok(Ok((project_path, settings)))
+}
+
+fn finite_positive(value: f64, field: &str) -> Result<f64, CallToolResult> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(CallToolResult::error(format!(
+            "Argument '{field}' is invalid: must be a finite number greater than 0 mm, got {value}"
+        )))
+    }
+}
+
+/// Palette track widths, with the 0 mm netclass sentinel always first.
+/// Caller zeros are dropped rather than duplicated.
+fn parse_track_widths(raw: &[Value]) -> Result<Vec<Value>, CallToolResult> {
+    let mut out = vec![json!(0.0)];
+    for (i, item) in raw.iter().enumerate() {
+        let width = item.as_f64().ok_or_else(|| {
+            CallToolResult::error(format!(
+                "Argument 'track_widths[{i}]' is invalid: missing or not a number"
+            ))
+        })?;
+        if width == 0.0 {
+            continue;
+        }
+        let width = finite_positive(width, &format!("track_widths[{i}]"))?;
+        let encoded = json!(width);
+        if !out.contains(&encoded) {
+            out.push(encoded);
+        }
+    }
+    Ok(out)
+}
+
+/// Palette vias, with the 0/0 netclass sentinel always first.
+fn parse_via_dimensions(raw: &[Value]) -> Result<Vec<Value>, CallToolResult> {
+    let mut out = vec![json!({ "diameter": 0.0, "drill": 0.0 })];
+    for (i, item) in raw.iter().enumerate() {
+        let obj = item.as_object().ok_or_else(|| {
+            CallToolResult::error(format!(
+                "Argument 'via_dimensions[{i}]' is invalid: missing or not an object"
+            ))
+        })?;
+        let diameter = obj.get("diameter").and_then(Value::as_f64).ok_or_else(|| {
+            CallToolResult::error(format!(
+                "Argument 'via_dimensions[{i}].diameter' is invalid: missing or not a number"
+            ))
+        })?;
+        let drill = obj.get("drill").and_then(Value::as_f64).ok_or_else(|| {
+            CallToolResult::error(format!(
+                "Argument 'via_dimensions[{i}].drill' is invalid: missing or not a number"
+            ))
+        })?;
+        if diameter == 0.0 && drill == 0.0 {
+            continue;
+        }
+        let diameter = finite_positive(diameter, &format!("via_dimensions[{i}].diameter"))?;
+        let drill = finite_positive(drill, &format!("via_dimensions[{i}].drill"))?;
+        if diameter <= drill {
+            return Err(CallToolResult::error(format!(
+                "Argument 'via_dimensions[{i}]' is invalid: diameter ({diameter} mm) \
+                 must be greater than drill ({drill} mm)"
+            )));
+        }
+        let encoded = json!({ "diameter": diameter, "drill": drill });
+        if !out.contains(&encoded) {
+            out.push(encoded);
+        }
+    }
+    Ok(out)
+}
+
+fn current_predefined_sizes(project: &Value) -> (Value, Value) {
+    let settings = &project["board"]["design_settings"];
+    let track_widths = settings["track_widths"].clone();
+    let via_dimensions = settings["via_dimensions"].clone();
+    (
+        if track_widths.is_array() {
+            track_widths
+        } else {
+            json!([0.0])
+        },
+        if via_dimensions.is_array() {
+            via_dimensions
+        } else {
+            json!([{ "diameter": 0.0, "drill": 0.0 }])
+        },
+    )
+}
+
+async fn handle_set_predefined_sizes(
+    args: &Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let tracks_arg = match args.get("track_widths") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => match parse_track_widths(items) {
+            Ok(v) => Some(v),
+            Err(e) => return Ok(e),
+        },
+        Some(_) => {
+            return Ok(CallToolResult::error(
+                "Argument 'track_widths' is invalid: missing or not an array".to_string(),
+            ))
+        }
+    };
+    let vias_arg = match args.get("via_dimensions") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => match parse_via_dimensions(items) {
+            Ok(v) => Some(v),
+            Err(e) => return Ok(e),
+        },
+        Some(_) => {
+            return Ok(CallToolResult::error(
+                "Argument 'via_dimensions' is invalid: missing or not an array".to_string(),
+            ))
+        }
+    };
+    if tracks_arg.is_none() && vias_arg.is_none() {
+        return Ok(CallToolResult::error(
+            "Argument 'track_widths' is invalid: name at least one of track_widths, via_dimensions"
+                .to_string(),
+        ));
+    }
+
+    if let Some(refusal) = crate::tools::pcb_board::refuse_if_board_open_in_kicad(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "Pre-defined Sizes list",
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+
+    let (project_path, mut project) = match load_sibling_project(&board)? {
+        Ok(v) => v,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    let (mut track_widths, mut via_dimensions) = current_predefined_sizes(&project);
+    let mut changed_fields = Vec::new();
+    if let Some(next) = tracks_arg {
+        let next = Value::Array(next);
+        if next != track_widths {
+            changed_fields.push("track_widths");
+            track_widths = next;
+        }
+    }
+    if let Some(next) = vias_arg {
+        let next = Value::Array(next);
+        if next != via_dimensions {
+            changed_fields.push("via_dimensions");
+            via_dimensions = next;
+        }
+    }
+
+    if !changed_fields.is_empty() {
+        let settings = project_design_settings_mut(&mut project)?;
+        settings.insert("track_widths".into(), track_widths.clone());
+        settings.insert("via_dimensions".into(), via_dimensions.clone());
+        let mut content = serde_json::to_string_pretty(&project)?;
+        content.push('\n');
+        write_atomic(&project_path, &content)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "success": true,
+        "project": project_path,
+        "changed": changed_fields,
+        "track_widths": track_widths,
+        "via_dimensions": via_dimensions,
+        "note": "Pre-defined Sizes live in the project file and fill the Track/Via dropdowns. \
+                 They are not DRC limits. KiCad reads the change on next project open."
+    })))
+}
+
+async fn handle_get_predefined_sizes(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let (project_path, project) = match load_sibling_project(&board)? {
+        Ok(v) => v,
+        Err(refusal) => return Ok(refusal),
+    };
+    let (track_widths, via_dimensions) = current_predefined_sizes(&project);
+    Ok(CallToolResult::json(&json!({
+        "project": project_path,
+        "track_widths": track_widths,
+        "via_dimensions": via_dimensions
+    })))
 }
 
 // ─── KiCAD UI management ──────────────────────────────────────────────────────
@@ -1076,6 +1359,173 @@ mod tests {
         assert_eq!(rules["min_through_hole_diameter"], 0.30);
         assert_eq!(rules["min_via_diameter"], 0.70);
         assert_eq!(rules["min_hole_to_hole"], 0.45);
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn project_json(project: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(project).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_predefined_sizes_writes_palette_and_leaves_the_board_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(&project, blank_project()).await.unwrap();
+        let original_board = tokio::fs::read(&board).await.unwrap();
+
+        let result = handle_set_predefined_sizes(
+            &json!({
+                "board": board,
+                "track_widths": [0.2, 0.5, 0.8],
+                "via_dimensions": [
+                    { "diameter": 0.6, "drill": 0.3 },
+                    { "diameter": 0.8, "drill": 0.4 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert_eq!(tokio::fs::read(&board).await.unwrap(), original_board);
+
+        let stored = project_json(&project);
+        assert_eq!(
+            stored["board"]["design_settings"]["track_widths"],
+            json!([0.0, 0.2, 0.5, 0.8])
+        );
+        assert_eq!(
+            stored["board"]["design_settings"]["via_dimensions"],
+            json!([
+                { "diameter": 0.0, "drill": 0.0 },
+                { "diameter": 0.6, "drill": 0.3 },
+                { "diameter": 0.8, "drill": 0.4 }
+            ])
+        );
+        assert_eq!(stored["meta"]["filename"], json!("board.kicad_pro"));
+    }
+
+    #[tokio::test]
+    async fn get_predefined_sizes_reads_what_set_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(&project, blank_project()).await.unwrap();
+        handle_set_predefined_sizes(
+            &json!({ "board": board, "track_widths": [0.2] }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle_get_predefined_sizes(&json!({ "board": board }), &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(body["track_widths"], json!([0.0, 0.2]));
+        assert_eq!(
+            body["via_dimensions"],
+            json!([{ "diameter": 0.0, "drill": 0.0 }])
+        );
+    }
+
+    #[tokio::test]
+    async fn set_predefined_sizes_without_a_project_file_refuses_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        let original_board = tokio::fs::read(&board).await.unwrap();
+
+        let result = handle_set_predefined_sizes(
+            &json!({ "board": board, "track_widths": [0.2] }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("kicad_pro"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(tokio::fs::read(&board).await.unwrap(), original_board);
+        assert!(!dir.path().join("board.kicad_pro").exists());
+    }
+
+    #[tokio::test]
+    async fn set_predefined_sizes_refuses_a_via_with_no_annular_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(&project, blank_project()).await.unwrap();
+        let original_project = tokio::fs::read(&project).await.unwrap();
+
+        let result = handle_set_predefined_sizes(
+            &json!({
+                "board": board,
+                "via_dimensions": [{ "diameter": 0.3, "drill": 0.3 }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(
+            text_of(&result).contains("greater than drill"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(tokio::fs::read(&project).await.unwrap(), original_project);
+    }
+
+    #[tokio::test]
+    async fn set_predefined_sizes_omitting_vias_leaves_existing_vias_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let project = dir.path().join("board.kicad_pro");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(&project, blank_project()).await.unwrap();
+        handle_set_predefined_sizes(
+            &json!({
+                "board": board,
+                "track_widths": [0.2],
+                "via_dimensions": [{ "diameter": 0.6, "drill": 0.3 }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle_set_predefined_sizes(
+            &json!({ "board": board, "track_widths": [0.2, 0.5] }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", text_of(&result));
+        let stored = project_json(&project);
+        assert_eq!(
+            stored["board"]["design_settings"]["track_widths"],
+            json!([0.0, 0.2, 0.5])
+        );
+        assert_eq!(
+            stored["board"]["design_settings"]["via_dimensions"],
+            json!([
+                { "diameter": 0.0, "drill": 0.0 },
+                { "diameter": 0.6, "drill": 0.3 }
+            ])
+        );
     }
 
     #[tokio::test]
