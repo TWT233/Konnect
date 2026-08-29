@@ -333,6 +333,23 @@ pub fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args[key].as_str()
 }
 
+/// Extract an optional array-of-strings argument: `None` when absent, a
+/// structured `InvalidArgument` error when present but not an array of
+/// strings. Prefer this over `as_array().unwrap_or_default()`, which reports a
+/// malformed argument as an empty list.
+pub fn opt_str_list(args: &Value, key: &str) -> Result<Option<Vec<String>>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or_else(|| invalid_arg(key, "every entry must be a string")),
+        _ => Err(invalid_arg(key, "expected an array of strings")),
+    }
+}
+
 /// Extract a required f64 argument. Returns a structured `InvalidArgument`
 /// error result if missing or not a number.
 pub fn require_f64(args: &Value, key: &str) -> Result<f64, CallToolResult> {

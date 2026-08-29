@@ -63,7 +63,9 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 Follow this sequence for a clean PCB workflow:
 
-1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry
+1. **Board outline** — `set_board_size` or draw Edge.Cuts geometry. Both outline tools
+   append, so resize with `delete_graphics(layer='Edge.Cuts')` first — a second call
+   without it leaves two overlapping outlines and a DRC failure.
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned

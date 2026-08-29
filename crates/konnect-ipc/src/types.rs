@@ -199,6 +199,24 @@ pub struct IpcNet {
     pub netcode: i32,
 }
 
+/// A board graphic — a shape, text, textbox, or dimension — read back from
+/// KiCad.
+///
+/// `kind` is normalized (`line`, `rect`, `arc`, `circle`, `poly`, `curve`,
+/// `text`, `textbox`, `dimension`) so the live and the file reader answer in
+/// one vocabulary rather than protobuf names on one side and `gr_*` file tags
+/// on the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcGraphic {
+    pub uuid: String,
+    pub kind: String,
+    pub layer: String,
+    /// First defining point in mm: a segment's start, a rectangle's top-left,
+    /// an arc's start, a circle's centre, a polygon's first vertex, a text's
+    /// position. `None` when KiCad sent no geometry.
+    pub origin: Option<IpcVector2>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcLayer {
     pub name: String,
