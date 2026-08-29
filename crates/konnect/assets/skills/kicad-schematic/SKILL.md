@@ -171,6 +171,10 @@ Connect multiple pins to the same net in one call. Ideal for:
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.
 
+### batch_set_schematic_field_visibility
+
+Set placed `Reference` and/or `Value` field visibility for one or more components in one atomic write. Each edit needs `reference` plus at least one of `reference_visible` or `value_visible`; duplicate references, missing references, unknown keys, and malformed existing hide nodes are rejected without writing.
+
 ### When to Use Batch vs Individual
 
 - 1-2 components: individual calls

@@ -312,6 +312,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "kicad_binary",
         "ipc_address",
         "project_dir",
+        "reference_visible",
+        "value_visible",
         "lib_id",
         "lib_name",
         "sym_lib_table",
