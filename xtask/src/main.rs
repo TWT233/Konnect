@@ -191,9 +191,15 @@ fn fix_doc_counts() {
         }
 
         if touched {
-            let mut joined = out.join(&NL.to_string());
+            // Preserve whatever line endings the file already had. Rewriting a
+            // CRLF document as LF churns every line in a Windows contributor's
+            // working tree for a one-digit change — and this repository has
+            // already shipped one line-ending regression (#352).
+            let crlf = text.contains("\r\n");
+            let sep = if crlf { "\r\n" } else { "\n" };
+            let mut joined = out.join(sep);
             if text.ends_with(NL) {
-                joined.push(NL);
+                joined.push_str(sep);
             }
             std::fs::write(path, joined).expect("write");
             changed.push(
