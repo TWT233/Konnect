@@ -98,7 +98,7 @@ pub fn tools() -> Vec<ToolDef> {
             "auto_place_from_schematic",
             "Deterministic first placement: cluster footprints by shared nets (union-find), \
              lay clusters out as tight grids inside the board outline, courtyards \
-             non-overlapping. A starting point for refinement, not a final layout — the \
+             non-overlapping. Footprints locked in KiCad are never moved and act as obstacles; add more with 'locked'. A starting point for refinement, not a final layout — the \
              response says so, and carries the board's score before and after the plan. \
              Dry-run by default.",
             json!({
@@ -106,6 +106,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "margin_mm": { "type": "number", "default": 2.0, "description": "Clearance from the board outline" },
+                    "locked": { "type": "array", "items": { "type": "string" }, "description": "Additional references that must not move. Footprints KiCad itself marks locked are always held, without needing to be listed here." },
                     "dry_run": { "type": "boolean", "default": true }
                 },
                 "required": ["board"]
@@ -763,6 +764,14 @@ async fn handle_auto_place(
     let board = get_path(args, "board")?;
     let margin = args["margin_mm"].as_f64().unwrap_or(2.0);
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let held_by_caller: BTreeSet<String> = args["locked"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let content = konnect_sexp::writer::read_consistent(&board)?;
     let tree = konnect_sexp::parse_sexp(&content)?;
@@ -775,12 +784,23 @@ async fn handle_auto_place(
     };
 
     // Union-find over references joined by shared nets.
-    let mut parts: Vec<&FootprintCourtyard> = scan
+    // A footprint KiCad has locked is one the user pinned deliberately. It is
+    // an obstacle for this pass, never an input to it (#350) — and the caller
+    // can hold more references without touching the board.
+    let mut all: Vec<&FootprintCourtyard> = scan
         .items
         .iter()
         .filter(|c| c.reference.is_some())
         .collect();
-    parts.sort_by_key(|c| c.reference.clone());
+    all.sort_by_key(|c| c.reference.clone());
+    let is_held = |c: &FootprintCourtyard| {
+        c.locked
+            || c.reference
+                .as_deref()
+                .is_some_and(|r| held_by_caller.contains(r))
+    };
+    let held: Vec<&FootprintCourtyard> = all.iter().copied().filter(|c| is_held(c)).collect();
+    let parts: Vec<&FootprintCourtyard> = all.iter().copied().filter(|c| !is_held(c)).collect();
     let ref_index: HashMap<&str, usize> = parts
         .iter()
         .enumerate()
@@ -821,6 +841,7 @@ async fn handle_auto_place(
     let snap = |v: f64| (v / GRID).round() * GRID;
     let (ox0, oy0, ox1, _oy1) = outline;
     let mut placements = Vec::new();
+    let mut moved_parts: Vec<&FootprintCourtyard> = Vec::new();
     let mut planned_moves = Vec::new();
     let mut cursor_x = ox0 + margin;
     let mut cursor_y = oy0 + margin;
@@ -872,6 +893,7 @@ async fn handle_auto_place(
                 snap(target_center.1 + (ay - bcy)),
             );
             let reference = part.reference.clone().expect("filtered");
+            moved_parts.push(part);
             placements.push(konnect_ipc::types::IpcFootprintPlacement {
                 reference: reference.clone(),
                 x: target.0,
@@ -885,6 +907,64 @@ async fn handle_auto_place(
             }));
         }
         cursor_x += cluster_w + margin;
+    }
+
+    // Held footprints are obstacles, so anything the grid drops on top of one
+    // is nudged off it. Same spiral-on-grid resolution the force-directed pass
+    // uses, for the same reason: deterministic by construction, no RNG.
+    if !held.is_empty() {
+        let obstacles: Vec<Obstacle> = held
+            .iter()
+            .map(|c| {
+                (
+                    bbox_center(c.bbox),
+                    (c.bbox.2 - c.bbox.0, c.bbox.3 - c.bbox.1),
+                    c.layer_side,
+                )
+            })
+            .collect();
+        let overlaps = |a: (f64, f64), sa: (f64, f64), b: (f64, f64), sb: (f64, f64)| {
+            (a.0 - b.0).abs() < (sa.0 + sb.0) * 0.5 && (a.1 - b.1).abs() < (sa.1 + sb.1) * 0.5
+        };
+        for (slot, placement) in placements.iter_mut().enumerate() {
+            let part = moved_parts[slot];
+            let size = (part.bbox.2 - part.bbox.0, part.bbox.3 - part.bbox.1);
+            let (bcx, bcy) = bbox_center(part.bbox);
+            let (ax, ay) = part.at;
+            // Courtyard centre implied by the anchor this plan is proposing.
+            let centre_of = |anchor: (f64, f64)| (anchor.0 + (bcx - ax), anchor.1 + (bcy - ay));
+            let hits = |anchor: (f64, f64)| {
+                let c = centre_of(anchor);
+                obstacles
+                    .iter()
+                    .any(|(oc, os, side)| *side == part.layer_side && overlaps(c, size, *oc, *os))
+            };
+            let mut anchor = (placement.x, placement.y);
+            if hits(anchor) {
+                'search: for ring in 1..400 {
+                    let r = ring as f64 * GRID;
+                    for (dx, dy) in [
+                        (r, 0.0),
+                        (0.0, r),
+                        (-r, 0.0),
+                        (0.0, -r),
+                        (r, r),
+                        (-r, r),
+                        (r, -r),
+                        (-r, -r),
+                    ] {
+                        let candidate = (snap(anchor.0 + dx), snap(anchor.1 + dy));
+                        if !hits(candidate) {
+                            anchor = candidate;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            placement.x = anchor.0;
+            placement.y = anchor.1;
+            planned_moves[slot]["to"] = json!({ "x": round3(anchor.0), "y": round3(anchor.1) });
+        }
     }
 
     let score_before = score_of_content(ctx, &content).await?;
@@ -901,12 +981,25 @@ async fn handle_auto_place(
         })
         .collect();
 
+    // Say what was refused, not just what moved: a caller who expected a part
+    // to be relocated needs to see that it was held, and why.
+    let held_report: Vec<serde_json::Value> = held
+        .iter()
+        .map(|c| {
+            json!({
+                "reference": c.reference.as_deref().unwrap_or_default(),
+                "reason": if c.locked { "locked in kicad" } else { "listed in locked" },
+            })
+        })
+        .collect();
+
     if dry_run {
         return Ok(CallToolResult::json(&json!({
             "dry_run": true,
             "note": "a starting point for refinement, not a final layout",
             "clusters": cluster_report,
             "planned_moves": planned_moves,
+            "held": held_report.clone(),
             "score_before": score_before["score"],
             "score_after_plan": score_after["score"],
             "verdict_after_plan": score_after["verdict"],
@@ -933,6 +1026,7 @@ async fn handle_auto_place(
         "note": "a starting point for refinement, not a final layout",
         "clusters": cluster_report,
         "applied_count": applied.len(),
+        "held": held_report,
         "score_before": score_before["score"],
         "score_after": score_written["score"],
         "verdict_after": score_written["verdict"],
@@ -1007,9 +1101,14 @@ async fn handle_force_directed(
         .collect();
     parts.sort_by_key(|c| c.reference.clone());
     let ref_of = |i: usize| parts[i].reference.as_deref().expect("filtered");
+    // Three ways a part is immovable, and KiCad's own lock is the one the
+    // caller should not have to restate: a footprint the user pinned in the
+    // editor must never be relocated by an automated pass (#350).
     let movable = |i: usize| {
         let name = ref_of(i);
-        !locked.contains(name) && selected.as_ref().map(|s| s.contains(name)).unwrap_or(true)
+        !parts[i].locked
+            && !locked.contains(name)
+            && selected.as_ref().map(|s| s.contains(name)).unwrap_or(true)
     };
 
     // Spring graph: accumulated weight per part pair sharing nets.
@@ -1281,6 +1380,9 @@ fn sorted_unique(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 /// A courtyard bounding box: (x_min, y_min, x_max, y_max) in mm.
 type Bbox = (f64, f64, f64, f64);
+
+/// A held footprint as the layout sees it: centre, size, and which side it is on.
+type Obstacle = ((f64, f64), (f64, f64), Side);
 
 /// One decoupling cap that sits further from its nearest shared-net IC than
 /// its value family allows.
@@ -1760,6 +1862,119 @@ mod tests {
         );
         let b = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
         assert_eq!(a, b, "same input, same plan");
+    }
+
+    /// Lock a footprint the way KiCad does, and neither planner may move it
+    /// (#350). Before this, `auto_place_from_schematic` relocated every
+    /// footprint on the board, locked or not, with no way to exempt one.
+    ///
+    /// The lock is written exactly as pcbnew writes it — `(locked yes)` as the
+    /// footprint's first child, at the file's own indentation — copied from a
+    /// KiCad-authored demo board rather than invented here.
+    fn lock_footprint(board: &std::path::Path, reference: &str) {
+        let content = std::fs::read_to_string(board).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let marker = format!(r#"(property "Reference" "{reference}""#);
+        let r = lines
+            .iter()
+            .position(|l| l.contains(&marker))
+            .expect("reference not present in fixture");
+        let f = lines[..r]
+            .iter()
+            .rposition(|l| l.trim_start().starts_with("(footprint "))
+            .expect("reference has no enclosing footprint");
+        let indent: String = lines[f + 1]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        out.insert(f + 1, format!("{indent}(locked yes)"));
+        let nl = String::from_utf8(vec![10]).unwrap();
+        std::fs::write(board, out.join(&nl)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_place_holds_footprints_kicad_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({ "board": board.to_string_lossy() });
+        let moved_u1 = |v: &serde_json::Value| {
+            v["planned_moves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["reference"] == "U1")
+        };
+
+        // Premise: unlocked, U1 is one of the parts this planner relocates.
+        // Without this the test could pass against a planner that moves nothing.
+        let before = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
+        assert!(
+            moved_u1(&before),
+            "premise failed, U1 must move unlocked: {before}"
+        );
+
+        lock_footprint(&board, "U1");
+        let after = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
+        assert!(!moved_u1(&after), "locked U1 was still relocated: {after}");
+        assert!(
+            after["held"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["reference"] == "U1" && h["reason"] == "locked in kicad"),
+            "the response must say what it refused to move: {after}"
+        );
+        assert_eq!(
+            after["planned_moves"].as_array().unwrap().len(),
+            7,
+            "the other seven parts still place: {after}"
+        );
+    }
+
+    /// The force-directed pass reads the board's own lock too, so a caller who
+    /// never passes `locked` still cannot shove a pinned part around.
+    #[tokio::test]
+    async fn force_directed_holds_footprints_kicad_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({ "board": board.to_string_lossy() });
+        let moved_u1 = |v: &serde_json::Value| {
+            v["planned_moves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["reference"] == "U1")
+        };
+        let before = text_of(&handle_force_directed(&args, &test_ctx()).await.unwrap()).await;
+        assert!(
+            moved_u1(&before),
+            "premise failed, U1 must move unlocked: {before}"
+        );
+
+        lock_footprint(&board, "U1");
+        let after = text_of(&handle_force_directed(&args, &test_ctx()).await.unwrap()).await;
+        assert!(!moved_u1(&after), "locked U1 was still relocated: {after}");
+    }
+
+    /// The same hold, requested by the caller instead of by the board.
+    #[tokio::test]
+    async fn auto_place_honours_the_locked_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = fixture_copy(&dir);
+        let args = json!({ "board": board.to_string_lossy(), "locked": ["U1"] });
+        let a = text_of(&handle_auto_place(&args, &test_ctx()).await.unwrap()).await;
+        for mv in a["planned_moves"].as_array().unwrap() {
+            assert_ne!(mv["reference"], "U1", "caller-locked reference moved: {mv}");
+        }
+        assert!(
+            a["held"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["reference"] == "U1" && h["reason"] == "listed in locked"),
+            "{a}"
+        );
     }
 
     /// Determinism and safety of the spring embedder: run-twice identical,

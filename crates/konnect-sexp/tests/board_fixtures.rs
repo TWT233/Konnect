@@ -716,3 +716,107 @@ fn every_installed_demo_board_indexes_consistently() {
         "suspiciously few courtyards ({n_courtyards})"
     );
 }
+
+// ─── Footprint lock state (#350) ─────────────────────────────────────────────
+
+/// `unlocked` contains `locked`, and KiCad writes far more of the former.
+///
+/// Every one of ecc83's 15 footprints carries `(unlocked yes)` — nested inside
+/// its `(property ...)` items — and the board contains **zero** `(locked yes)`.
+/// Two plausible implementations invert the attribute outright here: a text
+/// scan for `locked yes`, and a recursive search that matches the tag loosely.
+/// Either reports all 15 footprints as locked, so automated placement would
+/// refuse to move a board on which nothing is locked at all.
+///
+/// What makes the real implementation correct is reading the tag as the head of
+/// a **direct** child: that makes `unlocked` a different tag rather than a
+/// longer spelling of this one, and keeps a property's attribute from being
+/// mistaken for the footprint's.
+///
+/// (The author of this parse fell for exactly this with `grep -c "locked yes"`
+/// while writing it, which is why the test exists.)
+#[test]
+fn unlocked_is_not_a_spelling_of_locked() {
+    for (name, min_unlocked) in [
+        ("ecc83-pp.kicad_pcb", 30usize),
+        ("pic_programmer.kicad_pcb", 12),
+        ("RoyalBlue54L-NFC-Antenna.kicad_pcb", 9),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let content = std::fs::read_to_string(&path).expect("fixture readable");
+        assert!(
+            content.matches("(unlocked yes)").count() >= min_unlocked,
+            "{name}: expected at least {min_unlocked} `(unlocked yes)`; the fixture              changed and this test's premise no longer holds"
+        );
+        assert_eq!(
+            content.matches("(locked yes)").count(),
+            0,
+            "{name}: fixture now contains a real lock; this test assumes it has none"
+        );
+
+        let tree = parse_sexp(&content).expect("fixture parses");
+        let scan = footprint_courtyards(&tree);
+        let locked: Vec<&str> = scan
+            .items
+            .iter()
+            .filter(|c| c.locked)
+            .filter_map(|c| c.reference.as_deref())
+            .collect();
+        assert!(
+            locked.is_empty(),
+            "{name}: reported {} locked footprint(s) {:?} on a board whose only lock              attribute is `unlocked`",
+            locked.len(),
+            locked
+        );
+    }
+}
+
+/// The positive half, against real boards: pcbnew's own demos do contain
+/// genuinely locked footprints, and we must see them.
+///
+/// Pinning an exact total would break on the next KiCad release, so this
+/// asserts the shape instead — some board has locked footprints, no board
+/// reports more locked than it has, and (the real point) the count is nowhere
+/// near the total, which is what a depth-blind implementation would produce.
+#[test]
+fn installed_demo_boards_report_genuinely_locked_footprints() {
+    let Some(root) = demo_dirs() else {
+        eprintln!("SKIP: no KiCAD demos found (set KICAD_DEMOS to enable)");
+        return;
+    };
+
+    let (mut total, mut locked) = (0usize, 0usize);
+    let mut boards_with_locks = 0usize;
+    for board in collect_boards(&root) {
+        let content = std::fs::read_to_string(&board).unwrap_or_default();
+        let Ok(tree) = parse_sexp(&content) else {
+            continue;
+        };
+        let scan = footprint_courtyards(&tree);
+        let n = scan.items.iter().filter(|c| c.locked).count();
+        assert!(
+            n <= scan.items.len(),
+            "{}: {n} locked of {} footprints",
+            board.display(),
+            scan.items.len()
+        );
+        if n > 0 {
+            boards_with_locks += 1;
+        }
+        total += scan.items.len();
+        locked += n;
+    }
+
+    assert!(
+        locked > 0 && boards_with_locks > 0,
+        "no locked footprint found across {total} footprints in the installed demos — \
+         either the lock parse is blind, or pcbnew stopped shipping locked parts"
+    );
+    assert!(
+        locked * 4 < total,
+        "{locked} of {total} demo footprints reported locked; that ratio means the parse \
+         is matching pad- or graphic-level locks, not footprint-level ones"
+    );
+}
