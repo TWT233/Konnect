@@ -393,7 +393,7 @@ fn mask_sexp_comments(content: &str) -> String {
             } else if character == '\r' {
                 masked.push('\r');
             } else {
-                masked.push(' ');
+                masked.extend(std::iter::repeat_n(' ', character.len_utf8()));
             }
             continue;
         }
@@ -2506,6 +2506,26 @@ mod tests {
         assert!(block.starts_with("(rule \"target\""), "{block}");
         assert!(block.contains("(min 0.25mm)"), "{block}");
         assert!(!block.contains("(min 9mm)"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn upsert_named_rule_ignores_non_ascii_comments_without_shifting_offsets() {
+        let source = "(version 1)\n# 中文注释：这里有多字节字符，不应把后面的 offset 算错\n(rule \"keep\"\n  (constraint clearance (min 0.3mm))\n  (condition \"A.Type == 'Track' && B.Type == 'Track'\"))\n(rule \"target\"\n  (constraint clearance (min 0.25mm))\n  (condition \"A.Type == 'Pad' && B.Type == 'Pad'\"))\n";
+        let replacement = "(rule \"target\"\n  (constraint clearance (min 0.22mm))\n  (condition \"A.Type == 'Pad' && B.Type == 'Pad'\"))";
+        let updated = upsert_named_rule(source, "target", replacement);
+
+        assert!(
+            updated.contains(
+                "(rule \"keep\"\n  (constraint clearance (min 0.3mm))\n  (condition \"A.Type == 'Track' && B.Type == 'Track'\"))"
+            ),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("(rule \"target\"\n  (constraint clearance (min 0.22mm))"),
+            "{updated}"
+        );
+        assert!(updated.contains("(min 0.22mm)"), "{updated}");
+        assert!(!updated.contains("(min 0.25mm)"), "{updated}");
     }
 
     #[tokio::test]

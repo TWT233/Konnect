@@ -596,7 +596,7 @@ fn write_coupon_board(
     (layer "Edge.Cuts")
     (uuid "00000000-0000-0000-0000-000000000201")
   )
-  (footprint "Capacitor_SMD:C_0402_1005Metric"
+  (footprint "LH60:C_0402_1005Metric_C2856805"
     (layer "F.Cu")
     (uuid "00000000-0000-0000-0000-000000000001")
     (at 100 100)
@@ -706,7 +706,7 @@ fn write_coupon_rules(rules: &std::path::Path) {
         r#"(version 1)
 (rule "konnect:c2856805:except_same_footprint"
   (constraint clearance (min 0.25mm))
-  (condition "!(A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && B.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && A.Reference == B.Reference)")
+  (condition "!(A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('LH60:C_0402_1005Metric_C2856805') && B.memberOfFootprint('LH60:C_0402_1005Metric_C2856805') && A.Reference == B.Reference)")
 )
 "#,
     )
@@ -784,6 +784,10 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
         has_clearance_pair(&fail_report, "Pad 1 [N4] of R1", "Pad 2 [N5] of R1"),
         "same-footprint non-C2856805 pair must still fail at 0.20 mm: {fail_report}"
     );
+    assert!(
+        has_clearance_pair(&fail_report, "Pad 1 [N3] of C2", "Pad 2 [N6] of C2"),
+        "same-footprint non-target 0402 capacitor must still fail at 0.20 mm: {fail_report}"
+    );
 
     write_coupon_board(&board, 0.19, 0.20, 0.25);
     let (floor_output, floor_report) = drc_report(&kicad_cli, &board);
@@ -795,6 +799,10 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
     assert!(
         has_clearance_pair(&floor_report, "Pad 1 [N1] of C1", "Pad 2 [N2] of C1"),
         "same-footprint C2856805 pair must fail below the 0.20 mm board floor: {floor_report}"
+    );
+    assert!(
+        has_clearance_pair(&floor_report, "Pad 1 [N3] of C2", "Pad 2 [N6] of C2"),
+        "same-footprint non-target 0402 capacitor must still fail below the board floor: {floor_report}"
     );
 
     write_coupon_board(&board, 0.20, 0.20, 0.25);
@@ -819,5 +827,9 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
     assert!(
         has_clearance_pair(&pass_report, "Pad 1 [N4] of R1", "Pad 2 [N5] of R1"),
         "same-footprint non-C2856805 pair must still fail 0.25 mm rule: {pass_report}"
+    );
+    assert!(
+        has_clearance_pair(&pass_report, "Pad 1 [N3] of C2", "Pad 2 [N6] of C2"),
+        "same-footprint non-target 0402 capacitor must still fail 0.25 mm rule: {pass_report}"
     );
 }
