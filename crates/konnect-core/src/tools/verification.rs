@@ -8,7 +8,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use anyhow::Context;
-use konnect_sexp::writer::{write_atomic, write_atomic_if_unchanged};
+use konnect_sexp::writer::{write_atomic, write_atomic_if_unchanged, write_new_atomic};
+use konnect_sexp::{parse_sexp, SexpNode};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::task;
@@ -378,21 +379,61 @@ fn project_rule_value(project: &serde_json::Value, key: &str) -> Option<f64> {
     project["board"]["design_settings"]["rules"][key].as_f64()
 }
 
-fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
-    let needle = format!("(rule \"{name}\"");
-    let start = content.find(&needle)?;
-    let mut depth = 0i32;
+fn mask_sexp_comments(content: &str) -> String {
+    let mut masked = String::with_capacity(content.len());
     let mut in_string = false;
     let mut escaped = false;
     let mut in_comment = false;
 
-    for (offset, character) in content[start..].char_indices() {
+    for character in content.chars() {
         if in_comment {
             if character == '\n' {
                 in_comment = false;
+                masked.push('\n');
+            } else if character == '\r' {
+                masked.push('\r');
+            } else {
+                masked.push(' ');
             }
             continue;
         }
+
+        if in_string {
+            masked.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '#' => {
+                in_comment = true;
+                masked.push(' ');
+            }
+            '"' => {
+                in_string = true;
+                masked.push(character);
+            }
+            _ => masked.push(character),
+        }
+    }
+
+    masked
+}
+
+fn top_level_form_spans(content: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, character) in content.char_indices() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -403,17 +444,38 @@ fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
             }
             continue;
         }
+
         match character {
-            '#' => in_comment = true,
             '"' => in_string = true,
-            '(' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    start = Some(offset);
+                }
+                depth += 1;
+            }
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((start, start + offset + character.len_utf8()));
+                    if let Some(start) = start.take() {
+                        spans.push((start, offset + character.len_utf8()));
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    spans
+}
+
+fn named_rule_range(content: &str, name: &str) -> Option<(usize, usize)> {
+    let masked = mask_sexp_comments(content);
+    for (start, end) in top_level_form_spans(&masked) {
+        let Ok(node) = parse_sexp(&masked[start..end]) else {
+            continue;
+        };
+        if node.head() == Some("rule") && node.get(1).and_then(SexpNode::as_str) == Some(name) {
+            return Some((start, end));
         }
     }
     None
@@ -453,12 +515,30 @@ fn conflict_result(path: &Path) -> CallToolResult {
     )
 }
 
+fn write_new_custom_rules_if_absent(
+    path: &Path,
+    content: &str,
+) -> Result<(), konnect_sexp::SexpError> {
+    write_new_atomic(path, content)
+}
+
 fn layer_rule(name: &str, constraint: &str, value: f64, layer: &str) -> String {
     format!("(rule \"{name}\"\n  (constraint {constraint} (min {value}mm))\n  (layer \"{layer}\"))")
 }
 
 fn escape_rule_string(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn validate_rule_name(name: &str) -> Result<(), String> {
@@ -507,80 +587,476 @@ fn validate_layer_name(layer: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_condition_expression(condition: &str) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionToken {
+    Ident(String),
+    String(String),
+    LParen,
+    RParen,
+    Bang,
+    AndAnd,
+    OrOr,
+    EqEq,
+    NotEq,
+    Dot,
+    Comma,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionSide {
+    A,
+    B,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionFieldKind {
+    Type,
+    Reference,
+    ParentReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConditionField {
+    side: ConditionSide,
+    kind: ConditionFieldKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionComparison {
+    Eq,
+    Ne,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionValue {
+    String(String),
+    Field(ConditionField),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionExpr {
+    Not(Box<ConditionExpr>),
+    And(Box<ConditionExpr>, Box<ConditionExpr>),
+    Or(Box<ConditionExpr>, Box<ConditionExpr>),
+    Compare(ConditionField, ConditionComparison, ConditionValue),
+    MemberOfFootprint(ConditionSide, String),
+}
+
+fn tokenize_condition_expression(condition: &str) -> Result<Vec<ConditionToken>, String> {
     if condition.trim().is_empty() {
         return Err("must not be empty".to_string());
     }
     if condition.len() > 512 {
         return Err("is too long".to_string());
     }
-    if condition.contains('"')
-        || condition.contains('\n')
-        || condition.contains('\r')
-        || condition.contains('#')
-    {
-        return Err("must stay on one line and must not contain quotes or comments".to_string());
-    }
-    for disallowed in [
-        "layerOf(",
-        "existsOnLayer(",
-        "fromTo(",
-        "hasNetclass(",
-        "intersectsArea(",
-        "intersectsCourtyard(",
-        "insideArea(",
-        "enclosedByArea(",
-        "isCoupledDiffPair(",
-        "inDiffPair(",
-    ] {
-        if condition.contains(disallowed) {
-            return Err(format!("uses unsupported function '{disallowed}'"));
-        }
-    }
-    if !condition.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                ' ' | '\t' | '(' | ')' | '\'' | '_' | '.' | ':' | '*' | '?' | '!' | '&' | '|' | '='
-            )
-    }) {
-        return Err("contains unsupported characters".to_string());
-    }
 
-    let mut depth = 0i32;
-    for character in condition.chars() {
+    let chars: Vec<char> = condition.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let character = chars[index];
+        if character.is_whitespace() {
+            index += 1;
+            continue;
+        }
         match character {
-            '(' => depth += 1,
+            '(' => {
+                tokens.push(ConditionToken::LParen);
+                index += 1;
+            }
             ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err("has unmatched ')'".to_string());
+                tokens.push(ConditionToken::RParen);
+                index += 1;
+            }
+            '.' => {
+                tokens.push(ConditionToken::Dot);
+                index += 1;
+            }
+            ',' => {
+                tokens.push(ConditionToken::Comma);
+                index += 1;
+            }
+            '!' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(ConditionToken::NotEq);
+                    index += 2;
+                } else {
+                    tokens.push(ConditionToken::Bang);
+                    index += 1;
                 }
             }
-            _ => {}
+            '&' => {
+                if chars.get(index + 1) == Some(&'&') {
+                    tokens.push(ConditionToken::AndAnd);
+                    index += 2;
+                } else {
+                    return Err("contains unsupported character '&'".to_string());
+                }
+            }
+            '|' => {
+                if chars.get(index + 1) == Some(&'|') {
+                    tokens.push(ConditionToken::OrOr);
+                    index += 2;
+                } else {
+                    return Err("contains unsupported character '|'".to_string());
+                }
+            }
+            '=' => {
+                if chars.get(index + 1) == Some(&'=') {
+                    tokens.push(ConditionToken::EqEq);
+                    index += 2;
+                } else {
+                    return Err("contains unsupported character '='".to_string());
+                }
+            }
+            '\'' => {
+                index += 1;
+                let mut value = String::new();
+                let mut escaped = false;
+                while index < chars.len() {
+                    let next = chars[index];
+                    index += 1;
+                    if escaped {
+                        value.push(match next {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            '\'' => '\'',
+                            '\\' => '\\',
+                            other => other,
+                        });
+                        escaped = false;
+                        continue;
+                    }
+                    match next {
+                        '\\' => escaped = true,
+                        '\'' => break,
+                        _ => value.push(next),
+                    }
+                }
+                if escaped || index > chars.len() {
+                    return Err("unterminated string literal".to_string());
+                }
+                if chars.get(index.saturating_sub(1)) != Some(&'\'') {
+                    return Err("unterminated string literal".to_string());
+                }
+                tokens.push(ConditionToken::String(value));
+            }
+            'A'..='Z' | 'a'..='z' | '_' => {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+                {
+                    index += 1;
+                }
+                tokens.push(ConditionToken::Ident(
+                    chars[start..index].iter().collect::<String>(),
+                ));
+            }
+            other => return Err(format!("contains unsupported character '{other}'")),
         }
-    }
-    if depth != 0 {
-        return Err("has unmatched '('".to_string());
     }
 
-    let condensed = condition.replace('\t', " ");
-    for required in ["A.", "B.", "memberOfFootprint("] {
-        if !condensed.contains(required) {
-            return Err(format!("must reference '{required}'"));
+    Ok(tokens)
+}
+
+struct ConditionParser {
+    tokens: Vec<ConditionToken>,
+    index: usize,
+}
+
+impl ConditionParser {
+    fn new(tokens: Vec<ConditionToken>) -> Self {
+        Self { tokens, index: 0 }
+    }
+
+    fn parse(mut self) -> Result<ConditionExpr, String> {
+        let expression = self.parse_or()?;
+        if self.index != self.tokens.len() {
+            return Err("contains trailing tokens".to_string());
+        }
+        Ok(expression)
+    }
+
+    fn parse_or(&mut self) -> Result<ConditionExpr, String> {
+        let mut expression = self.parse_and()?;
+        while self.match_token(&ConditionToken::OrOr) {
+            expression = ConditionExpr::Or(Box::new(expression), Box::new(self.parse_and()?));
+        }
+        Ok(expression)
+    }
+
+    fn parse_and(&mut self) -> Result<ConditionExpr, String> {
+        let mut expression = self.parse_unary()?;
+        while self.match_token(&ConditionToken::AndAnd) {
+            expression = ConditionExpr::And(Box::new(expression), Box::new(self.parse_unary()?));
+        }
+        Ok(expression)
+    }
+
+    fn parse_unary(&mut self) -> Result<ConditionExpr, String> {
+        if self.match_token(&ConditionToken::Bang) {
+            return Ok(ConditionExpr::Not(Box::new(self.parse_unary()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<ConditionExpr, String> {
+        if self.match_token(&ConditionToken::LParen) {
+            let expression = self.parse_or()?;
+            self.expect(&ConditionToken::RParen, "missing ')'")?;
+            return Ok(expression);
+        }
+        self.parse_predicate()
+    }
+
+    fn parse_predicate(&mut self) -> Result<ConditionExpr, String> {
+        let side = self.parse_side()?;
+        self.expect(&ConditionToken::Dot, "expected '.' after A/B")?;
+        match self.next_ident()?.as_str() {
+            "memberOfFootprint" => {
+                self.expect(
+                    &ConditionToken::LParen,
+                    "expected '(' after memberOfFootprint",
+                )?;
+                let pattern = self.next_string()?;
+                self.expect(
+                    &ConditionToken::RParen,
+                    "expected ')' after memberOfFootprint argument",
+                )?;
+                Ok(ConditionExpr::MemberOfFootprint(side, pattern))
+            }
+            "Type" => self.parse_comparison_after_field(ConditionField {
+                side,
+                kind: ConditionFieldKind::Type,
+            }),
+            "Reference" => self.parse_comparison_after_field(ConditionField {
+                side,
+                kind: ConditionFieldKind::Reference,
+            }),
+            "Parent" => {
+                self.expect(&ConditionToken::Dot, "expected '.' after Parent")?;
+                let name = self.next_ident()?;
+                if name != "Reference" {
+                    return Err("unknown identifier after Parent".to_string());
+                }
+                self.parse_comparison_after_field(ConditionField {
+                    side,
+                    kind: ConditionFieldKind::ParentReference,
+                })
+            }
+            _ => Err("unknown identifier".to_string()),
         }
     }
-    for required in ["A.Type", "B.Type"] {
-        if !condensed.contains(required) {
-            return Err(format!("must reference '{required}'"));
+
+    fn parse_comparison_after_field(
+        &mut self,
+        field: ConditionField,
+    ) -> Result<ConditionExpr, String> {
+        let comparison = if self.match_token(&ConditionToken::EqEq) {
+            ConditionComparison::Eq
+        } else if self.match_token(&ConditionToken::NotEq) {
+            ConditionComparison::Ne
+        } else {
+            return Err("expected '==' or '!=' after field".to_string());
+        };
+
+        let right = match self.peek() {
+            Some(ConditionToken::String(_)) => ConditionValue::String(self.next_string()?),
+            Some(ConditionToken::Ident(_)) => ConditionValue::Field(self.parse_field()?),
+            _ => return Err("expected a quoted string literal or allowed field".to_string()),
+        };
+
+        Ok(ConditionExpr::Compare(field, comparison, right))
+    }
+
+    fn parse_field(&mut self) -> Result<ConditionField, String> {
+        let side = self.parse_side()?;
+        self.expect(&ConditionToken::Dot, "expected '.' after A/B")?;
+        match self.next_ident()?.as_str() {
+            "Type" => Ok(ConditionField {
+                side,
+                kind: ConditionFieldKind::Type,
+            }),
+            "Reference" => Ok(ConditionField {
+                side,
+                kind: ConditionFieldKind::Reference,
+            }),
+            "Parent" => {
+                self.expect(&ConditionToken::Dot, "expected '.' after Parent")?;
+                if self.next_ident()? != "Reference" {
+                    return Err("unknown identifier after Parent".to_string());
+                }
+                Ok(ConditionField {
+                    side,
+                    kind: ConditionFieldKind::ParentReference,
+                })
+            }
+            _ => Err("unknown identifier".to_string()),
         }
     }
-    if !(condensed.contains("Reference") || condensed.contains("Parent.Reference")) {
-        return Err("must reference Reference or Parent.Reference".to_string());
+
+    fn parse_side(&mut self) -> Result<ConditionSide, String> {
+        match self.next_ident()?.as_str() {
+            "A" => Ok(ConditionSide::A),
+            "B" => Ok(ConditionSide::B),
+            _ => Err("unknown identifier".to_string()),
+        }
     }
-    if !condensed.contains("==") && !condensed.contains("!=") {
-        return Err("must contain at least one equality comparison".to_string());
+
+    fn next_ident(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Some(ConditionToken::Ident(ident)) => Ok(ident),
+            _ => Err("expected identifier".to_string()),
+        }
     }
+
+    fn next_string(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Some(ConditionToken::String(value)) => Ok(value),
+            _ => Err("expected quoted string literal".to_string()),
+        }
+    }
+
+    fn expect(&mut self, token: &ConditionToken, message: &str) -> Result<(), String> {
+        if self.match_token(token) {
+            Ok(())
+        } else {
+            Err(message.to_string())
+        }
+    }
+
+    fn match_token(&mut self, token: &ConditionToken) -> bool {
+        if self.peek() == Some(token) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<&ConditionToken> {
+        self.tokens.get(self.index)
+    }
+
+    fn advance(&mut self) -> Option<ConditionToken> {
+        let token = self.tokens.get(self.index).cloned();
+        if token.is_some() {
+            self.index += 1;
+        }
+        token
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ConditionSemantics {
+    uses_a: bool,
+    uses_b: bool,
+    has_reference_comparison: bool,
+    has_member_of_footprint: bool,
+    member_of_footprint_on_a: bool,
+    member_of_footprint_on_b: bool,
+    has_non_type_predicate: bool,
+}
+
+fn mark_side_used(semantics: &mut ConditionSemantics, side: ConditionSide) {
+    match side {
+        ConditionSide::A => semantics.uses_a = true,
+        ConditionSide::B => semantics.uses_b = true,
+    }
+}
+
+fn validate_condition_compare(
+    field: ConditionField,
+    value: &ConditionValue,
+    semantics: &mut ConditionSemantics,
+) -> Result<(), String> {
+    mark_side_used(semantics, field.side);
+
+    match field.kind {
+        ConditionFieldKind::Type => match value {
+            ConditionValue::String(_) => Ok(()),
+            ConditionValue::Field(_) => {
+                Err("Type comparisons must use quoted string literals".to_string())
+            }
+        },
+        ConditionFieldKind::Reference | ConditionFieldKind::ParentReference => {
+            let ConditionValue::Field(other) = value else {
+                return Err(
+                    "Reference and Parent.Reference comparisons must compare A to B".to_string(),
+                );
+            };
+            mark_side_used(semantics, other.side);
+            if other.side == field.side {
+                return Err(
+                    "Reference and Parent.Reference comparisons must compare A to B".to_string(),
+                );
+            }
+            if other.kind != field.kind {
+                return Err(
+                    "Reference comparisons must match Reference to Reference or Parent.Reference to Parent.Reference"
+                        .to_string(),
+                );
+            }
+            semantics.has_reference_comparison = true;
+            semantics.has_non_type_predicate = true;
+            Ok(())
+        }
+    }
+}
+
+fn validate_condition_semantics(
+    expression: &ConditionExpr,
+    semantics: &mut ConditionSemantics,
+) -> Result<(), String> {
+    match expression {
+        ConditionExpr::Not(inner) => validate_condition_semantics(inner, semantics),
+        ConditionExpr::And(left, right) | ConditionExpr::Or(left, right) => {
+            validate_condition_semantics(left, semantics)?;
+            validate_condition_semantics(right, semantics)
+        }
+        ConditionExpr::Compare(field, _, value) => {
+            validate_condition_compare(*field, value, semantics)
+        }
+        ConditionExpr::MemberOfFootprint(side, _) => {
+            mark_side_used(semantics, *side);
+            semantics.has_member_of_footprint = true;
+            semantics.has_non_type_predicate = true;
+            match side {
+                ConditionSide::A => semantics.member_of_footprint_on_a = true,
+                ConditionSide::B => semantics.member_of_footprint_on_b = true,
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_condition_expression(condition: &str) -> Result<(), String> {
+    let tokens = tokenize_condition_expression(condition)?;
+    let expression = ConditionParser::new(tokens).parse()?;
+    let mut semantics = ConditionSemantics::default();
+    validate_condition_semantics(&expression, &mut semantics)?;
+
+    if !semantics.uses_a || !semantics.uses_b {
+        return Err("must reference both A and B".to_string());
+    }
+    if !semantics.has_non_type_predicate {
+        return Err("must contain memberOfFootprint or Reference comparison".to_string());
+    }
+    if semantics.has_member_of_footprint {
+        if !semantics.member_of_footprint_on_a || !semantics.member_of_footprint_on_b {
+            return Err("memberOfFootprint must appear on both A and B when used".to_string());
+        }
+        if !semantics.has_reference_comparison {
+            return Err(
+                "memberOfFootprint rules must also compare Reference or Parent.Reference"
+                    .to_string(),
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -616,63 +1092,49 @@ struct CustomRuleRecord {
     layer: Option<String>,
 }
 
-fn extract_quoted_value(line: &str) -> Option<String> {
-    let start = line.find('"')?;
-    let end = line[start + 1..].find('"')? + start + 1;
-    Some(line[start + 1..end].to_string())
-}
-
-fn extract_constraint(block: &str) -> Option<(String, f64)> {
-    let line = block
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("(constraint "))?;
-    let rest = line.strip_prefix("(constraint ")?;
-    let constraint = rest.split_whitespace().next()?.to_string();
-    let min_start = line.find("(min ")? + "(min ".len();
-    let min_end = line[min_start..].find("mm)")? + min_start;
-    let minimum_mm = line[min_start..min_end].trim().parse().ok()?;
-    Some((constraint, minimum_mm))
+fn extract_rule_record(node: &SexpNode) -> Option<CustomRuleRecord> {
+    if node.head() != Some("rule") {
+        return None;
+    }
+    let name = node.get(1)?.as_str()?.to_string();
+    let constraint = node.find("constraint")?;
+    let constraint_name = constraint.get(1)?.as_str()?.to_string();
+    let minimum_text = constraint.find("min")?.get(1)?.as_str()?;
+    let minimum_mm = minimum_text
+        .strip_suffix("mm")
+        .unwrap_or(minimum_text)
+        .parse()
+        .ok()?;
+    let layer = node
+        .find("layer")
+        .and_then(|child| child.get(1))
+        .and_then(SexpNode::as_str)
+        .map(ToOwned::to_owned);
+    let condition = node
+        .find("condition")
+        .and_then(|child| child.get(1))
+        .and_then(SexpNode::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(CustomRuleRecord {
+        name,
+        constraint: constraint_name,
+        minimum_mm,
+        condition,
+        layer,
+    })
 }
 
 fn parse_named_rules(content: &str) -> Vec<CustomRuleRecord> {
+    let masked = mask_sexp_comments(content);
     let mut rules = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(relative) = content[search_from..].find("(rule \"") {
-        let start = search_from + relative;
-        let rest = &content[start..];
-        let name_start = "(rule \"".len();
-        let Some(name_end_rel) = rest[name_start..].find('"') else {
-            break;
-        };
-        let name = rest[name_start..name_start + name_end_rel].to_string();
-        let Some((_, end)) = named_rule_range(rest, &name) else {
-            break;
-        };
-        let block = &rest[..end];
-        let Some((constraint, minimum_mm)) = extract_constraint(block) else {
-            search_from = start + end;
+    for (start, end) in top_level_form_spans(&masked) {
+        let Ok(node) = parse_sexp(&masked[start..end]) else {
             continue;
         };
-        let layer = block
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("(layer "))
-            .and_then(extract_quoted_value);
-        let condition = block
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("(condition "))
-            .and_then(extract_quoted_value)
-            .unwrap_or_default();
-        rules.push(CustomRuleRecord {
-            name,
-            constraint,
-            minimum_mm,
-            condition,
-            layer,
-        });
-        search_from = start + end;
+        if let Some(rule) = extract_rule_record(&node) {
+            rules.push(rule);
+        }
     }
     rules
 }
@@ -1534,7 +1996,17 @@ async fn handle_set_custom_rule(
                 };
             }
         } else {
-            write_atomic(&rules_path, &updated)?;
+            if let Err(error) = write_new_custom_rules_if_absent(&rules_path, &updated) {
+                return match error {
+                    konnect_sexp::SexpError::Conflict { .. } => Ok(conflict_result(&rules_path)),
+                    konnect_sexp::SexpError::Io(io)
+                        if io.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        Ok(conflict_result(&rules_path))
+                    }
+                    other => Err(other.into()),
+                };
+            }
         }
     }
 
@@ -1967,6 +2439,16 @@ mod tests {
     fn custom_rule_condition_is_restricted_to_the_safe_subset() {
         let ok = "A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)";
         assert!(validate_condition_expression(ok).is_ok(), "{ok}");
+        let ok_parent_reference = "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && B.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && A.Parent.Reference == B.Parent.Reference";
+        assert!(
+            validate_condition_expression(ok_parent_reference).is_ok(),
+            "{ok_parent_reference}"
+        );
+        let ok_nested = "!(A.Type == 'Track' || (B.Type == 'Pad' && A.Reference != B.Reference))";
+        assert!(
+            validate_condition_expression(ok_nested).is_ok(),
+            "{ok_nested}"
+        );
 
         for (bad, field) in [
             ("", "empty"),
@@ -1984,12 +2466,46 @@ mod tests {
                 "A.Type == 'Pad' && B.Type == 'Pad' && A.fromTo('U1-1','U2-1')",
                 "unsupported function",
             ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*') trailing",
+                "trailing tokens",
+            ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.Unknown == B.Reference",
+                "unknown identifier",
+            ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*'",
+                "unmatched paren",
+            ),
+            (
+                "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint(C*)",
+                "unquoted literal",
+            ),
         ] {
             assert!(
                 validate_condition_expression(bad).is_err(),
                 "{field}: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn named_rule_range_ignores_comments_and_strings() {
+        let source = r#"(version 1)
+# (rule "target" (constraint clearance (min 9mm)))
+(rule "other"
+  (constraint clearance (min 0.3mm))
+  (condition "mentions (rule \"target\") in a string"))
+(rule "target"
+  (constraint clearance (min 0.25mm))
+  (condition "A.Type == 'Pad' && B.Type == 'Pad'"))
+"#;
+        let (start, end) = named_rule_range(source, "target").expect("target rule found");
+        let block = &source[start..end];
+        assert!(block.starts_with("(rule \"target\""), "{block}");
+        assert!(block.contains("(min 0.25mm)"), "{block}");
+        assert!(!block.contains("(min 9mm)"), "{block}");
     }
 
     #[tokio::test]
@@ -2101,6 +2617,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_new_custom_rules_if_absent_preserves_an_existing_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("board.kicad_dru");
+        let ours = custom_rule(
+            "first",
+            "clearance",
+            0.25,
+            "A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference != B.Reference",
+            None,
+        );
+
+        std::fs::write(
+            &rules,
+            "(version 1)\n(rule \"winner\"\n  (constraint clearance (min 0.3mm))\n  (condition \"A.Type == 'Track' && B.Type == 'Track'\"))\n",
+        )
+        .unwrap();
+
+        let write = write_new_custom_rules_if_absent(&rules, &format!("(version 1)\n\n{ours}\n"));
+        assert!(
+            matches!(
+                write,
+                Err(konnect_sexp::SexpError::Io(ref io))
+                    if io.kind() == std::io::ErrorKind::AlreadyExists
+            ),
+            "first create path must refuse to replace an existing winner: {write:?}"
+        );
+        let retained = std::fs::read_to_string(&rules).unwrap();
+        assert!(retained.contains("(rule \"winner\""), "{retained}");
+        assert!(!retained.contains("(rule \"first\""), "{retained}");
+    }
+
     #[tokio::test]
     async fn list_custom_rules_reads_back_named_rules() {
         let dir = tempfile::tempdir().unwrap();
@@ -2128,6 +2676,45 @@ mod tests {
             listed["rules"][0]["condition"],
             "A.Type == 'Pad' && B.Type == 'Pad' && A.Reference != B.Reference"
         );
+    }
+
+    #[tokio::test]
+    async fn list_custom_rules_reads_multiline_and_escaped_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let rules = dir.path().join("board.kicad_dru");
+        tokio::fs::write(&board, blank_board()).await.unwrap();
+        tokio::fs::write(
+            &rules,
+            "(version 1)\n# (rule \"fake\" (constraint clearance (min 9mm)))\n(rule \"escaped\"\n  (constraint clearance (min 0.25mm))\n  (condition \"A.Type == 'Pad' &&\\nB.Type == 'Pad' && A.Parent.Reference == B.Parent.Reference && A.memberOfFootprint(\\\"Capacitor_SMD:C_0402_1005Metric\\\")\"))\n(rule \"layered\"\n  (constraint clearance (min 0.3mm))\n  (layer \"F.Cu\")\n  (condition \"A.Type == 'Track' || B.Type == 'Track'\"))\n",
+        )
+        .await
+        .unwrap();
+
+        let listed = handle_list_custom_rules(&json!({ "board": board }), &test_ctx())
+            .await
+            .unwrap();
+        assert!(!listed.is_error, "{}", text_of(&listed));
+        let listed: Value = serde_json::from_str(&text_of(&listed)).unwrap();
+        assert_eq!(listed["count"], 2, "{listed}");
+        assert_eq!(listed["rules"][0]["name"], "escaped");
+        assert_eq!(listed["rules"][0]["minimum_mm"], 0.25);
+        assert!(
+            listed["rules"][0]["condition"]
+                .as_str()
+                .unwrap()
+                .contains("A.Parent.Reference == B.Parent.Reference"),
+            "{listed}"
+        );
+        assert!(
+            listed["rules"][0]["condition"]
+                .as_str()
+                .unwrap()
+                .contains("Capacitor_SMD:C_0402_1005Metric"),
+            "{listed}"
+        );
+        assert_eq!(listed["rules"][1]["name"], "layered");
+        assert_eq!(listed["rules"][1]["layer"], "F.Cu");
     }
 }
 

@@ -537,9 +537,18 @@ fn write_coupon_project(project: &std::path::Path) {
     .unwrap();
 }
 
-fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
-    let track_one_end = 111.0;
-    let track_two_start = track_one_end + 0.2 + unrelated_gap_mm;
+fn write_coupon_board(
+    board: &std::path::Path,
+    same_c_gap_mm: f64,
+    same_r_gap_mm: f64,
+    unrelated_gap_mm: f64,
+) {
+    let pad_width_mm = 0.2;
+    let same_c_half_center_gap = (pad_width_mm + same_c_gap_mm) / 2.0;
+    let same_r_half_center_gap = (pad_width_mm + same_r_gap_mm) / 2.0;
+    let c1_pad2_x = 100.0 + same_c_half_center_gap;
+    let c2_pad1_x = c1_pad2_x + pad_width_mm + unrelated_gap_mm;
+    let c2_center_x = c2_pad1_x + 0.2;
     let board_text = format!(
         r#"(kicad_pcb
   (version 20250610)
@@ -576,9 +585,12 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
   (net 1 "N1")
   (net 2 "N2")
   (net 3 "N3")
+  (net 4 "N4")
+  (net 5 "N5")
+  (net 6 "N6")
   (gr_rect
     (start 95 95)
-    (end 120 105)
+    (end 130 110)
     (stroke (width 0.05) (type default))
     (fill no)
     (layer "Edge.Cuts")
@@ -600,7 +612,7 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
     )
     (attr smd)
     (pad "1" smd roundrect
-      (at -0.2 0)
+      (at -{same_c_half_center_gap:.4} 0)
       (size 0.2 0.62)
       (layers "F.Cu" "F.Paste" "F.Mask")
       (roundrect_rratio 0.25)
@@ -608,7 +620,7 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
       (uuid "00000000-0000-0000-0000-000000000011")
     )
     (pad "2" smd roundrect
-      (at 0.2 0)
+      (at {same_c_half_center_gap:.4} 0)
       (size 0.2 0.62)
       (layers "F.Cu" "F.Paste" "F.Mask")
       (roundrect_rratio 0.25)
@@ -619,7 +631,7 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
   (footprint "Capacitor_SMD:C_0402_1005Metric"
     (layer "F.Cu")
     (uuid "00000000-0000-0000-0000-000000000002")
-    (at 103 100)
+    (at {c2_center_x:.4} 100)
     (property "Reference" "C2"
       (at 0 -1 0)
       (layer "F.SilkS")
@@ -636,7 +648,7 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
       (size 0.2 0.62)
       (layers "F.Cu" "F.Paste" "F.Mask")
       (roundrect_rratio 0.25)
-      (net 2 "N2")
+      (net 3 "N3")
       (uuid "00000000-0000-0000-0000-000000000021")
     )
     (pad "2" smd roundrect
@@ -644,29 +656,46 @@ fn write_coupon_board(board: &std::path::Path, unrelated_gap_mm: f64) {
       (size 0.2 0.62)
       (layers "F.Cu" "F.Paste" "F.Mask")
       (roundrect_rratio 0.25)
-      (net 3 "N3")
+      (net 6 "N6")
       (uuid "00000000-0000-0000-0000-000000000022")
     )
   )
-  (segment
-    (start 110 100)
-    (end 111 100)
-    (width 0.2)
+  (footprint "Resistor_SMD:R_0402_1005Metric"
     (layer "F.Cu")
-    (net 1)
-    (uuid "00000000-0000-0000-0000-000000000101")
-  )
-  (segment
-    (start {track_two_start:.2} 100)
-    (end {track_two_end:.2} 100)
-    (width 0.2)
-    (layer "F.Cu")
-    (net 2)
-    (uuid "00000000-0000-0000-0000-000000000102")
+    (uuid "00000000-0000-0000-0000-000000000003")
+    (at 100 103)
+    (property "Reference" "R1"
+      (at 0 -1 0)
+      (layer "F.SilkS")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (property "Value" "R0402"
+      (at 0 1 0)
+      (layer "F.Fab")
+      (effects (font (size 1 1) (thickness 0.15)))
+    )
+    (attr smd)
+    (pad "1" smd roundrect
+      (at -{same_r_half_center_gap:.4} 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 4 "N4")
+      (uuid "00000000-0000-0000-0000-000000000031")
+    )
+    (pad "2" smd roundrect
+      (at {same_r_half_center_gap:.4} 0)
+      (size 0.2 0.62)
+      (layers "F.Cu" "F.Paste" "F.Mask")
+      (roundrect_rratio 0.25)
+      (net 5 "N5")
+      (uuid "00000000-0000-0000-0000-000000000032")
+    )
   )
 )"#,
-        track_two_start = track_two_start,
-        track_two_end = track_two_start + 1.0
+        same_c_half_center_gap = same_c_half_center_gap,
+        same_r_half_center_gap = same_r_half_center_gap,
+        c2_center_x = c2_center_x
     );
     std::fs::write(board, board_text).unwrap();
 }
@@ -677,11 +706,7 @@ fn write_coupon_rules(rules: &std::path::Path) {
         r#"(version 1)
 (rule "konnect:c2856805:except_same_footprint"
   (constraint clearance (min 0.25mm))
-  (condition "A.Type == 'Pad' && B.Type == 'Pad' && !(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)")
-)
-(rule "konnect:general-copper-clearance"
-  (constraint clearance (min 0.25mm))
-  (condition "!(A.memberOfFootprint('C*') && B.memberOfFootprint('C*') && A.Reference == B.Reference)")
+  (condition "!(A.Type == 'Pad' && B.Type == 'Pad' && A.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && B.memberOfFootprint('Capacitor_SMD:C_0402_1005Metric') && A.Reference == B.Reference)")
 )
 "#,
     )
@@ -736,7 +761,7 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
     write_coupon_project(&project);
     write_coupon_rules(&rules);
 
-    write_coupon_board(&board, 0.24);
+    write_coupon_board(&board, 0.20, 0.20, 0.24);
     let (fail_output, fail_report) = drc_report(&kicad_cli, &board);
     assert!(
         fail_output.status.success(),
@@ -748,11 +773,31 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
         "0.24 mm unrelated copper must fail the 0.25 mm custom rule: {fail_report}"
     );
     assert!(
+        has_clearance_pair(&fail_report, "Pad 2 [N2] of C1", "Pad 1 [N3] of C2"),
+        "the unrelated C1/C2 pad pair must be the 0.24 mm failing witness: {fail_report}"
+    );
+    assert!(
         !has_clearance_pair(&fail_report, "Pad 1 [N1] of C1", "Pad 2 [N2] of C1"),
         "same-footprint C2856805 pads must stay exempt at the 0.20 mm board floor: {fail_report}"
     );
+    assert!(
+        has_clearance_pair(&fail_report, "Pad 1 [N4] of R1", "Pad 2 [N5] of R1"),
+        "same-footprint non-C2856805 pair must still fail at 0.20 mm: {fail_report}"
+    );
 
-    write_coupon_board(&board, 0.25);
+    write_coupon_board(&board, 0.19, 0.20, 0.25);
+    let (floor_output, floor_report) = drc_report(&kicad_cli, &board);
+    assert!(
+        floor_output.status.success(),
+        "KiCad DRC failed to run: {}",
+        String::from_utf8_lossy(&floor_output.stderr)
+    );
+    assert!(
+        has_clearance_pair(&floor_report, "Pad 1 [N1] of C1", "Pad 2 [N2] of C1"),
+        "same-footprint C2856805 pair must fail below the 0.20 mm board floor: {floor_report}"
+    );
+
+    write_coupon_board(&board, 0.20, 0.20, 0.25);
     let (pass_output, pass_report) = drc_report(&kicad_cli, &board);
     assert!(
         pass_output.status.success(),
@@ -762,5 +807,17 @@ fn custom_rule_coupon_proves_board_floor_and_same_footprint_exception() {
     assert!(
         !has_clearance_violation(&pass_report, "0.2500"),
         "0.25 mm unrelated copper must satisfy the custom rule: {pass_report}"
+    );
+    assert!(
+        !has_clearance_pair(&pass_report, "Pad 2 [N2] of C1", "Pad 1 [N3] of C2"),
+        "the unrelated C1/C2 pad pair must clear once it reaches 0.25 mm: {pass_report}"
+    );
+    assert!(
+        !has_clearance_pair(&pass_report, "Pad 1 [N1] of C1", "Pad 2 [N2] of C1"),
+        "same-footprint C2856805 0.20 mm pair must remain exempt: {pass_report}"
+    );
+    assert!(
+        has_clearance_pair(&pass_report, "Pad 1 [N4] of R1", "Pad 2 [N5] of R1"),
+        "same-footprint non-C2856805 pair must still fail 0.25 mm rule: {pass_report}"
     );
 }
