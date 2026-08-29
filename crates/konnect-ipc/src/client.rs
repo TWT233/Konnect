@@ -519,10 +519,6 @@ impl KiCadIpcClient {
         self.find_open_board(requested).map(|_| ())
     }
 
-    fn make_header(&self) -> Result<kiapi::common::types::ItemHeader> {
-        Ok(header_for(self.get_board_document()?))
-    }
-
     /// Get all nets on the board.
     pub fn get_nets(&self) -> Result<Vec<IpcNet>> {
         self.get_nets_in(self.get_board_document()?)
@@ -564,14 +560,32 @@ impl KiCadIpcClient {
         document: kiapi::common::types::DocumentSpecifier,
         item_type: kiapi::common::types::KiCadObjectType,
     ) -> Result<Vec<prost_types::Any>> {
+        self.get_items_of_types_in(document, &[item_type])
+    }
+
+    /// As [`Self::get_items_in`], asking for several types at once.
+    ///
+    /// `GetItems.types` is repeated, and every `send_command` dials a fresh NNG
+    /// socket, so one request for four types costs a quarter of what four
+    /// requests do against a KiCad that may be mid-refill. Items come back in
+    /// KiCad's own order, not grouped by type — callers dispatch on
+    /// `type_url`.
+    pub fn get_items_of_types_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        item_types: &[kiapi::common::types::KiCadObjectType],
+    ) -> Result<Vec<prost_types::Any>> {
         let header = header_for(document);
         let cmd = kiapi::common::commands::GetItems {
             header: Some(header),
-            types: vec![item_type as i32],
+            types: item_types.iter().map(|t| *t as i32).collect(),
         };
         let response_any = self.send_command(&cmd, "kiapi.common.commands.GetItems")?;
         if let Some(any) = response_any {
             let resp: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
+            // Without this a failed request is indistinguishable from an empty
+            // board, and one failure now zeroes every type in the batch.
+            ensure_item_request_ok(resp.status, "item retrieval")?;
             Ok(resp.items)
         } else {
             Ok(vec![])
@@ -798,6 +812,20 @@ impl KiCadIpcClient {
         if ids.is_empty() {
             return Ok(());
         }
+        self.delete_items_in(self.get_board_document()?, ids)
+    }
+
+    /// As [`Self::delete_items`], targeting a specific open document — so a
+    /// path-bearing request deletes from the board it names, not from whichever
+    /// board KiCad lists first.
+    pub fn delete_items_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        ids: Vec<String>,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let expected_count = ids.len();
         let mut expected_ids = ids
             .iter()
@@ -806,7 +834,7 @@ impl KiCadIpcClient {
         if expected_ids.len() != expected_count {
             anyhow::bail!("delete request contains duplicate item identifiers");
         }
-        let header = self.make_header()?;
+        let header = header_for(document);
         let cmd = kiapi::common::commands::DeleteItems {
             header: Some(header),
             item_ids: ids

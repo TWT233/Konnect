@@ -728,7 +728,7 @@ async fn handle_bga_fanout(
         .collect();
     let addr = ctx.config.ipc_address.clone();
     let requested_board = board.clone();
-    let created = match super::pcb_components::with_ipc_classified(addr, move |c| {
+    let created = match super::with_ipc_classified(addr, move |c| {
         c.ensure_board_is_active(&requested_board)?;
         c.apply_fanout(
             &net_stubs,
