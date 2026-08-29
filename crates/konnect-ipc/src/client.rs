@@ -2418,15 +2418,17 @@ fn build_graphic_child(
             rotation: text_rotation,
             layer,
             size,
+            stroke_width_mm,
         } => {
             let (tx, ty) = xf(*position);
             builders::pack_any(
-                &builders::board_text(
+                &builders::board_text_with_stroke_width(
                     layer,
                     text,
                     tx,
                     ty,
                     *size,
+                    *stroke_width_mm,
                     readable_text_angle(text_rotation + rotation),
                     false,
                 ),
@@ -2607,6 +2609,7 @@ mod footprint_graphics_tests {
                 rotation: 0.0,
                 layer: "F.Fab".to_string(),
                 size: 0.5,
+                stroke_width_mm: 0.075,
             },
         ];
         let fp = build(&graphics, 100.0, 50.0, 90.0);
@@ -2671,6 +2674,7 @@ mod footprint_graphics_tests {
             rotation: 0.0,
             layer: "F.Fab".to_string(),
             size: 0.5,
+            stroke_width_mm: 0.075,
         }];
         let fp = build(&graphics, 0.0, 0.0, 180.0);
         let texts = texts(&fp);
@@ -2822,6 +2826,7 @@ mod footprint_graphics_tests {
                 rotation: 0.0,
                 layer: "Dwgs.User".to_string(),
                 size: 1.0,
+                stroke_width_mm: 0.15,
             },
         ];
         let any = KiCadIpcClient::build_footprint_item(

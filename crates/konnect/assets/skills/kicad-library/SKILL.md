@@ -90,17 +90,46 @@ Only create a custom symbol/footprint when:
 
 ## Symbol Creation
 
-### Pin Numbering Conventions
+### Pin Numbering — the datasheet decides, not a convention
 
-| Component Type     | Convention                                           |
+**There is no safe universal pin-numbering rule for a real part.** Physical
+lead numbers are defined by the exact manufacturer part number and package
+suffix. BJT and MOSFET lead order varies between manufacturers, packages and
+variants; bottom-view, mirrored, socketed and connector drawings reverse it.
+A symbol can be syntactically valid and still be electrically wrong when its
+pins and the footprint's pads describe different physical leads.
+
+Even KiCad's own generic symbols do not follow one order — `Device:LED` is
+**pin 1 = K (cathode), pin 2 = A (anode)**, the opposite of the "pin 1 =
+anode" rule people expect. Check, do not assume.
+
+Before creating or wiring a package-sensitive part:
+
+1. `search_symbols` / `list_symbols_in_library` first — prefer an existing
+   library symbol over authoring a new one.
+2. Confirm the exact manufacturer part number **and** package suffix.
+3. Note the drawing view of every datasheet figure (top, bottom, component,
+   solder, mating). An unstated view is the most common source of mirrored
+   parts.
+4. Walk the physical leads from the documented key, in the documented
+   direction.
+5. Reconcile three counts: datasheet leads, symbol pins, footprint pads.
+   Document any intentional duplicate or mechanical-only pad.
+6. Read the result back with `get_symbol_info` and `get_footprint_info`
+   rather than trusting what you just wrote.
+7. **Refuse to use the part in a real schematic** while any mirror,
+   reversal, duplicate, missing lead or view ambiguity is unresolved.
+
+The rows below are *starting hypotheses for generic parts only*. Verify each
+against the actual symbol with `get_symbol_info` before relying on it.
+
+| Component Type     | Typical (verify before use)                          |
 |--------------------|------------------------------------------------------|
-| IC (DIP/SOIC/QFP) | Counter-clockwise from pin 1 (standard IC convention)|
-| Passives (R, C, L) | Pin 1 and Pin 2                                    |
-| Diodes             | Pin 1 = Anode (A), Pin 2 = Cathode (K)             |
-| Transistors (BJT)  | 1=Base, 2=Collector, 3=Emitter (BCE)                |
-| MOSFETs            | 1=Gate, 2=Drain, 3=Source (GDS)                     |
+| Passives (R, C, L) | Pin 1 and Pin 2, interchangeable when unpolarised    |
+| Polarised caps     | Pin 1 = +, pin 2 = −, but confirm on the symbol      |
 | Connectors         | Sequential from 1                                    |
-| Crystal            | Pin 1, Pin 2 (+ case ground if 4-pin)               |
+| Crystal            | Pin 1, Pin 2 (+ case ground if 4-pin)                |
+| ICs, diodes, BJTs, MOSFETs | **No default** — datasheet + symbol only     |
 
 ### Pin Types
 
@@ -394,7 +423,7 @@ Dimension format: `LxW` in mm (body dimensions, not pad-to-pad).
 
 1. **Always search before creating** — most parts already exist in KiCAD libraries
 2. **Never edit .kicad_sym or .kicad_mod directly** — use MCP tools only
-3. **Follow pin numbering conventions** — IC pins counter-clockwise from pin 1
+3. **Derive pin numbering from the datasheet and verify it against the symbol** — there is no universal convention; read the part back with `get_symbol_info`
 4. **Set pin types correctly** — ERC depends on accurate pin types
 5. **Include all required properties** — Reference, Value, Footprint, Datasheet
 6. **Use 0.25mm courtyard margin** — standard clearance for assembly

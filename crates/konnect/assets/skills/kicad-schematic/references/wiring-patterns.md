@@ -37,7 +37,13 @@
 ```
     GPIO_OUT ──── R1 330Ω ──── D1 LED ──── GND
 ```
-**Tools**: Place R1 (330) and D1 (LED) → `connect_pins` (R1 pin 2 to D1 anode/pin 1) → `connect_to_net` (R1 pin 1, net "GPIO_OUT") → `add_power_symbol` (GND on D1 cathode/pin 2)
+**Tools**: Place R1 (330) and D1 (LED) → `connect_pins` (R1 pin 2 to D1 anode, **pin 2**) → `connect_to_net` (R1 pin 1, net "GPIO_OUT") → `add_power_symbol` (GND on D1 cathode, **pin 1**)
+
+> In KiCad's `Device:LED` the pins are **1 = K (cathode), 2 = A (anode)** — the
+> cathode is pin 1, not pin 2. Current flows anode → cathode, so the resistor
+> feeds pin 2 and pin 1 goes to ground. Confirm pin names with
+> `get_symbol_info` before wiring any polarised part rather than assuming an
+> order; diode and transistor numbering varies by symbol and by manufacturer.
 
 ## Pattern 5: Crystal Oscillator
 ```

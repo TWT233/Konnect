@@ -173,6 +173,24 @@ fn footprint_models(
         .collect()
 }
 
+fn footprint_text_stroke_widths(footprint: &kiapi::board::types::FootprintInstance) -> Vec<i64> {
+    footprint
+        .definition
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|item| item.type_url.ends_with("kiapi.board.types.BoardText"))
+        .map(|item| kiapi::board::types::BoardText::decode(item.value.as_slice()).unwrap())
+        .filter_map(|text| {
+            text.text
+                .and_then(|text| text.attributes)
+                .and_then(|attributes| attributes.stroke_width)
+                .map(|width| width.value_nm)
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "requires a running KiCad GUI, API socket, and standard footprint libraries"]
 fn place_component_loads_real_library_geometry() {
@@ -420,6 +438,18 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
             }
         }),
     );
+    let mut footprint_source = std::fs::read_to_string(&footprint_path).unwrap();
+    let root_end = footprint_source
+        .rfind("\n)")
+        .expect("created footprint must have a closing root");
+    footprint_source.insert_str(
+        root_end,
+        r#"
+  (fp_text user "${REFERENCE}" (at 0 1.5 0) (layer "F.Fab")
+    (uuid "f96c2efe-5925-4f74-81d2-f89a56f57e13")
+    (effects (font (size 0.8 0.8) (thickness 0.11))))"#,
+    );
+    std::fs::write(&footprint_path, footprint_source).unwrap();
     mcp.tool(
         "register_footprint_library",
         json!({
@@ -536,6 +566,10 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
         footprint_models(&after)[0].filename,
         "../models/revision-b.step"
     );
+    assert!(
+        footprint_text_stroke_widths(&after).contains(&110_000),
+        "explicit fab text thickness was not preserved"
+    );
 
     let converged = mcp.tool(
         "update_footprints_from_library",
@@ -550,6 +584,20 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
     assert_eq!(converged["status"], "noop", "{converged}");
 
     ipc.save_board().unwrap();
+    let saved_converged = mcp.tool(
+        "update_footprints_from_library",
+        json!({
+            "board": board,
+            "references": [reference],
+            "dry_run": true
+        }),
+    );
+    let saved_converged: Value =
+        serde_json::from_str(saved_converged["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        saved_converged["status"], "noop",
+        "KiCad save changed the rebuilt fab text: {saved_converged}"
+    );
     mcp.tool("load_toolset", json!({"name": "verification"}));
     let drc = mcp.tool(
         "run_drc",

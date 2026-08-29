@@ -14,7 +14,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["Konnect contributors"]
 license = "AGPL-3.0-only"
@@ -71,6 +71,7 @@ base64 = "0.23"
 
 # Platform directories (home dir, config dir)
 dirs = "6"
+winreg = "0.56"
 
 # SVG parsing (import_svg_logo)
 usvg = "0.48"

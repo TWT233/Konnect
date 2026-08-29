@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**215 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
+**217 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 215 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 217 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -152,8 +152,10 @@ konnect status --client codex
 konnect uninstall --client codex
 ```
 
-Keep `--client codex` in the MCP server command so first-launch setup also stays
-inside Codex's directories. For example, register a standalone binary with the
+MCP server startup never installs or restores guidance. Run `konnect init`
+explicitly when you want those files installed; after `konnect uninstall`,
+starting the server leaves them removed. `--client` remains accepted in server
+commands for compatibility. For example, register a standalone binary with the
 Codex CLI using:
 
 ```bash
@@ -193,8 +195,7 @@ KiCad on macOS keeps its tools inside the app bundle and they are not on
 kicad_cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
 kicad_binary = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad"
 # KiCad 10's IPC socket on macOS (enable it in KiCad:
-# Preferences → Plugins → "Enable KiCad API"). Only needed if KiCad listens
-# somewhere other than <temp dir>/kicad/api.sock, which Konnect finds on its own.
+# Preferences → Plugins → "Enable KiCad API")
 ipc_address = "ipc:///tmp/kicad/api.sock"
 ```
 

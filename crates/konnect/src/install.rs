@@ -1,7 +1,7 @@
 //! Client-aware installer for Konnect's bundled guidance.
 //!
-//! Handles client-scoped install, uninstall, status, first-launch setup, and
-//! Claude hook integration without writing into another client's directories.
+//! Handles explicit client-scoped install, uninstall, status, and Claude hook
+//! integration without writing into another client's directories.
 
 use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{bail, Context, Result};
@@ -95,10 +95,6 @@ pub fn run_install(client: InstallClient) -> Result<()> {
     run_install_at(client, &InstallPaths::for_current_user()?, true)
 }
 
-pub fn run_install_silent(client: InstallClient) -> Result<()> {
-    run_install_at(client, &InstallPaths::for_current_user()?, false)
-}
-
 pub fn run_uninstall(client: InstallClient) -> Result<()> {
     run_uninstall_at(client, &InstallPaths::for_current_user()?, true)
 }
@@ -123,12 +119,6 @@ pub fn print_skill_content(name: &str) -> Result<()> {
     }
     eprintln!("Unknown skill: {}", name);
     std::process::exit(1);
-}
-
-pub fn needs_install(client: InstallClient) -> bool {
-    InstallPaths::for_current_user()
-        .map(|paths| !has_install_marker(client, &paths))
-        .unwrap_or(false)
 }
 
 /// Double-click behavior remains Claude-focused for backward compatibility.
@@ -391,10 +381,6 @@ fn install_marker(client: InstallClient, paths: &InstallPaths) -> Option<PathBuf
     None
 }
 
-fn has_install_marker(client: InstallClient, paths: &InstallPaths) -> bool {
-    install_marker(client, paths).is_some()
-}
-
 fn remove_if_present(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)?;
@@ -502,71 +488,7 @@ fn remove_hooks_from_settings(path: &Path) -> Result<()> {
 
 /// Auto-detect a KiCad installation.
 pub fn detect_kicad() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let standard_paths: Vec<PathBuf> = [
-        r"C:\KiCad\10.0\bin\kicad-cli.exe",
-        r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
-        r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
-        r"C:\KiCad\9.0\bin\kicad-cli.exe",
-        r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
-        r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-
-    #[cfg(target_os = "macos")]
-    let standard_paths: Vec<PathBuf> = {
-        let mut paths = vec![
-            PathBuf::from("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
-            PathBuf::from("/usr/local/bin/kicad-cli"),
-        ];
-        if let Ok(home) = std::env::var("HOME") {
-            paths.push(
-                PathBuf::from(home).join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
-            );
-        }
-        paths
-    };
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let standard_paths: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/bin/kicad-cli"),
-        PathBuf::from("/usr/local/bin/kicad-cli"),
-    ];
-
-    for path in &standard_paths {
-        if path.exists() {
-            return Some(path.clone());
-        }
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(path) = detect_kicad_from_registry() {
-        return Some(path);
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn detect_kicad_from_registry() -> Option<PathBuf> {
-    use std::process::Command;
-    let output = Command::new("reg")
-        .args(["query", r"HKLM\SOFTWARE\KiCad\10.0", "/ve"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line.contains("REG_SZ") {
-                let path_str = line.split("REG_SZ").last()?.trim();
-                let cli_path = Path::new(path_str).join("bin").join("kicad-cli.exe");
-                if cli_path.exists() {
-                    return Some(cli_path);
-                }
-            }
-        }
-    }
-    None
+    konnect_core::kicad_install::find_cli("")
 }
 
 #[cfg(test)]
@@ -713,8 +635,8 @@ mod tests {
         let paths = test_paths(&temp);
         fs::create_dir_all(paths.data_dir()).unwrap();
         fs::write(paths.legacy_marker(), "0.4.0").unwrap();
-        assert!(has_install_marker(InstallClient::Claude, &paths));
-        assert!(!has_install_marker(InstallClient::Codex, &paths));
+        assert!(install_marker(InstallClient::Claude, &paths).is_some());
+        assert!(install_marker(InstallClient::Codex, &paths).is_none());
     }
 
     #[test]

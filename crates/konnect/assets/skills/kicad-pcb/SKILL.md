@@ -52,7 +52,7 @@ Load additional toolsets as needed:
 
 ```
 load_toolset('config')           # design rule storage: add_design_rule, list_design_rules
-load_toolset('verification')     # run_drc, set_design_rules, get_design_rules, check_clearance
+load_toolset('verification')     # run_drc, set_design_rules, set_predefined_sizes, check_clearance
 ```
 
 Always call `get_active_toolsets()` first to see what is already loaded.
@@ -221,6 +221,20 @@ Common netclass configurations:
 - Standard signal via: 0.4mm drill, 0.8mm pad diameter
 - Power via: 0.6mm drill, 1.0mm pad diameter
 - Micro via (HDI): 0.1mm drill, 0.3mm pad diameter
+
+### Pre-defined sizes
+
+Netclass width is the default. The Track/Via dropdowns are a separate palette
+in the sibling `.kicad_pro`. Fill them with `set_predefined_sizes` so `W` /
+`Shift+W` can step through extra widths without changing netclasses:
+
+```
+set_predefined_sizes(board, track_widths=[0.2, 0.5, 0.8],
+    via_dimensions=[{diameter:0.6, drill:0.3}, {diameter:0.8, drill:0.4}])
+```
+
+A leading 0 mm / 0,0 via is always kept as “use netclass values”. These sizes
+are not DRC limits. KiCad reads the list on next project open.
 
 ---
 

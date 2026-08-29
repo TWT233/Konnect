@@ -807,10 +807,14 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
                     .get(1)
                     .and_then(konnect_sexp::SexpNode::as_str)
                     .context("fp_text is missing its kind")?;
-                if !matches!(kind, "reference" | "value") {
-                    bail!(
-                        "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
-                    );
+                match kind {
+                    "reference" | "value" => {}
+                    "user" => validate_user_text(child)?,
+                    _ => {
+                        bail!(
+                            "fp_text kind '{kind}' is not supported losslessly by typed library refresh"
+                        );
+                    }
                 }
             }
             "property" => {
@@ -825,6 +829,164 @@ fn validate_supported_children(root: &konnect_sexp::SexpNode) -> Result<()> {
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Accept only the `fp_text user` subset the typed IPC rebuild can reproduce.
+/// Refusing an unknown clause is intentional: silently dropping even a visual
+/// modifier would make a refreshed board differ from its library definition.
+fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
+    text.get(2)
+        .and_then(konnect_sexp::SexpNode::as_str)
+        .context("fp_text user is missing its text")?;
+
+    let mut saw_at = false;
+    let mut saw_layer = false;
+    let mut saw_effects = false;
+    let mut identifier = None;
+    for clause in text.children().unwrap_or_default().iter().skip(3) {
+        let tag = clause
+            .head()
+            .context("fp_text user contains an unsupported atom")?;
+        match tag {
+            "at" => {
+                if saw_at {
+                    bail!("fp_text user contains duplicate 'at' clauses");
+                }
+                saw_at = true;
+                let count = clause.children().map_or(0, |children| children.len());
+                if !matches!(count, 3 | 4) {
+                    bail!("fp_text user 'at' must contain x, y, and optional rotation");
+                }
+                for index in 1..count {
+                    let value = clause
+                        .get_f64(index)
+                        .with_context(|| format!("fp_text user 'at' value {index} is invalid"))?;
+                    if !value.is_finite() {
+                        bail!("fp_text user 'at' values must be finite");
+                    }
+                }
+            }
+            "layer" => {
+                if saw_layer {
+                    bail!("fp_text user contains duplicate 'layer' clauses");
+                }
+                saw_layer = true;
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user 'layer' must name exactly one layer");
+                }
+            }
+            "uuid" | "tstamp" => {
+                if let Some(previous) = identifier {
+                    bail!(
+                        "fp_text user contains multiple identifier clauses ('{previous}' and '{tag}')"
+                    );
+                }
+                identifier = Some(tag);
+                if clause.children().map_or(0, |children| children.len()) != 2
+                    || clause
+                        .get(1)
+                        .and_then(konnect_sexp::SexpNode::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    bail!("fp_text user '{tag}' must contain exactly one identifier");
+                }
+            }
+            "effects" => {
+                if saw_effects {
+                    bail!("fp_text user contains duplicate 'effects' clauses");
+                }
+                saw_effects = true;
+                validate_user_text_effects(clause)?;
+            }
+            unsupported => {
+                bail!("fp_text user clause '{unsupported}' is not supported losslessly");
+            }
+        }
+    }
+
+    if !saw_at {
+        bail!("fp_text user is missing its 'at' clause");
+    }
+    if !saw_layer {
+        bail!("fp_text user is missing its 'layer' clause");
+    }
+    if !saw_effects {
+        bail!("fp_text user is missing its 'effects' clause");
+    }
+    Ok(())
+}
+
+fn validate_user_text_effects(effects: &konnect_sexp::SexpNode) -> Result<()> {
+    let mut font = None;
+    for clause in effects.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user effects contain an unsupported atom")?;
+        if tag != "font" {
+            bail!("fp_text user effects clause '{tag}' is not supported losslessly");
+        }
+        if font.replace(clause).is_some() {
+            bail!("fp_text user contains duplicate font clauses");
+        }
+    }
+    let font = font.context("fp_text user effects are missing the font clause")?;
+
+    let mut size = None;
+    let mut thickness = None;
+    for clause in font.children().unwrap_or_default().iter().skip(1) {
+        let tag = clause
+            .head()
+            .context("fp_text user font contains an unsupported atom")?;
+        match tag {
+            "size" => {
+                if size.is_some() {
+                    bail!("fp_text user contains duplicate font size clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 3 {
+                    bail!("fp_text user font size must contain width and height");
+                }
+                let width = clause
+                    .get_f64(1)
+                    .context("fp_text user font width is invalid")?;
+                let height = clause
+                    .get_f64(2)
+                    .context("fp_text user font height is invalid")?;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    bail!("fp_text user font size must be finite and positive");
+                }
+                if width != height {
+                    bail!("fp_text user non-square font size is not supported losslessly");
+                }
+                size = Some(width);
+            }
+            "thickness" => {
+                if thickness.is_some() {
+                    bail!("fp_text user contains duplicate font thickness clauses");
+                }
+                if clause.children().map_or(0, |children| children.len()) != 2 {
+                    bail!("fp_text user font thickness must contain exactly one value");
+                }
+                let value = clause
+                    .get_f64(1)
+                    .context("fp_text user font thickness is invalid")?;
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("fp_text user font thickness must be finite and positive");
+                }
+                thickness = Some(value);
+            }
+            unsupported => {
+                bail!("fp_text user font clause '{unsupported}' is not supported losslessly");
+            }
+        }
+    }
+    size.context("fp_text user font is missing its size")?;
+    thickness.context("fp_text user font is missing its thickness")?;
     Ok(())
 }
 
@@ -1296,12 +1458,14 @@ fn mirror_graphic(
             rotation,
             layer,
             size,
+            stroke_width_mm,
         } => Graphic::Text {
             text: text.clone(),
             position: point(*position),
             rotation: 180.0 - rotation,
             layer: flip_layer_name(layer)?,
             size: *size,
+            stroke_width_mm: *stroke_width_mm,
         },
     })
 }
@@ -1617,7 +1781,29 @@ mod tests {
         let library = parse_library_footprint("Konnect:Socket", source)
             .expect("KiCad's own serialization of the fixture must parse");
         assert_eq!(library.pads.len(), 4, "two '1' variants plus '2' and '3'");
-        assert_eq!(library.graphics.len(), 2, "one fp_line and one fp_poly");
+        assert_eq!(
+            library.graphics.len(),
+            3,
+            "one fp_line, one fp_poly, and KiCad's standard fab reference text"
+        );
+        assert!(library.graphics.iter().any(|graphic| {
+            matches!(
+                graphic,
+                konnect_ipc::IpcGraphicDefinition::Text {
+                    text,
+                    position,
+                    rotation,
+                    layer,
+                    size,
+                    stroke_width_mm,
+                } if text == "${REFERENCE}"
+                    && *position == (0.0, 1.5)
+                    && *rotation == 0.0
+                    && layer == "F.Fab"
+                    && *size == 1.0
+                    && *stroke_width_mm == 0.15
+            )
+        }));
         assert_eq!(library.datasheet.as_deref(), Some("new-datasheet.pdf"));
         assert_eq!(library.models.len(), 1);
 
@@ -1732,6 +1918,9 @@ mod tests {
     (effects (font (size 1 1) (thickness 0.15))))
   (fp_text value "Socket" (at 0 4 0) (layer "F.Fab")
     (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text user "${REFERENCE}" (at 0 1.5 0) (layer "F.Fab")
+    (uuid "f96c2efe-5925-4f74-81d2-f89a56f57e13")
+    (effects (font (size 0.8 0.8) (thickness 0.11))))
   (property "Datasheet" "new-datasheet.pdf" (at 0 0) (layer "F.Fab") (hide yes))
   (property "Description" "new field description" (at 0 0) (layer "F.Fab") (hide yes))
   (model "../models/Socket.step"
@@ -1863,7 +2052,16 @@ mod tests {
             "keyboard socket"
         );
         assert_eq!(library.pads.len(), 4);
-        assert_eq!(library.graphics.len(), 2);
+        assert_eq!(library.graphics.len(), 3);
+        assert!(library.graphics.iter().any(|graphic| matches!(
+            graphic,
+            konnect_ipc::IpcGraphicDefinition::Text {
+                text,
+                size,
+                stroke_width_mm,
+                ..
+            } if text == "${REFERENCE}" && *size == 0.8 && *stroke_width_mm == 0.11
+        )));
         assert_eq!(library.models.len(), 1);
         let model = &library.models[0];
         assert_eq!(model.filename, "../models/Socket.step");
@@ -2050,6 +2248,51 @@ mod tests {
             error.to_string().contains("solder_mask_margin"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn parser_rejects_lossy_user_text_variants() {
+        for (from, to, expected) in [
+            (
+                "(at 0 1.5 0) (layer \"F.Fab\")",
+                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
+                "unlocked",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.7) (thickness 0.11)))",
+                "non-square",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11)) (justify left))",
+                "justify",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8) (thickness 0.11) (italic yes)))",
+                "italic",
+            ),
+            (
+                "(effects (font (size 0.8 0.8) (thickness 0.11)))",
+                "(effects (font (size 0.8 0.8)))",
+                "missing its thickness",
+            ),
+            (
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\")",
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\") (uuid \"duplicate\")",
+                "multiple identifier clauses",
+            ),
+            (
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\")",
+                "(uuid \"f96c2efe-5925-4f74-81d2-f89a56f57e13\") (tstamp \"legacy-too\")",
+                "multiple identifier clauses",
+            ),
+        ] {
+            let unsupported = LIBRARY_FOOTPRINT.replacen(from, to, 1);
+            let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]

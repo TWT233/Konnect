@@ -46,26 +46,26 @@ Always call `get_active_toolsets()` first to see what is already loaded.
 
 ### Common Library IDs
 
-| Component        | lib_id                          |
-|------------------|---------------------------------|
-| Resistor         | `Device:R`                      |
-| Capacitor        | `Device:C`                      |
-| Capacitor Polar  | `Device:C_Polarized`            |
-| Inductor         | `Device:L`                      |
-| LED              | `Device:LED`                    |
-| Diode            | `Device:D`                      |
-| Zener            | `Device:D_Zener`                |
-| NPN Transistor   | `Device:Q_NPN_BCE`              |
-| PNP Transistor   | `Device:Q_PNP_BCE`              |
-| N-MOSFET         | `Device:Q_NMOS_GDS`             |
-| P-MOSFET         | `Device:Q_PMOS_GDS`             |
-| 2-pin Connector  | `Connector_Generic:Conn_01x02`  |
-| 4-pin Connector  | `Connector_Generic:Conn_01x04`  |
-| Ground           | `power:GND`                     |
-| +3.3V            | `power:+3V3`                    |
-| +5V              | `power:+5V`                     |
-| VCC              | `power:VCC`                     |
-| VDD              | `power:VDD`                     |
+| Component       | lib_id                         |
+|-----------------|--------------------------------|
+| Resistor        | `Device:R`                     |
+| Capacitor       | `Device:C`                     |
+| Capacitor Polar | `Device:C_Polarized`           |
+| Inductor        | `Device:L`                     |
+| LED             | `Device:LED`                   |
+| Diode           | `Device:D`                     |
+| Zener           | `Device:D_Zener`               |
+| NPN Transistor  | `Transistor_BJT:Q_NPN_BEC`     |
+| PNP Transistor  | `Transistor_BJT:Q_PNP_BEC`     |
+| N-MOSFET        | `Transistor_FET:Q_NMOS_GDS`    |
+| P-MOSFET        | `Transistor_FET:Q_PMOS_GDS`    |
+| 2-pin Connector | `Connector_Generic:Conn_01x02` |
+| 4-pin Connector | `Connector_Generic:Conn_01x04` |
+| Ground          | `power:GND`                    |
+| +3.3V           | `power:+3V3`                   |
+| +5V             | `power:+5V`                    |
+| VCC             | `power:VCC`                    |
+| VDD             | `power:VDD`                    |
 
 ### Rotation Conventions
 

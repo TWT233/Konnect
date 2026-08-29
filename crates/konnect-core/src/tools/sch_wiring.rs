@@ -1596,6 +1596,7 @@ async fn handle_add_power_symbol(
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
+    let metadata = cse::library::symbol_metadata(&sch, &lib_id);
 
     // Build the Symbol struct
     let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
@@ -1647,8 +1648,24 @@ async fn handle_add_power_symbol(
     ));
     sym.properties
         .push(positioned("Footprint", "", x, y, 0.0, true, centred));
-    sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
+    sym.properties.push(positioned(
+        "Datasheet",
+        &metadata.datasheet,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
+    sym.properties.push(positioned(
+        "Description",
+        &metadata.description,
+        x,
+        y,
+        0.0,
+        true,
+        centred,
+    ));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -2412,6 +2429,77 @@ mod unit_aware_wiring_tests {
             reconcile_junctions_at(RECONCILE_SCH.to_string(), &[(120.65, 139.7)]);
         assert_eq!((added, pruned), (0, 0), "the pin is still there");
         assert!(has_dot(&out, "120.65", "139.7"));
+    }
+
+    /// A hierarchical sheet pin justifies a dot exactly as a symbol pin does —
+    /// the `|| idx.has_sheet_pin(..)` half of the keep rule, which nothing else
+    /// reaches. Candidate points come from moved *symbol* pins, so the branch
+    /// only decides anything when a symbol pin vacates a point a sheet pin also
+    /// holds: in this fixture R1's pin, `test`'s SHPIN and the dot all sit at
+    /// (139.7, 190.5) on a wire's interior. Ask about it with R1 gone — the
+    /// post-move state — and the dot must stay.
+    ///
+    /// Its own fixture rather than an addition to `junction_reconcile`, so the
+    /// tests already merged against that sheet keep the inputs they were written
+    /// for. Built with Konnect tools, then rewritten by `kicad-cli sch upgrade`
+    /// so the committed text is eeschema's own — including the sheet-pin
+    /// placement, which KiCad snaps to the sheet border.
+    #[test]
+    fn reconcile_keeps_a_dot_a_sheet_pin_still_justifies() {
+        const SHEET_PIN_SCH: &str =
+            include_str!("../../tests/fixtures/junction_sheet_pin.kicad_sch");
+        let without_r1 = fixture_without_symbol(SHEET_PIN_SCH, "R1");
+
+        let (out, added, pruned) = reconcile_junctions_at(without_r1, &[(139.7, 190.5)]);
+        assert_eq!(
+            (added, pruned),
+            (0, 0),
+            "the sheet pin still justifies the dot"
+        );
+        assert!(
+            has_dot(&out, "139.7", "190.5"),
+            "the dot must survive: {out}"
+        );
+    }
+
+    /// The fixture with one placed symbol removed, so its pins vanish — the
+    /// post-move state without needing a move.
+    ///
+    /// Guarded, because a silent failure here would be invisible:
+    /// `reconcile_junctions_at` returns its input unchanged when the sheet does
+    /// not parse, which is exactly what a passing sheet-pin test looks like. If
+    /// this ever stops removing what it should, the assertions below fail loudly
+    /// instead of the test going quietly green.
+    fn fixture_without_symbol(src: &str, reference: &str) -> String {
+        let needle = format!("(property \"Reference\" \"{reference}\"");
+        let at = src.find(&needle).expect("fixture carries that reference");
+        let start = src[..at]
+            .rfind("(symbol")
+            .expect("reference sits inside a symbol");
+        let mut depth = 0usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > start, "never closed the symbol block");
+        let out = format!("{}{}", &src[..start], &src[end..]);
+        assert!(!out.contains(&needle), "the symbol is still there");
+        assert_eq!(
+            out.matches('(').count(),
+            out.matches(')').count(),
+            "removal left unbalanced parens, so the sheet would not parse"
+        );
+        out
     }
 
     /// A real T — two wires meeting — is never touched.
@@ -3367,6 +3455,51 @@ mod power_symbol_tests {
         assert!(
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),
             "must not write a bare Reference with no (at)"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_copies_library_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power-metadata.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 -6.35 0))\n      (property \"Value\" \"GND\" (at 0 -3.81 0))\n      (property \"Datasheet\" \"https://example.com/gnd.pdf\" (at 0 0 0))\n      (property \"Description\" \"Ground power symbol\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        assert_eq!(
+            sym.properties
+                .iter()
+                .find(|p| p.name == "Datasheet")
+                .map(|p| p.value.as_str()),
+            Some("https://example.com/gnd.pdf")
+        );
+        assert_eq!(
+            sym.properties
+                .iter()
+                .find(|p| p.name == "Description")
+                .map(|p| p.value.as_str()),
+            Some("Ground power symbol")
         );
     }
 

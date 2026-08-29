@@ -91,7 +91,7 @@ Konnect/
 │   │           ├── sch_bus.rs        # 4 tools (buses, bus entries, pin fan-out)
 │   │           ├── pcb_sync.rs       # update_pcb_from_schematic: pure planner + one-commit IPC apply
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
-│   │           ├── pcb_board.rs      # 12 tools (S-expr file editing, IPC fallback, SVG logo import)
+│   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
 │   │           ├── pcb_components.rs # 19 tools (IPC real-time + safe headless single-placement fallback)
 │   │           ├── pcb_footprint_update.rs # library refresh planner + one-commit IPC apply
 │   │           ├── pcb_routing.rs    # 12 tools (traces, vias, nets, netclasses)
@@ -101,7 +101,7 @@ Konnect/
 │   │           ├── footprint_metadata.rs # footprint description, tags, and attribute edits
 │   │           ├── footprint_models.rs # footprint 3D model validation and atomic edits
 │   │           ├── integration.rs    # 8 tools (JLCPCB SQLite, Freerouting discovery, datasheets)
-│   │           ├── verification.rs   # 8 tools (DRC, design rules, KiCAD UI)
+│   │           ├── verification.rs   # 10 tools (DRC, design rules, KiCAD UI)
 │   │           ├── config.rs         # 7 tools (user/project config, design rules)
 │   │           ├── design_review.rs  # 6 tools (decoupling/connection/power/DFM audits)
 │   │           ├── templates.rs      # 4 tools (6 built-in reference circuit templates)
@@ -177,9 +177,7 @@ Konnect/
 ### IPC API (PCB Editor — real-time)
 - Transport: **NNG** (nanomsg-next-gen) over IPC sockets (Windows named pipes)
 - Protocol: **Protocol Buffers** (protobuf3) with ApiRequest/ApiResponse envelope
-- Socket path: `ipc_address` from config, else `KICAD_API_SOCKET` (set by KiCad only for
-  plugins it launches), else the platform default `<temp dir>/kicad/api.sock` when
-  something is listening there (`konnect_ipc::socket`). The startup log names the source.
+- Socket path: from `KICAD_API_SOCKET` environment variable (set by KiCAD when launching plugins)
 - Scope: **PCB editor only** — full CRUD on all board items, layer management, design rules
 - Schematic editor IPC: export-only (SVG, PDF, BOM, netlist) — NO item CRUD
 
@@ -305,7 +303,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 215 tools (221 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 217 tools (223 total with the 6 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -380,9 +378,9 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **20 toolsets, 215 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **20 toolsets, 217 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: 20 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 221 tools (215 registered + 6 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 223 tools (217 registered + 6 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect

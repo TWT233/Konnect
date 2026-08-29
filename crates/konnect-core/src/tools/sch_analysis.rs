@@ -6,7 +6,9 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::sch_connectivity::{net_graph_for, pt_key, ConnectivityIndex};
-use crate::tools::{get_path, opt_f64, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{
+    get_path, opt_f64, placed_pins_by_reference, require_f64, require_str, ToolContext, ToolDef,
+};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
@@ -324,21 +326,18 @@ async fn handle_get_pin_connections(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let inst = instances
+    if !instances
         .iter()
-        .find(|i| i.reference == reference)
-        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
-    let pin_ep = lib_sym.and_then(|sym| {
-        konnect_sexp::schematic::extract_lib_pins(sym)
-            .iter()
-            .find(|p| p.number == pin_number)
-            .map(|p| konnect_sexp::schematic::pin_endpoint(p, inst.pin_transform()))
-    });
+        .any(|instance| instance.reference == reference)
+    {
+        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+    }
+    let pin_ep = placed_pins_by_reference(&tree)
+        .into_iter()
+        .filter(|(instance, _)| instance.reference == reference)
+        .flat_map(|(_, pins)| pins)
+        .find(|(pin, _)| pin.number == pin_number)
+        .map(|(pin, transform)| konnect_sexp::schematic::pin_endpoint(&pin, transform));
     let (px, py) = match pin_ep {
         Some(ep) => ep,
         None => {
@@ -367,25 +366,22 @@ async fn handle_get_component_nets(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let inst = instances
+    if !instances
         .iter()
-        .find(|i| i.reference == reference)
-        .ok_or_else(|| anyhow::anyhow!("Component '{}' not found", reference))?;
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
+        .any(|instance| instance.reference == reference)
+    {
+        return Err(anyhow::anyhow!("Component '{}' not found", reference));
+    }
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-        let t = inst.pin_transform();
-        konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
-            let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-            json!({ "pin": p.number, "name": p.name, "x": px, "y": py, "net": g.net_at(px, py) })
-        }).collect()
-    } else {
-        Vec::new()
-    };
+    let pins: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+        .into_iter()
+        .filter(|(instance, _)| instance.reference == reference)
+        .flat_map(|(_, pins)| pins)
+        .map(|(pin, transform)| {
+            let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
+            json!({ "pin": pin.number, "name": pin.name, "x": px, "y": py, "net": g.net_at(px, py) })
+        })
+        .collect();
     Ok(CallToolResult::json(
         &json!({ "reference": reference, "pins": pins }),
     ))
@@ -401,26 +397,19 @@ async fn handle_get_net_components(
         Err(e) => return Ok(e),
     };
     let (_, tree) = read_schematic(&sch_path)?;
-    let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
     let mut g = net_graph_for(&tree, &wires, &labels);
     let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
-    let result: Vec<serde_json::Value> = instances
-        .iter()
-        .filter_map(|inst| {
-            let ls = find_lib_symbol(&lib_syms, inst)?;
-            let t = inst.pin_transform();
-            let connected: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls)
-                .iter()
-                .filter_map(|p| {
-                    let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
+    let result: Vec<serde_json::Value> = placed_pins_by_reference(&tree)
+        .into_iter()
+        .filter_map(|(instance, pins)| {
+            let connected: Vec<_> = pins
+                .into_iter()
+                .filter_map(|(pin, transform)| {
+                    let (px, py) = konnect_sexp::schematic::pin_endpoint(&pin, transform);
                     if net_pts.contains(&pt_key(px, py)) {
-                        Some(json!({ "pin": p.number, "name": p.name }))
+                        Some(json!({ "pin": pin.number, "name": pin.name }))
                     } else {
                         None
                     }
@@ -429,7 +418,7 @@ async fn handle_get_net_components(
             if connected.is_empty() {
                 None
             } else {
-                Some(json!({ "reference": inst.reference, "value": inst.value, "pins": connected }))
+                Some(json!({ "reference": instance.reference, "value": instance.value, "pins": connected }))
             }
         })
         .collect();
@@ -622,30 +611,26 @@ async fn handle_get_connected_items(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
-
-    let inst = match instances.iter().find(|i| i.reference == reference) {
-        Some(i) => i,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Component '{}' not found",
-                reference
-            )))
-        }
-    };
-
-    let lib_sym = find_lib_symbol(&lib_syms, inst);
+    if !instances
+        .iter()
+        .any(|instance| instance.reference == reference)
+    {
+        return Ok(CallToolResult::error(format!(
+            "Component '{}' not found",
+            reference
+        )));
+    }
+    let placed_pins = placed_pins_by_reference(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Get nets for each pin
     let mut connected_nets: HashSet<String> = HashSet::new();
-    if let Some(sym) = lib_sym {
-        let t = inst.pin_transform();
-        for p in konnect_sexp::schematic::extract_lib_pins(sym) {
-            let (px, py) = konnect_sexp::schematic::pin_endpoint(&p, t);
+    for (_, pins) in placed_pins
+        .iter()
+        .filter(|(instance, _)| instance.reference == reference)
+    {
+        for (pin, transform) in pins {
+            let (px, py) = konnect_sexp::schematic::pin_endpoint(pin, *transform);
             if let Some(net) = g.net_at(px, py) {
                 connected_nets.insert(net);
             }
@@ -675,20 +660,26 @@ async fn handle_get_connected_items(
         .collect();
 
     // Find other components on the same nets (excluding the queried one)
-    let connected_components: Vec<serde_json::Value> = instances.iter()
-        .filter(|i| i.reference != reference)
-        .filter_map(|i| {
-            let ls = find_lib_symbol(&lib_syms, i)?;
-            let t = i.pin_transform();
-            let matching_pins: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls).iter()
-                .filter_map(|p| {
-                    let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
+    let connected_components: Vec<serde_json::Value> = placed_pins
+        .iter()
+        .filter(|(instance, _)| instance.reference != reference)
+        .filter_map(|(instance, pins)| {
+            let matching_pins: Vec<_> = pins
+                .iter()
+                .filter_map(|(pin, transform)| {
+                    let (px, py) = konnect_sexp::schematic::pin_endpoint(pin, *transform);
                     if all_net_pts.contains(&pt_key(px, py)) {
-                        Some(json!({ "pin": p.number, "name": p.name }))
-                    } else { None }
-                }).collect();
-            if matching_pins.is_empty() { None }
-            else { Some(json!({ "reference": i.reference, "value": i.value, "connected_pins": matching_pins })) }
+                        Some(json!({ "pin": pin.number, "name": pin.name }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if matching_pins.is_empty() {
+                None
+            } else {
+                Some(json!({ "reference": instance.reference, "value": instance.value, "connected_pins": matching_pins }))
+            }
         })
         .collect();
 
@@ -1227,5 +1218,133 @@ mod power_symbol_net_tests {
         );
         let s = call(&shorted, "find_shorted_nets", json!({})).await;
         assert_eq!(s["short_count"], 1, "SIG and GND share one wire: {s}");
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_tool_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    async fn call_content(
+        content: &str,
+        tool: &str,
+        mut args: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut schematic = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        schematic.write_all(content.as_bytes()).unwrap();
+        schematic.flush().unwrap();
+
+        args["schematic"] = json!(schematic.path().to_str().unwrap());
+        let definition = tools()
+            .into_iter()
+            .find(|tool_def| tool_def.name == tool)
+            .unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = (definition.handler)(&args, Arc::new(context))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{tool} failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn call(tool: &str, args: serde_json::Value) -> serde_json::Value {
+        call_content(ECC83, tool, args).await
+    }
+
+    #[tokio::test]
+    async fn pin_lookup_uses_the_unit_that_owns_the_pin() {
+        let result = call(
+            "get_pin_connections",
+            json!({ "reference": "U1", "pin_number": "4" }),
+        )
+        .await;
+
+        let pin_x = result["pin_x"].as_f64().unwrap();
+        let pin_y = result["pin_y"].as_f64().unwrap();
+        assert!((pin_x - 60.96).abs() < 1e-9, "wrong unit x: {pin_x}");
+        assert!((pin_y - 86.36).abs() < 1e-9, "wrong unit y: {pin_y}");
+    }
+
+    #[tokio::test]
+    async fn component_nets_use_each_pins_own_unit_placement() {
+        let result = call("get_component_nets", json!({ "reference": "U1" })).await;
+        let pins = result["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 9, "ECC83 must expose all three units: {pins:?}");
+
+        let pin_four = pins
+            .iter()
+            .find(|pin| pin["pin"] == "4")
+            .expect("heater pin 4");
+        let pin_x = pin_four["x"].as_f64().unwrap();
+        let pin_y = pin_four["y"].as_f64().unwrap();
+        assert!((pin_x - 60.96).abs() < 1e-9, "wrong unit x: {pin_x}");
+        assert!((pin_y - 86.36).abs() < 1e-9, "wrong unit y: {pin_y}");
+    }
+
+    #[tokio::test]
+    async fn net_components_ignore_pins_from_unplaced_units() {
+        // Applying the heater unit's pin 5 geometry to unit 2's placement
+        // invents a pin at (160.02, 119.38); no placed ECC83 unit owns it.
+        let phantom_label =
+            "\t(label \"PHANTOM_TEST\" (at 160.02 119.38 0) (uuid \"00000000-0000-4000-8000-000000000183\"))\n";
+        let content = ECC83.replacen(
+            "\t(sheet_instances",
+            &format!("{phantom_label}\t(sheet_instances"),
+            1,
+        );
+        assert_ne!(content, ECC83, "fixture insertion point changed");
+
+        let result = call_content(
+            &content,
+            "get_net_components",
+            json!({ "net": "PHANTOM_TEST" }),
+        )
+        .await;
+        assert!(
+            result["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|component| component["reference"] != "U1"),
+            "unit 2 must not invent heater pin 5: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_items_include_nets_from_every_placed_unit() {
+        let heater_label =
+            "\t(label \"HEATER_TEST\" (at 66.04 86.36 0) (uuid \"00000000-0000-4000-8000-000000000184\"))\n";
+        let content = ECC83.replacen(
+            "\t(sheet_instances",
+            &format!("{heater_label}\t(sheet_instances"),
+            1,
+        );
+        assert_ne!(content, ECC83, "fixture insertion point changed");
+
+        let result = call_content(
+            &content,
+            "get_connected_items",
+            json!({ "reference": "U1" }),
+        )
+        .await;
+        assert!(
+            result["nets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|net| net == "HEATER_TEST"),
+            "heater unit net missing: {result}"
+        );
     }
 }

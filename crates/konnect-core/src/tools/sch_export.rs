@@ -6,12 +6,12 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, ToolContext, ToolDef};
+use crate::tools::{get_path, placed_pins, placed_pins_by_reference, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_lib_pins, extract_symbol_instances,
-        extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
+        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
+        pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
@@ -533,10 +533,7 @@ async fn handle_export_netlist_summary(
     let instances = extract_symbol_instances(&tree);
     let wires = extract_wires(&tree);
     let labels = extract_all_net_labels(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
+    let placed = placed_pins_by_reference(&tree);
 
     let mut g = net_graph_for(&tree, &wires, &labels);
 
@@ -549,26 +546,35 @@ async fn handle_export_netlist_summary(
     let components: Vec<serde_json::Value> = instances
         .iter()
         .map(|inst| {
-            let lib_sym = find_lib_symbol(&lib_syms, inst);
-
-            let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
-                let t = inst.pin_transform();
-                extract_lib_pins(sym)
-                    .iter()
-                    .map(|p| {
-                        let (px, py) = pin_endpoint(p, t);
-                        let net = g.net_at(px, py).unwrap_or_else(|| "~".to_string());
-                        json!({
-                            "number": p.number,
-                            "name": p.name,
-                            "net": net,
-                            "x": px, "y": py
+            let pins: Vec<serde_json::Value> = placed
+                .iter()
+                .find(
+                    |(placed_instance, _)| match (&placed_instance.uuid, &inst.uuid) {
+                        (Some(placed_uuid), Some(uuid)) => placed_uuid == uuid,
+                        _ => {
+                            placed_instance.reference == inst.reference
+                                && placed_instance.unit == inst.unit
+                                && placed_instance.x == inst.x
+                                && placed_instance.y == inst.y
+                                && placed_instance.lib_symbol_name() == inst.lib_symbol_name()
+                        }
+                    },
+                )
+                .map(|(_, pins)| {
+                    pins.iter()
+                        .map(|(pin, transform)| {
+                            let (px, py) = pin_endpoint(pin, *transform);
+                            let net = g.net_at(px, py).unwrap_or_else(|| "~".to_string());
+                            json!({
+                                "number": pin.number,
+                                "name": pin.name,
+                                "net": net,
+                                "x": px, "y": py
+                            })
                         })
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                        .collect()
+                })
+                .unwrap_or_default();
 
             json!({
                 "reference": inst.reference,
@@ -704,23 +710,12 @@ async fn handle_fix_connectivity(
     let (content, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
     let labels = extract_labels(&tree);
-    let instances = extract_symbol_instances(&tree);
-    let lib_syms = tree
-        .find("lib_symbols")
-        .map(|n| n.find_all("symbol"))
-        .unwrap_or_default();
 
     // Collect all valid snap targets: pin endpoints + label positions + wire endpoints
     let mut snap_targets: Vec<(f64, f64)> = Vec::new();
 
-    for inst in &instances {
-        let lib_sym = find_lib_symbol(&lib_syms, inst);
-        if let Some(sym) = lib_sym {
-            let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
-                snap_targets.push(pin_endpoint(&pin, t));
-            }
-        }
+    for (pin, transform) in placed_pins(&tree) {
+        snap_targets.push(pin_endpoint(&pin, transform));
     }
     for l in &labels {
         snap_targets.push((l.x, l.y));
@@ -827,6 +822,7 @@ mod netlist_summary_tests {
     /// R1 with pin 2 wired to a `power:GND` symbol, and pin 1 on a plain label.
     /// The rail is the case that used to disappear.
     const SCH: &str = include_str!("../../tests/fixtures/power_rail.kicad_sch");
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
 
     async fn summary(content: &str) -> serde_json::Value {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
@@ -904,6 +900,100 @@ mod netlist_summary_tests {
         let s = summary(&sch).await;
         assert_eq!(net_of(&s, "R1", "2"), "~");
         assert!(s["nets"].as_array().unwrap().iter().any(|n| n == "GND"));
+    }
+
+    #[tokio::test]
+    async fn multi_unit_summary_reports_only_the_pins_placed_by_each_unit() {
+        let result = summary(ECC83).await;
+        let mut pin_sets: Vec<Vec<String>> = result["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|component| component["reference"] == "U1")
+            .map(|component| {
+                let mut pins: Vec<String> = component["pins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pin| pin["number"].as_str().unwrap().to_string())
+                    .collect();
+                pins.sort();
+                pins
+            })
+            .collect();
+        pin_sets.sort();
+
+        assert_eq!(
+            pin_sets,
+            vec![
+                vec!["1".to_string(), "2".to_string(), "3".to_string()],
+                vec!["4".to_string(), "5".to_string(), "9".to_string()],
+                vec!["6".to_string(), "7".to_string(), "8".to_string()],
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_unit_connectivity_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    const ECC83: &str = include_str!("../../tests/fixtures/ecc83_multiunit.kicad_sch");
+
+    #[tokio::test]
+    async fn connectivity_fix_does_not_snap_to_a_pin_from_an_unplaced_unit() {
+        // Unit 1 is placed at (160.02, 64.77). Applying that transform to the
+        // heater unit's pin 5 invents a phantom target at (162.56, 76.20).
+        // Keep a loose wire end 0.02 mm from that point: the old all-unit
+        // extraction proposed a destructive snap, while the placed-unit view
+        // correctly leaves it alone.
+        let probe_wire = r#"
+	(wire
+		(pts
+			(xy 162.56 76.22) (xy 170 80)
+		)
+		(stroke (width 0) (type default))
+		(uuid "00000000-0000-4000-8000-000000000182")
+	)
+"#;
+        let content = ECC83.replacen(
+            "\t(sheet_instances",
+            &format!("{probe_wire}\t(sheet_instances"),
+            1,
+        );
+        assert_ne!(content, ECC83, "fixture insertion point changed");
+
+        let mut schematic = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        schematic.write_all(content.as_bytes()).unwrap();
+        schematic.flush().unwrap();
+
+        let definition = tools()
+            .into_iter()
+            .find(|tool_def| tool_def.name == "fix_connectivity")
+            .unwrap();
+        let context = ToolContext::new(
+            ServerConfig::default(),
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        let result = (definition.handler)(
+            &json!({
+                "schematic": schematic.path().to_str().unwrap(),
+                "snap_tolerance": 0.05,
+                "dry_run": true
+            }),
+            Arc::new(context),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["fixes_found"], 0, "phantom pin snap: {response}");
     }
 }
 

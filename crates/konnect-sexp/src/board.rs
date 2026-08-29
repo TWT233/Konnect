@@ -427,6 +427,11 @@ pub struct FootprintCourtyard {
     pub bbox: (f64, f64, f64, f64),
     /// What the bbox actually bounds.
     pub bbox_source: CourtyardSource,
+    /// KiCad's own lock state for this footprint, from a direct `(locked yes)`
+    /// child (or the legacy bare `locked` token). A locked footprint is one the
+    /// user has pinned in the editor: automated placement must treat it as an
+    /// obstacle, never as something to move.
+    pub locked: bool,
 }
 
 /// Per-footprint courtyard bboxes in board coordinates, in file order.
@@ -516,7 +521,33 @@ fn footprint_courtyard(fp: &SexpNode) -> Option<FootprintCourtyard> {
         layer_side,
         bbox,
         bbox_source,
+        locked: footprint_locked(fp),
     })
+}
+
+/// KiCad's lock state for a footprint, read from its **direct** children only.
+///
+/// Two forms exist and both mean locked:
+/// - `(locked yes)` — what KiCad 10 writes.
+/// - a bare `locked` token — the older inline form.
+///
+/// Depth matters more than it looks: `locked` appears tens of thousands of
+/// times across the installed demo boards, almost all of it on pads and
+/// graphics, so a text scan or a recursive search would report nearly every
+/// footprint as locked. Only a direct child describes the footprint itself.
+fn footprint_locked(fp: &SexpNode) -> bool {
+    for child in fp.children().unwrap_or(&[]) {
+        match child {
+            // Legacy inline form: a bare `locked` token among the children.
+            SexpNode::Atom(a) if a == "locked" => return true,
+            _ => {}
+        }
+        if child.head() == Some("locked") {
+            // `(locked yes)` locks; `(locked no)` is an explicit unlock.
+            return matches!(child.get(1).and_then(|n| n.as_str()), Some("yes"));
+        }
+    }
+    false
 }
 
 /// The footprint's root `(at x y [rot])`. The rotation defaults to 0 when
