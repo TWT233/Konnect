@@ -4,6 +4,8 @@ Thanks for your interest! Bug reports, feature requests, and pull requests are w
 
 ## Before you start
 
+- Read [GOVERNANCE.md](GOVERNANCE.md) — who maintains what, how work is claimed,
+  and what has to be true before a change lands.
 - Check [ROADMAP.md](ROADMAP.md) — your idea may already be planned (or intentionally
   out of scope).
 - For anything non-trivial, open an issue first so we can agree on the approach before
