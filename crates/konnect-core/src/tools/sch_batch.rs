@@ -213,6 +213,10 @@ pub fn tools() -> Vec<ToolDef> {
                                 "value_visible": { "type": "boolean" }
                             },
                             "required": ["reference"],
+                            "anyOf": [
+                                { "required": ["reference_visible"] },
+                                { "required": ["value_visible"] }
+                            ],
                             "additionalProperties": false
                         }
                     }
@@ -2863,6 +2867,13 @@ mod field_visibility_tests {
         assert_eq!(
             schema["properties"]["edits"]["items"]["additionalProperties"],
             json!(false)
+        );
+        assert_eq!(
+            schema["properties"]["edits"]["items"]["anyOf"],
+            json!([
+                {"required": ["reference_visible"]},
+                {"required": ["value_visible"]}
+            ])
         );
     }
 
